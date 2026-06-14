@@ -2,11 +2,6 @@ name: Republish runner images to GHCR
 
 on:
   workflow_dispatch:
-    inputs:
-      source_tag:
-        description: Base source image tag; non-latest tags append -<tag>
-        required: true
-        type: string
 permissions:
   contents: read
   packages: write
@@ -44,27 +39,13 @@ jobs:
       - name: Resolve image
         id: resolve_image
         env:
-          DISPATCH_SOURCE_TAG: ${{ inputs.source_tag }}
           MATRIX_TARGET_TAG: ${{ matrix.target_tag }}
           MATRIX_SOURCE_IMAGE_REPO: ${{ matrix.source_image_repo }}
           MATRIX_DEST_REPO: ${{ matrix.dest_repo }}
         run: |
           set -eu
 
-          source_tag="${DISPATCH_SOURCE_TAG:-}"
-
-          if [ -z "${source_tag}" ]; then
-            echo "source_tag is required" >&2
-            exit 1
-          fi
-
-          if [ "${MATRIX_TARGET_TAG}" = "latest" ]; then
-            resolved_source_tag="${source_tag}"
-          else
-            resolved_source_tag="${source_tag}-${MATRIX_TARGET_TAG}"
-          fi
-
-          source_image="${MATRIX_SOURCE_IMAGE_REPO}:${resolved_source_tag}"
+          source_image="${MATRIX_SOURCE_IMAGE_REPO}:${MATRIX_TARGET_TAG}"
           dest_image="${MATRIX_DEST_REPO}:${MATRIX_TARGET_TAG}"
 
           echo "source_image=${source_image}" >> "${GITHUB_OUTPUT}"
