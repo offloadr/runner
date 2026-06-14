@@ -2,32 +2,6 @@ name: Republish runner images to GHCR
 
 on:
   workflow_dispatch:
-    inputs:
-      target:
-        description: Target image family to publish
-        required: false
-        type: choice
-        default: all
-        options:
-          - all
-          - comfyui
-          - forge-neo
-      source_tag:
-        description: Exact source image tag to mirror from oci.offloadr.app
-        required: false
-        type: string
-      target_tag:
-        description: Destination GHCR tag to publish; defaults to all configured tags
-        required: false
-        type: string
-      source_sha:
-        description: Source commit SHA for logging
-        required: false
-        type: string
-      source_repo:
-        description: Source repository for logging
-        required: false
-        type: string
 permissions:
   contents: read
   packages: write
@@ -38,126 +12,45 @@ concurrency:
 
 jobs:
   republish:
+    name: ${{ matrix.target }}:${{ matrix.target_tag }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: comfyui
+            target_tag: latest
+            source_image_repo: oci.offloadr.app/runner/nvidia
+            dest_repo: ghcr.io/offloadr/runner-comfyui
+          - target: comfyui
+            target_tag: master
+            source_image_repo: oci.offloadr.app/runner/nvidia
+            dest_repo: ghcr.io/offloadr/runner-comfyui
+          - target: forge-neo
+            target_tag: latest
+            source_image_repo: oci.offloadr.app/runner/forge-neo-nvidia
+            dest_repo: ghcr.io/offloadr/runner-forge-neo
+          - target: forge-neo
+            target_tag: neo
+            source_image_repo: oci.offloadr.app/runner/forge-neo-nvidia
+            dest_repo: ghcr.io/offloadr/runner-forge-neo
 
     steps:
-      - name: Resolve image pairs
-        id: resolve_images
+      - name: Resolve image
+        id: resolve_image
         env:
-          DISPATCH_TARGET: ${{ inputs.target }}
-          DISPATCH_SOURCE_REPO: ${{ inputs.source_repo }}
-          DISPATCH_SOURCE_SHA: ${{ inputs.source_sha }}
-          DISPATCH_SOURCE_TAG: ${{ inputs.source_tag }}
-          DISPATCH_TARGET_TAG: ${{ inputs.target_tag }}
+          MATRIX_TARGET_TAG: ${{ matrix.target_tag }}
+          MATRIX_SOURCE_IMAGE_REPO: ${{ matrix.source_image_repo }}
+          MATRIX_DEST_REPO: ${{ matrix.dest_repo }}
         run: |
           set -eu
 
-          target="${DISPATCH_TARGET:-all}"
-          source_tag="${DISPATCH_SOURCE_TAG:-}"
-          target_tag="${DISPATCH_TARGET_TAG:-}"
-          image_pairs=""
-          pairs_file="${RUNNER_TEMP}/republish-image-pairs.txt"
+          source_image="${MATRIX_SOURCE_IMAGE_REPO}:${MATRIX_TARGET_TAG}"
+          dest_image="${MATRIX_DEST_REPO}:${MATRIX_TARGET_TAG}"
 
-          case "${target}" in
-            all|comfyui|forge-neo) ;;
-            *)
-              echo "Unsupported target: ${target}" >&2
-              exit 1
-              ;;
-          esac
-
-          source_repo_for_target() {
-            case "$1" in
-              comfyui) echo "oci.offloadr.app/runner/nvidia" ;;
-              forge-neo) echo "oci.offloadr.app/runner/forge-neo-nvidia" ;;
-              *)
-                echo "Unsupported target: $1" >&2
-                return 1
-                ;;
-            esac
-          }
-
-          dest_repo_for_target() {
-            case "$1" in
-              comfyui) echo "ghcr.io/offloadr/runner-comfyui" ;;
-              forge-neo) echo "ghcr.io/offloadr/runner-forge-neo" ;;
-              *)
-                echo "Unsupported target: $1" >&2
-                return 1
-                ;;
-            esac
-          }
-
-          supports_tag() {
-            case "$1:$2" in
-              comfyui:latest|comfyui:master|forge-neo:latest|forge-neo:neo) return 0 ;;
-              *) return 1 ;;
-            esac
-          }
-
-          add_pair() {
-            pair_target="$1"
-            pair_tag="$2"
-
-            if [ "${target}" != "all" ] && [ "${target}" != "${pair_target}" ]; then
-              return 0
-            fi
-
-            if [ -n "${target_tag}" ] && [ "${target_tag}" != "${pair_tag}" ]; then
-              return 0
-            fi
-
-            src_repo="$(source_repo_for_target "${pair_target}")"
-            dst_repo="$(dest_repo_for_target "${pair_target}")"
-            src_tag="${source_tag:-${pair_tag}}"
-            line="${src_repo}:${src_tag}|${dst_repo}:${pair_tag}"
-
-            if [ -z "${image_pairs}" ]; then
-              image_pairs="${line}"
-            else
-              image_pairs="$(printf '%s\n%s' "${image_pairs}" "${line}")"
-            fi
-
-            echo "Will mirror ${src_repo}:${src_tag} -> ${dst_repo}:${pair_tag}"
-          }
-
-          if [ -n "${source_tag}" ]; then
-            if [ "${target}" = "all" ]; then
-              echo "target must be a concrete image family when source_tag is provided" >&2
-              exit 1
-            fi
-
-            if [ -z "${target_tag}" ]; then
-              echo "target_tag is required when source_tag is provided" >&2
-              exit 1
-            fi
-
-            if ! supports_tag "${target}" "${target_tag}"; then
-              echo "Unsupported tag '${target_tag}' for target '${target}'" >&2
-              exit 1
-            fi
-          fi
-
-          add_pair comfyui latest
-          add_pair comfyui master
-          add_pair forge-neo latest
-          add_pair forge-neo neo
-
-          if [ -z "${image_pairs}" ]; then
-            echo "No image pairs matched target='${target}' target_tag='${target_tag}'" >&2
-            exit 1
-          fi
-
-          printf '%s\n' "${image_pairs}" > "${pairs_file}"
-          echo "pairs_file=${pairs_file}" >> "${GITHUB_OUTPUT}"
-
-          if [ -n "${DISPATCH_SOURCE_REPO:-}" ]; then
-            echo "Source repository: ${DISPATCH_SOURCE_REPO}"
-          fi
-
-          if [ -n "${DISPATCH_SOURCE_SHA:-}" ]; then
-            echo "Source revision: ${DISPATCH_SOURCE_SHA}"
-          fi
+          echo "source_image=${source_image}" >> "${GITHUB_OUTPUT}"
+          echo "dest_image=${dest_image}" >> "${GITHUB_OUTPUT}"
+          echo "Will mirror ${source_image} -> ${dest_image}"
 
       - name: Install skopeo
         run: |
@@ -171,40 +64,34 @@ jobs:
               --username "${{ github.actor }}" \
               --password-stdin
 
-      - name: Copy images from source registry to GHCR
+      - name: Copy image from source registry to GHCR
         run: |
           set -eu
 
-          while IFS='|' read -r source_image dest_image; do
-            if [ -z "${source_image}" ]; then
-              continue
-            fi
+          source_image="${{ steps.resolve_image.outputs.source_image }}"
+          dest_image="${{ steps.resolve_image.outputs.dest_image }}"
 
-            echo "Copying ${source_image} -> ${dest_image}"
-            skopeo copy --all \
-              "docker://${source_image}" \
-              "docker://${dest_image}"
-          done < "${{ steps.resolve_images.outputs.pairs_file }}"
+          echo "Copying ${source_image} -> ${dest_image}"
+          skopeo copy --all \
+            "docker://${source_image}" \
+            "docker://${dest_image}"
 
-      - name: Verify copied digests
+      - name: Verify copied digest
         run: |
           set -eu
 
-          while IFS='|' read -r source_image dest_image; do
-            if [ -z "${source_image}" ]; then
-              continue
-            fi
+          source_image="${{ steps.resolve_image.outputs.source_image }}"
+          dest_image="${{ steps.resolve_image.outputs.dest_image }}"
 
-            src_digest="$(skopeo inspect --format '{{.Digest}}' "docker://${source_image}")"
-            dest_digest="$(skopeo inspect --format '{{.Digest}}' "docker://${dest_image}")"
+          src_digest="$(skopeo inspect --format '{{.Digest}}' "docker://${source_image}")"
+          dest_digest="$(skopeo inspect --format '{{.Digest}}' "docker://${dest_image}")"
 
-            echo "Source image: ${source_image}"
-            echo "Destination image: ${dest_image}"
-            echo "Source digest: ${src_digest}"
-            echo "Destination digest: ${dest_digest}"
+          echo "Source image: ${source_image}"
+          echo "Destination image: ${dest_image}"
+          echo "Source digest: ${src_digest}"
+          echo "Destination digest: ${dest_digest}"
 
-            if [ "${src_digest}" != "${dest_digest}" ]; then
-              echo "Mirrored digest does not match source digest" >&2
-              exit 1
-            fi
-          done < "${{ steps.resolve_images.outputs.pairs_file }}"
+          if [ "${src_digest}" != "${dest_digest}" ]; then
+            echo "Mirrored digest does not match source digest" >&2
+            exit 1
+          fi
