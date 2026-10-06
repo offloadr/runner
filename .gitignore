@@ -1,0 +1,15 @@
+# Build output
+[Bb]in/
+[Oo]bj/
+artifacts/
+TestResults/
+*.binlog
+
+# User-specific and editor files
+*.user
+*.suo
+*.rsuser
+.vs/
+.vscode/
+.idea/
+.claude/settings.local.json

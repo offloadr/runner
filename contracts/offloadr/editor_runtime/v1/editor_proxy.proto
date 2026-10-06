@@ -1,0 +1,353 @@
+syntax = "proto3";
+
+package offloadr.editor_runtime.v1;
+
+import "offloadr/common/v1/prompt.proto";
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/wrappers.proto";
+
+message EditorProxyInfo {
+  string id = 1;
+  string address = 2;
+  string owner = 3;
+  string template = 4;
+  string runtime_kind = 5;
+  string lifecycle_id = 6;
+  uint64 generation = 7;
+  uint64 cpu_runtime_generation = 8;
+  string cpu_runtime_instance_id = 9;
+}
+
+message SubmitEditorActionRequest {
+  offloadr.common.v1.PromptSubmission submission = 1;
+}
+
+message SubmitEditorActionResponse {
+  offloadr.common.v1.PromptSubmissionSnapshot submission = 1;
+}
+
+message GetEditorActionRequest {
+  string owner = 1;
+  string submission_id = 2;
+}
+
+message GetEditorActionResponse {
+  offloadr.common.v1.PromptSubmissionSnapshot submission = 1;
+}
+
+message ListEditorActionsRequest {
+  string owner = 1;
+  string editor_sid = 2;
+  string editor_lifecycle_id = 3;
+  uint64 editor_generation = 4;
+}
+
+message ListEditorActionsResponse {
+  repeated offloadr.common.v1.PromptSubmissionSummary submissions = 1;
+}
+
+message WaitEditorActionResultRequest {
+  string owner = 1;
+  string submission_id = 2;
+}
+
+message WaitEditorActionResultResponse {
+  offloadr.common.v1.PromptSubmissionSnapshot submission = 1;
+}
+
+// Durable native-route discovery; Redis hints never authorize another queue reader.
+message FindForgeEditorActionsRequest {
+  string owner = 1;
+  string editor_sid = 2;
+  string editor_lifecycle_id = 3;
+  uint64 editor_generation = 4;
+  uint64 cpu_runtime_generation = 5;
+  string cpu_runtime_instance_id = 6;
+  string session_hash = 7;
+  string task_id = 8;
+}
+
+message FindForgeEditorActionsResponse {
+  offloadr.common.v1.PromptSubmissionSnapshot generation = 1;
+  offloadr.common.v1.PromptSubmissionSnapshot event_reader = 2;
+}
+
+enum EditorExecutionAuthorityState {
+  EDITOR_EXECUTION_AUTHORITY_STATE_UNSPECIFIED = 0;
+  EDITOR_EXECUTION_AUTHORITY_STATE_NONE = 1;
+  EDITOR_EXECUTION_AUTHORITY_STATE_STARTING = 2;
+  EDITOR_EXECUTION_AUTHORITY_STATE_READY = 3;
+  EDITOR_EXECUTION_AUTHORITY_STATE_STALE = 4;
+  EDITOR_EXECUTION_AUTHORITY_STATE_STOPPING = 5;
+  EDITOR_EXECUTION_AUTHORITY_STATE_RESTARTING = 6;
+  EDITOR_EXECUTION_AUTHORITY_STATE_UNAVAILABLE = 7;
+}
+
+enum EditorRuntimeRestartDeliveryOutcome {
+  EDITOR_RUNTIME_RESTART_DELIVERY_OUTCOME_UNSPECIFIED = 0;
+  EDITOR_RUNTIME_RESTART_DELIVERY_OUTCOME_ACCEPTED = 1;
+  EDITOR_RUNTIME_RESTART_DELIVERY_OUTCOME_EXPECTED_CONNECTION_RESET = 2;
+  EDITOR_RUNTIME_RESTART_DELIVERY_OUTCOME_DEFINITE_FAILURE = 3;
+  EDITOR_RUNTIME_RESTART_DELIVERY_OUTCOME_INDETERMINATE = 4;
+}
+
+enum CpuRuntimeReadinessEvidence {
+  CPU_RUNTIME_READINESS_EVIDENCE_UNSPECIFIED = 0;
+  CPU_RUNTIME_READINESS_EVIDENCE_WEBSOCKET_REPLACED = 1;
+  CPU_RUNTIME_READINESS_EVIDENCE_SYSTEM_STATS_DOWN_READY = 2;
+}
+
+enum EditorRuntimeRequestKind {
+  EDITOR_RUNTIME_REQUEST_KIND_UNSPECIFIED = 0;
+  EDITOR_RUNTIME_REQUEST_KIND_CONTROL = 1;
+  EDITOR_RUNTIME_REQUEST_KIND_READ = 2;
+  EDITOR_RUNTIME_REQUEST_KIND_CLIENT_MESSAGE = 3;
+}
+
+message ResolveEditorExecutionAuthorityRequest {
+  string owner = 1;
+  string editor_sid = 2;
+}
+
+message ResolveEditorExecutionAuthorityResponse {
+  EditorExecutionAuthorityState state = 1;
+  offloadr.common.v1.PromptExecutionTarget target = 2;
+  bool heartbeat_fresh = 3;
+  uint64 desired_runtime_epoch = 4;
+  uint64 applied_runtime_epoch = 5;
+  uint32 restart_revision = 6;
+  string runtime_status_message = 7;
+}
+
+message BeginEditorRuntimeRestartDeliveryRequest {
+  string owner = 1;
+  string editor_sid = 2;
+}
+
+message BeginEditorRuntimeRestartDeliveryResponse {
+  string restart_id = 1;
+  uint64 cpu_runtime_generation = 2;
+  string cpu_runtime_instance_id = 3;
+  google.protobuf.Timestamp delivery_attempted_utc = 4;
+}
+
+message ResolveEditorRuntimeRestartDeliveryRequest {
+  string owner = 1;
+  string editor_sid = 2;
+  string restart_id = 3;
+  EditorRuntimeRestartDeliveryOutcome outcome = 4;
+  int32 cpu_status_code = 5;
+  string message = 6;
+}
+
+message ResolveEditorRuntimeRestartDeliveryResponse {
+  bool accepted = 1;
+  uint64 desired_runtime_epoch = 2;
+  uint32 restart_revision = 3;
+  uint64 cpu_runtime_generation = 4;
+  string cpu_runtime_instance_id = 5;
+}
+
+message ReportCpuRuntimeReadyRequest {
+  reserved 7;
+
+  string owner = 1;
+  string editor_sid = 2;
+  string restart_id = 3;
+  uint64 cpu_runtime_generation = 4;
+  string cpu_runtime_instance_id = 5;
+  CpuRuntimeReadinessEvidence evidence = 6;
+}
+
+message ReportCpuRuntimeReadyResponse {
+  bool accepted = 1;
+}
+
+message RelayEditorRuntimeRequestRequest {
+  string owner = 1;
+  string editor_sid = 2;
+  EditorRuntimeRequestKind kind = 3;
+  string method = 4;
+  string path = 5;
+  string query = 6;
+  bytes body = 7;
+  string content_type = 8;
+  // Immutable browser target. Absence asserts that no GPU lifecycle is selected;
+  // it never authorizes rebinding to a currently available runtime.
+  offloadr.common.v1.PromptExecutionTarget expected_target = 9;
+}
+
+message RelayEditorRuntimeRequestResponse {
+  bool relayed = 1;
+  int32 status_code = 2;
+  bytes body = 3;
+  string content_type = 4;
+}
+
+message PublishEditorWebSocketClientMessageRequest {
+  string owner = 1;
+  string editor_sid = 2;
+  string client_id = 3;
+  bytes payload = 4;
+  offloadr.common.v1.PromptExecutionTarget expected_target = 5;
+}
+
+message PublishEditorWebSocketClientMessageResponse {
+  bool relayed = 1;
+}
+
+message EditorArtifactMetadata {
+  string editor_sid = 1;
+  google.protobuf.StringValue prompt_id = 2;
+  string filename = 3;
+  string type = 4;
+  string subfolder = 5;
+  string object_key = 6;
+  google.protobuf.StringValue content_type = 7;
+  google.protobuf.Int64Value size_bytes = 8;
+  google.protobuf.StringValue sha256 = 9;
+  google.protobuf.Timestamp created_utc = 10;
+}
+
+message ListArtifactsRequest {
+  string editor_sid = 1;
+  string type = 2;
+  string subfolder = 3;
+}
+
+message ListArtifactsResponse {
+  repeated EditorArtifactMetadata artifacts = 1;
+}
+
+message ArtifactReadMetadata {
+  google.protobuf.StringValue content_type = 1;
+  google.protobuf.Int64Value size_bytes = 2;
+  google.protobuf.StringValue sha256 = 3;
+  google.protobuf.Timestamp modified_utc = 4;
+}
+
+message ReadArtifactRequest {
+  string editor_sid = 1;
+  string filename = 2;
+  string type = 3;
+  string subfolder = 4;
+}
+
+message ReadArtifactResponse {
+  oneof payload {
+    ArtifactReadMetadata metadata = 1;
+    bytes chunk = 2;
+  }
+}
+
+message GetDownloadUrlRequest {
+  string editor_sid = 1;
+  string filename = 2;
+  string type = 3;
+  string subfolder = 4;
+}
+
+message GetDownloadUrlResponse {
+  string url = 1;
+  google.protobuf.StringValue content_type = 2;
+  google.protobuf.Int64Value size_bytes = 3;
+  google.protobuf.StringValue sha256 = 4;
+  google.protobuf.Timestamp created_utc = 5;
+}
+
+message EditorWorkspaceFileReadMetadata {
+  google.protobuf.StringValue content_type = 1;
+  google.protobuf.Int64Value size_bytes = 2;
+  google.protobuf.Timestamp modified_utc = 3;
+}
+
+message ReadEditorWorkspaceFileRequest {
+  string root = 1;
+  string relative_path = 2;
+}
+
+message ReadEditorWorkspaceFileResponse {
+  oneof payload {
+    EditorWorkspaceFileReadMetadata metadata = 1;
+    bytes chunk = 2;
+  }
+}
+
+message EditorArtifactUploadMetadata {
+  string editor_sid = 1;
+  google.protobuf.StringValue prompt_id = 2;
+  string filename = 3;
+  string type = 4;
+  string subfolder = 5;
+  google.protobuf.StringValue content_type = 6;
+  google.protobuf.Int64Value size_bytes = 7;
+  google.protobuf.StringValue sha256 = 8;
+  google.protobuf.StringValue owner = 9;
+  google.protobuf.StringValue session_id = 10;
+}
+
+message UploadArtifactRequest {
+  oneof payload {
+    EditorArtifactUploadMetadata metadata = 1;
+    bytes chunk = 2;
+  }
+}
+
+message UploadArtifactResponse {
+  bool success = 1;
+  string message = 2;
+  EditorArtifactMetadata artifact = 3;
+}
+
+message CleanupForgePreparationRequest {
+  string editor_sid = 1;
+  string submission_id = 2;
+  string attempt_id = 3;
+}
+
+message CleanupForgePreparationResponse {
+  uint32 removed_artifacts = 1;
+}
+
+message RegisterMetadataRequest {
+  EditorArtifactUploadMetadata metadata = 1;
+}
+
+message RegisterMetadataResponse {
+  EditorArtifactMetadata artifact = 1;
+}
+
+message ResolveEditorRouteRequest {
+  string owner = 1;
+}
+
+message ResolveEditorRouteResponse {
+  EditorProxyInfo proxy = 1;
+}
+
+service EditorRuntimeService {
+  rpc ResolveEditorRoute(ResolveEditorRouteRequest) returns (ResolveEditorRouteResponse);
+  rpc ResolveEditorExecutionAuthority(ResolveEditorExecutionAuthorityRequest) returns (ResolveEditorExecutionAuthorityResponse);
+  rpc SubmitEditorAction(SubmitEditorActionRequest) returns (SubmitEditorActionResponse);
+  rpc GetEditorAction(GetEditorActionRequest) returns (GetEditorActionResponse);
+  rpc ListEditorActions(ListEditorActionsRequest) returns (ListEditorActionsResponse);
+  rpc WaitEditorActionResult(WaitEditorActionResultRequest) returns (WaitEditorActionResultResponse);
+  rpc FindForgeEditorActions(FindForgeEditorActionsRequest) returns (FindForgeEditorActionsResponse);
+  rpc RelayEditorRuntimeRequest(RelayEditorRuntimeRequestRequest) returns (RelayEditorRuntimeRequestResponse);
+  rpc PublishEditorWebSocketClientMessage(PublishEditorWebSocketClientMessageRequest) returns (PublishEditorWebSocketClientMessageResponse);
+  rpc BeginEditorRuntimeRestartDelivery(BeginEditorRuntimeRestartDeliveryRequest) returns (BeginEditorRuntimeRestartDeliveryResponse);
+  rpc ResolveEditorRuntimeRestartDelivery(ResolveEditorRuntimeRestartDeliveryRequest) returns (ResolveEditorRuntimeRestartDeliveryResponse);
+  rpc ReportCpuRuntimeReady(ReportCpuRuntimeReadyRequest) returns (ReportCpuRuntimeReadyResponse);
+}
+
+service EditorArtifactService {
+  rpc ListArtifacts(ListArtifactsRequest) returns (ListArtifactsResponse);
+  rpc ReadArtifact(ReadArtifactRequest) returns (stream ReadArtifactResponse);
+  rpc UploadArtifact(stream UploadArtifactRequest) returns (UploadArtifactResponse);
+  rpc RegisterMetadata(RegisterMetadataRequest) returns (RegisterMetadataResponse);
+  rpc CleanupForgePreparation(CleanupForgePreparationRequest) returns (CleanupForgePreparationResponse);
+}
+
+service EditorWorkspaceFileService {
+  rpc ReadEditorWorkspaceFile(ReadEditorWorkspaceFileRequest) returns (stream ReadEditorWorkspaceFileResponse);
+}

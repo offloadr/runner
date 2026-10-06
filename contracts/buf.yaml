@@ -1,0 +1,10 @@
+# Runner contracts copied from the Offloadr control plane. See docs/contracts-sync.md.
+version: v2
+modules:
+  - path: .
+lint:
+  use:
+    - STANDARD
+breaking:
+  use:
+    - FILE
