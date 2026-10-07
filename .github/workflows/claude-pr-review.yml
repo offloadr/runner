@@ -1,0 +1,76 @@
+name: Claude PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: claude-pr-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: Claude review
+    # Pull requests from forks get no secrets, so only branches of this repository are reviewed.
+    if: ${{ !github.event.pull_request.draft && github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Review with Claude
+        uses: anthropics/claude-code-action@v1.0.235
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+            BASE REF: origin/${{ github.base_ref }}
+
+            Review this pull request. Read AGENTS.md and the docs under docs/
+            that the change touches; the change should follow them. Inspect
+            the change with `git diff origin/${{ github.base_ref }}...HEAD` and
+            read surrounding code for context.
+
+            Focus on:
+            - Correctness and bugs, including command, session and runtime
+              identity, stale or duplicate commands, acknowledgement replay,
+              and cleanup after failed starts or unexpected exits.
+            - Concurrency: races, cancellation that is misclassified (host
+              shutdown, workflow cancellation, Stop, failure), and lanes that
+              can block one another.
+            - Security: secrets, signed URLs or runner keys in code, logs or
+              command lines; unsafe filesystem, process or container
+              operations; anything that exposes an inbound port.
+            - Boundaries: Core, Supervisor, UI or Desktop referencing
+              Offloadr.Runner.Linux, and runtime-specific behavior that is not
+              gated by runtime kind.
+            - Contracts: protobuf changes that the control plane would not
+              accept, and hand edits to generated code.
+            - Missing tests for changed behavior.
+
+            Only report actionable, high-confidence issues. Put each one as an
+            inline comment on the relevant line. Do not comment on style or
+            restate what the PR does. If there is nothing actionable, say so in
+            one line.
+          claude_args: |
+            --model claude-opus-5-5
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(git diff:*),Bash(git log:*),Bash(git show:*)"
+
+      - name: Show Claude error
+        if: failure()
+        shell: bash
+        run: |
+          file="${RUNNER_TEMP}/claude-execution-output.json"
+          [ -f "${file}" ] || exit 0
+          jq -r '[.[] | select(.type == "result")] | last | .result // empty' "${file}"
