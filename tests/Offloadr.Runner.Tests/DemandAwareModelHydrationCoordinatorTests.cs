@@ -717,7 +717,8 @@ public class DemandAwareModelHydrationCoordinatorTests
             await coordinator.ReleaseAsync(opened.LeaseId);
 
             await WaitUntilAsync(
-                () => backend.PauseAttempts.Count(attempt => attempt == handle) >= 2,
+                () => backend.PauseAttempts.Count(attempt => attempt == handle) >= 2 &&
+                      backend.PausedHandles.Contains(handle),
                 TimeSpan.FromSeconds(2));
             Assert.That(backend.PausedHandles.Count(attempt => attempt == handle), Is.EqualTo(1));
         }
