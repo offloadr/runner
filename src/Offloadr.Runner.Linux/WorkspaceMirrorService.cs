@@ -379,6 +379,9 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
             var tempPath = Path.Combine(Path.GetTempPath(), $"workspace-seed-{_sessionId}-{Guid.NewGuid():N}.zip");
             long totalBytes = 0;
             bool sawMetadata = false;
+            long? expectedSize = null;
+            string? expectedSha256 = null;
+            using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
 
             try
             {
@@ -395,6 +398,12 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                                 throw new InvalidOperationException($"Workspace seed archive exceeds max allowed size ({MaxArchiveBytes} bytes).");
                             }
 
+                            expectedSize = response.Metadata.SizeBytes;
+                            if (!string.IsNullOrWhiteSpace(response.Metadata.Sha256))
+                            {
+                                expectedSha256 = response.Metadata.Sha256.Trim();
+                            }
+
                             break;
                         case RunnerWorkspaceServiceReadWorkspaceSeedArchiveResponse.PayloadOneofCase.Chunk:
                             if (!sawMetadata)
@@ -403,11 +412,13 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                             }
 
                             totalBytes += response.Chunk.Length;
-                            if (totalBytes > MaxArchiveBytes)
+                            if (totalBytes > MaxArchiveBytes || totalBytes > expectedSize)
                             {
-                                throw new InvalidOperationException($"Workspace seed archive exceeds max allowed size ({MaxArchiveBytes} bytes).");
+                                throw new InvalidOperationException(
+                                    $"Workspace seed archive exceeds its declared or maximum size ({expectedSize ?? MaxArchiveBytes} bytes).");
                             }
 
+                            hash.AppendData(response.Chunk.Span);
                             await destination.WriteAsync(response.Chunk.Memory, cancellationToken).ConfigureAwait(false);
                             break;
                     }
@@ -416,6 +427,19 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                 if (!sawMetadata)
                 {
                     throw new InvalidOperationException("Workspace seed archive stream completed without metadata.");
+                }
+
+                // Only an archive that matches its declared size and digest seeds the workspace.
+                if (expectedSize is { } size && totalBytes != size)
+                {
+                    throw new InvalidOperationException(
+                        $"Workspace seed archive size mismatch: expected {size} bytes but received {totalBytes} bytes.");
+                }
+
+                if (expectedSha256 is not null &&
+                    !string.Equals(Convert.ToHexString(hash.GetHashAndReset()), expectedSha256, StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidOperationException("Workspace seed archive SHA-256 mismatch.");
                 }
 
                 await destination.FlushAsync(cancellationToken).ConfigureAwait(false);

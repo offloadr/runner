@@ -301,6 +301,35 @@ public class WorkspaceMirrorServiceTests
         }
     }
 
+    [TestCase(4096L, null)]
+    [TestCase(null, "0000000000000000000000000000000000000000000000000000000000000000")]
+    public void PrepareSessionAsync_RefusesASeedArchiveThatFailsVerification(long? declaredSize, string? declaredSha256)
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var tempRoot = CreateTempDirectory();
+        try
+        {
+            var paths = CreateSessionPaths(tempRoot);
+            var workspaceClient = new FakeRunnerWorkspaceClient
+            {
+                SeedArchiveDeclaredSize = declaredSize,
+                SeedArchiveDeclaredSha256 = declaredSha256,
+            };
+            var service = new WorkspaceMirrorService(
+                workspaceClient,
+                "runner-secret-value",
+                NullLogger<WorkspaceMirrorService>.Instance);
+
+            Assert.That(
+                async () => await service.PrepareSessionAsync("session-seed-verify", paths, "editor-1", "comfyui", [], CancellationToken.None),
+                Throws.Exception.With.Message.Contains("seed archive"));
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+        }
+    }
+
     [Test]
     public async Task TryEnsureWorkspaceFileAvailableAsync_DownloadsInputFilesAddedAfterStartup()
     {
@@ -673,6 +702,8 @@ public class WorkspaceMirrorServiceTests
     private sealed class FakeRunnerWorkspaceClient : RunnerWorkspaceService.RunnerWorkspaceServiceClient
     {
         public byte[] SeedArchiveBytes { get; init; } = CreateEmptyZipBytes();
+        public long? SeedArchiveDeclaredSize { get; init; }
+        public string? SeedArchiveDeclaredSha256 { get; init; }
         public IReadOnlyDictionary<string, string> FileContentsByRelativePath { get; init; } = new Dictionary<string, string>(StringComparer.Ordinal);
         public IReadOnlyDictionary<string, DateTime> FileModifiedUtcByRelativePath { get; init; } = new Dictionary<string, DateTime>(StringComparer.Ordinal);
         /// <summary>Metadata sizes that differ from the streamed content, as a faulty server might send.</summary>
@@ -695,7 +726,8 @@ public class WorkspaceMirrorServiceTests
                             Metadata = new RunnerReadStreamMetadata
                             {
                                 ContentType = "application/zip",
-                                SizeBytes = SeedArchiveBytes.LongLength
+                                SizeBytes = SeedArchiveDeclaredSize ?? SeedArchiveBytes.LongLength,
+                                Sha256 = SeedArchiveDeclaredSha256
                             }
                         },
                         new RunnerWorkspaceServiceReadWorkspaceSeedArchiveResponse
