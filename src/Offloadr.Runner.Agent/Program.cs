@@ -28,8 +28,9 @@ try
 }
 catch (Exception ex)
 {
+    // Exit non-zero so supervisors and restart policies see a failed start.
     RunnerLog.Error(ex.Message);
-    return;
+    return 1;
 }
 
 RunnerResources resources = ResourceDetection.BuildInitialResources();
@@ -121,12 +122,12 @@ try
 catch (OperationCanceledException) when (shutdown.IsCancellationRequested)
 {
     RunnerLog.Info("Startup cancelled before download backend ready.");
-    return;
+    return 0;
 }
 catch (Exception ex)
 {
     RunnerLog.Error(ex, $"Failed to initialize download backend: {ex.Message}");
-    return;
+    return 1;
 }
 
 LocalModelScanner? scanner = null;
@@ -211,3 +212,4 @@ finally
 }
 
 RunnerLog.Info("Runner agent exiting.");
+return 0;
