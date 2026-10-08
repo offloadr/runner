@@ -4,6 +4,11 @@ namespace Offloadr.Runner.Tests;
 
 public class DemandAwareModelHydrationCoordinatorTests
 {
+    // The coordinator tracks placeholders by Linux device and inode (statx); without them most
+    // scenarios take different paths, so the class runs only where it can be meaningful.
+    [SetUp]
+    public void RequireLinux() => LinuxTestPrerequisites.RequireLinux();
+
     [Test]
     public void ModelTransferIdentity_IsDeterministicAndDestinationSensitive()
     {
@@ -282,6 +287,10 @@ public class DemandAwareModelHydrationCoordinatorTests
                 CancellationToken.None);
             var statusCallsBeforeWaiters = backend.StatusCallsByHandle.Values.Single();
 
+            // Allow exactly one status read: both waiters must be satisfied by it. Later
+            // periodic polls of the now active transfer wait for a permit and are not counted.
+            var statusPermits = new SemaphoreSlim(0);
+            backend.StatusPermits = statusPermits;
             var first = coordinator.EnsureRangeAsync(
                 opened.LeaseId,
                 opened.TransferEpoch,
@@ -294,12 +303,14 @@ public class DemandAwareModelHydrationCoordinatorTests
                 0,
                 4,
                 CancellationToken.None);
-            await Task.WhenAll(first, second).WaitAsync(TimeSpan.FromSeconds(2));
-            await Task.Delay(50);
+            statusPermits.Release();
+            await Task.WhenAll(first, second).WaitAsync(TimeSpan.FromSeconds(5));
 
             Assert.That(
                 backend.StatusCallsByHandle.Values.Single() - statusCallsBeforeWaiters,
                 Is.EqualTo(1));
+            backend.StatusPermits = null;
+            statusPermits.Release(1_000);
             await coordinator.ReleaseAsync(opened.LeaseId);
         }
         finally
@@ -1085,7 +1096,9 @@ public class DemandAwareModelHydrationCoordinatorTests
                 0,
                 8,
                 CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(2));
-            await Task.Delay(250);
+            await WaitUntilAsync(
+                () => backend.StatusCallsByHandle[backend.CreatedHandle!.Value] > 1,
+                TimeSpan.FromSeconds(5));
 
             Assert.That(
                 backend.StatusCallsByHandle[backend.CreatedHandle!.Value],
@@ -2805,7 +2818,39 @@ public class DemandAwareModelHydrationCoordinatorTests
         {
             var stateDirectory = Path.Combine(root, "state");
             var request = CreateRequest(root, "reclaimed-partial.bin");
-            var backend = new DemandBackend();
+            var identity = ModelTransferIdentity.Create(
+                request.ModelId,
+                request.DestinationPath,
+                request.SizeBytes);
+            var requestHandle = new ModelTransferHandle(identity.DeterministicIdentifier);
+
+            // Park the scheduler in a restored-pause retry for an unrelated transfer, so the
+            // queued orphan cleanup cannot run between the release and the reclaim below.
+            var parkingHandle = new ModelTransferHandle("0123456789abcdef");
+            var parked = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var releaseParked = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var backend = new DemandBackend
+            {
+                ListedSnapshots =
+                [
+                    TestModelTransferBackend.Snapshot(
+                        parkingHandle,
+                        "active",
+                        completedLength: 0,
+                        totalLength: 8,
+                        files:
+                        [
+                            new ModelTransferFileSnapshot(
+                                Path.Combine(root, "parking.bin"),
+                                8,
+                                0,
+                                ["https://models.example.test/parking.bin"])
+                        ])
+                ],
+                PauseAttemptStarted = parked,
+                PauseAttemptRelease = releaseParked.Task
+            };
+            backend.PauseFailuresRemaining[parkingHandle] = 1;
             await using var coordinator = new DemandAwareModelHydrationCoordinator(
                 backend,
                 new ModelHydrationRuntimeCapabilities(
@@ -2814,16 +2859,27 @@ public class DemandAwareModelHydrationCoordinatorTests
                     PersistentModelRoots: [root]),
                 stateDirectory);
             await coordinator.InitializeAsync(CancellationToken.None);
+            await parked.Task.WaitAsync(TimeSpan.FromSeconds(2));
 
-            coordinator.RegisterDownloads("session-1", [request], replaceExisting: true);
-            coordinator.RegisterDownloads("session-1", [], replaceExisting: true);
-            coordinator.RegisterDownloads("session-2", [request], replaceExisting: true);
+            try
+            {
+                coordinator.RegisterDownloads("session-1", [request], replaceExisting: true);
+                coordinator.RegisterDownloads("session-1", [], replaceExisting: true);
+                coordinator.RegisterDownloads("session-2", [request], replaceExisting: true);
+            }
+            finally
+            {
+                releaseParked.TrySetResult();
+            }
+
+            // The registration snapshot also retires the unrelated transfer, so its removal shows
+            // the scheduler resumed. The orphan stage runs right after it in the same pass; the
+            // short delay only gives a regression time to show and cannot fail a correct run.
+            await WaitUntilAsync(
+                () => backend.RemovedHandles.Contains(parkingHandle),
+                TimeSpan.FromSeconds(5));
             await Task.Delay(250);
 
-            var identity = ModelTransferIdentity.Create(
-                request.ModelId,
-                request.DestinationPath,
-                request.SizeBytes);
             var reloaded = new ModelTransferIndex(stateDirectory);
             var opened = await coordinator.OpenAsync(
                 request.DestinationPath,
@@ -2831,7 +2887,7 @@ public class DemandAwareModelHydrationCoordinatorTests
                 CancellationToken.None);
             Assert.Multiple(() =>
             {
-                Assert.That(backend.RemovedHandles, Is.Empty);
+                Assert.That(backend.RemovedHandles, Does.Not.Contain(requestHandle));
                 Assert.That(File.Exists(request.DestinationPath), Is.True);
                 Assert.That(reloaded.TryGet(identity.Digest, out _), Is.True);
                 Assert.That(opened.Disposition, Is.EqualTo(ModelHydrationOpenDisposition.RangeManaged));
@@ -3525,9 +3581,13 @@ public class DemandAwareModelHydrationCoordinatorTests
             await coordinator.InitializeAsync(CancellationToken.None);
 
             coordinator.RegisterDownloads("session-1", [], replaceExisting: true);
+            // Legacy cleanup removes the transfer before deleting its files: wait for both.
             await WaitUntilAsync(
-                () => backend.RemoveAttempts >= 2 && backend.RemovedHandles.Contains(handle),
-                TimeSpan.FromSeconds(2));
+                () => backend.RemoveAttempts >= 2 &&
+                      backend.RemovedHandles.Contains(handle) &&
+                      !File.Exists(path) &&
+                      !File.Exists($"{path}.aria2"),
+                TimeSpan.FromSeconds(5));
 
             Assert.Multiple(() =>
             {
@@ -4122,6 +4182,9 @@ public class DemandAwareModelHydrationCoordinatorTests
         public Task? PauseAttemptRelease { get; init; }
         public TaskCompletionSource? StatusAttemptStarted { get; set; }
         public Task? StatusAttemptRelease { get; set; }
+
+        /// <summary>When set, each status read takes one permit before it is counted and answered.</summary>
+        public SemaphoreSlim? StatusPermits { get; set; }
         public TaskCompletionSource? RemoveAttemptStarted { get; init; }
         public Task? RemoveAttemptRelease { get; init; }
         public TaskCompletionSource? CreateAttemptStarted { get; init; }
@@ -4193,6 +4256,11 @@ public class DemandAwareModelHydrationCoordinatorTests
             if (StatusAttemptRelease is not null)
             {
                 await StatusAttemptRelease.WaitAsync(cancellationToken);
+            }
+
+            if (StatusPermits is { } permits)
+            {
+                await permits.WaitAsync(cancellationToken);
             }
 
             StatusCallsByHandle[handle] = StatusCallsByHandle.GetValueOrDefault(handle) + 1;
