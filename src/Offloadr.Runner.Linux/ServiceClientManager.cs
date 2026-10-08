@@ -705,6 +705,7 @@ internal static class ServiceClientManager
 
         downloadService.ProgressReporter = async progress =>
         {
+            RuntimeIdentity? reportedRuntime = null;
             try
             {
                 var request = new ReportModelDownloadRequest
@@ -727,23 +728,27 @@ internal static class ServiceClientManager
                     request.LifecycleGeneration = runtimeIdentity.LifecycleGeneration;
                     request.RuntimeEpoch = runtimeIdentity.RuntimeEpoch;
                     request.RuntimeInstanceId = runtimeIdentity.RuntimeInstanceId;
+                    reportedRuntime = runtimeIdentity;
                 }
                 await sessionSink.ReportModelDownloadAsync(request, CancellationToken.None).ConfigureAwait(false);
             }
             catch (RpcException ex) when (ex.StatusCode == StatusCode.PermissionDenied)
             {
-                ClearRuntimeSessionState(logicalSessionState, runtimeIdentities, progress.SessionId);
-                await AbortRevokedSessionAsync(
+                RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed to report model download progress: {ex.Message}");
+                await HandleRevokedRuntimeReportAsync(
                     progress.SessionId,
+                    reportedRuntime,
+                    logicalSessionState,
+                    runtimeIdentities,
                     sessionManager.GetActiveSessionId,
                     sessionManager.StopSessionAsync,
+                    sessionManager.StopSessionIfRuntimeMatchesAsync,
                     sessionEventRelay.StopSessionAsync,
                     artifactUploadService.StopSessionAsync,
                     workspaceMirrorService.StopSessionAsync,
                     downloadService.CancelSession,
                     downloadService.GetActiveSessionId,
                     downloadService.SetActiveSession).ConfigureAwait(false);
-                RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed to report model download progress: {ex.Message}");
             }
             catch (Exception ex)
             {
@@ -1370,6 +1375,86 @@ internal static class ServiceClientManager
         }
 
         return activeSessionId;
+    }
+
+    /// <summary>
+    /// Handles the control plane revoking a runtime that made a report. The
+    /// revocation applies only to the identity sent with the report: when the
+    /// session has since moved to another runtime, nothing is cleared or stopped.
+    /// </summary>
+    internal static async Task HandleRevokedRuntimeReportAsync(
+        string? sessionId,
+        RuntimeIdentity? reportedRuntime,
+        LogicalSessionState logicalSessionState,
+        RuntimeIdentityRegistry runtimeIdentities,
+        Func<string> getActiveSessionId,
+        Func<string, Func<string, CancellationToken, Task>?, CancellationToken, Task> stopSession,
+        Func<string, RuntimeIdentity, Func<string, CancellationToken, Task>?, CancellationToken, Task<bool>> stopSessionIfRuntimeMatches,
+        Func<string, Task> stopSessionRelay,
+        Func<string, Task> stopArtifactUploads,
+        Func<string, Task> stopWorkspaceMirrors,
+        Action<string?> cancelSessionDownloads,
+        Func<string?> getDownloadActiveSessionId,
+        Action<string?> setDownloadActiveSessionId)
+    {
+        var normalizedSessionId = sessionId?.Trim() ?? string.Empty;
+        if (normalizedSessionId.Length == 0)
+        {
+            return;
+        }
+
+        var hasCurrent = runtimeIdentities.TryGet(normalizedSessionId, out var currentRuntime);
+        if (reportedRuntime is { } reported ? hasCurrent && !currentRuntime.SameRuntime(reported) : hasCurrent)
+        {
+            RunnerLog.Warning(
+                nameof(ServiceClientManager),
+                $"Ignoring revocation of a superseded runtime of session {normalizedSessionId}.");
+            return;
+        }
+
+        try
+        {
+            if (reportedRuntime is { } revoked)
+            {
+                await AbortRevokedSessionAsync(
+                    normalizedSessionId,
+                    getActiveSessionId,
+                    async (sid, beforeCleanup, token) =>
+                        await stopSessionIfRuntimeMatches(sid, revoked, beforeCleanup, token).ConfigureAwait(false),
+                    stopSessionRelay,
+                    stopArtifactUploads,
+                    stopWorkspaceMirrors,
+                    cancelSessionDownloads,
+                    getDownloadActiveSessionId,
+                    setDownloadActiveSessionId).ConfigureAwait(false);
+                ClearRuntimeSessionStateIfIdentityMatches(
+                    logicalSessionState,
+                    runtimeIdentities,
+                    normalizedSessionId,
+                    revoked.LifecycleGeneration,
+                    revoked.RuntimeEpoch,
+                    revoked.RuntimeInstanceId);
+            }
+            else
+            {
+                await AbortRevokedSessionAsync(
+                    normalizedSessionId,
+                    getActiveSessionId,
+                    stopSession,
+                    stopSessionRelay,
+                    stopArtifactUploads,
+                    stopWorkspaceMirrors,
+                    cancelSessionDownloads,
+                    getDownloadActiveSessionId,
+                    setDownloadActiveSessionId).ConfigureAwait(false);
+                ClearRuntimeSessionState(logicalSessionState, runtimeIdentities, normalizedSessionId);
+            }
+        }
+        catch (Exception ex)
+        {
+            // The child may still be alive; keep its state until it exits.
+            RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed to abort revoked session {normalizedSessionId}: {ex.Message}");
+        }
     }
 
     internal static async Task<bool> AbortRevokedSessionAsync(

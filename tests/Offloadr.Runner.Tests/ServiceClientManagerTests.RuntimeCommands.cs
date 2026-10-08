@@ -678,6 +678,68 @@ public partial class ServiceClientManagerTests
                 CancellationToken.None);
     }
 
+    [Test]
+    public async Task RevokedReport_ForASupersededRuntime_LeavesTheNewerRuntimeAlone()
+    {
+        var harness = RunningHarness(7, 4, InstanceB);
+
+        await RevokeAsync(harness, new RuntimeIdentity(7, 3, InstanceA));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(harness.Calls, Is.Empty);
+            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(new RuntimeIdentity(7, 4, InstanceB)));
+            Assert.That(harness.Logical.GetActiveSessionId(), Is.EqualTo(CommandSessionId));
+            Assert.That(harness.Identities.TryGet(CommandSessionId, out _), Is.True);
+        });
+    }
+
+    [Test]
+    public async Task RevokedReport_ForTheCurrentRuntime_StopsItAndClearsItsState()
+    {
+        var harness = RunningHarness(7, 3, InstanceA);
+
+        await RevokeAsync(harness, new RuntimeIdentity(7, 3, InstanceA));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(harness.Calls, Does.Contain("stop:" + CommandSessionId));
+            Assert.That(harness.Tracked(CommandSessionId), Is.Null);
+            Assert.That(harness.Logical.GetActiveSessionId(), Is.Empty);
+            Assert.That(harness.Identities.TryGet(CommandSessionId, out _), Is.False);
+        });
+    }
+
+    [Test]
+    public async Task RevokedReport_WithoutIdentity_IsIgnoredOnceARuntimeWasAdopted()
+    {
+        var harness = RunningHarness(7, 3, InstanceA);
+
+        await RevokeAsync(harness, reported: null);
+
+        Assert.That(harness.Calls, Is.Empty);
+        Assert.That(harness.Tracked(CommandSessionId), Is.Not.Null);
+    }
+
+    private static Task RevokeAsync(RuntimeCommandHarness harness, RuntimeIdentity? reported)
+    {
+        var deps = harness.Deps;
+        return ServiceClientManager.HandleRevokedRuntimeReportAsync(
+            CommandSessionId,
+            reported,
+            harness.Logical,
+            harness.Identities,
+            deps.GetActiveRuntimeSessionId,
+            deps.StopRuntime,
+            deps.StopRuntimeIfIdentityMatches,
+            deps.StopSessionRelay,
+            deps.StopArtifactUploads,
+            deps.StopWorkspaceMirrors,
+            deps.CancelSessionDownloads,
+            deps.GetDownloadActiveSessionId,
+            deps.SetDownloadActiveSession);
+    }
+
     private static StopSessionCommand Stop(ulong generation, ulong epoch, string instance)
         => new()
         {
