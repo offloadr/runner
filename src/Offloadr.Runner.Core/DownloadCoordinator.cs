@@ -834,7 +834,8 @@ public sealed class DownloadCoordinator
 
         try
         {
-            return _fileSystem.GetFileSize(path) >= expectedSize;
+            // A larger file is stale or wrong, not complete: the catalog size is the total size.
+            return _fileSystem.GetFileSize(path) == expectedSize;
         }
         catch
         {

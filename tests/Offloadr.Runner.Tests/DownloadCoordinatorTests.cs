@@ -89,6 +89,31 @@ public class DownloadCoordinatorTests
     }
 
     [Test]
+    public async Task EnsureDownloadedAsync_DownloadsAgain_WhenExistingFileIsLargerThanExpected()
+    {
+        var fileSystem = new FakeFileSystem();
+        fileSystem.SetFileSize("/tmp/model.safetensors", 12);
+        var aria = new FakeAria2Client
+        {
+            OnAddUri = () => fileSystem.SetFileSize("/tmp/model.safetensors", 8)
+        };
+        var sut = new DownloadCoordinator(aria, fileSystem);
+        sut.SetActiveSession("session-1");
+        sut.RegisterDownloads("session-1", [new ModelDownloadRequest
+        {
+            ModelId = "model-1",
+            Filename = "model.safetensors",
+            DestinationPath = "/tmp/model.safetensors",
+            SizeBytes = 8,
+            SourceUrl = "https://example.com/model"
+        }]);
+
+        await sut.EnsureDownloadedAsync("/tmp/model.safetensors", CancellationToken.None, highPriority: true);
+
+        Assert.That(aria.AddUriCalls, Is.EqualTo(1));
+    }
+
+    [Test]
     public async Task EnsureDownloadedAsync_PassesSourceUriAndQueuePosition_ToBackend()
     {
         var fileSystem = new FakeFileSystem();
