@@ -592,6 +592,69 @@ public class DemandAwareModelHydrationCoordinatorTests
     }
 
     [Test]
+    public async Task DescriptorLeases_AreCappedPerSessionModelAndPerSession()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var backend = new DemandBackend();
+            await using var coordinator = CreateCoordinator(backend, root);
+            await coordinator.InitializeAsync(CancellationToken.None);
+            var modelCount = DemandAwareModelHydrationCoordinator.MaxDescriptorLeasesPerSession /
+                             DemandAwareModelHydrationCoordinator.MaxDescriptorLeasesPerSessionModel + 1;
+            var requests = Enumerable.Range(0, modelCount)
+                .Select(index => CreateRequest(root, $"capped-{index}.bin"))
+                .ToArray();
+            coordinator.RegisterDownloads("session-1", requests, replaceExisting: true);
+
+            var leases = new List<ulong>();
+            for (var index = 0; index < DemandAwareModelHydrationCoordinator.MaxDescriptorLeasesPerSessionModel; index++)
+            {
+                leases.Add((await coordinator.OpenAsync(requests[0].DestinationPath, "session-1", CancellationToken.None)).LeaseId);
+            }
+
+            Assert.That(
+                async () => await coordinator.OpenAsync(requests[0].DestinationPath, "session-1", CancellationToken.None),
+                Throws.InstanceOf<ModelHydrationIOException>());
+            var otherSession = await coordinator.OpenAsync(requests[0].DestinationPath, "session-2", CancellationToken.None);
+            Assert.That(otherSession.Disposition, Is.EqualTo(ModelHydrationOpenDisposition.RangeManaged));
+
+            await coordinator.ReleaseAsync(leases[^1]);
+            leases.RemoveAt(leases.Count - 1);
+            leases.Add((await coordinator.OpenAsync(requests[0].DestinationPath, "session-1", CancellationToken.None)).LeaseId);
+
+            for (var model = 1; leases.Count < DemandAwareModelHydrationCoordinator.MaxDescriptorLeasesPerSession; model++)
+            {
+                for (var index = 0;
+                     index < DemandAwareModelHydrationCoordinator.MaxDescriptorLeasesPerSessionModel &&
+                     leases.Count < DemandAwareModelHydrationCoordinator.MaxDescriptorLeasesPerSession;
+                     index++)
+                {
+                    leases.Add((await coordinator.OpenAsync(requests[model].DestinationPath, "session-1", CancellationToken.None)).LeaseId);
+                }
+            }
+
+            Assert.That(
+                async () => await coordinator.OpenAsync(requests[^1].DestinationPath, "session-1", CancellationToken.None),
+                Throws.InstanceOf<ModelHydrationIOException>());
+
+            await coordinator.ReleaseAsync(otherSession.LeaseId);
+            foreach (var leaseId in leases)
+            {
+                await coordinator.ReleaseAsync(leaseId);
+            }
+
+            var reopened = await coordinator.OpenAsync(requests[^1].DestinationPath, "session-1", CancellationToken.None);
+            Assert.That(reopened.Disposition, Is.EqualTo(ModelHydrationOpenDisposition.RangeManaged));
+            await coordinator.ReleaseAsync(reopened.LeaseId);
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
     public async Task RangeWaiters_PerLeaseAreCappedAndCancelledWaitersFreeCapacity()
     {
         var root = CreateTempDirectory();

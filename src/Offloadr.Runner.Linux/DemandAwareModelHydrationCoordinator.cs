@@ -49,6 +49,8 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
     private const long MaximumSafetensorsHeaderLength = 8L * 1024 * 1024;
     // Half of the IPC server's default client slots.
     internal const int MaxRangeWaitersPerLease = 32;
+    internal const int MaxDescriptorLeasesPerSession = 4096;
+    internal const int MaxDescriptorLeasesPerSessionModel = 256;
     private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(100);
     private static readonly TimeSpan ProgressInterval = TimeSpan.FromSeconds(3);
     private static readonly TimeSpan DefaultShutdownCleanupTimeout = TimeSpan.FromSeconds(5);
@@ -416,6 +418,7 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
             if (state is not null)
             {
                 leaseSessionId = requestedSessionId ?? state.SessionId;
+                ThrowIfDescriptorLeaseLimitReachedLocked(leaseSessionId, state);
                 leaseSessionGeneration = CaptureSessionGenerationLocked(leaseSessionId, state);
                 state.OpenReservationCount++;
             }
@@ -446,6 +449,7 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
                     leaseSessionGeneration,
                     state);
                 VerifyCurrentFileIdentity(state);
+                ThrowIfDescriptorLeaseLimitReachedLocked(leaseSessionId!, state);
 
                 var leaseId = CreateLeaseIdLocked();
 
@@ -539,6 +543,36 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
             RegisterCancellation(lease.State, waiter, cancellationToken);
             SignalScheduler();
             return waiter.Completion.Task;
+        }
+    }
+
+    /// <summary>
+    /// Every acknowledged Open holds a lease until the descriptor is released, including for
+    /// complete models, so live leases are bounded per session and per (session, model).
+    /// </summary>
+    private void ThrowIfDescriptorLeaseLimitReachedLocked(string sessionId, TransferState state)
+    {
+        var sessionLeases = 0;
+        var modelLeases = 0;
+        foreach (var lease in _descriptorLeases.Values)
+        {
+            if (!string.Equals(lease.SessionId, sessionId, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            sessionLeases++;
+            if (ReferenceEquals(lease.State, state))
+            {
+                modelLeases++;
+            }
+        }
+
+        if (sessionLeases >= MaxDescriptorLeasesPerSession || modelLeases >= MaxDescriptorLeasesPerSessionModel)
+        {
+            throw new ModelHydrationIOException(
+                $"Session '{sessionId}' holds too many open model descriptors ({sessionLeases} in total, {modelLeases} for this model).",
+                transferEpoch: state.TransferEpoch);
         }
     }
 

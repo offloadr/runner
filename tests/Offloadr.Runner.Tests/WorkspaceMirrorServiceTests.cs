@@ -437,6 +437,71 @@ public class WorkspaceMirrorServiceTests
     }
 
     [Test]
+    public async Task TryEnsureWorkspaceFileAvailableAsync_CapsOnDemandEntriesAndDropsFailedFetches()
+    {
+        const string sessionId = "session-dynamic-cap";
+        var tempRoot = CreateTempDirectory();
+
+        try
+        {
+            var paths = CreateSessionPaths(tempRoot);
+            var workspaceClient = new FakeRunnerWorkspaceClient
+            {
+                FileContentsByRelativePath = new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["present-1.png"] = "one",
+                    ["present-2.png"] = "two"
+                }
+            };
+            await using var service = new WorkspaceMirrorService(
+                workspaceClient,
+                "runner-secret-value",
+                NullLogger<WorkspaceMirrorService>.Instance,
+                maxDynamicInputEntries: 2);
+            await service.PrepareSessionAsync(sessionId, paths, "editor-1", "comfyui", [], CancellationToken.None);
+
+            // Failed fetches must not occupy catalog capacity.
+            for (var index = 0; index < 5; index++)
+            {
+                var missingPath = Path.Combine(paths.InputDirectory, $"missing-{index}.png");
+                Assert.That(
+                    async () => await service.TryEnsureWorkspaceFileAvailableAsync(missingPath, highPriority: false, CancellationToken.None),
+                    Throws.Exception);
+            }
+
+            Assert.That(
+                await service.TryEnsureWorkspaceFileAvailableAsync(Path.Combine(paths.InputDirectory, "present-1.png"), highPriority: false, CancellationToken.None),
+                Is.True);
+            Assert.That(
+                await service.TryEnsureWorkspaceFileAvailableAsync(Path.Combine(paths.InputDirectory, "present-2.png"), highPriority: false, CancellationToken.None),
+                Is.True);
+            var requestsBeforeOverCap = workspaceClient.DownloadRequests.Count;
+
+            Assert.That(
+                async () => await service.TryEnsureWorkspaceFileAvailableAsync(
+                    Path.Combine(paths.InputDirectory, "one-too-many.png"),
+                    highPriority: false,
+                    CancellationToken.None),
+                Throws.InstanceOf<IOException>());
+            Assert.Multiple(() =>
+            {
+                Assert.That(workspaceClient.DownloadRequests, Has.Count.EqualTo(requestsBeforeOverCap));
+                Assert.That(requestsBeforeOverCap, Is.EqualTo(7));
+            });
+
+            // Entries that were fetched stay usable without another control-plane read.
+            Assert.That(
+                await service.TryEnsureWorkspaceFileAvailableAsync(Path.Combine(paths.InputDirectory, "present-1.png"), highPriority: false, CancellationToken.None),
+                Is.True);
+            Assert.That(workspaceClient.DownloadRequests, Has.Count.EqualTo(7));
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+        }
+    }
+
+    [Test]
     public async Task StopSessionAsync_CancelsInFlightWorkspaceDownloads()
     {
         const string sessionId = "session-cancel-download";

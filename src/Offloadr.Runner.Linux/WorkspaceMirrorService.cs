@@ -10,20 +10,28 @@ namespace Offloadr.Runner.Linux;
 internal sealed class WorkspaceMirrorService : IAsyncDisposable
 {
     private const string ComfyUiRuntimeKind = "comfyui";
+    // Input files outside the session's initial snapshot are fetched on demand, one control
+    // plane read per distinct path; bound how many such entries a session can accumulate.
+    internal const int DefaultMaxDynamicInputEntries = 4096;
 
     private readonly RunnerWorkspaceService.RunnerWorkspaceServiceClient _workspaceClient;
     private readonly Metadata? _authHeaders;
     private readonly ILogger<WorkspaceMirrorService> _logger;
+    private readonly int _maxDynamicInputEntries;
     private readonly ConcurrentDictionary<string, SessionMirror> _sessions = new(StringComparer.Ordinal);
 
     public WorkspaceMirrorService(
         RunnerWorkspaceService.RunnerWorkspaceServiceClient workspaceClient,
         string? runnerSecret,
-        ILogger<WorkspaceMirrorService> logger)
+        ILogger<WorkspaceMirrorService> logger,
+        int maxDynamicInputEntries = DefaultMaxDynamicInputEntries)
     {
         _workspaceClient = workspaceClient ?? throw new ArgumentNullException(nameof(workspaceClient));
         _authHeaders = BuildAuthHeaders(runnerSecret);
         _logger = logger;
+        _maxDynamicInputEntries = maxDynamicInputEntries > 0
+            ? maxDynamicInputEntries
+            : throw new ArgumentOutOfRangeException(nameof(maxDynamicInputEntries));
     }
 
     public async Task PrepareSessionAsync(
@@ -36,7 +44,7 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
     {
         await StopSessionAsync(sessionId).ConfigureAwait(false);
 
-        var mirror = new SessionMirror(_workspaceClient, _authHeaders, sessionId, paths, _logger);
+        var mirror = new SessionMirror(_workspaceClient, _authHeaders, sessionId, paths, _logger, _maxDynamicInputEntries);
         if (!_sessions.TryAdd(sessionId, mirror))
         {
             await mirror.DisposeAsync().ConfigureAwait(false);
@@ -115,21 +123,26 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
         private readonly ConcurrentDictionary<string, WorkspaceFileState> _inputCatalog = new(StringComparer.Ordinal);
         private readonly ConcurrentDictionary<string, Task> _downloadTasks = new(StringComparer.Ordinal);
         private readonly CancellationTokenSource _disposeCts = new();
+        private readonly object _dynamicInputGate = new();
+        private readonly int _maxDynamicInputEntries;
 
         private string? _editorSid;
+        private int _dynamicInputCount;
 
         public SessionMirror(
             RunnerWorkspaceService.RunnerWorkspaceServiceClient workspaceClient,
             Metadata? authHeaders,
             string sessionId,
             SessionProcessManager.SessionPaths paths,
-            ILogger logger)
+            ILogger logger,
+            int maxDynamicInputEntries)
         {
             _workspaceClient = workspaceClient;
             _authHeaders = authHeaders;
             _sessionId = sessionId;
             _paths = paths;
             _logger = logger;
+            _maxDynamicInputEntries = maxDynamicInputEntries;
             _secureInputRoot = new LinuxSecureDirectoryRoot(paths.InputDirectory);
         }
 
@@ -169,13 +182,11 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
 
             if (!_inputCatalog.TryGetValue(normalized, out var state))
             {
-                var dynamicState = TryCreateDynamicInputState(normalized);
-                if (dynamicState is null)
+                state = TryAddDynamicInputState(normalized);
+                if (state is null)
                 {
                     return false;
                 }
-
-                state = _inputCatalog.GetOrAdd(normalized, dynamicState);
             }
 
             if (state.Downloaded && File.Exists(state.LocalPath))
@@ -183,19 +194,84 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                 return true;
             }
 
-            var downloadTask = _downloadTasks.GetOrAdd(normalized, _ => DownloadInputFileAsync(state, highPriority, cancellationToken));
+            // The fetch is shared by every caller for this path and is not tied to any one
+            // caller's token: a client that hangs up stops waiting without failing the others.
+            var downloadTask = GetOrStartInputDownload(normalized, state, highPriority);
             try
             {
-                await downloadTask.ConfigureAwait(false);
+                await downloadTask.WaitAsync(cancellationToken).ConfigureAwait(false);
                 return true;
             }
             catch (OperationCanceledException) when (_disposeCts.IsCancellationRequested)
             {
                 return false;
             }
-            finally
+        }
+
+        private Task GetOrStartInputDownload(string normalized, WorkspaceFileState state, bool highPriority)
+        {
+            lock (_dynamicInputGate)
             {
-                _downloadTasks.TryRemove(normalized, out _);
+                if (_downloadTasks.TryGetValue(normalized, out var existing))
+                {
+                    return existing;
+                }
+
+                var download = Task.Run(() => DownloadInputFileAsync(state, highPriority, CancellationToken.None));
+                _downloadTasks[normalized] = download;
+                // Registered after the add, so an already finished download is still removed.
+                _ = download.ContinueWith(
+                    completed =>
+                    {
+                        ((ICollection<KeyValuePair<string, Task>>)_downloadTasks).Remove(new(normalized, completed));
+                        if (!completed.IsCompletedSuccessfully && state.IsDynamic)
+                        {
+                            // Do not keep entries for paths the control plane could not serve.
+                            RemoveDynamicInputState(normalized, state);
+                        }
+                    },
+                    CancellationToken.None,
+                    TaskContinuationOptions.ExecuteSynchronously,
+                    TaskScheduler.Default);
+                return download;
+            }
+        }
+
+        private WorkspaceFileState? TryAddDynamicInputState(string normalized)
+        {
+            lock (_dynamicInputGate)
+            {
+                if (_inputCatalog.TryGetValue(normalized, out var existing))
+                {
+                    return existing;
+                }
+
+                if (_dynamicInputCount >= _maxDynamicInputEntries)
+                {
+                    throw new IOException(
+                        $"Workspace input catalog for session '{_sessionId}' already tracks {_maxDynamicInputEntries} files fetched on demand.");
+                }
+
+                var dynamicState = TryCreateDynamicInputState(normalized);
+                if (dynamicState is null)
+                {
+                    return null;
+                }
+
+                _inputCatalog[normalized] = dynamicState;
+                _dynamicInputCount++;
+                return dynamicState;
+            }
+        }
+
+        private void RemoveDynamicInputState(string normalized, WorkspaceFileState state)
+        {
+            lock (_dynamicInputGate)
+            {
+                if (((ICollection<KeyValuePair<string, WorkspaceFileState>>)_inputCatalog).Remove(new(normalized, state)))
+                {
+                    _dynamicInputCount--;
+                }
             }
         }
 
@@ -217,7 +293,16 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                     file.SizeBytes,
                     ToDateTime(file.ModifiedUtc));
 
-                _inputCatalog[localPath] = state;
+                lock (_dynamicInputGate)
+                {
+                    if (_inputCatalog.TryGetValue(localPath, out var previous) && previous.IsDynamic)
+                    {
+                        _dynamicInputCount--;
+                    }
+
+                    _inputCatalog[localPath] = state;
+                }
+
                 EnsurePlaceholder(state);
             }
         }
@@ -240,7 +325,10 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                 relativePath,
                 localPath,
                 sizeBytes: null,
-                modifiedUtc: null);
+                modifiedUtc: null)
+            {
+                IsDynamic = true
+            };
         }
 
         private async Task DownloadInputFileAsync(WorkspaceFileState state, bool highPriority, CancellationToken cancellationToken)
@@ -666,6 +754,7 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
             public long? SizeBytes { get; set; } = sizeBytes;
             public DateTime? ModifiedUtc { get; set; } = modifiedUtc;
             public bool Downloaded { get; set; }
+            public bool IsDynamic { get; init; }
         }
     }
 }
