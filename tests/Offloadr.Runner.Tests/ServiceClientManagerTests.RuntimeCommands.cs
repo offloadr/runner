@@ -355,6 +355,43 @@ public partial class ServiceClientManagerTests
         });
     }
 
+    [Test]
+    public async Task FailedLaunch_DoesNotStopAValidRuntimeOfAnotherIdentity()
+    {
+        // The runtime at epoch 4 is still tracked, so the launch at epoch 5 fails.
+        var harness = RunningHarness(7, 4, InstanceB);
+
+        await ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 5, InstanceA, revision: 3), harness.Deps);
+
+        var ack = await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 1);
+        Assert.Multiple(() =>
+        {
+            Assert.That(ack.Ready, Is.False);
+            Assert.That(harness.Calls.Where(call => !call.StartsWith("start:", StringComparison.Ordinal)), Is.Empty);
+            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(new RuntimeIdentity(7, 4, InstanceB)));
+            Assert.That(harness.Logical.TryGetRuntime(CommandSessionId, out var logical, out _), Is.True);
+            Assert.That(logical, Is.EqualTo(new RuntimeIdentity(7, 4, InstanceB)), "The session stays visible under its running identity.");
+            Assert.That(harness.Identities.TryGet(CommandSessionId, out var identity), Is.True);
+            Assert.That(identity, Is.EqualTo(new RuntimeIdentity(7, 4, InstanceB)));
+        });
+    }
+
+    [Test]
+    public async Task FailedLaunch_ClearsOnlyItsOwnIdentity()
+    {
+        var harness = new RuntimeCommandHarness { BeforeStart = (_, _) => throw new TimeoutException("not ready") };
+
+        await ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 3, InstanceA, revision: 1), harness.Deps);
+
+        Assert.That((await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 1)).Ready, Is.False);
+        Assert.Multiple(() =>
+        {
+            Assert.That(harness.Calls, Does.Contain("stop:" + CommandSessionId));
+            Assert.That(harness.Logical.GetActiveSessionId(), Is.Empty);
+            Assert.That(harness.Identities.TryGet(CommandSessionId, out _), Is.False);
+        });
+    }
+
     private static async Task WaitUntilAsync(Func<bool> condition, TimeSpan? timeout = null)
     {
         var deadline = DateTime.UtcNow + (timeout ?? TimeSpan.FromSeconds(10));

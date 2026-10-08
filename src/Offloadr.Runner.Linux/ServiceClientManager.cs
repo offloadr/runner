@@ -281,6 +281,31 @@ internal static class ServiceClientManager
             };
         }
 
+        /// <summary>
+        /// Swaps the session's runtime identity from exactly <paramref name="expected"/>
+        /// to <paramref name="replacement"/>; a different identity is left untouched.
+        /// </summary>
+        public bool ReplaceRuntimeIfMatches(string? sessionId, RuntimeIdentity expected, RuntimeIdentity replacement)
+        {
+            var normalizedSessionId = sessionId?.Trim() ?? string.Empty;
+            while (true)
+            {
+                var current = Volatile.Read(ref _state);
+                if (!string.Equals(current.SessionId, normalizedSessionId, StringComparison.Ordinal) ||
+                    current.RuntimeIdentity != expected)
+                {
+                    return false;
+                }
+
+                if (ReferenceEquals(
+                    Interlocked.CompareExchange(ref _state, new State(normalizedSessionId, replacement), current),
+                    current))
+                {
+                    return true;
+                }
+            }
+        }
+
         /// <summary>True when the same session already holds a runtime newer than the candidate.</summary>
         public bool IsSuperseded(string? sessionId, RuntimeIdentity candidate, uint restartRevision)
             => TryGetRuntime(sessionId, out var current, out var currentRevision) &&
@@ -1437,17 +1462,49 @@ internal static class ServiceClientManager
             deps.SetDownloadActiveSession,
             cancellationToken);
 
-    private static async Task<bool> TryStopSessionAndCleanupAsync(string sessionId, RuntimeCommandDependencies deps)
+    /// <summary>
+    /// Cleans up after a failed start or launch of exactly <paramref name="failedRuntime"/>.
+    /// A different runtime of the session that is still tracked is left running and
+    /// remains the session's identity; a cleanup that could not stop the child keeps
+    /// the state until the process exits.
+    /// </summary>
+    private static async Task CleanUpFailedStartupAsync(
+        string sessionId,
+        RuntimeIdentity failedRuntime,
+        RuntimeCommandDependencies deps)
     {
+        bool stopped;
         try
         {
-            await StopSessionAndCleanupAsync(sessionId, deps, CancellationToken.None).ConfigureAwait(false);
-            return true;
+            stopped = await StopRuntimeAndCleanupIfCurrentAsync(sessionId, failedRuntime, deps, CancellationToken.None).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
             RunnerLog.Error(nameof(ServiceClientManager), ex, $"Cleanup after failed start of session {sessionId} did not complete; retaining its state.");
-            return false;
+            return;
+        }
+
+        if (stopped)
+        {
+            ClearRuntimeSessionStateIfIdentityMatches(
+                deps.LogicalSessionState,
+                deps.RuntimeIdentities,
+                sessionId,
+                failedRuntime.LifecycleGeneration,
+                failedRuntime.RuntimeEpoch,
+                failedRuntime.RuntimeInstanceId);
+            return;
+        }
+
+        if (deps.GetTrackedRuntime(sessionId) is { } running &&
+            deps.LogicalSessionState.ReplaceRuntimeIfMatches(sessionId, failedRuntime, running) &&
+            deps.RuntimeIdentities.RemoveIfMatches(
+                sessionId,
+                failedRuntime.LifecycleGeneration,
+                failedRuntime.RuntimeEpoch,
+                failedRuntime.RuntimeInstanceId))
+        {
+            deps.RuntimeIdentities.Set(sessionId, running.LifecycleGeneration, running.RuntimeEpoch, running.RuntimeInstanceId);
         }
     }
 
@@ -1498,7 +1555,7 @@ internal static class ServiceClientManager
 
     internal static Task HandleStartSessionCommand(StartSessionCommand command, RuntimeCommandDependencies deps)
     {
-        var runtimeIdentity = new RuntimeIdentity(command.LifecycleGeneration, command.RuntimeEpoch, command.RuntimeInstanceId);
+        var runtimeIdentity = new RuntimeIdentity(command.LifecycleGeneration, command.RuntimeEpoch, command.RuntimeInstanceId.Trim());
         var ack = new AcknowledgeSessionStartRequest
         {
             SessionId = command.SessionId,
@@ -1571,16 +1628,7 @@ internal static class ServiceClientManager
                     RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed to start session {command.SessionId}: {ex.Message}");
                     ack.Ready = false;
                     ack.Message = ex.Message;
-                    if (await TryStopSessionAndCleanupAsync(command.SessionId, deps).ConfigureAwait(false))
-                    {
-                        ClearRuntimeSessionStateIfIdentityMatches(
-                            deps.LogicalSessionState,
-                            deps.RuntimeIdentities,
-                            command.SessionId,
-                            command.LifecycleGeneration,
-                            command.RuntimeEpoch,
-                            command.RuntimeInstanceId);
-                    }
+                    await CleanUpFailedStartupAsync(command.SessionId, runtimeIdentity, deps).ConfigureAwait(false);
                 }
 
                 return ack;
@@ -1604,7 +1652,7 @@ internal static class ServiceClientManager
             RuntimeInstanceId = command.RuntimeInstanceId,
             RestartRevision = command.RestartRevision,
         };
-        var target = new RuntimeIdentity(command.LifecycleGeneration, command.RuntimeEpoch, command.RuntimeInstanceId);
+        var target = new RuntimeIdentity(command.LifecycleGeneration, command.RuntimeEpoch, command.RuntimeInstanceId.Trim());
         if (!RunnerIdMatches(command.RunnerId, deps.RunnerId) || !IsQuiesceTargetCurrent(command, target, deps))
         {
             // A delayed quiesce for an older runtime must not touch a newer one.
@@ -1721,7 +1769,7 @@ internal static class ServiceClientManager
         LaunchEditorRuntimeCommand command,
         RuntimeCommandDependencies deps)
     {
-        var runtimeIdentity = new RuntimeIdentity(command.LifecycleGeneration, command.RuntimeEpoch, command.RuntimeInstanceId);
+        var runtimeIdentity = new RuntimeIdentity(command.LifecycleGeneration, command.RuntimeEpoch, command.RuntimeInstanceId.Trim());
         var ack = new AcknowledgeEditorRuntimeLaunchRequest
         {
             CommandId = command.CommandId,
@@ -1783,7 +1831,6 @@ internal static class ServiceClientManager
             runtimeIdentity,
             async cancellationToken =>
             {
-                var cleanedUp = true;
                 try
                 {
                     await deps.StartRuntimeAndWaitForReady(start, cancellationToken).ConfigureAwait(false);
@@ -1795,18 +1842,9 @@ internal static class ServiceClientManager
                     ack.Ready = false;
                     ack.Message = ex.Message;
                     RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed launching runtime for restart {command.RestartId}: {ex.Message}");
-                    cleanedUp = await TryStopSessionAndCleanupAsync(command.SessionId, deps).ConfigureAwait(false);
-                }
-
-                if (!ack.Ready && cleanedUp)
-                {
-                    ClearRuntimeSessionStateIfIdentityMatches(
-                        deps.LogicalSessionState,
-                        deps.RuntimeIdentities,
-                        command.SessionId,
-                        command.LifecycleGeneration,
-                        command.RuntimeEpoch,
-                        command.RuntimeInstanceId);
+                    // Clean up only this launch's runtime, never a valid runtime of
+                    // another identity that happens to share the session id.
+                    await CleanUpFailedStartupAsync(command.SessionId, runtimeIdentity, deps).ConfigureAwait(false);
                 }
 
                 return ack;
