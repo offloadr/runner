@@ -1,5 +1,6 @@
 using Offloadr.Runner.V1;
 using Google.Protobuf.WellKnownTypes;
+using Grpc.Core;
 using System.Threading.Channels;
 
 namespace Offloadr.Runner.Core;
@@ -19,6 +20,7 @@ internal sealed class SessionProcessLogRelay : IAsyncDisposable
     private readonly CancellationTokenSource _shutdown = new();
     private readonly Task _senderTask;
     private readonly object _sinkLock = new();
+    private readonly LogRelayDropWarning _dropWarning = new(LogRelayBounds.DropWarningInterval);
     private long _nextSequence;
 
     private IRunnerSessionSink? _sink;
@@ -79,7 +81,7 @@ internal sealed class SessionProcessLogRelay : IAsyncDisposable
             RunnerId = _runnerId,
             SessionId = sessionId.Trim(),
             Stream = stream,
-            Message = message,
+            Message = LogRelayBounds.TruncateMessage(message),
             CreatedUtc = Timestamp.FromDateTime(DateTime.UtcNow),
             Sequence = (ulong)Interlocked.Increment(ref _nextSequence)
         };
@@ -96,27 +98,45 @@ internal sealed class SessionProcessLogRelay : IAsyncDisposable
     private async Task SenderLoopAsync()
     {
         var buffer = new List<SessionProcessLogEntry>(MaxBatchSize);
+        SessionProcessLogEntry? carry = null;
 
         while (!_shutdown.IsCancellationRequested)
         {
             SessionProcessLogEntry entry;
-            try
+            if (carry is not null)
             {
-                entry = await _queue.Reader.ReadAsync(_shutdown.Token).ConfigureAwait(false);
+                entry = carry;
+                carry = null;
             }
-            catch (OperationCanceledException)
+            else
             {
-                break;
+                try
+                {
+                    entry = await _queue.Reader.ReadAsync(_shutdown.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
             }
 
             buffer.Add(entry);
+            var batchBytes = LogRelayBounds.EntryBytes(entry);
             var flushDelay = Task.Delay(FlushInterval, _shutdown.Token);
 
             while (buffer.Count < MaxBatchSize)
             {
                 if (_queue.Reader.TryRead(out var next))
                 {
+                    var nextBytes = LogRelayBounds.EntryBytes(next);
+                    if (batchBytes + nextBytes > LogRelayBounds.MaxBatchBytes)
+                    {
+                        carry = next;
+                        break;
+                    }
+
                     buffer.Add(next);
+                    batchBytes += nextBytes;
                     continue;
                 }
 
@@ -141,14 +161,25 @@ internal sealed class SessionProcessLogRelay : IAsyncDisposable
             buffer.Clear();
         }
 
+        var drainBytes = 0;
+        if (carry is not null)
+        {
+            buffer.Add(carry);
+            drainBytes = LogRelayBounds.EntryBytes(carry);
+        }
+
         while (_queue.Reader.TryRead(out var remaining))
         {
-            buffer.Add(remaining);
-            if (buffer.Count >= MaxBatchSize)
+            var remainingBytes = LogRelayBounds.EntryBytes(remaining);
+            if (buffer.Count >= MaxBatchSize || (buffer.Count > 0 && drainBytes + remainingBytes > LogRelayBounds.MaxBatchBytes))
             {
                 await TryFlushBufferAsync(buffer).ConfigureAwait(false);
                 buffer.Clear();
+                drainBytes = 0;
             }
+
+            buffer.Add(remaining);
+            drainBytes += remainingBytes;
         }
 
         if (buffer.Count > 0)
@@ -159,9 +190,10 @@ internal sealed class SessionProcessLogRelay : IAsyncDisposable
 
     private async Task FlushBufferWithRetryAsync(List<SessionProcessLogEntry> entries)
     {
+        var attempt = 0;
         while (!_shutdown.IsCancellationRequested)
         {
-            if (await TryFlushBufferAsync(entries).ConfigureAwait(false))
+            if (await TryFlushBufferAsync(entries, logFailure: attempt++ == 0).ConfigureAwait(false))
             {
                 return;
             }
@@ -177,7 +209,11 @@ internal sealed class SessionProcessLogRelay : IAsyncDisposable
         }
     }
 
-    private async Task<bool> TryFlushBufferAsync(List<SessionProcessLogEntry> entries)
+    /// <summary>
+    /// Returns true when the batch is finished with (delivered, or dropped because the control plane
+    /// will never accept it) and false when the same batch should be retried.
+    /// </summary>
+    private async Task<bool> TryFlushBufferAsync(List<SessionProcessLogEntry> entries, bool logFailure = true)
     {
         if (entries.Count == 0)
         {
@@ -212,9 +248,25 @@ internal sealed class SessionProcessLogRelay : IAsyncDisposable
         {
             return false;
         }
+        catch (RpcException ex) when (LogRelayBounds.IsNonRetryable(ex))
+        {
+            // Retrying a batch the control plane refuses would block every later session log line.
+            var totals = _dropWarning.RecordDrop(entries.Count, DateTime.UtcNow);
+            if (totals is { } dropped)
+            {
+                RunnerLog.Warning<SessionProcessLogRelay>(
+                    $"Dropped {dropped.Batches} session process log batch(es) ({dropped.Entries} entries) the control plane will not accept; last status {ex.StatusCode}.");
+            }
+
+            return true;
+        }
         catch (Exception ex)
         {
-            RunnerLog.Error<SessionProcessLogRelay>(ex, $"Failed to report session process logs batch ({entries.Count}): {ex.Message}");
+            if (logFailure)
+            {
+                RunnerLog.Error<SessionProcessLogRelay>(ex, $"Failed to report session process logs batch ({entries.Count}); retrying: {ex.Message}");
+            }
+
             return false;
         }
     }

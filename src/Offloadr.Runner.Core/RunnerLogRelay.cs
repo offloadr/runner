@@ -1,5 +1,6 @@
 using Offloadr.Runner.V1;
 using Google.Protobuf.WellKnownTypes;
+using Grpc.Core;
 using Microsoft.Extensions.Logging;
 using System.Linq;
 using System.Threading.Channels;
@@ -18,6 +19,7 @@ internal sealed class RunnerLogRelay : IAsyncDisposable
     private readonly CancellationTokenSource _shutdown = new();
     private readonly Task _senderTask;
     private readonly object _sinkLock = new();
+    private readonly LogRelayDropWarning _dropWarning = new(LogRelayBounds.DropWarningInterval);
     private long _nextSequence;
     private volatile bool _completing;
 
@@ -95,7 +97,7 @@ internal sealed class RunnerLogRelay : IAsyncDisposable
         {
             RunnerId = _runnerId,
             Category = string.IsNullOrWhiteSpace(category) ? "RunnerAgent" : category.Trim(),
-            Message = message.Trim(),
+            Message = LogRelayBounds.TruncateMessage(message.Trim()),
             CreatedUtc = Timestamp.FromDateTime(DateTime.UtcNow),
             Sequence = (ulong)Interlocked.Increment(ref _nextSequence),
         };
@@ -106,31 +108,49 @@ internal sealed class RunnerLogRelay : IAsyncDisposable
     private async Task SenderLoopAsync()
     {
         var buffer = new List<QueuedRunnerLogEntry>(MaxBatchSize);
+        QueuedRunnerLogEntry? carry = null;
 
         while (!_shutdown.IsCancellationRequested)
         {
             QueuedRunnerLogEntry entry;
-            try
+            if (carry is { } carried)
             {
-                entry = await _queue.Reader.ReadAsync(_shutdown.Token).ConfigureAwait(false);
+                entry = carried;
+                carry = null;
             }
-            catch (ChannelClosedException)
+            else
             {
-                break;
-            }
-            catch (OperationCanceledException)
-            {
-                break;
+                try
+                {
+                    entry = await _queue.Reader.ReadAsync(_shutdown.Token).ConfigureAwait(false);
+                }
+                catch (ChannelClosedException)
+                {
+                    break;
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
             }
 
             buffer.Add(entry);
+            var batchBytes = LogRelayBounds.EntryBytes(entry.Entry);
             var flushDelay = Task.Delay(FlushInterval, _shutdown.Token);
 
             while (buffer.Count < MaxBatchSize)
             {
                 if (_queue.Reader.TryRead(out var next))
                 {
+                    var nextBytes = LogRelayBounds.EntryBytes(next.Entry);
+                    if (batchBytes + nextBytes > LogRelayBounds.MaxBatchBytes)
+                    {
+                        carry = next;
+                        break;
+                    }
+
                     buffer.Add(next);
+                    batchBytes += nextBytes;
                     continue;
                 }
 
@@ -155,14 +175,25 @@ internal sealed class RunnerLogRelay : IAsyncDisposable
             buffer.Clear();
         }
 
+        var drainBytes = 0;
+        if (carry is { } leftover)
+        {
+            buffer.Add(leftover);
+            drainBytes = LogRelayBounds.EntryBytes(leftover.Entry);
+        }
+
         while (_queue.Reader.TryRead(out var remaining))
         {
-            buffer.Add(remaining);
-            if (buffer.Count >= MaxBatchSize)
+            var remainingBytes = LogRelayBounds.EntryBytes(remaining.Entry);
+            if (buffer.Count >= MaxBatchSize || (buffer.Count > 0 && drainBytes + remainingBytes > LogRelayBounds.MaxBatchBytes))
             {
                 await TryFlushBufferAsync(buffer).ConfigureAwait(false);
                 buffer.Clear();
+                drainBytes = 0;
             }
+
+            buffer.Add(remaining);
+            drainBytes += remainingBytes;
         }
 
         if (buffer.Count > 0)
@@ -237,6 +268,19 @@ internal sealed class RunnerLogRelay : IAsyncDisposable
         }
         catch (OperationCanceledException) when (sinkLifetime.IsCancellationRequested)
         {
+            return true;
+        }
+        catch (RpcException ex) when (LogRelayBounds.IsNonRetryable(ex))
+        {
+            // Retrying a batch the control plane refuses would block every later log line.
+            // The warning is rate limited because it is forwarded through this relay too.
+            var totals = _dropWarning.RecordDrop(entries.Count, DateTime.UtcNow);
+            if (totals is { } dropped)
+            {
+                RunnerLog.Warning<RunnerLogRelay>(
+                    $"Dropped {dropped.Batches} runner log batch(es) ({dropped.Entries} entries) the control plane will not accept; last status {ex.StatusCode}.");
+            }
+
             return true;
         }
         catch

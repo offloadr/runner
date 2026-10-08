@@ -142,6 +142,37 @@ public class RunnerLogRelayTests
         await disposeTask.ConfigureAwait(false);
     }
 
+    [Test]
+    public async Task OversizedMessage_IsTruncatedWithMarker()
+    {
+        await using var relay = new RunnerLogRelay("runner-1");
+        var client = new RecordingSink();
+        relay.AttachSink(client);
+
+        relay.Enqueue("RunnerAgent", new string('z', 50_000));
+
+        var request = await WaitForAsync(client.FirstRequest.Task, TimeSpan.FromSeconds(3));
+        var message = request.Entries.Single().Message;
+        Assert.That(System.Text.Encoding.UTF8.GetByteCount(message), Is.LessThanOrEqualTo(LogRelayBounds.MaxMessageBytes));
+        Assert.That(message, Does.EndWith("[truncated from 50000 bytes]"));
+    }
+
+    [Test]
+    public async Task NonRetryableRejection_DropsBatch_AndLaterLogsStillFlow()
+    {
+        await using var relay = new RunnerLogRelay("runner-1");
+        var client = new RejectingSink("poison");
+        relay.AttachSink(client);
+
+        relay.Enqueue("RunnerAgent", "poison");
+        await WaitForAsync(client.Rejected.Task, TimeSpan.FromSeconds(3));
+        relay.Enqueue("RunnerAgent", "after-poison");
+
+        var delivered = await WaitForAsync(client.Delivered.Task, TimeSpan.FromSeconds(3));
+        Assert.That(delivered.Entries.Select(entry => entry.Message), Is.EqualTo(new[] { "after-poison" }));
+        Assert.That(client.RejectedCalls, Is.EqualTo(1));
+    }
+
     private static async Task<T> WaitForAsync<T>(Task<T> task, TimeSpan timeout)
     {
         var completed = await Task.WhenAny(task, Task.Delay(timeout)).ConfigureAwait(false);
@@ -183,6 +214,62 @@ public class RunnerLogRelayTests
         public Task ReportRunnerLogsAsync(ReportRunnerLogsRequest request, CancellationToken cancellationToken)
         {
             FirstRequest.TrySetResult(request.Clone());
+            return Task.CompletedTask;
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class RejectingSink : IRunnerSessionSink
+    {
+        private readonly string _rejectedMessage;
+        private int _rejectedCalls;
+
+        public RejectingSink(string rejectedMessage)
+        {
+            _rejectedMessage = rejectedMessage;
+        }
+
+        public int RejectedCalls => Volatile.Read(ref _rejectedCalls);
+
+        public TaskCompletionSource<bool> Rejected { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource<ReportRunnerLogsRequest> Delivered { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Task<RegisterRunnerResponse> RegisterRunnerAsync(RegisterRunnerRequest request, CancellationToken cancellationToken)
+            => Task.FromResult(new RegisterRunnerResponse { Accepted = true });
+
+        public Task<SyncLocalModelsResponse> SyncLocalModelsAsync(SyncLocalModelsRequest request, CancellationToken cancellationToken)
+            => Task.FromResult(new SyncLocalModelsResponse());
+
+        public Task AckStartSessionAsync(AcknowledgeSessionStartRequest request, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task AckStopSessionAsync(AcknowledgeSessionStopRequest request, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task<GrantGpuPowerExecutionResponse> GrantGpuPowerExecutionAsync(GrantGpuPowerExecutionRequest request, CancellationToken cancellationToken)
+            => throw new NotSupportedException("Power execution is not part of this fixture");
+
+        public Task AckGpuPowerLimitAsync(AcknowledgeGpuPowerLimitRequest request, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task<GrantPromptExecutionResponse> GrantPromptExecutionAsync(GrantPromptExecutionRequest request, CancellationToken cancellationToken)
+            => throw new NotSupportedException("This fixture does not execute prompts.");
+        public Task ReportPromptEvidenceAsync(ReportPromptEvidenceRequest request, CancellationToken cancellationToken)
+            => throw new NotSupportedException("This fixture does not observe prompts.");
+        public Task AckSubmitEditorActionAsync(AcknowledgePromptResultRequest request, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task ReportModelDownloadAsync(ReportModelDownloadRequest request, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task ReportSessionEventsAsync(ReportSessionEventsRequest request, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task ReportSessionLogsAsync(ReportSessionLogsRequest request, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task ReportRuntimeTelemetryAsync(ReportRuntimeTelemetryRequest request, CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public Task ReportRunnerLogsAsync(ReportRunnerLogsRequest request, CancellationToken cancellationToken)
+        {
+            if (request.Entries.Any(entry => entry.Message == _rejectedMessage))
+            {
+                Interlocked.Increment(ref _rejectedCalls);
+                Rejected.TrySetResult(true);
+                throw new RpcException(new Status(StatusCode.InvalidArgument, "rejected"));
+            }
+
+            Delivered.TrySetResult(request.Clone());
             return Task.CompletedTask;
         }
 
