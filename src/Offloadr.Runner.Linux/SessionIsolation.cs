@@ -12,11 +12,23 @@ public interface ISessionIsolationStrategy
 
 public sealed class LinuxUserIsolationStrategy : ISessionIsolationStrategy
 {
+    // userdel's exit status when the user does not exist.
+    private const int UserdelUnknownUser = 6;
+
     private readonly ILinuxCommandRunner _commandRunner;
+    private readonly Func<uint, CancellationToken, Task<bool>> _killUserProcesses;
 
     public LinuxUserIsolationStrategy(ILinuxCommandRunner commandRunner)
+        : this(commandRunner, static (userId, token) => LinuxProcessReaper.KillAllOwnedByAsync(userId, token))
+    {
+    }
+
+    internal LinuxUserIsolationStrategy(
+        ILinuxCommandRunner commandRunner,
+        Func<uint, CancellationToken, Task<bool>> killUserProcesses)
     {
         _commandRunner = commandRunner ?? throw new ArgumentNullException(nameof(commandRunner));
+        _killUserProcesses = killUserProcesses ?? throw new ArgumentNullException(nameof(killUserProcesses));
     }
 
     public void ValidatePrerequisites(ICollection<string> errors)
@@ -68,6 +80,7 @@ public sealed class LinuxUserIsolationStrategy : ISessionIsolationStrategy
         var userName = LinuxSessionIdentity.BuildUserName(normalizedSessionId);
 
         bool userCreated = false;
+        uint? createdUserId = null;
         try
         {
             Directory.CreateDirectory(sessionRoot);
@@ -80,6 +93,12 @@ public sealed class LinuxUserIsolationStrategy : ISessionIsolationStrategy
             }
 
             var userId = ParseUserId(userName, exists);
+            createdUserId = userCreated ? userId : null;
+
+            // useradd may hand out a uid that an earlier, incompletely cleaned session used, and
+            // a pre-existing user may still have processes. Nothing may run as the session uid
+            // before the editor starts.
+            await KillUserProcessesAsync(userName, userId, cancellationToken).ConfigureAwait(false);
 
             Directory.CreateDirectory(homeDirectory);
             await _commandRunner.RunAsync(LinuxCommandFactory.ChownRecursive(userName, homeDirectory), cancellationToken).ConfigureAwait(false);
@@ -92,7 +111,12 @@ public sealed class LinuxUserIsolationStrategy : ISessionIsolationStrategy
             {
                 try
                 {
-                    await _commandRunner.RunAsync(LinuxCommandFactory.RemoveUser(userName), cancellationToken).ConfigureAwait(false);
+                    if (createdUserId is { } userId)
+                    {
+                        await KillUserProcessesAsync(userName, userId, CancellationToken.None).ConfigureAwait(false);
+                    }
+
+                    await _commandRunner.RunAsync(LinuxCommandFactory.RemoveUser(userName), CancellationToken.None).ConfigureAwait(false);
                 }
                 catch
                 {
@@ -125,10 +149,37 @@ public sealed class LinuxUserIsolationStrategy : ISessionIsolationStrategy
             return;
         }
 
+        // Kill everything still running as the session uid, including processes that left the
+        // editor's tree, before the user is removed and its uid can be handed out again.
+        var userId = identity.UserId;
+        if (userId is null)
+        {
+            var lookup = await _commandRunner.RunAsync(LinuxCommandFactory.CheckUserExists(identity.UserName), cancellationToken).ConfigureAwait(false);
+            if (lookup.ExitCode == 0 &&
+                uint.TryParse(lookup.Stdout.Trim(), System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var resolved))
+            {
+                userId = resolved;
+            }
+        }
+
+        if (userId is { } uid and not 0)
+        {
+            await KillUserProcessesAsync(identity.UserName, uid, cancellationToken).ConfigureAwait(false);
+        }
+
         var result = await _commandRunner.RunAsync(LinuxCommandFactory.RemoveUser(identity.UserName), cancellationToken).ConfigureAwait(false);
-        if (result.ExitCode != 0 && !string.IsNullOrWhiteSpace(result.Stderr))
+        if (result.ExitCode != 0 && result.ExitCode != UserdelUnknownUser && !string.IsNullOrWhiteSpace(result.Stderr))
         {
             RunnerLog.Error<LinuxUserIsolationStrategy>($"userdel for '{identity.UserName}' returned {result.ExitCode}: {result.Stderr.Trim()}");
+        }
+    }
+
+    private async Task KillUserProcessesAsync(string userName, uint userId, CancellationToken cancellationToken)
+    {
+        if (!await _killUserProcesses(userId, cancellationToken).ConfigureAwait(false))
+        {
+            RunnerLog.Warning<LinuxUserIsolationStrategy>(
+                $"Processes of session user '{userName}' (uid {userId}) were still running after SIGKILL.");
         }
     }
 }

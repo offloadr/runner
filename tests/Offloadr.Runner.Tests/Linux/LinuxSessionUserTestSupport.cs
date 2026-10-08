@@ -32,6 +32,7 @@ internal sealed class LinuxTestUser : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        await LinuxProcessReaper.KillAllOwnedByAsync(UserId, CancellationToken.None);
         await new LinuxCommandRunner().RunAsync(
             new LinuxCommand("/usr/sbin/userdel", ["--force", Name], ThrowOnError: false),
             CancellationToken.None);
