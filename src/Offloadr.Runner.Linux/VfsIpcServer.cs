@@ -22,6 +22,8 @@ public sealed class VfsIpcServer : IAsyncDisposable
     private readonly Dictionary<ulong, ProvisionalOpenLease> _provisionalLeases = [];
     private readonly HashSet<Task> _provisionalExpirationTasks = [];
     private readonly CancellationTokenSource _shutdown = new();
+    // Shared by every log line a client can trigger at will.
+    private readonly LogRateLimiter _clientLogLimiter = new(maxPerWindow: 20, TimeSpan.FromMinutes(1));
 
     private Socket? _listener;
     private Task? _acceptLoop;
@@ -311,7 +313,7 @@ public sealed class VfsIpcServer : IAsyncDisposable
                     if (_logEnabled)
                     {
                         RunnerLog.Info<VfsIpcServer>(
-                            $"[vfs-ipc] operation={parsed.Request.Operation} path='{parsed.Request.Path}'");
+                            $"[vfs-ipc] operation={parsed.Request.Operation} path='{VfsIpcLogText.Sanitize(parsed.Request.Path)}'");
                     }
 
                     var response = await DispatchUntilHangupAsync(client, parsed.Request, peer, cancellationToken)
@@ -334,7 +336,7 @@ public sealed class VfsIpcServer : IAsyncDisposable
                     if (_logEnabled && response.Status == VfsIpcStatus.Success)
                     {
                         RunnerLog.Info<VfsIpcServer>(
-                            $"[vfs-ipc] ready operation={parsed.Request.Operation} path='{parsed.Request.Path}' disposition={response.OpenDisposition}");
+                            $"[vfs-ipc] ready operation={parsed.Request.Operation} path='{VfsIpcLogText.Sanitize(parsed.Request.Path)}' disposition={response.OpenDisposition}");
                     }
                 }
                 catch (ClientHungUpException)
@@ -344,9 +346,7 @@ public sealed class VfsIpcServer : IAsyncDisposable
                 }
                 catch (Exception ex)
                 {
-                    RunnerLog.Error<VfsIpcServer>(
-                        ex,
-                        $"[vfs-ipc] Operation {parsed.Request.Operation} failed for '{parsed.Request.Path}': {ex.Message}");
+                    LogRequestFailure(parsed.Request, ex);
                     await VfsIpcProtocol
                         .WriteResponseAsync(
                             client,
@@ -374,7 +374,11 @@ public sealed class VfsIpcServer : IAsyncDisposable
             }
             catch (Exception ex)
             {
-                RunnerLog.Error<VfsIpcServer>(ex, $"[vfs-ipc] Client handling error: {ex.Message}");
+                if (_clientLogLimiter.TryAcquire(out var suppressed))
+                {
+                    RunnerLog.Error<VfsIpcServer>(
+                        $"[vfs-ipc] Client handling error{SuppressedSuffix(suppressed)}: {DescribeUnexpected(ex)}");
+                }
                 try
                 {
                     await VfsIpcProtocol
@@ -393,7 +397,12 @@ public sealed class VfsIpcServer : IAsyncDisposable
     {
         if (!VfsIpcPeerCredentials.TryRead(client, out peer))
         {
-            RunnerLog.Warning<VfsIpcServer>("[vfs-ipc] Rejected a client whose peer credentials could not be read.");
+            if (_clientLogLimiter.TryAcquire(out var unreadableSuppressed))
+            {
+                RunnerLog.Warning<VfsIpcServer>(
+                    $"[vfs-ipc] Rejected a client whose peer credentials could not be read{SuppressedSuffix(unreadableSuppressed)}.");
+            }
+
             return false;
         }
 
@@ -408,13 +417,43 @@ public sealed class VfsIpcServer : IAsyncDisposable
             authorized = false;
         }
 
-        if (!authorized)
+        if (!authorized && _clientLogLimiter.TryAcquire(out var suppressed))
         {
-            RunnerLog.Warning<VfsIpcServer>($"[vfs-ipc] Rejected unauthorized client {peer}.");
+            RunnerLog.Warning<VfsIpcServer>($"[vfs-ipc] Rejected unauthorized client {peer}{SuppressedSuffix(suppressed)}.");
         }
 
         return authorized;
     }
+
+    private void LogRequestFailure(VfsIpcRequest request, Exception exception)
+    {
+        if (!_clientLogLimiter.TryAcquire(out var suppressed))
+        {
+            return;
+        }
+
+        // The path and messages that embed it come from the client; never log them raw.
+        var path = VfsIpcLogText.Sanitize(request.Path);
+        if (exception is ModelHydrationIOException or IOException)
+        {
+            RunnerLog.Warning<VfsIpcServer>(
+                $"[vfs-ipc] Operation {request.Operation} failed for '{path}'{SuppressedSuffix(suppressed)}: " +
+                $"{exception.GetType().Name}: {VfsIpcLogText.Sanitize(exception.Message, 512)}");
+            return;
+        }
+
+        RunnerLog.Error<VfsIpcServer>(
+            $"[vfs-ipc] Operation {request.Operation} failed for '{path}'{SuppressedSuffix(suppressed)}: " +
+            DescribeUnexpected(exception));
+    }
+
+    /// <summary>Type, bounded message and stack of an unexpected exception, on one line.</summary>
+    private static string DescribeUnexpected(Exception exception)
+        => $"{exception.GetType().FullName}: {VfsIpcLogText.Sanitize(exception.Message, 512)} " +
+           $"at {VfsIpcLogText.Sanitize(exception.StackTrace, 2048)}";
+
+    private static string SuppressedSuffix(int suppressed)
+        => suppressed > 0 ? $" ({suppressed} similar messages suppressed)" : string.Empty;
 
     /// <summary>
     /// Dispatches with a token that is also cancelled when the client hangs up, so a waiter

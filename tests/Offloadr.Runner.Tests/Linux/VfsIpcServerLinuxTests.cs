@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.Net.Sockets;
 using System.Runtime.Versioning;
+using Microsoft.Extensions.Logging;
 
 namespace Offloadr.Runner.Tests;
 
@@ -311,6 +312,89 @@ public class VfsIpcServerLinuxTests
             Assert.That(secondResponse!.Value.Status, Is.EqualTo(VfsIpcStatus.Success));
             Assert.That(Volatile.Read(ref invocationCount), Is.EqualTo(2));
         });
+    }
+
+    [Test]
+    public async Task Start_FailedRequests_LogEscapedBoundedPathsAtALimitedRate()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        LinuxTestPrerequisites.RequireUnixDomainSockets();
+
+        var logs = new List<string>();
+        using var loggerFactory = LoggerFactory.Create(builder =>
+        {
+            builder.AddProvider(new RecordingLoggerProvider(logs));
+            builder.SetMinimumLevel(LogLevel.Information);
+        });
+        RunnerLog.Configure(loggerFactory);
+        try
+        {
+            var socketPath = CreateSocketPath();
+            await using var server = new VfsIpcServer(
+                socketPath,
+                (request, _) => throw new InvalidOperationException($"cannot open '{request.Path}'"));
+            server.Start();
+
+            var forgedPath = "/models/x.bin\n2026-01-01 [INF] forged entry\u001b[2J" + new string('p', 5000);
+            for (var attempt = 0; attempt < 60; attempt++)
+            {
+                using var client = await ConnectAsync(socketPath);
+                await VfsIpcProtocol.WriteRequestAsync(client, VfsIpcRequest.Open(forgedPath, "session-1"), CancellationToken.None);
+                var response = await VfsIpcProtocol.ReadResponseAsync(client, CancellationToken.None);
+                Assert.That(response!.Value.Status, Is.EqualTo(VfsIpcStatus.EnsureFailed));
+            }
+
+            string[] failures;
+            lock (logs)
+            {
+                failures = logs.Where(static line => line.Contains("[vfs-ipc] Operation Open failed", StringComparison.Ordinal)).ToArray();
+            }
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(failures, Is.Not.Empty);
+                Assert.That(failures, Has.Length.LessThanOrEqualTo(20));
+                Assert.That(failures.Any(static line => line.Any(char.IsControl)), Is.False);
+                Assert.That(failures.All(static line => line.Contains(@"x.bin\u000a2026", StringComparison.Ordinal)), Is.True);
+                Assert.That(failures.All(static line => line.Length < 6000), Is.True);
+                Assert.That(failures.All(static line => !line.Contains(new string('p', 600), StringComparison.Ordinal)), Is.True);
+            });
+        }
+        finally
+        {
+            RunnerLog.Configure(null);
+        }
+    }
+
+    private sealed class RecordingLoggerProvider(List<string> lines) : ILoggerProvider
+    {
+        public ILogger CreateLogger(string categoryName) => new RecordingLogger(lines);
+
+        public void Dispose()
+        {
+        }
+
+        private sealed class RecordingLogger(List<string> lines) : ILogger
+        {
+            public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+            public bool IsEnabled(LogLevel logLevel) => true;
+
+            public void Log<TState>(
+                LogLevel logLevel,
+                EventId eventId,
+                TState state,
+                Exception? exception,
+                Func<TState, Exception?, string> formatter)
+            {
+                // What a console sink would print: the message plus any attached exception.
+                var line = formatter(state, exception) + (exception is null ? string.Empty : " " + exception);
+                lock (lines)
+                {
+                    lines.Add(line);
+                }
+            }
+        }
     }
 
     [Test]
