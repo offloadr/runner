@@ -276,6 +276,85 @@ public partial class ServiceClientManagerTests
         });
     }
 
+    [Test]
+    public async Task MatchingQuiesce_StopsTheRuntimeAndKeepsTheLogicalSession()
+    {
+        var harness = RunningHarness(7, 3, InstanceA);
+        var prompt = harness.StartPrompt(7, 3, InstanceA);
+
+        await ServiceClientManager.HandleQuiesceRuntimeCommandAsync(Quiesce(7, 3, InstanceA, revision: 1), harness.Deps);
+
+        var ack = await harness.Sink.WaitForAsync(harness.Sink.QuiesceAcks, 1);
+        Assert.Multiple(() =>
+        {
+            Assert.That(ack.Quiesced, Is.True);
+            Assert.That(prompt.IsCompleted, Is.True, "The quiesced runtime's prompt work is cancelled and joined.");
+            Assert.That(harness.Tracked(CommandSessionId), Is.Null);
+            Assert.That(harness.Logical.GetActiveSessionId(), Is.EqualTo(CommandSessionId));
+        });
+    }
+
+    [TestCase(7UL, 2UL, InstanceA, 1U)]
+    [TestCase(6UL, 3UL, InstanceA, 1U)]
+    [TestCase(7UL, 3UL, InstanceB, 1U)]
+    public async Task StaleQuiesce_LeavesTheNewerRuntimeUntouched(ulong generation, ulong epoch, string instance, uint revision)
+    {
+        var harness = RunningHarness(7, 3, InstanceA);
+        var prompt = harness.StartPrompt(7, 3, InstanceA);
+
+        await ServiceClientManager.HandleQuiesceRuntimeCommandAsync(Quiesce(generation, epoch, instance, revision), harness.Deps);
+
+        var ack = await harness.Sink.WaitForAsync(harness.Sink.QuiesceAcks, 1);
+        Assert.Multiple(() =>
+        {
+            Assert.That(ack.Quiesced, Is.False);
+            Assert.That(ack.RuntimeEpoch, Is.EqualTo(epoch), "The acknowledgement echoes the stale identity.");
+            Assert.That(prompt.IsCompleted, Is.False, "The current runtime's prompt keeps running.");
+            Assert.That(harness.Calls, Is.Empty);
+            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(new RuntimeIdentity(7, 3, InstanceA)));
+        });
+        await harness.Shutdown.CancelAsync();
+    }
+
+    [Test]
+    public async Task QuiesceFromAnotherRunner_IsNotApplied()
+    {
+        var harness = RunningHarness(7, 3, InstanceA);
+        var quiesce = Quiesce(7, 3, InstanceA, revision: 1);
+        quiesce.RunnerId = "99999999999949998999999999999999";
+
+        await ServiceClientManager.HandleQuiesceRuntimeCommandAsync(quiesce, harness.Deps);
+
+        Assert.That((await harness.Sink.WaitForAsync(harness.Sink.QuiesceAcks, 1)).Quiesced, Is.False);
+        Assert.That(harness.Tracked(CommandSessionId), Is.Not.Null);
+    }
+
+    [Test]
+    public async Task DelayedQuiesce_DoesNotCancelTheNewerStartup()
+    {
+        var harness = new RuntimeCommandHarness();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        harness.BeforeStart = async (_, token) =>
+        {
+            entered.TrySetResult();
+            await release.Task.WaitAsync(token);
+        };
+
+        var launch = ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 4, InstanceB, revision: 2), harness.Deps);
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await ServiceClientManager.HandleQuiesceRuntimeCommandAsync(Quiesce(7, 3, InstanceA, revision: 1), harness.Deps);
+        release.TrySetResult();
+        await launch.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(harness.Sink.QuiesceAcks.Single().Quiesced, Is.False);
+            Assert.That(harness.Sink.LaunchAcks.Single().Ready, Is.True);
+            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(new RuntimeIdentity(7, 4, InstanceB)));
+        });
+    }
+
     private static async Task WaitUntilAsync(Func<bool> condition, TimeSpan? timeout = null)
     {
         var deadline = DateTime.UtcNow + (timeout ?? TimeSpan.FromSeconds(10));
@@ -374,6 +453,37 @@ public partial class ServiceClientManagerTests
 
         public void Track(string sessionId, RuntimeIdentity identity) => _tracked[sessionId] = identity;
 
+        /// <summary>Starts prompt work for the runtime that runs until it is cancelled.</summary>
+        public Task StartPrompt(ulong generation, ulong epoch, string instance)
+        {
+            var completed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var prompt = new SubmitPromptCommand
+            {
+                CommandId = Guid.NewGuid().ToString("n"),
+                SessionId = CommandSessionId,
+                Target = new()
+                {
+                    GpuGeneration = generation,
+                    RuntimeEpoch = epoch,
+                    RuntimeInstanceId = instance,
+                    RunnerId = CommandRunnerId,
+                    RunnerSessionId = CommandSessionId,
+                },
+            };
+            WorkState.Prompts.Start(prompt, async (_, token) =>
+            {
+                try
+                {
+                    await Task.Delay(Timeout.Infinite, token).ConfigureAwait(false);
+                }
+                finally
+                {
+                    completed.TrySetResult();
+                }
+            });
+            return completed.Task;
+        }
+
         public ServiceClientManager.RuntimeCommandDependencies Deps => new()
         {
             RunnerId = CommandRunnerId,
@@ -385,6 +495,17 @@ public partial class ServiceClientManagerTests
             GetActiveRuntimeSessionId = () => _tracked.Keys.FirstOrDefault() ?? string.Empty,
             StartRuntimeAndWaitForReady = StartAsync,
             StopRuntime = StopAsync,
+            StopRuntimeIfIdentityMatches = async (sessionId, expected, beforeCleanup, token) =>
+            {
+                if (_tracked.TryGetValue(sessionId, out var tracked) && !tracked.SameRuntime(expected))
+                {
+                    return false;
+                }
+
+                await StopAsync(sessionId, beforeCleanup, token).ConfigureAwait(false);
+                return true;
+            },
+            GetTrackedRuntime = sessionId => Tracked(sessionId),
             StopSessionRelay = sessionId => Record("relay:" + sessionId),
             StopArtifactUploads = sessionId => Record("uploads:" + sessionId),
             StopWorkspaceMirrors = sessionId => Record("mirror:" + sessionId),

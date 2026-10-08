@@ -60,6 +60,33 @@ public partial class SessionProcessManagerOwnershipTests
         }
     }
 
+    [Test]
+    public async Task IdentityCheckedStopLeavesADifferentRuntimeRunning()
+    {
+        await using var fixture = await PromptRuntimeFixture.CreateAsync();
+        var start = fixture.Start;
+        var tracked = new RuntimeIdentity(start.LifecycleGeneration, start.RuntimeEpoch, start.RuntimeInstanceId);
+        var cleanupCalls = 0;
+        Task CountCleanup(string _, CancellationToken __)
+        {
+            cleanupCalls++;
+            return Task.CompletedTask;
+        }
+
+        var stale = await fixture.Manager.StopSessionIfRuntimeMatchesAsync(
+            start.SessionId, tracked with { RuntimeEpoch = start.RuntimeEpoch - 1 }, CountCleanup, CancellationToken.None);
+        Assert.That(stale, Is.False);
+        Assert.That(cleanupCalls, Is.Zero);
+        Assert.That(fixture.Manager.TryGetRuntimeIdentity(start.SessionId, out var current), Is.True);
+        Assert.That(current.SameRuntime(tracked), Is.True);
+
+        // The same runtime spelled with dashes still matches.
+        var exact = tracked with { RuntimeInstanceId = Guid.Parse(start.RuntimeInstanceId).ToString("D") };
+        Assert.That(await fixture.Manager.StopSessionIfRuntimeMatchesAsync(start.SessionId, exact, CountCleanup, CancellationToken.None), Is.True);
+        Assert.That(cleanupCalls, Is.EqualTo(1));
+        Assert.That(fixture.Manager.TryGetRuntimeIdentity(start.SessionId, out _), Is.False);
+    }
+
     [TestCase("generation")]
     [TestCase("epoch")]
     [TestCase("instance")]

@@ -175,6 +175,8 @@ internal static class ServiceClientManager
         public required Func<string> GetActiveRuntimeSessionId { get; init; }
         public required Func<StartSessionCommand, CancellationToken, Task> StartRuntimeAndWaitForReady { get; init; }
         public required Func<string, Func<string, CancellationToken, Task>?, CancellationToken, Task> StopRuntime { get; init; }
+        public required Func<string, RuntimeIdentity, Func<string, CancellationToken, Task>?, CancellationToken, Task<bool>> StopRuntimeIfIdentityMatches { get; init; }
+        public required Func<string, RuntimeIdentity?> GetTrackedRuntime { get; init; }
         public required Func<string, Task> StopSessionRelay { get; init; }
         public required Func<string, Task> StopArtifactUploads { get; init; }
         public required Func<string, Task> StopWorkspaceMirrors { get; init; }
@@ -872,6 +874,8 @@ internal static class ServiceClientManager
                 localModelProjectionReconciler,
                 token),
             StopRuntime = sessionManager.StopSessionAsync,
+            StopRuntimeIfIdentityMatches = sessionManager.StopSessionIfRuntimeMatchesAsync,
+            GetTrackedRuntime = sessionId => sessionManager.TryGetRuntimeIdentity(sessionId, out var tracked) ? tracked : null,
             StopSessionRelay = sessionEventRelay.StopSessionAsync,
             StopArtifactUploads = artifactUploadService.StopSessionAsync,
             StopWorkspaceMirrors = workspaceMirrorService.StopSessionAsync,
@@ -1600,25 +1604,50 @@ internal static class ServiceClientManager
             RuntimeInstanceId = command.RuntimeInstanceId,
             RestartRevision = command.RestartRevision,
         };
-        try
+        var target = new RuntimeIdentity(command.LifecycleGeneration, command.RuntimeEpoch, command.RuntimeInstanceId);
+        if (!RunnerIdMatches(command.RunnerId, deps.RunnerId) || !IsQuiesceTargetCurrent(command, target, deps))
         {
-            await CancelTrackedWorkAsync(deps.WorkState.GetActiveStartup()).ConfigureAwait(false);
-            await deps.WorkState.Prompts.CancelAndWaitAsync(_ => true).ConfigureAwait(false);
-            if (deps.TransientSessionCancellation.TryRemove(command.SessionId, out var transientCancellation))
-            {
-                transientCancellation.Cancel();
-                transientCancellation.Dispose();
-            }
-
-            await StopSessionAndCleanupAsync(command.SessionId, deps, deps.Shutdown).ConfigureAwait(false);
-            ack.Quiesced = true;
-            ack.Message = "GPU child runtime quiesced";
-        }
-        catch (Exception ex)
-        {
+            // A delayed quiesce for an older runtime must not touch a newer one.
+            RunnerLog.Warning(
+                nameof(ServiceClientManager),
+                $"Rejecting stale or foreign quiesce {command.CommandId} for session {command.SessionId}.");
             ack.Quiesced = false;
-            ack.Message = ex.Message;
-            RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed quiescing runtime for restart {command.RestartId}: {ex.Message}");
+            ack.Message = StaleRuntimeCommandMessage;
+        }
+        else
+        {
+            try
+            {
+                var activeStartup = deps.WorkState.GetActiveStartup();
+                if (activeStartup is not null &&
+                    string.Equals(activeStartup.SessionId, command.SessionId, StringComparison.Ordinal) &&
+                    activeStartup.RuntimeIdentity.SameRuntime(target))
+                {
+                    await CancelTrackedWorkAsync(activeStartup).ConfigureAwait(false);
+                }
+
+                await deps.WorkState.Prompts.CancelAndWaitAsync(
+                    prompt => PromptTargetsRuntime(prompt, command.SessionId, target)).ConfigureAwait(false);
+                if (deps.TransientSessionCancellation.TryRemove(command.SessionId, out var transientCancellation))
+                {
+                    transientCancellation.Cancel();
+                    transientCancellation.Dispose();
+                }
+
+                if (!await StopRuntimeAndCleanupIfCurrentAsync(command.SessionId, target, deps, deps.Shutdown).ConfigureAwait(false))
+                {
+                    throw new InvalidOperationException(StaleRuntimeCommandMessage);
+                }
+
+                ack.Quiesced = true;
+                ack.Message = "GPU child runtime quiesced";
+            }
+            catch (Exception ex)
+            {
+                ack.Quiesced = false;
+                ack.Message = ex.Message;
+                RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed quiescing runtime for restart {command.RestartId}: {ex.Message}");
+            }
         }
 
         await AcknowledgeRuntimeCommandWithRetryAsync(
@@ -1626,6 +1655,66 @@ internal static class ServiceClientManager
             ack,
             command.CommandId,
             deps.Shutdown).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// A quiesce applies only to the session's current runtime: the logical
+    /// identity when one is held, otherwise the tracked child, if any.
+    /// </summary>
+    private static bool IsQuiesceTargetCurrent(
+        QuiesceEditorRuntimeCommand command,
+        RuntimeIdentity target,
+        RuntimeCommandDependencies deps)
+    {
+        if (!target.IsValid)
+        {
+            return false;
+        }
+
+        if (deps.LogicalSessionState.TryGetRuntime(command.SessionId, out var current, out var currentRevision))
+        {
+            return current.SameRuntime(target) && command.RestartRevision >= currentRevision;
+        }
+
+        return deps.GetTrackedRuntime(command.SessionId) is not { } tracked || tracked.SameRuntime(target);
+    }
+
+    private static bool PromptTargetsRuntime(SubmitPromptCommand prompt, string sessionId, RuntimeIdentity runtimeIdentity)
+        => string.Equals(prompt.SessionId, sessionId, StringComparison.Ordinal) &&
+           prompt.Target is { } target &&
+           new RuntimeIdentity(target.GpuGeneration, target.RuntimeEpoch, target.RuntimeInstanceId).SameRuntime(runtimeIdentity);
+
+    /// <summary>
+    /// Stops and cleans up a session only while its tracked child is the expected
+    /// runtime. Returns false, touching nothing, when another runtime is tracked.
+    /// </summary>
+    private static async Task<bool> StopRuntimeAndCleanupIfCurrentAsync(
+        string sessionId,
+        RuntimeIdentity expected,
+        RuntimeCommandDependencies deps,
+        CancellationToken cancellationToken)
+    {
+        if (deps.GetTrackedRuntime(sessionId) is { } tracked && !tracked.SameRuntime(expected))
+        {
+            RunnerLog.Warning(
+                nameof(ServiceClientManager),
+                $"Leaving session {sessionId} running: its runtime is not the identity being cleaned up.");
+            return false;
+        }
+
+        var stopped = true;
+        await StopSessionAndCleanupAsync(
+            sessionId,
+            async (sid, beforeCleanup, token) =>
+                stopped = await deps.StopRuntimeIfIdentityMatches(sid, expected, beforeCleanup, token).ConfigureAwait(false),
+            deps.StopSessionRelay,
+            deps.StopArtifactUploads,
+            deps.StopWorkspaceMirrors,
+            deps.CancelSessionDownloads,
+            deps.GetDownloadActiveSessionId,
+            deps.SetDownloadActiveSession,
+            cancellationToken).ConfigureAwait(false);
+        return stopped;
     }
 
     internal static Task HandleLaunchRuntimeCommand(

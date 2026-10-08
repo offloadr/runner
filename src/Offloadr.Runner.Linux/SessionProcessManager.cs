@@ -234,12 +234,44 @@ internal sealed partial class SessionProcessManager : IDisposable
     public Task StopSessionAsync(string sessionId, CancellationToken cancellationToken)
         => StopSessionAsync(sessionId, beforeCleanup: null, cancellationToken);
 
-    internal async Task StopSessionAsync(
+    internal Task StopSessionAsync(
         string sessionId,
         Func<string, CancellationToken, Task>? beforeCleanup,
         CancellationToken cancellationToken)
+        => StopSessionCoreAsync(sessionId, expectedRuntime: null, beforeCleanup, cancellationToken);
+
+    /// <summary>
+    /// Stops the session only while its tracked child is exactly
+    /// <paramref name="expectedRuntime"/>. Returns false, touching nothing, when a
+    /// different runtime of the session is tracked.
+    /// </summary>
+    internal Task<bool> StopSessionIfRuntimeMatchesAsync(
+        string sessionId,
+        RuntimeIdentity expectedRuntime,
+        Func<string, CancellationToken, Task>? beforeCleanup,
+        CancellationToken cancellationToken)
+        => StopSessionCoreAsync(sessionId, expectedRuntime, beforeCleanup, cancellationToken);
+
+    /// <summary>The exact runtime identity of the tracked child of a session, if any.</summary>
+    public bool TryGetRuntimeIdentity(string? sessionId, out RuntimeIdentity runtimeIdentity)
     {
-        if (string.IsNullOrWhiteSpace(sessionId)) return;
+        if (!string.IsNullOrWhiteSpace(sessionId) && _sessions.TryGetValue(sessionId.Trim(), out var context))
+        {
+            runtimeIdentity = context.RuntimeIdentity;
+            return true;
+        }
+
+        runtimeIdentity = default;
+        return false;
+    }
+
+    private async Task<bool> StopSessionCoreAsync(
+        string sessionId,
+        RuntimeIdentity? expectedRuntime,
+        Func<string, CancellationToken, Task>? beforeCleanup,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(sessionId)) return true;
         sessionId = sessionId.Trim();
 
         if (!_sessions.TryGetValue(sessionId, out var context))
@@ -250,7 +282,13 @@ internal sealed partial class SessionProcessManager : IDisposable
             }
 
             LogSessionInfo(sessionId, "Stop requested for unknown session.");
-            return;
+            return true;
+        }
+
+        if (expectedRuntime is { } expected && !context.RuntimeIdentity.SameRuntime(expected))
+        {
+            LogSessionInfo(sessionId, "Stop skipped: the tracked runtime is not the requested identity.");
+            return false;
         }
 
         if (!context.TryBeginStop(out var stopCompletion, out var inFlightStop))
@@ -259,7 +297,7 @@ internal sealed partial class SessionProcessManager : IDisposable
             // caller clear state and acknowledge while the child is still alive.
             LogSessionInfo(sessionId, "Stop already in progress; awaiting it.");
             await inFlightStop.WaitAsync(cancellationToken).ConfigureAwait(false);
-            return;
+            return true;
         }
 
         context.Cancellation.Cancel();
@@ -275,6 +313,7 @@ internal sealed partial class SessionProcessManager : IDisposable
 
             await CleanupTrackedContextAsync(context, cancellationToken).ConfigureAwait(false);
             stopCompletion.TrySetResult();
+            return true;
         }
         catch (Exception ex)
         {
