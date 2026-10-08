@@ -1,5 +1,7 @@
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using Google.Protobuf.WellKnownTypes;
+using Grpc.Core;
 using Microsoft.Extensions.Logging.Abstractions;
 using Offloadr.EditorRuntime.V1;
 using Offloadr.Runner.V1;
@@ -170,6 +172,38 @@ public partial class ArtifactUploadServiceTests
     }
 
     [Test]
+    public async Task StopSessionAsync_CompletesWhenUploadWorkerIgnoresCancellation()
+    {
+        var originalTimeout = ArtifactUploadService.StopWaitTimeout;
+        ArtifactUploadService.StopWaitTimeout = TimeSpan.FromMilliseconds(200);
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = CreateSessionPaths(root);
+            var artifactClient = new HangingUploadArtifactClient();
+            await using var service = new ArtifactUploadService(
+                runnerSecret: "runner-secret-value",
+                artifactClient,
+                NullLogger<ArtifactUploadService>.Instance);
+
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            await File.WriteAllBytesAsync(Path.Combine(paths.OutputDirectory, "stuck.png"), [1, 2, 3]);
+            await artifactClient.UploadStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+            var stopwatch = Stopwatch.StartNew();
+            await service.StopSessionAsync("session-1").WaitAsync(TimeSpan.FromSeconds(20));
+
+            Assert.That(stopwatch.Elapsed, Is.LessThan(TimeSpan.FromSeconds(15)));
+        }
+        finally
+        {
+            ArtifactUploadService.StopWaitTimeout = originalTimeout;
+            TryDelete(root);
+        }
+    }
+
+    [Test]
     public async Task SeedSessionAsync_IgnoresArtifactNamesThatEscapeTheirRoot()
     {
         var root = CreateTempDirectory();
@@ -263,6 +297,46 @@ public partial class ArtifactUploadServiceTests
 
     [DllImport("libc", SetLastError = true)]
     private static extern int link(string existingPath, string newPath);
+
+    private sealed class HangingUploadArtifactClient : RunnerArtifactService.RunnerArtifactServiceClient
+    {
+        public TaskCompletionSource UploadStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public override AsyncUnaryCall<RunnerArtifactServiceListArtifactsResponse> ListArtifactsAsync(
+            RunnerArtifactServiceListArtifactsRequest request,
+            CallOptions options)
+            => new(
+                Task.FromResult(new RunnerArtifactServiceListArtifactsResponse()),
+                Task.FromResult(new Metadata()),
+                () => Status.DefaultSuccess,
+                () => new Metadata(),
+                () => { });
+
+        public override AsyncClientStreamingCall<RunnerArtifactServiceUploadArtifactRequest, RunnerArtifactServiceUploadArtifactResponse> UploadArtifact(
+            CallOptions options)
+        {
+            UploadStarted.TrySetResult();
+            return new AsyncClientStreamingCall<RunnerArtifactServiceUploadArtifactRequest, RunnerArtifactServiceUploadArtifactResponse>(
+                new HangingStreamWriter(),
+                new TaskCompletionSource<RunnerArtifactServiceUploadArtifactResponse>().Task,
+                Task.FromResult(new Metadata()),
+                () => Status.DefaultSuccess,
+                () => new Metadata(),
+                () => { });
+        }
+    }
+
+    // Simulates a transport write that never observes cancellation.
+    private sealed class HangingStreamWriter : IClientStreamWriter<RunnerArtifactServiceUploadArtifactRequest>
+    {
+        public WriteOptions? WriteOptions { get; set; }
+
+        public Task WriteAsync(RunnerArtifactServiceUploadArtifactRequest message)
+            => new TaskCompletionSource().Task;
+
+        public Task CompleteAsync()
+            => new TaskCompletionSource().Task;
+    }
 
     private static EditorArtifactMetadata CreateArtifact(string type, string subfolder, string filename, long sizeBytes = 4)
         => new()

@@ -21,6 +21,9 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
     /// <summary>Largest session file the uploader will send; larger files are skipped.</summary>
     internal const long MaxUploadBytes = 4L * 1024 * 1024 * 1024;
 
+    /// <summary>How long Stop waits for cancelled upload and download work before moving on.</summary>
+    internal static TimeSpan StopWaitTimeout { get; set; } = TimeSpan.FromSeconds(10);
+
     private readonly string? _runnerSecret;
     private readonly RunnerArtifactService.RunnerArtifactServiceClient _artifactClient;
     private readonly Metadata? _authHeaders;
@@ -1704,15 +1707,38 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 CancelOutstandingTransfers();
             }
 
+            // Outstanding work has been cancelled; bound the wait so a worker stuck in a
+            // non-cancellable operation cannot keep Stop from completing.
             if (_worker is not null)
             {
-                try { await _worker.ConfigureAwait(false); } catch { }
+                await WaitAfterCancellationAsync(_worker, "upload worker").ConfigureAwait(false);
             }
 
             var downloadTasks = _downloadTasks.Values.ToArray();
             if (downloadTasks.Length > 0)
             {
-                try { await Task.WhenAll(downloadTasks).ConfigureAwait(false); } catch { }
+                await WaitAfterCancellationAsync(Task.WhenAll(downloadTasks), "artifact downloads").ConfigureAwait(false);
+            }
+        }
+
+        private async Task WaitAfterCancellationAsync(Task task, string description)
+        {
+            var timeout = StopWaitTimeout;
+            try
+            {
+                await task.WaitAsync(timeout).ConfigureAwait(false);
+            }
+            catch (TimeoutException) when (!task.IsCompleted)
+            {
+                _logger.LogWarning(
+                    "Artifact {Description} did not stop within {TimeoutSeconds}s session={SessionId}; continuing",
+                    description,
+                    timeout.TotalSeconds,
+                    _sessionId);
+            }
+            catch
+            {
+                // Failures of cancelled work are observed by their callers.
             }
         }
 

@@ -1286,7 +1286,7 @@ internal static class ServiceClientManager
             runtimeInstanceId);
     }
 
-    private static async Task StopArtifactAndWorkspaceMirrorsAsync(
+    internal static async Task StopArtifactAndWorkspaceMirrorsAsync(
         string sessionId,
         Func<string, Task> stopArtifactUploads,
         Func<string, Task> stopWorkspaceMirrors,
@@ -1294,9 +1294,15 @@ internal static class ServiceClientManager
     {
         _ = cancellationToken;
 
+        // Stop must always complete: a mirror that does not stop in time is logged
+        // and left behind rather than blocking session cleanup.
         try
         {
-            await stopArtifactUploads(sessionId).ConfigureAwait(false);
+            await stopArtifactUploads(sessionId).WaitAsync(MirrorStopTimeout).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            RunnerLog.Error(nameof(ServiceClientManager), $"Artifact uploader for session {sessionId} did not stop within {MirrorStopTimeout.TotalSeconds:F0}s; continuing");
         }
         catch (Exception ex)
         {
@@ -1305,13 +1311,19 @@ internal static class ServiceClientManager
 
         try
         {
-            await stopWorkspaceMirrors(sessionId).ConfigureAwait(false);
+            await stopWorkspaceMirrors(sessionId).WaitAsync(MirrorStopTimeout).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            RunnerLog.Error(nameof(ServiceClientManager), $"Workspace mirror for session {sessionId} did not stop within {MirrorStopTimeout.TotalSeconds:F0}s; continuing");
         }
         catch (Exception ex)
         {
             RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed to stop workspace mirror for session {sessionId}");
         }
     }
+
+    internal static TimeSpan MirrorStopTimeout { get; set; } = TimeSpan.FromSeconds(30);
 
     private static Task HandleStartSessionCommandAsync(
         StartSessionCommand command,
