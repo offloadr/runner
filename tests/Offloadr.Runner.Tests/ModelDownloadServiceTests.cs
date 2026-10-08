@@ -448,7 +448,10 @@ public class ModelDownloadServiceTests
 
             backend.AllowRemoval.TrySetResult();
             Assert.That(async () => await download, Throws.InstanceOf<OperationCanceledException>());
-            await WaitUntilAsync(() => !File.Exists(destinationPath), TimeSpan.FromSeconds(5));
+            // The target and then its control file are deleted; wait for both.
+            await WaitUntilAsync(
+                () => !File.Exists(destinationPath) && !File.Exists($"{destinationPath}.aria2"),
+                TimeSpan.FromSeconds(5));
 
             Assert.Multiple(() =>
             {
