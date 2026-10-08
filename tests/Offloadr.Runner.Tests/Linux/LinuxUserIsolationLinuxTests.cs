@@ -77,18 +77,26 @@ public class LinuxUserIsolationLinuxTests
     [Test]
     public async Task Prepare_KillsProcessesAlreadyRunningAsTheSessionUid()
     {
+        const string sessionId = "5e551011-0000-4000-8000-000000000001";
         var killed = new List<uint>();
+        var sessionRoot = Path.Combine(Path.GetTempPath(), "runneragent-isolation-tests", Guid.NewGuid().ToString("n"));
+        Directory.CreateDirectory(sessionRoot);
+        // The account already exists, as a runner-created account for this session.
+        var passwdPath = Path.Combine(sessionRoot, "passwd");
+        await File.WriteAllTextAsync(
+            passwdPath,
+            $"{LinuxSessionIdentity.BuildUserName(sessionId)}:x:4242:4242::{Path.Combine(sessionRoot, sessionId)}:/usr/sbin/nologin\n");
         var strategy = new LinuxUserIsolationStrategy(
             new ScriptedCommandRunner(userId: "4242"),
             (userId, _) =>
             {
                 killed.Add(userId);
                 return Task.FromResult(true);
-            });
-        var sessionRoot = Path.Combine(Path.GetTempPath(), "runneragent-isolation-tests", Guid.NewGuid().ToString("n"));
+            },
+            passwdPath: passwdPath);
         try
         {
-            var identity = await strategy.PrepareAsync("5e551011-0000-4000-8000-000000000001", sessionRoot, CancellationToken.None);
+            var identity = await strategy.PrepareAsync(sessionId, sessionRoot, CancellationToken.None);
             await strategy.CleanupAsync(identity, CancellationToken.None);
             await strategy.CleanupAsync(identity with { UserId = null }, CancellationToken.None);
 

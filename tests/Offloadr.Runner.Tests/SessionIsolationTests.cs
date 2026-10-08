@@ -76,16 +76,22 @@ public class SessionIsolationTests
     [Test]
     public async Task PrepareAsync_WithUuidSessionId_PreparesHomeBeneathSessionRoot()
     {
+        // passwd fields are colon-separated, so the home must be a Linux path.
+        LinuxTestPrerequisites.RequireLinux();
         var root = CreateTempDirectory();
         try
         {
             var sessionRoot = Path.Combine(root, "sessions");
+            var expectedHome = Path.Combine(Path.GetFullPath(sessionRoot), SessionId);
             var runner = new RecordingCommandRunner(userExists: true);
-            var strategy = new LinuxUserIsolationStrategy(runner);
+            var strategy = new LinuxUserIsolationStrategy(
+                runner,
+                static (_, _) => Task.FromResult(true),
+                residueRoots: [],
+                passwdPath: WritePasswd(root, LinuxSessionIdentity.BuildUserName(SessionId), expectedHome));
 
             var identity = await strategy.PrepareAsync(SessionId, sessionRoot, CancellationToken.None);
 
-            var expectedHome = Path.Combine(Path.GetFullPath(sessionRoot), SessionId);
             Assert.Multiple(() =>
             {
                 Assert.That(identity.HomeDirectory, Is.EqualTo(expectedHome));
@@ -100,6 +106,48 @@ public class SessionIsolationTests
         {
             TryDelete(root);
         }
+    }
+
+    [Test]
+    public void PrepareAsync_RefusesAnExistingAccountWithoutThisSessionsHome()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var sessionRoot = Path.Combine(root, "sessions");
+            var runner = new RecordingCommandRunner(userExists: true);
+            var killed = new List<uint>();
+            var strategy = new LinuxUserIsolationStrategy(
+                runner,
+                (userId, _) =>
+                {
+                    killed.Add(userId);
+                    return Task.FromResult(true);
+                },
+                residueRoots: [],
+                passwdPath: WritePasswd(root, LinuxSessionIdentity.BuildUserName(SessionId), "/home/service"));
+
+            Assert.That(
+                async () => await strategy.PrepareAsync(SessionId, sessionRoot, CancellationToken.None),
+                Throws.InvalidOperationException);
+            Assert.Multiple(() =>
+            {
+                Assert.That(killed, Is.Empty);
+                Assert.That(runner.Commands.Select(static command => command.FileName), Does.Not.Contain("/bin/chown"));
+                Assert.That(runner.Commands.Select(static command => command.FileName), Does.Not.Contain("/usr/sbin/userdel"));
+            });
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    private static string WritePasswd(string directory, string userName, string homeDirectory)
+    {
+        var path = Path.Combine(directory, "passwd");
+        File.WriteAllText(path, $"root:x:0:0:root:/root:/bin/sh\n{userName}:x:4242:4242::{homeDirectory}:/usr/sbin/nologin\n");
+        return path;
     }
 
     [TestCase("../escape")]

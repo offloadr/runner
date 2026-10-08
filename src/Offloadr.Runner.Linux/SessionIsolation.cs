@@ -104,6 +104,13 @@ public sealed class LinuxUserIsolationStrategy : ISessionIsolationStrategy
                 userCreated = true;
                 exists = await _commandRunner.RunAsync(LinuxCommandFactory.CheckUserExists(userName), cancellationToken).ConfigureAwait(false);
             }
+            else if (!HasSessionHome(userName, homeDirectory))
+            {
+                // The name may belong to an unrelated account, or to another session whose
+                // id shares the same prefix. Its processes and home are not ours to touch.
+                throw new InvalidOperationException(
+                    $"Account '{userName}' already exists without this session's home; refusing to use it.");
+            }
 
             var userId = ParseUserId(userName, exists);
             createdUserId = userCreated ? userId : null;
@@ -139,6 +146,15 @@ public sealed class LinuxUserIsolationStrategy : ISessionIsolationStrategy
 
             throw;
         }
+    }
+
+    private bool HasSessionHome(string userName, string homeDirectory)
+    {
+        var expected = Path.TrimEndingDirectorySeparator(Path.GetFullPath(homeDirectory));
+        return LinuxSessionResidue.ReadUsers(_passwdPath).Any(user =>
+            string.Equals(user.UserName, userName, StringComparison.Ordinal) &&
+            !string.IsNullOrWhiteSpace(user.HomeDirectory) &&
+            string.Equals(Path.TrimEndingDirectorySeparator(Path.GetFullPath(user.HomeDirectory)), expected, StringComparison.Ordinal));
     }
 
     private static uint ParseUserId(string userName, LinuxCommandResult result)
