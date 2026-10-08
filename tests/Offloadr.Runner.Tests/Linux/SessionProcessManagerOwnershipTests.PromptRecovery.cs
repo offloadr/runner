@@ -31,6 +31,35 @@ public partial class SessionProcessManagerOwnershipTests
         Assert.That((await fixture.Manager.SubmitEditorActionAsync(fixture.Command(), CancellationToken.None)).StatusCode, Is.EqualTo(200));
     }
 
+    [Test]
+    public async Task OverlappingStopAwaitsTheInFlightStop()
+    {
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var fixture = await PromptRuntimeFixture.CreateAsync(cleanup: async () =>
+        {
+            entered.TrySetResult();
+            await release.Task;
+        });
+        var first = fixture.Manager.StopSessionAsync(fixture.Start.SessionId, CancellationToken.None);
+        try
+        {
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            var second = fixture.Manager.StopSessionAsync(fixture.Start.SessionId, CancellationToken.None);
+            await Task.Delay(TimeSpan.FromMilliseconds(200));
+            Assert.That(second.IsCompleted, Is.False, "A second Stop must not report completion while the first is still stopping.");
+
+            release.TrySetResult();
+            await second.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.That(fixture.Manager.GetActiveSessionId(), Is.Empty);
+        }
+        finally
+        {
+            release.TrySetResult();
+            await first;
+        }
+    }
+
     [TestCase("generation")]
     [TestCase("epoch")]
     [TestCase("instance")]

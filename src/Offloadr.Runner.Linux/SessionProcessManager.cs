@@ -253,9 +253,12 @@ internal sealed partial class SessionProcessManager : IDisposable
             return;
         }
 
-        if (!context.TryBeginStop())
+        if (!context.TryBeginStop(out var stopCompletion, out var inFlightStop))
         {
-            LogSessionInfo(sessionId, "Stop already in progress.");
+            // A concurrent caller owns termination. Returning now would let this
+            // caller clear state and acknowledge while the child is still alive.
+            LogSessionInfo(sessionId, "Stop already in progress; awaiting it.");
+            await inFlightStop.WaitAsync(cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -271,19 +274,28 @@ internal sealed partial class SessionProcessManager : IDisposable
             }
 
             await CleanupTrackedContextAsync(context, cancellationToken).ConfigureAwait(false);
+            stopCompletion.TrySetResult();
         }
-        catch
+        catch (Exception ex)
         {
             context.ResetStopState();
 
-            if (context.Process.HasExited)
+            try
             {
-                if (!beforeCleanupCompleted)
+                if (context.Process.HasExited)
                 {
-                    await RunBestEffortBeforeCleanupAsync(beforeCleanup, sessionId).ConfigureAwait(false);
-                }
+                    if (!beforeCleanupCompleted)
+                    {
+                        await RunBestEffortBeforeCleanupAsync(beforeCleanup, sessionId).ConfigureAwait(false);
+                    }
 
-                await CleanupTrackedContextAsync(context, CancellationToken.None).ConfigureAwait(false);
+                    await CleanupTrackedContextAsync(context, CancellationToken.None).ConfigureAwait(false);
+                }
+            }
+            finally
+            {
+                stopCompletion.TrySetException(ex);
+                _ = stopCompletion.Task.Exception;
             }
 
             throw;
@@ -2788,6 +2800,8 @@ internal sealed partial class SessionProcessManager : IDisposable
 
     private sealed class SessionContext
     {
+        private readonly object _stopGate = new();
+        private TaskCompletionSource? _stopCompletion;
         private int _stopState;
         private int _cleanupState;
 
@@ -2814,14 +2828,37 @@ internal sealed partial class SessionProcessManager : IDisposable
 
         public bool TryBeginCleanup() => Interlocked.CompareExchange(ref _cleanupState, 1, 0) == 0;
 
-        public bool TryBeginStop()
+        /// <summary>
+        /// Claims termination for one caller. Later callers receive the in-flight
+        /// stop so they can await the same process exit instead of returning early.
+        /// </summary>
+        public bool TryBeginStop(out TaskCompletionSource stopCompletion, out Task inFlightStop)
         {
-            return Interlocked.CompareExchange(ref _stopState, 1, 0) == 0;
+            lock (_stopGate)
+            {
+                if (_stopCompletion is { } existing)
+                {
+                    stopCompletion = existing;
+                    inFlightStop = existing.Task;
+                    return false;
+                }
+
+                _stopCompletion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                Volatile.Write(ref _stopState, 1);
+                stopCompletion = _stopCompletion;
+                inFlightStop = _stopCompletion.Task;
+                return true;
+            }
         }
 
+        /// <summary>Allows a later stop to retry after this one failed.</summary>
         public void ResetStopState()
         {
-            Volatile.Write(ref _stopState, 0);
+            lock (_stopGate)
+            {
+                _stopCompletion = null;
+                Volatile.Write(ref _stopState, 0);
+            }
         }
     }
 
