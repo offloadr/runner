@@ -79,6 +79,28 @@ public sealed class GpuPowerCommandExecutorTests
     }
 
     [Test]
+    public async Task CompletedDeliveries_AreBoundedAndRecentRedeliveryStillDoesNotRepeat()
+    {
+        var runner = new PhysicalRunner(); var executor = Executor(runner);
+        var total = GpuPowerCommandExecutor.MaxRetainedCompletedDeliveries + 44;
+        SetGpuPowerLimitCommand? last = null;
+        for (var i = 0; i < total; i++)
+        {
+            last = Command();
+            last.CommandId = Guid.NewGuid().ToString("n");
+            await executor.HandleAsync(last, "runner", () => "session", () => 9,
+                (_, _) => Task.FromResult(new GrantGpuPowerExecutionResponse { MayExecute = true }),
+                (_, _) => Task.CompletedTask, default);
+        }
+
+        Assert.That(executor.RetainedDeliveryCount, Is.EqualTo(GpuPowerCommandExecutor.MaxRetainedCompletedDeliveries));
+        await executor.HandleAsync(last!.Clone(), "runner", () => "session", () => 9,
+            (_, _) => throw new AssertionException("A retained delivery must not ask for another grant"),
+            (_, _) => Task.CompletedTask, default);
+        Assert.That(runner.Calls, Is.EqualTo(total));
+    }
+
+    [Test]
     public async Task ReplacementActivation_WaitsForPhysicalExecutionButNotAcknowledgementRetry()
     {
         var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);

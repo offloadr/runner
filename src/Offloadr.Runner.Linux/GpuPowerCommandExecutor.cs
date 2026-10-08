@@ -8,8 +8,16 @@ namespace Offloadr.Runner.Linux;
 /// <summary>Retries fenced grants and retains the original execution result for acknowledgement recovery.</summary>
 public sealed class GpuPowerCommandExecutor(GpuPowerLimitService service)
 {
+    /// <summary>
+    /// Completed deliveries retained to absorb redelivery of the same command id
+    /// without re-execution. Older ones are dropped; a later redelivery of a dropped
+    /// command is still fenced by the control plane's execution grant.
+    /// </summary>
+    internal const int MaxRetainedCompletedDeliveries = 256;
+
     private sealed record Delivery(SetGpuPowerLimitCommand Command, Lazy<Task> Work);
     private readonly ConcurrentDictionary<string, Delivery> _deliveries = new(StringComparer.Ordinal);
+    private readonly Queue<string> _completedDeliveries = new();
     private readonly SemaphoreSlim _physicalExecution = new(1, 1);
     private readonly object _admission = new();
     private readonly CancellationTokenSource _stopping = new();
@@ -35,13 +43,31 @@ public sealed class GpuPowerCommandExecutor(GpuPowerLimitService service)
             if (_closed) return Task.CompletedTask;
             var captured = command.Clone();
             var delivery = _deliveries.GetOrAdd(captured.CommandId, _ => new(captured,
-                new Lazy<Task>(() => Task.Run(() => ExecuteAsync(captured, runnerId, activeSession, activeGeneration, grant, acknowledge, shutdown)))));
+                new Lazy<Task>(() => Task.Run(async () =>
+                {
+                    try { await ExecuteAsync(captured, runnerId, activeSession, activeGeneration, grant, acknowledge, shutdown).ConfigureAwait(false); }
+                    finally { RetireDelivery(captured.CommandId); }
+                }))));
             if (!delivery.Command.Equals(captured))
             {
                 RunnerLog.Error(nameof(GpuPowerCommandExecutor), $"Conflicting delivery for power command {captured.CommandId}");
                 return Task.CompletedTask;
             }
             return delivery.Work.Value;
+        }
+    }
+
+    internal int RetainedDeliveryCount => _deliveries.Count;
+
+    private void RetireDelivery(string commandId)
+    {
+        lock (_admission)
+        {
+            _completedDeliveries.Enqueue(commandId);
+            while (_completedDeliveries.Count > MaxRetainedCompletedDeliveries)
+            {
+                _deliveries.TryRemove(_completedDeliveries.Dequeue(), out _);
+            }
         }
     }
 
