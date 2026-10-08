@@ -1259,7 +1259,7 @@ internal static class ServiceClientManager
                             downloadService.RegisterDownloads,
                             (downloads, token, highPriority) => downloadService.EnsureDownloadsAsync(downloads, token, highPriority),
                             (submitPromptCommand, responseChunkSink, onNativeRequestAttempt, token) => sessionManager.SubmitEditorActionAsync(submitPromptCommand, responseChunkSink, token, onNativeRequestAttempt),
-                            (sessionId, clientId, promptId, submissionId) => sessionEventRelay.MapPrompt(sessionId, clientId, promptId, submissionId),
+                            (sessionId, clientId, promptId, _) => sessionEventRelay.MapPrompt(sessionId, clientId, captured, promptId),
                             physicalCancellation,
                             localModelProjectionReconciler,
                             sessionId => sessionManager.TryGetSessionPaths(sessionId, out var paths) ? paths : null,

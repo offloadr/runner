@@ -87,6 +87,24 @@ public partial class SessionProcessManagerOwnershipTests
         Assert.That(fixture.Manager.TryGetRuntimeIdentity(start.SessionId, out _), Is.False);
     }
 
+    [Test]
+    public async Task IsTrackedRuntimeMatchesOnlyTheExactLiveChild()
+    {
+        await using var fixture = await PromptRuntimeFixture.CreateAsync();
+        var start = fixture.Start;
+        var tracked = new RuntimeIdentity(start.LifecycleGeneration, start.RuntimeEpoch, Guid.Parse(start.RuntimeInstanceId).ToString("D"));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(fixture.Manager.IsTrackedRuntime(start.SessionId, tracked), Is.True);
+            Assert.That(fixture.Manager.IsTrackedRuntime(start.SessionId, tracked with { RuntimeEpoch = start.RuntimeEpoch + 1 }), Is.False);
+            Assert.That(fixture.Manager.IsTrackedRuntime(Guid.NewGuid().ToString("n"), tracked), Is.False);
+        });
+
+        await fixture.Manager.StopSessionAsync(start.SessionId, CancellationToken.None);
+        Assert.That(fixture.Manager.IsTrackedRuntime(start.SessionId, tracked), Is.False);
+    }
+
     [TestCase("generation")]
     [TestCase("epoch")]
     [TestCase("instance")]

@@ -44,6 +44,7 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
     private readonly Task _senderTask;
     private readonly object _sinkLock = new();
     private readonly Func<string, Func<Task>>? _captureSessionArtifactRefresh;
+    private readonly Func<string, RuntimeIdentity, bool>? _isTrackedRuntime;
     private readonly ConcurrentDictionary<string, DateTimeOffset> _lastArtifactRefreshUtc = new(StringComparer.Ordinal);
 
     internal static TimeSpan ArtifactRefreshDebounceInterval { get; set; } = TimeSpan.FromMilliseconds(500);
@@ -58,12 +59,14 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
         string comfyHost,
         int comfyPort,
         Func<string, Func<Task>>? captureSessionArtifactRefresh = null,
-        int queueCapacity = DefaultQueueCapacity)
+        int queueCapacity = DefaultQueueCapacity,
+        Func<string, RuntimeIdentity, bool>? isTrackedRuntime = null)
     {
         _runnerId = runnerId ?? throw new ArgumentNullException(nameof(runnerId));
         _comfyHost = string.IsNullOrWhiteSpace(comfyHost) ? "127.0.0.1" : comfyHost.Trim();
         _comfyPort = comfyPort;
         _captureSessionArtifactRefresh = captureSessionArtifactRefresh;
+        _isTrackedRuntime = isTrackedRuntime;
         if (queueCapacity <= 0)
         {
             throw new ArgumentOutOfRangeException(nameof(queueCapacity), "Queue capacity must be positive.");
@@ -113,10 +116,36 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
             || lifecycleGeneration == 0 || runtimeEpoch == 0 || !Guid.TryParse(runtimeInstanceId, out var instance) || instance == Guid.Empty)
             throw new ArgumentException("A complete captured bridge identity is required.");
 
-        var key = BuildKey(sessionId, clientId);
+        var runtime = new RuntimeIdentity(lifecycleGeneration, runtimeEpoch, runtimeInstanceId).Normalized();
+
+        // Only the session's tracked child may receive a bridge: a delayed relay
+        // for an old runtime would otherwise reconnect to its replacement.
+        if (_isTrackedRuntime is not null && !_isTrackedRuntime(sessionId.Trim(), runtime))
+            throw new InvalidOperationException("The bridge identity is not the session's tracked runtime.");
+
+        var key = BuildKey(sessionId, clientId, runtime);
+        await RetireOtherRuntimeBridgesAsync(sessionId, clientId, key).ConfigureAwait(false);
         var bridge = _bridges.GetOrAdd(key, _ => new SessionBridge(this, _runnerId, sessionId, editorSid, clientId, lifecycleGeneration, runtimeEpoch, runtimeInstanceId, BuildWsUri(clientId)));
         bridge.UpdateConnectionData(editorSid, lifecycleGeneration, runtimeEpoch, runtimeInstanceId, clientMessage);
         await bridge.StartAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task RetireOtherRuntimeBridgesAsync(string sessionId, string clientId, string key)
+    {
+        var prefix = BuildClientPrefix(sessionId, clientId);
+        foreach (var other in _bridges.Keys.Where(candidate =>
+                     candidate.StartsWith(prefix, StringComparison.Ordinal) && !string.Equals(candidate, key, StringComparison.Ordinal)).ToArray())
+        {
+            // Without a runtime check this relay cannot tell which bridge is
+            // current, so an existing bridge is never rebound.
+            if (_isTrackedRuntime is null)
+                throw new InvalidOperationException("An existing bridge cannot be rebound to another runtime.");
+
+            if (_bridges.TryRemove(other, out var retired))
+            {
+                await retired.DisposeAsync().ConfigureAwait(false);
+            }
+        }
     }
 
     public async Task SendClientMessageAsync(
@@ -130,7 +159,7 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
         CancellationToken cancellationToken)
     {
         await EnsureBridgeAsync(sessionId, editorSid, clientId, lifecycleGeneration, runtimeEpoch, runtimeInstanceId, payload, cancellationToken).ConfigureAwait(false);
-        if (TryGetBridge(sessionId, clientId, out var bridge))
+        if (TryGetBridge(sessionId, clientId, new RuntimeIdentity(lifecycleGeneration, runtimeEpoch, runtimeInstanceId), out var bridge))
         {
             await bridge.SendClientMessageAsync(payload, cancellationToken).ConfigureAwait(false);
         }
@@ -138,7 +167,7 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
 
     public void RegisterSubmission(string sessionId, string clientId, SubmitPromptCommand command)
     {
-        if (TryGetBridge(sessionId, clientId, out var bridge))
+        if (TryGetBridge(sessionId, clientId, TargetRuntime(command), out var bridge))
         {
             bridge.RegisterSubmission(command);
         }
@@ -146,20 +175,25 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
 
     public void UnregisterUninvokedSubmission(string sessionId, string clientId, SubmitPromptCommand command)
     {
-        if (TryGetBridge(sessionId, clientId, out var bridge))
+        if (TryGetBridge(sessionId, clientId, TargetRuntime(command), out var bridge))
         {
             bridge.UnregisterUninvokedSubmission(command);
         }
     }
 
-    public void MapPrompt(string sessionId, string clientId, string promptId, string submissionId)
+    public void MapPrompt(string sessionId, string clientId, SubmitPromptCommand command, string promptId)
     {
-        if (string.IsNullOrWhiteSpace(promptId) || string.IsNullOrWhiteSpace(submissionId)) return;
-        if (TryGetBridge(sessionId, clientId, out var bridge))
+        if (string.IsNullOrWhiteSpace(promptId) || string.IsNullOrWhiteSpace(command.SubmissionId)) return;
+        if (TryGetBridge(sessionId, clientId, TargetRuntime(command), out var bridge))
         {
-            bridge.MapPrompt(promptId, submissionId);
+            bridge.MapPrompt(promptId, command.SubmissionId);
         }
     }
+
+    private static RuntimeIdentity TargetRuntime(SubmitPromptCommand command)
+        => command.Target is { } target
+            ? new RuntimeIdentity(target.GpuGeneration, target.RuntimeEpoch, target.RuntimeInstanceId)
+            : default;
 
     public async Task StopSessionAsync(string sessionId)
     {
@@ -187,9 +221,9 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
         return true;
     }
 
-    private bool TryGetBridge(string sessionId, string clientId, out SessionBridge bridge)
+    private bool TryGetBridge(string sessionId, string clientId, RuntimeIdentity runtime, out SessionBridge bridge)
     {
-        var key = BuildKey(sessionId, clientId);
+        var key = BuildKey(sessionId, clientId, runtime.Normalized());
         return _bridges.TryGetValue(key, out bridge!);
     }
 
@@ -230,8 +264,17 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
         return true;
     }
 
-    private static string BuildKey(string sessionId, string clientId)
-        => string.Concat(sessionId.Trim(), "|", clientId.Trim());
+    // Bridges are keyed by session, client and exact runtime, so a lookup made
+    // for one runtime can never reach a bridge connected for another.
+    private static string BuildKey(string sessionId, string clientId, RuntimeIdentity runtime)
+        => string.Concat(
+            BuildClientPrefix(sessionId, clientId),
+            runtime.LifecycleGeneration.ToString(System.Globalization.CultureInfo.InvariantCulture), "|",
+            runtime.RuntimeEpoch.ToString(System.Globalization.CultureInfo.InvariantCulture), "|",
+            runtime.RuntimeInstanceId);
+
+    private static string BuildClientPrefix(string sessionId, string clientId)
+        => string.Concat(sessionId.Trim(), "|", clientId.Trim(), "|");
 
     private Uri BuildWsUri(string clientId)
     {

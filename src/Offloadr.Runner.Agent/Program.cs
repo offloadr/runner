@@ -97,7 +97,8 @@ await using var sessionEventRelay = new ComfySessionEventRelay(
     options.RunnerId,
     sessionManager.ComfyHost,
     sessionManager.ComfyPort,
-    artifactUploadService.CaptureSessionRefresh);
+    artifactUploadService.CaptureSessionRefresh,
+    isTrackedRuntime: sessionManager.IsTrackedRuntime);
 var runtimeTelemetryService = new RuntimeTelemetryService(options.Aria2.DownloadDirectory);
 var gpuPowerLimitService = new GpuPowerCommandExecutor(new GpuPowerLimitService(runtimeTelemetryService));
 var runtimeTelemetryReporter = new ActiveSessionRuntimeTelemetryReporter(

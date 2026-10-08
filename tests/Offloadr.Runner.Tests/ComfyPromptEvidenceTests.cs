@@ -211,6 +211,72 @@ public sealed class ComfyPromptEvidenceTests
     }
 
     [Test]
+    public async Task BridgeIsRefusedUnlessTheExactRuntimeIsTracked()
+    {
+        var command = Command();
+        var checkedRuntimes = new List<(string Session, RuntimeIdentity Runtime)>();
+        await using var relay = new ComfySessionEventRelay(command.Target.RunnerId, "127.0.0.1", 1,
+            isTrackedRuntime: (session, runtime) =>
+            {
+                checkedRuntimes.Add((session, runtime));
+                return false;
+            });
+
+        Assert.ThrowsAsync<InvalidOperationException>(() => relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client",
+            command.Target.GpuGeneration, command.Target.RuntimeEpoch, Guid.Parse(command.Target.RuntimeInstanceId).ToString("D"), [], CancellationToken.None));
+        Assert.That(BridgeCount(relay), Is.Zero);
+        Assert.That(checkedRuntimes, Is.EqualTo(new[]
+        {
+            (command.SessionId, new RuntimeIdentity(command.Target.GpuGeneration, command.Target.RuntimeEpoch, command.Target.RuntimeInstanceId)),
+        }));
+    }
+
+    [Test]
+    public async Task BridgeLookupForAnotherRuntimeDoesNotReachTheBridge()
+    {
+        var command = Command();
+        await using var relay = new ComfySessionEventRelay(command.Target.RunnerId, "127.0.0.1", 1, isTrackedRuntime: (_, _) => true);
+        await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", command.Target.GpuGeneration,
+            command.Target.RuntimeEpoch, command.Target.RuntimeInstanceId, [], CancellationToken.None);
+
+        var other = command.Clone();
+        other.Target.RuntimeEpoch++;
+        relay.RegisterSubmission(command.SessionId, "client", other);
+        Assert.That(RetainedCommandCount(relay), Is.Zero);
+
+        relay.RegisterSubmission(command.SessionId, "client", command);
+        Assert.That(RetainedCommandCount(relay), Is.EqualTo(1));
+    }
+
+    [Test]
+    public async Task TrackedReplacementRuntimeRetiresThePreviousRuntimesBridge()
+    {
+        var command = Command();
+        var tracked = new RuntimeIdentity(command.Target.GpuGeneration, command.Target.RuntimeEpoch, command.Target.RuntimeInstanceId);
+        await using var relay = new ComfySessionEventRelay(command.Target.RunnerId, "127.0.0.1", 1,
+            isTrackedRuntime: (_, runtime) => runtime.SameRuntime(tracked));
+        await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", command.Target.GpuGeneration,
+            command.Target.RuntimeEpoch, command.Target.RuntimeInstanceId, [], CancellationToken.None);
+
+        var replacement = command.Clone();
+        replacement.Target.RuntimeEpoch++;
+        replacement.Target.RuntimeInstanceId = Guid.NewGuid().ToString("n");
+        tracked = new RuntimeIdentity(replacement.Target.GpuGeneration, replacement.Target.RuntimeEpoch, replacement.Target.RuntimeInstanceId);
+        await relay.EnsureBridgeAsync(replacement.SessionId, replacement.EditorSid, "client", replacement.Target.GpuGeneration,
+            replacement.Target.RuntimeEpoch, replacement.Target.RuntimeInstanceId, [], CancellationToken.None);
+
+        Assert.That(BridgeCount(relay), Is.EqualTo(1));
+        relay.RegisterSubmission(command.SessionId, "client", command);
+        Assert.That(RetainedCommandCount(relay), Is.Zero, "The retired runtime's bridge no longer accepts submissions.");
+        relay.RegisterSubmission(replacement.SessionId, "client", replacement);
+        Assert.That(RetainedCommandCount(relay), Is.EqualTo(1));
+    }
+
+    private static int BridgeCount(ComfySessionEventRelay relay)
+        => ((IDictionary)typeof(ComfySessionEventRelay)
+            .GetField("_bridges", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(relay)!).Count;
+
+    [Test]
     public async Task UninvokedPromptReleasesOnlyItsExactRetainedCommand()
     {
         var command = Command();

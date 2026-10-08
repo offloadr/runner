@@ -265,6 +265,31 @@ internal sealed partial class SessionProcessManager : IDisposable
         return false;
     }
 
+    /// <summary>
+    /// True only while the session's tracked child is exactly <paramref name="runtimeIdentity"/>
+    /// and is neither stopping nor exited.
+    /// </summary>
+    public bool IsTrackedRuntime(string? sessionId, RuntimeIdentity runtimeIdentity)
+    {
+        if (string.IsNullOrWhiteSpace(sessionId) || !_sessions.TryGetValue(sessionId.Trim(), out var context))
+        {
+            return false;
+        }
+
+        try
+        {
+            return !context.StopInProgress &&
+                   !context.Cancellation.IsCancellationRequested &&
+                   !context.Process.HasExited &&
+                   context.RuntimeIdentity.SameRuntime(runtimeIdentity);
+        }
+        catch (InvalidOperationException)
+        {
+            // The process handle was already released by cleanup.
+            return false;
+        }
+    }
+
     private async Task<bool> StopSessionCoreAsync(
         string sessionId,
         RuntimeIdentity? expectedRuntime,
