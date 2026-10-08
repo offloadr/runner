@@ -1623,6 +1623,49 @@ internal static class ServiceClientManager
         stopFailure?.Throw();
     }
 
+    /// <summary>
+    /// Cleans up after a runtime exited on its own. A replacement for the same session may
+    /// already have adopted its identity, so only state and sidecars that still belong to
+    /// the exited runtime are touched.
+    /// </summary>
+    internal static async Task HandleUnexpectedRuntimeExitAsync(
+        string sessionId,
+        RuntimeIdentity exitedRuntime,
+        LogicalSessionState logicalSessionState,
+        RuntimeIdentityRegistry runtimeIdentities,
+        Func<string, CancellationToken, Task> cleanupSidecars,
+        CancellationToken cancellationToken)
+    {
+        if (!exitedRuntime.IsValid)
+        {
+            // A runtime started without an identity has nothing newer to protect.
+            ClearRuntimeSessionState(logicalSessionState, runtimeIdentities, sessionId);
+            await cleanupSidecars(sessionId, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        var supersededInRegistry = runtimeIdentities.TryGet(sessionId, out var registered) &&
+                                   !registered.SameRuntime(exitedRuntime);
+        var supersededInSession = logicalSessionState.TryGetRuntime(sessionId, out var logical, out _) &&
+                                  !logical.SameRuntime(exitedRuntime);
+        if (supersededInRegistry || supersededInSession)
+        {
+            RunnerLog.Warning(
+                nameof(ServiceClientManager),
+                $"Exited runtime {exitedRuntime.RuntimeInstanceId} of session '{sessionId}' was already replaced; leaving the newer runtime's state and sidecars.");
+            return;
+        }
+
+        ClearRuntimeSessionStateIfIdentityMatches(
+            logicalSessionState,
+            runtimeIdentities,
+            sessionId,
+            exitedRuntime.LifecycleGeneration,
+            exitedRuntime.RuntimeEpoch,
+            exitedRuntime.RuntimeInstanceId);
+        await cleanupSidecars(sessionId, cancellationToken).ConfigureAwait(false);
+    }
+
     internal static async Task CleanupExitedSessionAsync(
         string? sessionId,
         Func<string, Task> stopSessionRelay,

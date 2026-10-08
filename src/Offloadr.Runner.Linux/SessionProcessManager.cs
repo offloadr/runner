@@ -57,7 +57,7 @@ internal sealed partial class SessionProcessManager : IDisposable
     private readonly ILinuxCommandRunner _signalCommandRunner;
     private readonly SessionProcessLogRelay? _processLogRelay;
 
-    internal Func<string, int?, CancellationToken, Task>? UnexpectedSessionExitCleanup { get; set; }
+    internal Func<string, RuntimeIdentity, int?, CancellationToken, Task>? UnexpectedSessionExitCleanup { get; set; }
 
     public SessionProcessManager()
         : this(
@@ -1174,12 +1174,13 @@ internal sealed partial class SessionProcessManager : IDisposable
             return;
         }
 
-        await RunBestEffortUnexpectedExitCleanupAsync(context.SessionId, exitCode, cancellationToken).ConfigureAwait(false);
+        await RunBestEffortUnexpectedExitCleanupAsync(context.SessionId, context.RuntimeIdentity, exitCode, cancellationToken).ConfigureAwait(false);
         await CleanupTrackedContextAsync(context, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task RunBestEffortUnexpectedExitCleanupAsync(
         string sessionId,
+        RuntimeIdentity runtimeIdentity,
         int? exitCode,
         CancellationToken cancellationToken)
     {
@@ -1191,7 +1192,7 @@ internal sealed partial class SessionProcessManager : IDisposable
 
         try
         {
-            await cleanup(sessionId, exitCode, cancellationToken).ConfigureAwait(false);
+            await cleanup(sessionId, runtimeIdentity, exitCode, cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex)
         {

@@ -129,19 +129,24 @@ var runtimeTelemetryReporter = new ActiveSessionRuntimeTelemetryReporter(
     runtimeTelemetryService.TryCaptureSnapshot,
     sessionRuntimeTelemetryRelay.Enqueue,
     options.RuntimeTelemetryInterval);
-sessionManager.UnexpectedSessionExitCleanup = async (sessionId, exitCode, token) =>
+sessionManager.UnexpectedSessionExitCleanup = async (sessionId, exitedRuntime, exitCode, token) =>
 {
     var exitSummary = exitCode.HasValue ? $" code={exitCode.Value}" : string.Empty;
     RunnerLog.Warning($"Session '{sessionId}' process exited unexpectedly{exitSummary}; stopping session sidecars.");
-    ServiceClientManager.ClearRuntimeSessionState(logicalSessionState, runtimeIdentities, sessionId);
-    await ServiceClientManager.CleanupExitedSessionAsync(
+    await ServiceClientManager.HandleUnexpectedRuntimeExitAsync(
         sessionId,
-        sessionEventRelay.StopSessionAsync,
-        artifactUploadService.StopSessionAsync,
-        workspaceMirrorService.StopSessionAsync,
-        downloadService.CancelSession,
-        downloadService.GetActiveSessionId,
-        downloadService.SetActiveSession,
+        exitedRuntime,
+        logicalSessionState,
+        runtimeIdentities,
+        (exitedSessionId, cancellationToken) => ServiceClientManager.CleanupExitedSessionAsync(
+            exitedSessionId,
+            sessionEventRelay.StopSessionAsync,
+            artifactUploadService.StopSessionAsync,
+            workspaceMirrorService.StopSessionAsync,
+            downloadService.CancelSession,
+            downloadService.GetActiveSessionId,
+            downloadService.SetActiveSession,
+            cancellationToken),
         token).ConfigureAwait(false);
 };
 

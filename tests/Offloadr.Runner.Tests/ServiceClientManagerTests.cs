@@ -991,6 +991,120 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
+    public async Task HandleUnexpectedRuntimeExitAsync_ClearsStateAndSidecarsOfTheExitedRuntime()
+    {
+        var logicalSession = new ServiceClientManager.LogicalSessionState(string.Empty);
+        logicalSession.SetActiveRuntime("session-1", 7, 3, "runtime-1");
+        var runtimeIdentities = new RuntimeIdentityRegistry();
+        runtimeIdentities.Set("session-1", 7, 3, "runtime-1");
+        var cleaned = new List<string>();
+
+        await ServiceClientManager.HandleUnexpectedRuntimeExitAsync(
+            "session-1",
+            new RuntimeIdentity(7, 3, "runtime-1"),
+            logicalSession,
+            runtimeIdentities,
+            (sessionId, _) =>
+            {
+                cleaned.Add(sessionId);
+                return Task.CompletedTask;
+            },
+            CancellationToken.None);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(logicalSession.GetActiveSessionId(), Is.Empty);
+            Assert.That(runtimeIdentities.TryGet("session-1", out _), Is.False);
+            Assert.That(cleaned, Is.EqualTo(new[] { "session-1" }));
+        });
+    }
+
+    [Test]
+    public async Task HandleUnexpectedRuntimeExitAsync_LeavesAReplacementRuntimeAndItsSidecars()
+    {
+        var logicalSession = new ServiceClientManager.LogicalSessionState(string.Empty);
+        logicalSession.SetActiveRuntime("session-1", 7, 4, "runtime-2");
+        var runtimeIdentities = new RuntimeIdentityRegistry();
+        runtimeIdentities.Set("session-1", 7, 4, "runtime-2");
+        var cleaned = new List<string>();
+
+        await ServiceClientManager.HandleUnexpectedRuntimeExitAsync(
+            "session-1",
+            new RuntimeIdentity(7, 3, "runtime-1"),
+            logicalSession,
+            runtimeIdentities,
+            (sessionId, _) =>
+            {
+                cleaned.Add(sessionId);
+                return Task.CompletedTask;
+            },
+            CancellationToken.None);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(logicalSession.GetActiveSessionId(), Is.EqualTo("session-1"));
+            Assert.That(runtimeIdentities.TryGet("session-1", out var identity), Is.True);
+            Assert.That(identity, Is.EqualTo(new RuntimeIdentity(7, 4, "runtime-2")));
+            Assert.That(cleaned, Is.Empty);
+        });
+    }
+
+    [Test]
+    public async Task HandleUnexpectedRuntimeExitAsync_LeavesAReplacementKnownOnlyToTheRegistry()
+    {
+        var logicalSession = new ServiceClientManager.LogicalSessionState(string.Empty);
+        logicalSession.SetActiveRuntime("session-1", 7, 3, "runtime-1");
+        var runtimeIdentities = new RuntimeIdentityRegistry();
+        runtimeIdentities.Set("session-1", 8, 1, "runtime-2");
+        var cleaned = new List<string>();
+
+        await ServiceClientManager.HandleUnexpectedRuntimeExitAsync(
+            "session-1",
+            new RuntimeIdentity(7, 3, "runtime-1"),
+            logicalSession,
+            runtimeIdentities,
+            (sessionId, _) =>
+            {
+                cleaned.Add(sessionId);
+                return Task.CompletedTask;
+            },
+            CancellationToken.None);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(runtimeIdentities.TryGet("session-1", out var identity), Is.True);
+            Assert.That(identity, Is.EqualTo(new RuntimeIdentity(8, 1, "runtime-2")));
+            Assert.That(cleaned, Is.Empty);
+        });
+    }
+
+    [Test]
+    public async Task HandleUnexpectedRuntimeExitAsync_ClearsBySessionWhenTheRuntimeHadNoIdentity()
+    {
+        var logicalSession = new ServiceClientManager.LogicalSessionState("session-1");
+        var runtimeIdentities = new RuntimeIdentityRegistry();
+        var cleaned = new List<string>();
+
+        await ServiceClientManager.HandleUnexpectedRuntimeExitAsync(
+            "session-1",
+            default,
+            logicalSession,
+            runtimeIdentities,
+            (sessionId, _) =>
+            {
+                cleaned.Add(sessionId);
+                return Task.CompletedTask;
+            },
+            CancellationToken.None);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(logicalSession.GetActiveSessionId(), Is.Empty);
+            Assert.That(cleaned, Is.EqualTo(new[] { "session-1" }));
+        });
+    }
+
+    [Test]
     public void ClearRuntimeSessionStateIfIdentityMatches_PreservesReplacementLaunchForSameSession()
     {
         var logicalSession = new ServiceClientManager.LogicalSessionState(string.Empty);
