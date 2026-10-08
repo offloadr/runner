@@ -12,7 +12,7 @@ public class LinuxUserIsolationLinuxTests
         LinuxTestPrerequisites.RequireCommand("/bin/sh");
 
         var sessionRoot = Path.Combine(Path.GetTempPath(), "runneragent-isolation-tests", Guid.NewGuid().ToString("n"));
-        var sessionId = $"reap{Guid.NewGuid():N}"[..12];
+        var sessionId = Guid.NewGuid().ToString();
         var commandRunner = new LinuxCommandRunner();
         var strategy = new LinuxUserIsolationStrategy(commandRunner);
         PreparedSessionIdentity identity = default;
@@ -88,7 +88,7 @@ public class LinuxUserIsolationLinuxTests
         var sessionRoot = Path.Combine(Path.GetTempPath(), "runneragent-isolation-tests", Guid.NewGuid().ToString("n"));
         try
         {
-            var identity = await strategy.PrepareAsync("session-reused", sessionRoot, CancellationToken.None);
+            var identity = await strategy.PrepareAsync("5e551011-0000-4000-8000-000000000001", sessionRoot, CancellationToken.None);
             await strategy.CleanupAsync(identity, CancellationToken.None);
             await strategy.CleanupAsync(identity with { UserId = null }, CancellationToken.None);
 

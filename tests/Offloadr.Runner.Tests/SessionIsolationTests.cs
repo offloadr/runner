@@ -145,7 +145,8 @@ public class SessionIsolationTests
         {
             _commands.Enqueue(command);
             var exitCode = command.FileName == "/usr/bin/id" && !userExists ? 1 : 0;
-            return Task.FromResult(new LinuxCommandResult(exitCode, string.Empty, string.Empty));
+            var stdout = command.FileName == "/usr/bin/id" && userExists ? "4242" : string.Empty;
+            return Task.FromResult(new LinuxCommandResult(exitCode, stdout, string.Empty));
         }
     }
 }

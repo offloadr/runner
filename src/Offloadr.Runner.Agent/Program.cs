@@ -62,7 +62,7 @@ try
 }
 catch (OperationCanceledException) when (shutdown.IsCancellationRequested)
 {
-    return;
+    return 0;
 }
 var logicalSessionState = new ServiceClientManager.LogicalSessionState(sessionManager.GetActiveSessionId());
 await using IModelTransferBackend downloadBackend = new Aria2DownloadBackend(options.Aria2);
