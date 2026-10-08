@@ -139,14 +139,39 @@ internal static class ServiceClientManager
         }
     }
 
-    private sealed class TrackedCommandWork
+    internal sealed class TrackedCommandWork
     {
         public Task? Task { get; set; }
         public required CancellationTokenSource CancellationSource { get; init; }
         public required string SessionId { get; init; }
     }
 
-    private sealed class RunnerCommandWorkState(CancellationToken shutdown)
+    /// <summary>
+    /// The physical operations and state one runtime command handler needs. The
+    /// command stream binds them to the live services; tests bind fakes.
+    /// </summary>
+    internal sealed class RuntimeCommandDependencies
+    {
+        public required string RunnerId { get; init; }
+        public required IRunnerSessionSink Sink { get; init; }
+        public required RunnerCommandWorkState WorkState { get; init; }
+        public required LogicalSessionState LogicalSessionState { get; init; }
+        public required RuntimeIdentityRegistry RuntimeIdentities { get; init; }
+        public required ConcurrentDictionary<string, CancellationTokenSource> TransientSessionCancellation { get; init; }
+        public required Func<string> GetActiveRuntimeSessionId { get; init; }
+        public required Func<StartSessionCommand, CancellationToken, Task> StartRuntimeAndWaitForReady { get; init; }
+        public required Func<string, Func<string, CancellationToken, Task>?, CancellationToken, Task> StopRuntime { get; init; }
+        public required Func<string, Task> StopSessionRelay { get; init; }
+        public required Func<string, Task> StopArtifactUploads { get; init; }
+        public required Func<string, Task> StopWorkspaceMirrors { get; init; }
+        public required Action<string?> CancelSessionDownloads { get; init; }
+        public required Func<string?> GetDownloadActiveSessionId { get; init; }
+        public required Action<string?> SetDownloadActiveSession { get; init; }
+        public required Func<Action, CancellationToken, Task> ActivateSession { get; init; }
+        public required CancellationToken Shutdown { get; init; }
+    }
+
+    internal sealed class RunnerCommandWorkState(CancellationToken shutdown)
     {
         private readonly object _gate = new();
         public PromptCommandWorkSet Prompts { get; } = new(shutdown);
@@ -707,6 +732,33 @@ internal static class ServiceClientManager
         var transientSessionCancellation = new ConcurrentDictionary<string, CancellationTokenSource>(StringComparer.Ordinal);
         using var ordinaryControlGate = new SemaphoreSlim(1, 1);
         using var readGate = new SemaphoreSlim(4, 4);
+        var runtimeCommands = new RuntimeCommandDependencies
+        {
+            RunnerId = runnerId,
+            Sink = sessionSink,
+            WorkState = commandWorkState,
+            LogicalSessionState = logicalSessionState,
+            RuntimeIdentities = runtimeIdentities,
+            TransientSessionCancellation = transientSessionCancellation,
+            GetActiveRuntimeSessionId = sessionManager.GetActiveSessionId,
+            StartRuntimeAndWaitForReady = (start, token) => StartSessionAndWaitForReadyAsync(
+                start,
+                sessionManager,
+                artifactUploadService,
+                workspaceMirrorService,
+                downloadService,
+                localModelProjectionReconciler,
+                token),
+            StopRuntime = sessionManager.StopSessionAsync,
+            StopSessionRelay = sessionEventRelay.StopSessionAsync,
+            StopArtifactUploads = artifactUploadService.StopSessionAsync,
+            StopWorkspaceMirrors = workspaceMirrorService.StopSessionAsync,
+            CancelSessionDownloads = downloadService.CancelSession,
+            GetDownloadActiveSessionId = downloadService.GetActiveSessionId,
+            SetDownloadActiveSession = downloadService.SetActiveSession,
+            ActivateSession = gpuPowerLimitService.ActivateSessionAsync,
+            Shutdown = shutdown,
+        };
 
         while (!shutdown.IsCancellationRequested)
         {
@@ -740,21 +792,7 @@ internal static class ServiceClientManager
                         }
 
                         RunnerLog.Info(nameof(ServiceClientManager), $"StartSession event: session={evt.StartSession.SessionId} user={evt.StartSession.User}");
-                        _ = HandleStartSessionCommandAsync(
-                            evt.StartSession,
-                            runnerId,
-                            sessionSink,
-                            sessionManager,
-                            downloadService,
-                            sessionEventRelay,
-                            artifactUploadService,
-                            workspaceMirrorService,
-                            localModelProjectionReconciler,
-                            commandWorkState,
-                            logicalSessionState,
-                            runtimeIdentities,
-                            gpuPowerLimitService,
-                            shutdown);
+                        _ = HandleStartSessionCommand(evt.StartSession, runtimeCommands);
                         continue;
                     }
 
@@ -765,18 +803,7 @@ internal static class ServiceClientManager
                             continue;
                         }
 
-                        _ = HandleQuiesceRuntimeCommandAsync(
-                            evt.QuiesceEditorRuntime,
-                            runnerId,
-                            sessionSink,
-                            sessionManager,
-                            downloadService,
-                            sessionEventRelay,
-                            artifactUploadService,
-                            workspaceMirrorService,
-                            commandWorkState,
-                            transientSessionCancellation,
-                            shutdown);
+                        _ = HandleQuiesceRuntimeCommandAsync(evt.QuiesceEditorRuntime, runtimeCommands);
                         continue;
                     }
 
@@ -787,76 +814,14 @@ internal static class ServiceClientManager
                             continue;
                         }
 
-                        logicalSessionState.SetActiveRuntime(
-                            evt.LaunchEditorRuntime.SessionId,
-                            evt.LaunchEditorRuntime.LifecycleGeneration,
-                            evt.LaunchEditorRuntime.RuntimeEpoch,
-                            evt.LaunchEditorRuntime.RuntimeInstanceId);
-                        runtimeIdentities.Set(
-                            evt.LaunchEditorRuntime.SessionId,
-                            evt.LaunchEditorRuntime.LifecycleGeneration,
-                            evt.LaunchEditorRuntime.RuntimeEpoch,
-                            evt.LaunchEditorRuntime.RuntimeInstanceId);
-                        _ = HandleLaunchRuntimeCommandAsync(
-                            evt.LaunchEditorRuntime,
-                            runnerId,
-                            sessionSink,
-                            sessionManager,
-                            downloadService,
-                            sessionEventRelay,
-                            artifactUploadService,
-                            workspaceMirrorService,
-                            localModelProjectionReconciler,
-                            commandWorkState,
-                            logicalSessionState,
-                            runtimeIdentities,
-                            shutdown);
+                        _ = HandleLaunchRuntimeCommand(evt.LaunchEditorRuntime, runtimeCommands);
                         continue;
                     }
 
                     if (evt.StopSession != null && !string.IsNullOrWhiteSpace(evt.StopSession.SessionId))
                     {
                         RunnerLog.Info(nameof(ServiceClientManager), $"StopSession event: session={evt.StopSession.SessionId} user={evt.StopSession.User}");
-                        await commandWorkState.Prompts.CancelAndWaitAsync(
-                            prompt => prompt.SessionId == evt.StopSession.SessionId).ConfigureAwait(false);
-
-                        var activeStartup = commandWorkState.GetActiveStartup();
-                        if (activeStartup is not null &&
-                            string.Equals(activeStartup.SessionId, evt.StopSession.SessionId, StringComparison.Ordinal))
-                        {
-                            await CancelTrackedWorkAsync(activeStartup).ConfigureAwait(false);
-                        }
-
-                        if (transientSessionCancellation.TryRemove(evt.StopSession.SessionId, out var transientCancellation))
-                        {
-                            transientCancellation.Cancel();
-                            transientCancellation.Dispose();
-                        }
-
-                        await StopSessionAndCleanupAsync(
-                            evt.StopSession.SessionId,
-                            sessionManager.StopSessionAsync,
-                            sessionEventRelay.StopSessionAsync,
-                            artifactUploadService.StopSessionAsync,
-                            workspaceMirrorService.StopSessionAsync,
-                            downloadService.CancelSession,
-                            downloadService.GetActiveSessionId,
-                            downloadService.SetActiveSession,
-                            shutdown).ConfigureAwait(false);
-                        logicalSessionState.ClearIfMatches(evt.StopSession.SessionId);
-                        runtimeIdentities.Remove(evt.StopSession.SessionId);
-
-                        try
-                        {
-                            await sessionSink.AckStopSessionAsync(
-                                new AcknowledgeSessionStopRequest { SessionId = evt.StopSession.SessionId, User = evt.StopSession.User },
-                                shutdown).ConfigureAwait(false);
-                        }
-                        catch (Exception ex)
-                        {
-                            RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed stop ack: {ex.Message}");
-                        }
-
+                        await HandleStopSessionCommandAsync(evt.StopSession, runtimeCommands).ConfigureAwait(false);
                         continue;
                     }
 
@@ -1325,24 +1290,60 @@ internal static class ServiceClientManager
 
     internal static TimeSpan MirrorStopTimeout { get; set; } = TimeSpan.FromSeconds(30);
 
-    private static Task HandleStartSessionCommandAsync(
-        StartSessionCommand command,
-        string runnerId,
-        IRunnerSessionSink sessionSink,
-        SessionProcessManager sessionManager,
-        ModelDownloadService downloadService,
-        ComfySessionEventRelay sessionEventRelay,
-        ArtifactUploadService artifactUploadService,
-        WorkspaceMirrorService workspaceMirrorService,
-        Action<IEnumerable<ModelDownloadRequest>, bool>? localModelProjectionReconciler,
-        RunnerCommandWorkState commandWorkState,
-        LogicalSessionState logicalSessionState,
-        RuntimeIdentityRegistry runtimeIdentities,
-        GpuPowerCommandExecutor gpuPowerCommands,
-        CancellationToken shutdown)
+    private static Task StopSessionAndCleanupAsync(
+        string? sessionId,
+        RuntimeCommandDependencies deps,
+        CancellationToken cancellationToken)
+        => StopSessionAndCleanupAsync(
+            sessionId,
+            deps.StopRuntime,
+            deps.StopSessionRelay,
+            deps.StopArtifactUploads,
+            deps.StopWorkspaceMirrors,
+            deps.CancelSessionDownloads,
+            deps.GetDownloadActiveSessionId,
+            deps.SetDownloadActiveSession,
+            cancellationToken);
+
+    internal static async Task HandleStopSessionCommandAsync(StopSessionCommand command, RuntimeCommandDependencies deps)
     {
+        await deps.WorkState.Prompts.CancelAndWaitAsync(
+            prompt => prompt.SessionId == command.SessionId).ConfigureAwait(false);
+
+        var activeStartup = deps.WorkState.GetActiveStartup();
+        if (activeStartup is not null &&
+            string.Equals(activeStartup.SessionId, command.SessionId, StringComparison.Ordinal))
+        {
+            await CancelTrackedWorkAsync(activeStartup).ConfigureAwait(false);
+        }
+
+        if (deps.TransientSessionCancellation.TryRemove(command.SessionId, out var transientCancellation))
+        {
+            transientCancellation.Cancel();
+            transientCancellation.Dispose();
+        }
+
+        await StopSessionAndCleanupAsync(command.SessionId, deps, deps.Shutdown).ConfigureAwait(false);
+        deps.LogicalSessionState.ClearIfMatches(command.SessionId);
+        deps.RuntimeIdentities.Remove(command.SessionId);
+
+        try
+        {
+            await deps.Sink.AckStopSessionAsync(
+                new AcknowledgeSessionStopRequest { SessionId = command.SessionId, User = command.User },
+                deps.Shutdown).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed stop ack: {ex.Message}");
+        }
+    }
+
+    internal static Task HandleStartSessionCommand(StartSessionCommand command, RuntimeCommandDependencies deps)
+    {
+        var commandWorkState = deps.WorkState;
         var previousStartup = commandWorkState.GetActiveStartup();
-        var cancellationSource = CancellationTokenSource.CreateLinkedTokenSource(shutdown);
+        var cancellationSource = CancellationTokenSource.CreateLinkedTokenSource(deps.Shutdown);
         var tracked = new TrackedCommandWork
         {
             CancellationSource = cancellationSource,
@@ -1372,34 +1373,27 @@ internal static class ServiceClientManager
 
                 // This wait belongs to cancellable startup work, never the
                 // command stream: Stop must still preempt a queued replacement.
-                await gpuPowerCommands.ActivateSessionAsync(() =>
+                await deps.ActivateSession(() =>
                 {
-                    logicalSessionState.SetActiveRuntime(command.SessionId, command.LifecycleGeneration,
+                    deps.LogicalSessionState.SetActiveRuntime(command.SessionId, command.LifecycleGeneration,
                         command.RuntimeEpoch, command.RuntimeInstanceId);
-                    runtimeIdentities.Set(command.SessionId, command.LifecycleGeneration,
+                    deps.RuntimeIdentities.Set(command.SessionId, command.LifecycleGeneration,
                         command.RuntimeEpoch, command.RuntimeInstanceId);
                 }, cancellationSource.Token).ConfigureAwait(false);
 
                 var preemptedSessionId = await PreemptActiveSessionIfNeededAsync(
                     command.SessionId,
-                    sessionManager.GetActiveSessionId,
-                    sessionManager.StopSessionAsync,
-                    sessionEventRelay.StopSessionAsync,
-                    artifactUploadService.StopSessionAsync,
-                    workspaceMirrorService.StopSessionAsync,
-                    downloadService.CancelSession,
-                    downloadService.GetActiveSessionId,
-                    downloadService.SetActiveSession,
+                    deps.GetActiveRuntimeSessionId,
+                    deps.StopRuntime,
+                    deps.StopSessionRelay,
+                    deps.StopArtifactUploads,
+                    deps.StopWorkspaceMirrors,
+                    deps.CancelSessionDownloads,
+                    deps.GetDownloadActiveSessionId,
+                    deps.SetDownloadActiveSession,
                     cancellationSource.Token).ConfigureAwait(false);
-                runtimeIdentities.Remove(preemptedSessionId);
-                await StartSessionAndWaitForReadyAsync(
-                    command,
-                    sessionManager,
-                    artifactUploadService,
-                    workspaceMirrorService,
-                    downloadService,
-                    localModelProjectionReconciler,
-                    cancellationSource.Token).ConfigureAwait(false);
+                deps.RuntimeIdentities.Remove(preemptedSessionId);
+                await deps.StartRuntimeAndWaitForReady(command, cancellationSource.Token).ConfigureAwait(false);
                 ack.Ready = true;
                 ack.Message = IsComfyRuntime(command.EditorRuntimeKind) ? "ComfyUI ready" : "GPU runtime ready";
             }
@@ -1409,22 +1403,13 @@ internal static class ServiceClientManager
                 ack.Ready = false;
                 ack.Message = ex.Message;
                 ClearRuntimeSessionStateIfIdentityMatches(
-                    logicalSessionState,
-                    runtimeIdentities,
+                    deps.LogicalSessionState,
+                    deps.RuntimeIdentities,
                     command.SessionId,
                     command.LifecycleGeneration,
                     command.RuntimeEpoch,
                     command.RuntimeInstanceId);
-                await StopSessionAndCleanupAsync(
-                    command.SessionId,
-                    sessionManager.StopSessionAsync,
-                    sessionEventRelay.StopSessionAsync,
-                    artifactUploadService.StopSessionAsync,
-                    workspaceMirrorService.StopSessionAsync,
-                    downloadService.CancelSession,
-                    downloadService.GetActiveSessionId,
-                    downloadService.SetActiveSession,
-                    CancellationToken.None).ConfigureAwait(false);
+                await StopSessionAndCleanupAsync(command.SessionId, deps, CancellationToken.None).ConfigureAwait(false);
             }
             finally
             {
@@ -1433,31 +1418,22 @@ internal static class ServiceClientManager
             }
 
             await AcknowledgeRuntimeCommandWithRetryAsync(
-                sessionSink.AckStartSessionAsync,
+                deps.Sink.AckStartSessionAsync,
                 ack,
                 command.SessionId,
-                shutdown).ConfigureAwait(false);
+                deps.Shutdown).ConfigureAwait(false);
         }
     }
 
-    private static async Task HandleQuiesceRuntimeCommandAsync(
+    internal static async Task HandleQuiesceRuntimeCommandAsync(
         QuiesceEditorRuntimeCommand command,
-        string runnerId,
-        IRunnerSessionSink sessionSink,
-        SessionProcessManager sessionManager,
-        ModelDownloadService downloadService,
-        ComfySessionEventRelay sessionEventRelay,
-        ArtifactUploadService artifactUploadService,
-        WorkspaceMirrorService workspaceMirrorService,
-        RunnerCommandWorkState commandWorkState,
-        ConcurrentDictionary<string, CancellationTokenSource> transientSessionCancellation,
-        CancellationToken shutdown)
+        RuntimeCommandDependencies deps)
     {
         var ack = new AcknowledgeEditorRuntimeQuiesceRequest
         {
             CommandId = command.CommandId,
             RestartId = command.RestartId,
-            RunnerId = runnerId,
+            RunnerId = deps.RunnerId,
             SessionId = command.SessionId,
             LifecycleGeneration = command.LifecycleGeneration,
             RuntimeEpoch = command.RuntimeEpoch,
@@ -1466,24 +1442,15 @@ internal static class ServiceClientManager
         };
         try
         {
-            await CancelTrackedWorkAsync(commandWorkState.GetActiveStartup()).ConfigureAwait(false);
-            await commandWorkState.Prompts.CancelAndWaitAsync(_ => true).ConfigureAwait(false);
-            if (transientSessionCancellation.TryRemove(command.SessionId, out var transientCancellation))
+            await CancelTrackedWorkAsync(deps.WorkState.GetActiveStartup()).ConfigureAwait(false);
+            await deps.WorkState.Prompts.CancelAndWaitAsync(_ => true).ConfigureAwait(false);
+            if (deps.TransientSessionCancellation.TryRemove(command.SessionId, out var transientCancellation))
             {
                 transientCancellation.Cancel();
                 transientCancellation.Dispose();
             }
 
-            await StopSessionAndCleanupAsync(
-                command.SessionId,
-                sessionManager.StopSessionAsync,
-                sessionEventRelay.StopSessionAsync,
-                artifactUploadService.StopSessionAsync,
-                workspaceMirrorService.StopSessionAsync,
-                downloadService.CancelSession,
-                downloadService.GetActiveSessionId,
-                downloadService.SetActiveSession,
-                shutdown).ConfigureAwait(false);
+            await StopSessionAndCleanupAsync(command.SessionId, deps, deps.Shutdown).ConfigureAwait(false);
             ack.Quiesced = true;
             ack.Message = "GPU child runtime quiesced";
         }
@@ -1495,28 +1462,28 @@ internal static class ServiceClientManager
         }
 
         await AcknowledgeRuntimeCommandWithRetryAsync(
-            sessionSink.AckEditorRuntimeQuiesceAsync,
+            deps.Sink.AckEditorRuntimeQuiesceAsync,
             ack,
             command.CommandId,
-            shutdown).ConfigureAwait(false);
+            deps.Shutdown).ConfigureAwait(false);
     }
 
-    private static Task HandleLaunchRuntimeCommandAsync(
+    internal static Task HandleLaunchRuntimeCommand(
         LaunchEditorRuntimeCommand command,
-        string runnerId,
-        IRunnerSessionSink sessionSink,
-        SessionProcessManager sessionManager,
-        ModelDownloadService downloadService,
-        ComfySessionEventRelay sessionEventRelay,
-        ArtifactUploadService artifactUploadService,
-        WorkspaceMirrorService workspaceMirrorService,
-        Action<IEnumerable<ModelDownloadRequest>, bool>? localModelProjectionReconciler,
-        RunnerCommandWorkState commandWorkState,
-        LogicalSessionState logicalSessionState,
-        RuntimeIdentityRegistry runtimeIdentities,
-        CancellationToken shutdown)
+        RuntimeCommandDependencies deps)
     {
-        var cancellationSource = CancellationTokenSource.CreateLinkedTokenSource(shutdown);
+        var commandWorkState = deps.WorkState;
+        deps.LogicalSessionState.SetActiveRuntime(
+            command.SessionId,
+            command.LifecycleGeneration,
+            command.RuntimeEpoch,
+            command.RuntimeInstanceId);
+        deps.RuntimeIdentities.Set(
+            command.SessionId,
+            command.LifecycleGeneration,
+            command.RuntimeEpoch,
+            command.RuntimeInstanceId);
+        var cancellationSource = CancellationTokenSource.CreateLinkedTokenSource(deps.Shutdown);
         var tracked = new TrackedCommandWork { CancellationSource = cancellationSource, SessionId = command.SessionId };
         Task? task = null;
         task = RunAsync();
@@ -1544,7 +1511,7 @@ internal static class ServiceClientManager
             {
                 CommandId = command.CommandId,
                 RestartId = command.RestartId,
-                RunnerId = runnerId,
+                RunnerId = deps.RunnerId,
                 SessionId = command.SessionId,
                 LifecycleGeneration = command.LifecycleGeneration,
                 RuntimeEpoch = command.RuntimeEpoch,
@@ -1554,14 +1521,7 @@ internal static class ServiceClientManager
             };
             try
             {
-                await StartSessionAndWaitForReadyAsync(
-                    start,
-                    sessionManager,
-                    artifactUploadService,
-                    workspaceMirrorService,
-                    downloadService,
-                    localModelProjectionReconciler,
-                    cancellationSource.Token).ConfigureAwait(false);
+                await deps.StartRuntimeAndWaitForReady(start, cancellationSource.Token).ConfigureAwait(false);
                 ack.Ready = true;
                 ack.Message = IsComfyRuntime(command.EditorRuntimeKind) ? "ComfyUI ready" : "GPU runtime ready";
             }
@@ -1570,24 +1530,15 @@ internal static class ServiceClientManager
                 ack.Ready = false;
                 ack.Message = ex.Message;
                 RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed launching runtime for restart {command.RestartId}: {ex.Message}");
-                await StopSessionAndCleanupAsync(
-                    command.SessionId,
-                    sessionManager.StopSessionAsync,
-                    sessionEventRelay.StopSessionAsync,
-                    artifactUploadService.StopSessionAsync,
-                    workspaceMirrorService.StopSessionAsync,
-                    downloadService.CancelSession,
-                    downloadService.GetActiveSessionId,
-                    downloadService.SetActiveSession,
-                    CancellationToken.None).ConfigureAwait(false);
+                await StopSessionAndCleanupAsync(command.SessionId, deps, CancellationToken.None).ConfigureAwait(false);
             }
             finally
             {
                 if (!ack.Ready)
                 {
                     ClearRuntimeSessionStateIfIdentityMatches(
-                        logicalSessionState,
-                        runtimeIdentities,
+                        deps.LogicalSessionState,
+                        deps.RuntimeIdentities,
                         command.SessionId,
                         command.LifecycleGeneration,
                         command.RuntimeEpoch,
@@ -1599,10 +1550,10 @@ internal static class ServiceClientManager
             }
 
             await AcknowledgeRuntimeCommandWithRetryAsync(
-                sessionSink.AckEditorRuntimeLaunchAsync,
+                deps.Sink.AckEditorRuntimeLaunchAsync,
                 ack,
                 command.CommandId,
-                shutdown).ConfigureAwait(false);
+                deps.Shutdown).ConfigureAwait(false);
         }
     }
 

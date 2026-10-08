@@ -4,7 +4,7 @@ using Google.Protobuf;
 using Grpc.Core;
 using Offloadr.Runner.V1;
 
-public class ServiceClientManagerTests
+public partial class ServiceClientManagerTests
 {
     private const string PromptRunnerId = "11111111111141118111111111111111";
     private const string PromptSessionId = "22222222222242228222222222222222";
