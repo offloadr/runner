@@ -314,7 +314,7 @@ public sealed class VfsIpcServer : IAsyncDisposable
                             $"[vfs-ipc] operation={parsed.Request.Operation} path='{parsed.Request.Path}'");
                     }
 
-                    var response = await DispatchRequestAsync(parsed.Request, peer, cancellationToken)
+                    var response = await DispatchUntilHangupAsync(client, parsed.Request, peer, cancellationToken)
                         .ConfigureAwait(false);
                     if (IsProvisionalOpenResponse(parsed.Request, response))
                     {
@@ -336,6 +336,11 @@ public sealed class VfsIpcServer : IAsyncDisposable
                         RunnerLog.Info<VfsIpcServer>(
                             $"[vfs-ipc] ready operation={parsed.Request.Operation} path='{parsed.Request.Path}' disposition={response.OpenDisposition}");
                     }
+                }
+                catch (ClientHungUpException)
+                {
+                    // Nobody is waiting for the answer; the handler's waiters were cancelled.
+                    return;
                 }
                 catch (Exception ex)
                 {
@@ -409,6 +414,71 @@ public sealed class VfsIpcServer : IAsyncDisposable
         }
 
         return authorized;
+    }
+
+    /// <summary>
+    /// Dispatches with a token that is also cancelled when the client hangs up, so a waiter
+    /// whose reader is gone (killed, timed out) stops holding hydration demand and a client slot.
+    /// </summary>
+    private async Task<VfsIpcResponse> DispatchUntilHangupAsync(
+        Socket client,
+        VfsIpcRequest request,
+        VfsIpcPeerCredentials peer,
+        CancellationToken cancellationToken)
+    {
+        using var connectionCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        using var stopWatching = new CancellationTokenSource();
+        var hangupWatch = WatchForHangupAsync(client, connectionCancellation, stopWatching.Token);
+        try
+        {
+            return await DispatchRequestAsync(request, peer, connectionCancellation.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (
+            connectionCancellation.IsCancellationRequested &&
+            !cancellationToken.IsCancellationRequested)
+        {
+            throw new ClientHungUpException();
+        }
+        finally
+        {
+            await stopWatching.CancelAsync().ConfigureAwait(false);
+            await hangupWatch.ConfigureAwait(false);
+        }
+    }
+
+    private static async Task WatchForHangupAsync(
+        Socket client,
+        CancellationTokenSource connectionCancellation,
+        CancellationToken stopWatching)
+    {
+        // The client sends exactly one request and then only reads, so anything readable here
+        // (end of stream, a reset, or stray bytes) means it is no longer waiting for the answer.
+        try
+        {
+            await client
+                .ReceiveAsync(new byte[1], SocketFlags.None, stopWatching)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (stopWatching.IsCancellationRequested)
+        {
+            return;
+        }
+        catch (Exception ex) when (ex is SocketException or ObjectDisposedException)
+        {
+        }
+
+        if (stopWatching.IsCancellationRequested)
+        {
+            return;
+        }
+
+        try
+        {
+            await connectionCancellation.CancelAsync().ConfigureAwait(false);
+        }
+        catch (ObjectDisposedException)
+        {
+        }
     }
 
     private async Task<VfsIpcResponse> DispatchRequestAsync(
@@ -676,6 +746,10 @@ public sealed class VfsIpcServer : IAsyncDisposable
 
         _clientSlots.Dispose();
         _shutdown.Dispose();
+    }
+
+    private sealed class ClientHungUpException : Exception
+    {
     }
 
     private sealed class ProvisionalOpenLease(

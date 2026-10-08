@@ -314,6 +314,84 @@ public class VfsIpcServerLinuxTests
     }
 
     [Test]
+    public async Task Start_ClientHangsUpWhileWaiting_CancelsHandlerAndFreesSlot()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        LinuxTestPrerequisites.RequireUnixDomainSockets();
+
+        var socketPath = CreateSocketPath();
+        var waiting = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cancelled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var server = new VfsIpcServer(
+            socketPath,
+            async (request, cancellationToken) =>
+            {
+                if (request.Operation == VfsIpcOperation.EnsureRange)
+                {
+                    using var registration = cancellationToken.Register(() => cancelled.TrySetResult());
+                    waiting.TrySetResult();
+                    await Task.Delay(Timeout.Infinite, cancellationToken).ConfigureAwait(false);
+                }
+
+                return VfsIpcResponse.Success();
+            },
+            maxConcurrentClients: 1);
+        server.Start();
+
+        var waitingClient = await ConnectAsync(socketPath);
+        await VfsIpcProtocol.WriteRequestAsync(
+            waitingClient,
+            VfsIpcRequest.EnsureRange(leaseId: 5, transferEpoch: 1, offset: 0, length: 4),
+            CancellationToken.None);
+        await waiting.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        waitingClient.Dispose();
+
+        await cancelled.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        using var nextClient = await ConnectAsync(socketPath);
+        await VfsIpcProtocol.WriteRequestAsync(nextClient, VfsIpcRequest.Release(5), CancellationToken.None);
+        var response = await VfsIpcProtocol
+            .ReadResponseAsync(nextClient, CancellationToken.None)
+            .WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.That(response!.Value.Status, Is.EqualTo(VfsIpcStatus.Success));
+    }
+
+    [Test]
+    public async Task Start_ConnectedClientWaiting_IsNotCancelled()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        LinuxTestPrerequisites.RequireUnixDomainSockets();
+
+        var socketPath = CreateSocketPath();
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var server = new VfsIpcServer(
+            socketPath,
+            async (_, cancellationToken) =>
+            {
+                await release.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+                return VfsIpcResponse.Success(transferEpoch: 3);
+            });
+        server.Start();
+
+        using var client = await ConnectAsync(socketPath);
+        await VfsIpcProtocol.WriteRequestAsync(
+            client,
+            VfsIpcRequest.EnsureComplete(leaseId: 5, transferEpoch: 1, reason: "mapping"),
+            CancellationToken.None);
+        await Task.Delay(200);
+        release.TrySetResult();
+        var response = await VfsIpcProtocol
+            .ReadResponseAsync(client, CancellationToken.None)
+            .WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(response!.Value.Status, Is.EqualTo(VfsIpcStatus.Success));
+            Assert.That(response.Value.TransferEpoch, Is.EqualTo(3));
+        });
+    }
+
+    [Test]
     public async Task Start_ClientDisconnectsBeforeOpenResponse_ReleasesRangeManagedLease()
     {
         LinuxTestPrerequisites.RequireLinux();

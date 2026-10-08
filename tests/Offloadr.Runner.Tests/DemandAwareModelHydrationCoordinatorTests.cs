@@ -592,6 +592,68 @@ public class DemandAwareModelHydrationCoordinatorTests
     }
 
     [Test]
+    public async Task RangeWaiters_PerLeaseAreCappedAndCancelledWaitersFreeCapacity()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var backend = new DemandBackend
+            {
+                BitfieldOnUnpause = "00"
+            };
+            await using var coordinator = CreateCoordinator(backend, root);
+            await coordinator.InitializeAsync(CancellationToken.None);
+            var request = CreateRequest(root, "capped.bin");
+            coordinator.RegisterDownloads("session-1", [request], replaceExisting: true);
+            var opened = await coordinator.OpenAsync(
+                request.DestinationPath,
+                "session-1",
+                CancellationToken.None);
+            var other = await coordinator.OpenAsync(
+                request.DestinationPath,
+                "session-1",
+                CancellationToken.None);
+
+            using var firstWaiterCancellation = new CancellationTokenSource();
+            var waiters = new List<Task<ModelHydrationEnsureResult>>
+            {
+                coordinator.EnsureRangeAsync(opened.LeaseId, opened.TransferEpoch, 0, 4, firstWaiterCancellation.Token)
+            };
+            for (var index = 1; index < DemandAwareModelHydrationCoordinator.MaxRangeWaitersPerLease; index++)
+            {
+                waiters.Add(coordinator.EnsureRangeAsync(opened.LeaseId, opened.TransferEpoch, 0, 4, CancellationToken.None));
+            }
+
+            Assert.That(waiters.Any(static waiter => waiter.IsCompleted), Is.False);
+            Assert.That(
+                async () => await coordinator.EnsureRangeAsync(opened.LeaseId, opened.TransferEpoch, 0, 4, CancellationToken.None),
+                Throws.InstanceOf<ModelHydrationIOException>());
+            Assert.That(
+                async () => await coordinator.EnsureCompleteAsync(opened.LeaseId, opened.TransferEpoch, "mapping", CancellationToken.None),
+                Throws.InstanceOf<ModelHydrationIOException>());
+
+            // The cap is per descriptor; another lease on the same file is unaffected.
+            var otherWaiter = coordinator.EnsureRangeAsync(other.LeaseId, other.TransferEpoch, 0, 4, CancellationToken.None);
+            Assert.That(otherWaiter.IsFaulted, Is.False);
+
+            await firstWaiterCancellation.CancelAsync();
+            Assert.That(async () => await waiters[0], Throws.InstanceOf<OperationCanceledException>());
+            var replacement = coordinator.EnsureRangeAsync(opened.LeaseId, opened.TransferEpoch, 0, 4, CancellationToken.None);
+            Assert.That(replacement.IsFaulted, Is.False);
+
+            await coordinator.ReleaseAsync(opened.LeaseId);
+            await coordinator.ReleaseAsync(other.LeaseId);
+            Assert.That(
+                async () => await Task.WhenAll(waiters.Skip(1).Append(replacement).Append(otherWaiter)),
+                Throws.InstanceOf<OperationCanceledException>());
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
     public async Task PromptDependencies_RunInDeclaredOrdinalOrder()
     {
         var root = CreateTempDirectory();

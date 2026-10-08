@@ -47,6 +47,8 @@ public sealed class ModelHydrationIOException : IOException
 public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
 {
     private const long MaximumSafetensorsHeaderLength = 8L * 1024 * 1024;
+    // Half of the IPC server's default client slots.
+    internal const int MaxRangeWaitersPerLease = 32;
     private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(100);
     private static readonly TimeSpan ProgressInterval = TimeSpan.FromSeconds(3);
     private static readonly TimeSpan DefaultShutdownCleanupTimeout = TimeSpan.FromSeconds(5);
@@ -516,6 +518,11 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
                 return Task.FromResult(new ModelHydrationEnsureResult(lease.State.TransferEpoch));
             }
 
+            if (TryRejectExcessWaiterLocked(lease) is { } rejected)
+            {
+                return rejected;
+            }
+
             if (!IsSafetensors(lease.State.Identity.DestinationPath))
             {
                 PromoteSticky(lease.State, "first_non_empty_read");
@@ -533,6 +540,27 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
             SignalScheduler();
             return waiter.Completion.Task;
         }
+    }
+
+    /// <summary>
+    /// Bounds the waits one descriptor can hold open at a time, so a single client cannot pin
+    /// every IPC slot. Over the limit the request fails with an I/O error instead of queueing.
+    /// </summary>
+    private static Task<ModelHydrationEnsureResult>? TryRejectExcessWaiterLocked(DescriptorLease lease)
+    {
+        var waiting = 0;
+        foreach (var waiter in lease.State.RangeWaiters)
+        {
+            if (waiter.LeaseId == lease.LeaseId && ++waiting >= MaxRangeWaitersPerLease)
+            {
+                return Task.FromException<ModelHydrationEnsureResult>(
+                    new ModelHydrationIOException(
+                        $"Descriptor lease '{lease.LeaseId}' already has {MaxRangeWaitersPerLease} outstanding waits.",
+                        transferEpoch: lease.State.TransferEpoch));
+            }
+        }
+
+        return null;
     }
 
     private ulong CreateLeaseIdLocked()
@@ -577,6 +605,11 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
             if (lease.State.Complete)
             {
                 return Task.FromResult(new ModelHydrationEnsureResult(lease.State.TransferEpoch));
+            }
+
+            if (TryRejectExcessWaiterLocked(lease) is { } rejected)
+            {
+                return rejected;
             }
 
             PromoteSticky(lease.State, string.IsNullOrWhiteSpace(reason) ? "mapping" : reason);
