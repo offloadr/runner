@@ -334,6 +334,31 @@ internal sealed partial class SessionProcessManager : IDisposable
         return _sessions.Keys.FirstOrDefault() ?? string.Empty;
     }
 
+    /// <summary>
+    /// Removes session users and homes left by an earlier run of the agent. Does nothing once a
+    /// session has been prepared, so it can never touch a live session.
+    /// </summary>
+    public async Task CleanupStaleSessionsAsync(CancellationToken cancellationToken)
+    {
+        if (!_sessions.IsEmpty || !_preparedIdentities.IsEmpty)
+        {
+            return;
+        }
+
+        try
+        {
+            await _sessionIsolationStrategy.CleanupStaleAsync(_sessionRoot, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            RunnerLog.Error<SessionProcessManager>(ex, $"Failed to remove stale session state: {ex.Message}");
+        }
+    }
+
     /// <summary>The uid of the Linux user prepared for <paramref name="sessionId"/>, if any.</summary>
     public uint? GetSessionUserId(string sessionId)
     {

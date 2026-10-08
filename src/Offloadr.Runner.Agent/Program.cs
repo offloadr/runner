@@ -55,6 +55,15 @@ Console.CancelKeyPress += (_, e) =>
 await using var sessionProcessLogRelay = new SessionProcessLogRelay(options.RunnerId, runtimeIdentities);
 await using var sessionRuntimeTelemetryRelay = new SessionRuntimeTelemetryRelay(options.RunnerId, runtimeIdentities);
 using var sessionManager = new SessionProcessManager(options.Session, sessionIsolationStrategy, new RunnerVfsEnvironmentBuilder(), new LinuxCommandRunner(), sessionProcessLogRelay);
+// Before any session starts: users, processes and homes left by a crashed earlier run.
+try
+{
+    await sessionManager.CleanupStaleSessionsAsync(shutdown.Token);
+}
+catch (OperationCanceledException) when (shutdown.IsCancellationRequested)
+{
+    return;
+}
 var logicalSessionState = new ServiceClientManager.LogicalSessionState(sessionManager.GetActiveSessionId());
 await using IModelTransferBackend downloadBackend = new Aria2DownloadBackend(options.Aria2);
 using var artifactGrpcChannel = GrpcChannelManager.CreateChannel(

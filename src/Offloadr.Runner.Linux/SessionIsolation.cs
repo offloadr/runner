@@ -8,15 +8,24 @@ public interface ISessionIsolationStrategy
     void ValidatePrerequisites(ICollection<string> errors);
     Task<PreparedSessionIdentity> PrepareAsync(string sessionId, string sessionRoot, CancellationToken cancellationToken);
     Task CleanupAsync(PreparedSessionIdentity identity, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Removes session users and homes left behind by an earlier agent run (for example after a
+    /// crash). Called at startup, before any session exists.
+    /// </summary>
+    Task CleanupStaleAsync(string sessionRoot, CancellationToken cancellationToken) => Task.CompletedTask;
 }
 
 public sealed class LinuxUserIsolationStrategy : ISessionIsolationStrategy
 {
     // userdel's exit status when the user does not exist.
     private const int UserdelUnknownUser = 6;
+    private const string SessionUserPrefix = "sess_";
 
     private readonly ILinuxCommandRunner _commandRunner;
     private readonly Func<uint, CancellationToken, Task<bool>> _killUserProcesses;
+    private readonly IReadOnlyList<string> _residueRoots;
+    private readonly string _passwdPath;
 
     public LinuxUserIsolationStrategy(ILinuxCommandRunner commandRunner)
         : this(commandRunner, static (userId, token) => LinuxProcessReaper.KillAllOwnedByAsync(userId, token))
@@ -25,10 +34,14 @@ public sealed class LinuxUserIsolationStrategy : ISessionIsolationStrategy
 
     internal LinuxUserIsolationStrategy(
         ILinuxCommandRunner commandRunner,
-        Func<uint, CancellationToken, Task<bool>> killUserProcesses)
+        Func<uint, CancellationToken, Task<bool>> killUserProcesses,
+        IReadOnlyList<string>? residueRoots = null,
+        string passwdPath = "/etc/passwd")
     {
         _commandRunner = commandRunner ?? throw new ArgumentNullException(nameof(commandRunner));
         _killUserProcesses = killUserProcesses ?? throw new ArgumentNullException(nameof(killUserProcesses));
+        _residueRoots = residueRoots ?? LinuxSessionResidue.SharedTemporaryRoots;
+        _passwdPath = passwdPath;
     }
 
     public void ValidatePrerequisites(ICollection<string> errors)
@@ -165,12 +178,60 @@ public sealed class LinuxUserIsolationStrategy : ISessionIsolationStrategy
         if (userId is { } uid and not 0)
         {
             await KillUserProcessesAsync(identity.UserName, uid, cancellationToken).ConfigureAwait(false);
+            RemoveSharedResidue(identity.UserName, uid);
         }
 
         var result = await _commandRunner.RunAsync(LinuxCommandFactory.RemoveUser(identity.UserName), cancellationToken).ConfigureAwait(false);
         if (result.ExitCode != 0 && result.ExitCode != UserdelUnknownUser && !string.IsNullOrWhiteSpace(result.Stderr))
         {
             RunnerLog.Error<LinuxUserIsolationStrategy>($"userdel for '{identity.UserName}' returned {result.ExitCode}: {result.Stderr.Trim()}");
+        }
+    }
+
+    public async Task CleanupStaleAsync(string sessionRoot, CancellationToken cancellationToken)
+    {
+        foreach (var (userName, userId) in LinuxSessionResidue.ReadUsers(_passwdPath))
+        {
+            if (!userName.StartsWith(SessionUserPrefix, StringComparison.Ordinal) || userId == 0)
+            {
+                continue;
+            }
+
+            RunnerLog.Warning<LinuxUserIsolationStrategy>($"Removing session user '{userName}' left by an earlier run.");
+            await CleanupAsync(
+                    new PreparedSessionIdentity(userName, string.Empty, CleanupIdentity: true, userId),
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        if (string.IsNullOrWhiteSpace(sessionRoot))
+        {
+            return;
+        }
+
+        // Homes of removed users are now owned by uids without a passwd entry. The agent's own
+        // (root-owned) entries in the session root are left alone.
+        var liveUserIds = LinuxSessionResidue.ReadUsers(_passwdPath)
+            .Select(static user => user.UserId)
+            .ToHashSet();
+        var removed = LinuxSessionResidue.RemoveEntriesOfUnknownOwners(sessionRoot, liveUserIds.Contains);
+        if (removed > 0)
+        {
+            RunnerLog.Warning<LinuxUserIsolationStrategy>($"Removed {removed} stale session home(s) from '{sessionRoot}'.");
+        }
+    }
+
+    private void RemoveSharedResidue(string userName, uint userId)
+    {
+        try
+        {
+            LinuxSessionResidue.RemoveEntriesOwnedBy(userId, _residueRoots);
+        }
+        catch (Exception ex)
+        {
+            RunnerLog.Error<LinuxUserIsolationStrategy>(
+                ex,
+                $"Failed removing temporary files of session user '{userName}' (uid {userId}): {ex.Message}");
         }
     }
 
