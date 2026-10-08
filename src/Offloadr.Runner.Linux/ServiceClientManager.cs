@@ -112,6 +112,12 @@ internal static class ServiceClientManager
         Execute,
         Joined,
         Replay,
+
+        /// <summary>The request already ran here, but its result is no longer retained.</summary>
+        AlreadyExecuted,
+
+        /// <summary>The request's deadline passed before it could run.</summary>
+        Expired,
     }
 
     /// <summary>
@@ -122,18 +128,34 @@ internal static class ServiceClientManager
     /// </summary>
     internal sealed class TransientRequestDeliveries(TransientAcknowledgementCache completed)
     {
+        /// <summary>Executed requests remembered after their result is evicted, until their deadline.</summary>
+        internal const int MaxExecutedMarkers = 16_384;
+
+        /// <summary>How long a request without a deadline is remembered as executed.</summary>
+        internal static readonly TimeSpan MarkerLifetimeWithoutDeadline = TimeSpan.FromMinutes(15);
+
         private readonly object _gate = new();
         private readonly Dictionary<string, List<string>> _inFlight = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, DateTime> _executedUntil = new(StringComparer.Ordinal);
+        private readonly Queue<string> _executedOrder = new();
+        private readonly Dictionary<string, DateTime> _deadlines = new(StringComparer.Ordinal);
 
         public int InFlightCount
         {
             get { lock (_gate) return _inFlight.Count; }
         }
 
+        public int ExecutedMarkerCount
+        {
+            get { lock (_gate) return _executedUntil.Count; }
+        }
+
         public TransientRequestAdmission Admit(
             RelayEditorRuntimeRequestCommand request,
-            out AcknowledgeEditorRuntimeRequestRequest? replay)
+            out AcknowledgeEditorRuntimeRequestRequest? replay,
+            DateTime? nowUtc = null)
         {
+            var now = nowUtc ?? DateTime.UtcNow;
             lock (_gate)
             {
                 if (completed.TryGet(request.RequestId, out var cached))
@@ -154,8 +176,63 @@ internal static class ServiceClientManager
                     return TransientRequestAdmission.Joined;
                 }
 
+                PruneExecutedMarkers(now);
+                if (_executedUntil.ContainsKey(request.RequestId))
+                {
+                    // Never run a request twice, even when its result was evicted.
+                    return TransientRequestAdmission.AlreadyExecuted;
+                }
+
+                if (IsExpired(request, now))
+                {
+                    return TransientRequestAdmission.Expired;
+                }
+
                 _inFlight.Add(request.RequestId, [request.DeliveryId]);
+                _deadlines[request.RequestId] = DeadlineOf(request, now);
                 return TransientRequestAdmission.Execute;
+            }
+        }
+
+        public static bool IsExpired(RelayEditorRuntimeRequestCommand request, DateTime nowUtc)
+            => request.ExpiresUtc is { } expires &&
+               (expires.Seconds != 0 || expires.Nanos != 0) &&
+               expires.ToDateTime() <= nowUtc;
+
+        private static DateTime DeadlineOf(RelayEditorRuntimeRequestCommand request, DateTime nowUtc)
+            => request.ExpiresUtc is { } expires && (expires.Seconds != 0 || expires.Nanos != 0)
+                ? expires.ToDateTime()
+                : nowUtc + MarkerLifetimeWithoutDeadline;
+
+        private void RememberExecuted(string requestId, DateTime until)
+        {
+            if (_executedUntil.ContainsKey(requestId))
+            {
+                return;
+            }
+
+            _executedUntil[requestId] = until;
+            _executedOrder.Enqueue(requestId);
+            while (_executedUntil.Count > MaxExecutedMarkers)
+            {
+                _executedUntil.Remove(_executedOrder.Dequeue());
+            }
+        }
+
+        private void PruneExecutedMarkers(DateTime nowUtc)
+        {
+            while (_executedOrder.TryPeek(out var oldest))
+            {
+                if (_executedUntil.TryGetValue(oldest, out var until) && until > nowUtc)
+                {
+                    return;
+                }
+
+                _executedOrder.Dequeue();
+                if (_executedUntil.TryGetValue(oldest, out until) && until <= nowUtc)
+                {
+                    _executedUntil.Remove(oldest);
+                }
             }
         }
 
@@ -168,6 +245,11 @@ internal static class ServiceClientManager
             lock (_gate)
             {
                 completed.Set(result);
+                RememberExecuted(
+                    result.RequestId,
+                    _deadlines.Remove(result.RequestId, out var deadline)
+                        ? deadline
+                        : DateTime.UtcNow + MarkerLifetimeWithoutDeadline);
                 if (!_inFlight.Remove(result.RequestId, out var deliveries))
                 {
                     deliveries = [result.DeliveryId];
@@ -2541,6 +2623,19 @@ internal static class ServiceClientManager
                 return;
             case TransientRequestAdmission.Joined:
                 return;
+            case TransientRequestAdmission.AlreadyExecuted:
+                await AcknowledgeTransientRequestWithRetryAsync(
+                    acknowledge,
+                    TransientRequestFailure(request, 409, "The request already ran on this runner; its result is no longer retained."),
+                    acknowledgementCancellationToken).ConfigureAwait(false);
+                return;
+            case TransientRequestAdmission.Expired:
+                // Nothing runs for an expired request, including the work done before execution.
+                await AcknowledgeTransientRequestWithRetryAsync(
+                    acknowledge,
+                    TransientRequestFailure(request, 504, "The request expired before it could run."),
+                    acknowledgementCancellationToken).ConfigureAwait(false);
+                return;
         }
 
         AcknowledgeEditorRuntimeRequestRequest response;
@@ -2577,6 +2672,25 @@ internal static class ServiceClientManager
             AcknowledgeTransientRequestWithRetryAsync(acknowledge, ack, acknowledgementCancellationToken))).ConfigureAwait(false);
     }
 
+    private static AcknowledgeEditorRuntimeRequestRequest TransientRequestFailure(
+        RelayEditorRuntimeRequestCommand request,
+        int statusCode,
+        string message)
+        => new()
+        {
+            RequestId = request.RequestId,
+            DeliveryId = request.DeliveryId,
+            RunnerId = request.RunnerId,
+            SessionId = request.SessionId,
+            LifecycleGeneration = request.LifecycleGeneration,
+            RuntimeEpoch = request.RuntimeEpoch,
+            RuntimeInstanceId = request.RuntimeInstanceId,
+            Kind = request.Kind,
+            TransportSucceeded = false,
+            StatusCode = statusCode,
+            ErrorMessage = message,
+        };
+
     private static async Task<AcknowledgeEditorRuntimeRequestRequest> ExecuteTransientEditorRuntimeRequestAsync(
         RelayEditorRuntimeRequestCommand command,
         string runnerId,
@@ -2611,6 +2725,15 @@ internal static class ServiceClientManager
             {
                 await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
                 gateAcquired = true;
+            }
+
+            // The deadline can pass while the request waits behind others of its kind.
+            if (TransientRequestDeliveries.IsExpired(command, DateTime.UtcNow))
+            {
+                response.TransportSucceeded = false;
+                response.StatusCode = 504;
+                response.ErrorMessage = "The request expired before it could run.";
+                return response;
             }
 
             if (command.Kind == EditorRuntimeRequestKind.ClientMessage)

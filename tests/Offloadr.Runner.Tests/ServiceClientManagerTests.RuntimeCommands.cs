@@ -683,20 +683,66 @@ public partial class ServiceClientManagerTests
         });
     }
 
-    private sealed class TransientRequestHarness
+    [Test]
+    public async Task EditorRequestRedeliveryAfterItsResultWasEvicted_IsNotExecutedAgain()
+    {
+        var harness = new TransientRequestHarness(retainedResults: 1);
+        var request = harness.Request("delivery-1");
+
+        await harness.DispatchAsync(request);
+        // Another result pushes the first one out of the bounded result cache.
+        await harness.DispatchAsync(harness.Request("delivery-other", requestId: "request-2"));
+        var redelivery = request.Clone();
+        redelivery.DeliveryId = "delivery-2";
+        await harness.DispatchAsync(redelivery);
+
+        var last = harness.Acknowledgements.Last();
+        Assert.Multiple(() =>
+        {
+            Assert.That(harness.Executions, Is.EqualTo(2));
+            Assert.That(last.DeliveryId, Is.EqualTo("delivery-2"));
+            Assert.That(last.TransportSucceeded, Is.False);
+            Assert.That(last.StatusCode, Is.EqualTo(409));
+        });
+    }
+
+    [Test]
+    public async Task ExpiredEditorRequest_IsAcknowledgedWithoutRunningAnything()
+    {
+        var harness = new TransientRequestHarness();
+        var request = harness.Request("delivery-1");
+        request.ExpiresUtc = Google.Protobuf.WellKnownTypes.Timestamp.FromDateTime(DateTime.UtcNow.AddMinutes(-1));
+
+        await harness.DispatchAsync(request);
+
+        var ack = harness.Acknowledgements.Single();
+        Assert.Multiple(() =>
+        {
+            Assert.That(harness.Executions, Is.Zero);
+            Assert.That(harness.BeforeExecuteCalls, Is.Zero);
+            Assert.That(ack.TransportSucceeded, Is.False);
+            Assert.That(ack.StatusCode, Is.EqualTo(504));
+            Assert.That(harness.Deliveries.InFlightCount, Is.Zero);
+        });
+    }
+
+    private sealed class TransientRequestHarness(int retainedResults = 256)
     {
         private int _executions;
 
-        public ServiceClientManager.TransientRequestDeliveries Deliveries { get; } = new(new ServiceClientManager.TransientAcknowledgementCache());
+        private int _beforeExecuteCalls;
+
+        public ServiceClientManager.TransientRequestDeliveries Deliveries { get; } = new(new ServiceClientManager.TransientAcknowledgementCache(retainedResults));
+        public int BeforeExecuteCalls => Volatile.Read(ref _beforeExecuteCalls);
         public ServiceClientManager.TransientCancellationRegistry Cancellation { get; } = new(CancellationToken.None);
         public ConcurrentQueue<AcknowledgeEditorRuntimeRequestRequest> AcknowledgementQueue { get; } = new();
         public List<AcknowledgeEditorRuntimeRequestRequest> Acknowledgements => [.. AcknowledgementQueue];
         public int Executions => Volatile.Read(ref _executions);
         public Task BeforeResult { get; set; } = Task.CompletedTask;
 
-        public RelayEditorRuntimeRequestCommand Request(string deliveryId) => new()
+        public RelayEditorRuntimeRequestCommand Request(string deliveryId, string requestId = "request-1") => new()
         {
-            RequestId = "request-1",
+            RequestId = requestId,
             DeliveryId = deliveryId,
             RunnerId = CommandRunnerId,
             SessionId = CommandSessionId,
@@ -711,7 +757,7 @@ public partial class ServiceClientManagerTests
                 request,
                 Deliveries,
                 Cancellation,
-                () => { },
+                () => Interlocked.Increment(ref _beforeExecuteCalls),
                 async (command, token) =>
                 {
                     var execution = Interlocked.Increment(ref _executions);
