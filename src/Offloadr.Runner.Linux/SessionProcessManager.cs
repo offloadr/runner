@@ -797,30 +797,12 @@ internal sealed partial class SessionProcessManager : IDisposable
         var root = string.Equals(reference.Type, "output", StringComparison.OrdinalIgnoreCase)
             ? paths.OutputDirectory
             : paths.TempDirectory;
-        var current = root;
-        if (!string.IsNullOrWhiteSpace(reference.Subfolder))
-        {
-            foreach (var segment in reference.Subfolder.Split(new[] { '/', '\\' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-            {
-                if (segment is "." or "..")
-                {
-                    throw new InvalidOperationException("Prompt artifact subfolder escapes the session root.");
-                }
-
-                current = Path.Combine(current, segment);
-            }
-        }
-
-        var filename = Path.GetFileName(reference.Filename);
-        if (string.IsNullOrWhiteSpace(filename))
+        if (string.IsNullOrWhiteSpace(reference.Filename))
         {
             throw new InvalidOperationException("Prompt artifact filename is required.");
         }
 
-        var candidate = Path.GetFullPath(Path.Combine(current, filename));
-        var rootFullPath = Path.GetFullPath(root);
-        if (!candidate.StartsWith(rootFullPath + Path.DirectorySeparatorChar, StringComparison.Ordinal) &&
-            !string.Equals(candidate, rootFullPath, StringComparison.Ordinal))
+        if (!SessionArtifactPaths.TryResolve(root, reference.Subfolder, reference.Filename, out var candidate, out _))
         {
             throw new InvalidOperationException("Prompt artifact path escapes the session root.");
         }

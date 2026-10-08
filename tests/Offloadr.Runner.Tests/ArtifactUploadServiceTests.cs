@@ -10,7 +10,7 @@ using System.Threading.Channels;
 
 namespace Offloadr.Runner.Tests;
 
-public class ArtifactUploadServiceTests
+public partial class ArtifactUploadServiceTests
 {
     [Test]
     public async Task ActivateSession_WithCatalogPlaceholder_UploadsWhenLocalFileGetsRealContent()

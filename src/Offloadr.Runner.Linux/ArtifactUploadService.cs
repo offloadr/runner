@@ -1068,19 +1068,18 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 return null;
             }
 
-            var current = root;
-            if (!string.IsNullOrWhiteSpace(subfolder))
+            if (!SessionArtifactPaths.TryResolve(root, subfolder, filename, out var localPath, out _))
             {
-                var segments = subfolder.Split(new[] { '/', '\\' }, StringSplitOptions.RemoveEmptyEntries);
-                foreach (var segment in segments)
-                {
-                    current = Path.Combine(current, segment);
-                }
+                _logger.LogWarning(
+                    "Ignoring artifact with an unsafe name session={SessionId} type={Type} subfolder={Subfolder} filename={Filename}",
+                    _sessionId,
+                    type,
+                    subfolder,
+                    filename);
+                return null;
             }
 
-            Directory.CreateDirectory(current);
-            var combined = Path.Combine(current, filename);
-            return NormalizePath(combined);
+            return localPath;
         }
 
         private void EnsurePlaceholder(RemoteArtifactState state, RemoteArtifactState? previousState)
