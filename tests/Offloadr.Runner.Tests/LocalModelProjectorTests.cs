@@ -253,6 +253,76 @@ public class LocalModelProjectorTests
         }
     }
 
+    [Test]
+    public async Task ConcurrentScanAndCommandUpdates_AreSerialized()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var sourceRoot = Path.Combine(root, "local");
+            var destinationRoot = Path.Combine(root, "comfy", "models");
+            Directory.CreateDirectory(Path.Combine(sourceRoot, "loras"));
+            var models = new List<ModelInfo>();
+            var requests = new List<ModelDownloadRequest>();
+            for (var i = 0; i < 16; i++)
+            {
+                var sourceFile = Path.Combine(sourceRoot, "loras", $"lora-{i:D2}.safetensors");
+                File.WriteAllText(sourceFile, new string('l', i + 1));
+                models.Add(CreateModel(sourceFile, ModelCategory.Lora));
+                requests.Add(CreateLocalProjectionRequest(
+                    sourceFile,
+                    ModelCategory.Lora,
+                    Path.Combine(destinationRoot, "loras", $"lora-{i:D2}.safetensors")));
+            }
+
+            var snapshot = CreateSnapshot([.. models]);
+            var projector = new LocalModelProjector(sourceRoot, destinationRoot);
+            projector.UpdateSnapshot(snapshot);
+
+            using var start = new Barrier(3);
+            const int iterations = 200;
+            var scanLoop = Task.Run(() =>
+            {
+                start.SignalAndWait();
+                for (var i = 0; i < iterations; i++)
+                {
+                    projector.UpdateSnapshot(snapshot);
+                }
+            });
+            var startLoop = Task.Run(() =>
+            {
+                start.SignalAndWait();
+                for (var i = 0; i < iterations; i++)
+                {
+                    projector.SetRequestedModels(requests.Take(1 + (i % requests.Count)));
+                }
+            });
+            var promptLoop = Task.Run(() =>
+            {
+                start.SignalAndWait();
+                for (var i = 0; i < iterations; i++)
+                {
+                    projector.AddRequestedModels([requests[(i * 7) % requests.Count]]);
+                }
+            });
+
+            await Task.WhenAll(scanLoop, startLoop, promptLoop);
+
+            projector.SetRequestedModels(requests);
+            foreach (var request in requests)
+            {
+                Assert.That(File.Exists(request.DestinationPath), Is.True, request.DestinationPath);
+            }
+
+            projector.SetRequestedModels([]);
+            Assert.That(Directory.EnumerateFileSystemEntries(Path.Combine(destinationRoot, "loras")), Is.Empty);
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
     private static ModelInfo CreateModel(string fullPath, ModelCategory category)
     {
         return new ModelInfo

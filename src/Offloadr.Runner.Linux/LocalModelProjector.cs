@@ -3,8 +3,15 @@ using Offloadr.Runner.V1;
 
 namespace Offloadr.Runner.Linux;
 
+/// <summary>
+/// Projects registered local models into the editor's model directory as symbolic links.
+/// The periodic inventory scan and the start/prompt command handlers call in from different
+/// threads, so every public entry point holds <see cref="_gate"/> for the whole update,
+/// including its filesystem work.
+/// </summary>
 internal sealed class LocalModelProjector
 {
+    private readonly object _gate = new();
     private readonly string _sourceRoot;
     private readonly string _destinationRoot;
     private readonly Dictionary<string, ModelInfo> _modelsBySelectionHash = new(StringComparer.Ordinal);
@@ -31,45 +38,54 @@ internal sealed class LocalModelProjector
 
     public void UpdateSnapshot(LocalModelSnapshot snapshot)
     {
-        _modelsBySelectionHash.Clear();
-        _modelsByNormalizedFilename.Clear();
-        foreach (var model in snapshot.Models)
+        lock (_gate)
         {
-            var normalizedFilename = LocalModelSelectionHash.NormalizeFileName(model.Filename);
-            if (normalizedFilename.Length > 0)
+            _modelsBySelectionHash.Clear();
+            _modelsByNormalizedFilename.Clear();
+            foreach (var model in snapshot.Models)
             {
-                if (!_modelsByNormalizedFilename.TryGetValue(normalizedFilename, out var filenameMatches))
+                var normalizedFilename = LocalModelSelectionHash.NormalizeFileName(model.Filename);
+                if (normalizedFilename.Length > 0)
                 {
-                    filenameMatches = [];
-                    _modelsByNormalizedFilename.Add(normalizedFilename, filenameMatches);
+                    if (!_modelsByNormalizedFilename.TryGetValue(normalizedFilename, out var filenameMatches))
+                    {
+                        filenameMatches = [];
+                        _modelsByNormalizedFilename.Add(normalizedFilename, filenameMatches);
+                    }
+
+                    filenameMatches.Add(model);
                 }
 
-                filenameMatches.Add(model);
+                var selectionHash = ComputeSelectionHash(model);
+                if (selectionHash is null || _modelsBySelectionHash.ContainsKey(selectionHash))
+                {
+                    continue;
+                }
+
+                _modelsBySelectionHash.Add(selectionHash, model);
             }
 
-            var selectionHash = ComputeSelectionHash(model);
-            if (selectionHash is null || _modelsBySelectionHash.ContainsKey(selectionHash))
-            {
-                continue;
-            }
-
-            _modelsBySelectionHash.Add(selectionHash, model);
+            ReconcileDesiredProjections();
         }
-
-        ReconcileDesiredProjections();
     }
 
     public void SetRequestedModels(IEnumerable<ModelDownloadRequest> downloads)
     {
-        _desiredProjections.Clear();
-        AddProjectionRequests(downloads, reportRemoteFallbacks: false);
-        ReconcileDesiredProjections();
+        lock (_gate)
+        {
+            _desiredProjections.Clear();
+            AddProjectionRequests(downloads, reportRemoteFallbacks: false);
+            ReconcileDesiredProjections();
+        }
     }
 
     public void AddRequestedModels(IEnumerable<ModelDownloadRequest> downloads)
     {
-        AddProjectionRequests(downloads, reportRemoteFallbacks: true);
-        ReconcileDesiredProjections();
+        lock (_gate)
+        {
+            AddProjectionRequests(downloads, reportRemoteFallbacks: true);
+            ReconcileDesiredProjections();
+        }
     }
 
     public static bool IsLocalProjectionRequest(ModelDownloadRequest? download)
