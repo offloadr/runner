@@ -75,10 +75,15 @@ await using var workspaceMirrorService = new WorkspaceMirrorService(
     loggerFactory.CreateLogger<WorkspaceMirrorService>());
 var hydrationCapabilities = ModelHydrationRuntimeCapabilities.FromEnvironment(
     options.Session.RuntimeKind);
+var modelProjectionRoot = string.Equals(options.Session.RuntimeKind, "forge-neo", StringComparison.OrdinalIgnoreCase)
+    ? options.Session.SessionRoot
+    : "/comfyui/models";
 await using var downloadService = new ModelDownloadService(
     downloadBackend,
     options.Aria2,
-    hydrationCapabilities);
+    hydrationCapabilities,
+    new ModelDestinationPolicy(
+        [options.Aria2.DownloadDirectory, modelProjectionRoot, .. hydrationCapabilities.PersistentModelRoots]));
 await using var sessionEventRelay = new ComfySessionEventRelay(
     options.RunnerId,
     sessionManager.ComfyHost,
@@ -135,9 +140,6 @@ LocalModelProjector? projector = null;
 if (!string.IsNullOrWhiteSpace(options.LocalModelsDirectory))
 {
     scanner = new LocalModelScanner(options.RunnerId, options.LocalModelsDirectory);
-    var modelProjectionRoot = string.Equals(options.Session.RuntimeKind, "forge-neo", StringComparison.OrdinalIgnoreCase)
-        ? options.Session.SessionRoot
-        : "/comfyui/models";
     projector = new LocalModelProjector(options.LocalModelsDirectory, modelProjectionRoot, options.Session.RuntimeKind);
     RunnerLog.Info(
         $"Local model scanning enabled dir='{options.LocalModelsDirectory}' interval={options.LocalModelsScanInterval.TotalSeconds:F0}s");

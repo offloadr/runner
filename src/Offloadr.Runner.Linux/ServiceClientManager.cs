@@ -2330,6 +2330,9 @@ internal static class ServiceClientManager
             throw new InvalidOperationException($"Forge model download '{filename}' escapes the session model root.");
         }
 
+        // The session user owns its models directory; refuse symlinked components so
+        // root-run downloads and placeholders cannot be redirected out of it.
+        ModelDestinationPolicy.ConfineToSessionRoot(modelsRoot, destinationPath);
         return destinationPath;
     }
 

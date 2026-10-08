@@ -13,12 +13,15 @@ internal sealed class ModelDownloadService : IAsyncDisposable
     private readonly Dictionary<string, HashSet<string>> _conventionalPathsBySession = new(StringComparer.Ordinal);
     private readonly Dictionary<string, LinuxFileIdentity> _ownedConventionalPlaceholders = new(StringComparer.Ordinal);
     private readonly Dictionary<string, HashSet<Task>> _conventionalOperations = new(StringComparer.Ordinal);
+    private readonly ModelDestinationPolicy? _destinationPolicy;
 
     public ModelDownloadService(
         IModelTransferBackend transferBackend,
         Aria2Settings settings,
-        ModelHydrationRuntimeCapabilities? capabilities = null)
+        ModelHydrationRuntimeCapabilities? capabilities = null,
+        ModelDestinationPolicy? destinationPolicy = null)
     {
+        _destinationPolicy = destinationPolicy;
         _fullDownloadCoordinator = new DownloadCoordinator(
             transferBackend ?? throw new ArgumentNullException(nameof(transferBackend)),
             settings ?? throw new ArgumentNullException(nameof(settings)));
@@ -69,6 +72,7 @@ internal sealed class ModelDownloadService : IAsyncDisposable
     public void RegisterDownloads(string sessionId, IEnumerable<ModelDownloadRequest> downloads)
     {
         var snapshot = FilterRemoteDownloadRequests(downloads);
+        ConfineDestinations(snapshot);
         var (managed, full) = PartitionDownloads(snapshot);
         _hydrationCoordinator?.RegisterDownloads(
             sessionId,
@@ -81,6 +85,7 @@ internal sealed class ModelDownloadService : IAsyncDisposable
     public void SeedDownloads(string sessionId, IEnumerable<ModelDownloadRequest> downloads)
     {
         var snapshot = FilterRemoteDownloadRequests(downloads);
+        ConfineDestinations(snapshot);
         var (managed, full) = PartitionDownloads(snapshot);
         _hydrationCoordinator?.RegisterDownloads(
             sessionId,
@@ -275,6 +280,23 @@ internal sealed class ModelDownloadService : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Refuses the whole batch when any destination escapes the configured model
+    /// roots, before placeholders are created or transfers registered.
+    /// </summary>
+    private void ConfineDestinations(IEnumerable<ModelDownloadRequest> downloads)
+    {
+        if (_destinationPolicy is null)
+        {
+            return;
+        }
+
+        foreach (var download in downloads)
+        {
+            _destinationPolicy.Confine(download.DestinationPath);
+        }
+    }
+
     private static ModelDownloadRequest[] FilterRemoteDownloadRequests(IEnumerable<ModelDownloadRequest>? downloads)
         => downloads?
             .Where(static download => download is not null && !LocalModelProjector.IsLocalProjectionRequest(download))
@@ -284,6 +306,7 @@ internal sealed class ModelDownloadService : IAsyncDisposable
     public Task EnsureDownloadsAsync(IEnumerable<ModelDownloadRequest> downloads, CancellationToken cancellationToken, bool highPriority)
     {
         var snapshot = FilterRemoteDownloadRequests(downloads);
+        ConfineDestinations(snapshot);
         var (managed, full) = PartitionDownloads(snapshot);
         Task conventional;
         lock (_conventionalPlaceholderGate)
@@ -302,6 +325,7 @@ internal sealed class ModelDownloadService : IAsyncDisposable
 
     public Task EnsureDownloadedAsync(string destinationPath, CancellationToken cancellationToken, bool highPriority)
     {
+        _destinationPolicy?.Confine(destinationPath);
         lock (_conventionalPlaceholderGate)
         {
             var operation = EnsureConventionalDownloadAsync(destinationPath, cancellationToken, highPriority);
