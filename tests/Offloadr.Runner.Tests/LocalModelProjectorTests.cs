@@ -158,6 +158,46 @@ public class LocalModelProjectorTests
     }
 
     [Test]
+    public void SetRequestedModels_RemovesLinksLeftByAnEarlierProcess()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var sourceRoot = Path.Combine(root, "local");
+            var destinationRoot = Path.Combine(root, "comfy", "models");
+            var imageModels = Path.Combine(root, "image-models");
+            Directory.CreateDirectory(Path.Combine(sourceRoot, "checkpoints"));
+            Directory.CreateDirectory(Path.Combine(imageModels, "vae"));
+            var sourceFile = Path.Combine(sourceRoot, "checkpoints", "demo.safetensors");
+            File.WriteAllText(sourceFile, "checkpoint");
+            var projected = Path.Combine(destinationRoot, "checkpoints", "demo.safetensors");
+
+            var earlier = new LocalModelProjector(sourceRoot, destinationRoot);
+            earlier.UpdateSnapshot(CreateSnapshot(CreateModel(sourceFile, ModelCategory.Checkpoint)));
+            earlier.SetRequestedModels([CreateLocalProjectionRequest(sourceFile, ModelCategory.Checkpoint, projected)]);
+            // A link the image itself provides, into a folder that is not the local model root.
+            var imageLink = Path.Combine(destinationRoot, "vae");
+            Directory.CreateSymbolicLink(imageLink, Path.Combine(imageModels, "vae"));
+            Assert.That(File.Exists(projected), Is.True);
+
+            // A new agent process starts with no memory of the links it made before.
+            var restarted = new LocalModelProjector(sourceRoot, destinationRoot);
+            restarted.UpdateSnapshot(CreateSnapshot(CreateModel(sourceFile, ModelCategory.Checkpoint)));
+            restarted.SetRequestedModels([]);
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(File.Exists(projected) || new FileInfo(projected).LinkTarget is not null, Is.False);
+                Assert.That(Directory.Exists(imageLink), Is.True);
+            });
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
     public void AddRequestedModels_DoesNotDropExistingProjection()
     {
         var root = CreateTempDirectory();

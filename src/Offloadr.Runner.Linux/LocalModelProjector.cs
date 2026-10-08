@@ -18,6 +18,8 @@ internal sealed class LocalModelProjector
     private readonly Dictionary<string, List<ModelInfo>> _modelsByNormalizedFilename = new(StringComparer.Ordinal);
     private readonly Dictionary<string, LocalProjectionRequest> _desiredProjections = new(StringComparer.Ordinal);
     private readonly HashSet<string> _managedTargets = new(StringComparer.Ordinal);
+    private const int MaxDiscoveryEntries = 200_000;
+    private bool _discoveredEarlierProjections;
 
     public LocalModelProjector(string sourceRoot, string destinationRoot = "/comfyui/models", string runtimeKind = "comfyui")
     {
@@ -177,8 +179,63 @@ internal sealed class LocalModelProjector
             $"{string.Join(" and ", differences)}. Downloading the catalog version instead.");
     }
 
+    /// <summary>
+    /// Adopts links that an earlier agent process left in the destination tree, so they are
+    /// reconciled like this process's own. Only the projector creates links from the
+    /// destination into the local model root. The walk never enters a linked directory, and
+    /// removal goes through the pinned destination root.
+    /// </summary>
+    private void DiscoverEarlierProjections()
+    {
+        if (_discoveredEarlierProjections)
+        {
+            return;
+        }
+
+        _discoveredEarlierProjections = true;
+        if (!Directory.Exists(_destinationRoot))
+        {
+            return;
+        }
+
+        var options = new EnumerationOptions { AttributesToSkip = 0, IgnoreInaccessible = true };
+        var pending = new Stack<string>();
+        pending.Push(_destinationRoot);
+        var visited = 0;
+        while (pending.Count > 0 && visited < MaxDiscoveryEntries)
+        {
+            List<FileSystemInfo> entries;
+            try
+            {
+                entries = new DirectoryInfo(pending.Pop()).EnumerateFileSystemInfos("*", options).ToList();
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                continue;
+            }
+
+            foreach (var entry in entries)
+            {
+                visited++;
+                if (entry.LinkTarget is { } linkTarget)
+                {
+                    var resolved = Path.GetFullPath(linkTarget, Path.GetDirectoryName(entry.FullName)!);
+                    if (IsUnderRoot(resolved, _sourceRoot))
+                    {
+                        _managedTargets.Add(NormalizePath(entry.FullName));
+                    }
+                }
+                else if (entry is DirectoryInfo)
+                {
+                    pending.Push(entry.FullName);
+                }
+            }
+        }
+    }
+
     private void ReconcileDesiredProjections()
     {
+        DiscoverEarlierProjections();
         var desiredTargets = new HashSet<string>(_desiredProjections.Keys, StringComparer.Ordinal);
 
         foreach (var projection in _desiredProjections.Values)
