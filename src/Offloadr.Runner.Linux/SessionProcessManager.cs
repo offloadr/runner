@@ -1204,6 +1204,13 @@ internal sealed partial class SessionProcessManager : IDisposable
             return;
         }
 
+        if (!SessionHomePaths.IsDirectChildOf(_sessionRoot, homeDirectory))
+        {
+            RunnerLog.Error<SessionProcessManager>(
+                $"Refusing to remove session directory '{homeDirectory}' outside session root '{_sessionRoot}'.");
+            return;
+        }
+
         try
         {
             Directory.Delete(homeDirectory, recursive: true);

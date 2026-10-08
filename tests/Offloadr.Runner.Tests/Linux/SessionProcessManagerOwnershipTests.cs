@@ -283,6 +283,62 @@ public partial class SessionProcessManagerOwnershipTests
     }
 
     [Test]
+    public async Task StartSessionAsync_FailedStartCleanupDoesNotRemoveHomeOutsideSessionRoot()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+
+        var tempRoot = Path.Combine(Path.GetTempPath(), $"runner-session-home-outside-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempRoot);
+        var customNodesSeedPath = Path.Combine(tempRoot, "seed-custom_nodes");
+        var inputSeedPath = Path.Combine(tempRoot, "seed-input");
+        Directory.CreateDirectory(customNodesSeedPath);
+        Directory.CreateDirectory(inputSeedPath);
+
+        var options = new SessionProcessOptions
+        {
+            SessionRoot = Path.Combine(tempRoot, "sessions"),
+            EntryPointPath = Path.Combine(tempRoot, "missing-entrypoint.sh"),
+            WorkingDirectory = tempRoot,
+            BundledCustomNodesSeedPath = customNodesSeedPath,
+            BundledInputSeedPath = inputSeedPath,
+            SeedVirtualEnvPath = CreateEmptySeedVirtualEnv(tempRoot),
+            UvBinaryPath = FakeUvBinaryPath(tempRoot),
+            ComfyPort = 8188,
+            ShutdownGracePeriod = TimeSpan.FromSeconds(5),
+            ReadyTimeout = TimeSpan.FromSeconds(5),
+            ReadyHost = "127.0.0.1"
+        };
+
+        var homeDirectory = Path.Combine(tempRoot, "elsewhere", "home");
+        var isolation = new RecordingIsolationStrategy("sess_outside", homeDirectory);
+
+        try
+        {
+            using var manager = new SessionProcessManager(options, isolation, new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
+
+            Exception? launchError = null;
+            try
+            {
+                await manager.StartSessionAsync(
+                    new StartSessionCommand { SessionId = "session-outside", User = "user-1", LifecycleGeneration = 1, RuntimeEpoch = 1, RuntimeInstanceId = "33333333333343338333333333333333" },
+                    CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                launchError = ex;
+            }
+
+            Assert.That(launchError, Is.Not.Null);
+            Assert.That(isolation.CleanupCallCount, Is.EqualTo(1));
+            Assert.That(Directory.Exists(homeDirectory), Is.True);
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+        }
+    }
+
+    [Test]
     public async Task StartSessionAsync_PreparesSessionLocalModelsRootForBaseDirectory()
     {
         LinuxTestPrerequisites.RequireLinux();

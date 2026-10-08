@@ -60,9 +60,11 @@ public sealed class LinuxUserIsolationStrategy : ISessionIsolationStrategy
             throw new ArgumentException("Session root is required.", nameof(sessionRoot));
         }
 
+        // Validate before any filesystem or user operation: the home directory is
+        // later chowned recursively and removed with the user.
         var normalizedSessionId = sessionId.Trim();
+        var homeDirectory = SessionHomePaths.ResolveHomeDirectory(sessionRoot, normalizedSessionId);
         var userName = LinuxSessionIdentity.BuildUserName(normalizedSessionId);
-        var homeDirectory = Path.Combine(sessionRoot, normalizedSessionId);
 
         bool userCreated = false;
         try
