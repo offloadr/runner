@@ -250,6 +250,56 @@ public partial class ArtifactUploadServiceTests
         }
     }
 
+    [Test]
+    public async Task TryEnsureArtifactAvailableAsync_CallerCancellationDoesNotFailOtherWaiters()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = CreateSessionPaths(root);
+            var gatedReader = new GatedReadArtifactStreamReader([1, 2, 3, 4]);
+            var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse())
+            {
+                BlockingReadArtifactReader = gatedReader
+            };
+            await using var service = new ArtifactUploadService(
+                runnerSecret: "runner-secret-value",
+                artifactClient,
+                NullLogger<ArtifactUploadService>.Instance);
+
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.SeedSessionAsync(
+                "session-1",
+                "editor-1",
+                "owner-1",
+                [CreateArtifact("output", string.Empty, "shared.png")],
+                CancellationToken.None);
+            var outputPath = Path.Combine(paths.OutputDirectory, "shared.png");
+
+            using var firstCallerCancellation = new CancellationTokenSource();
+            var first = service.TryEnsureArtifactAvailableAsync(outputPath, highPriority: true, firstCallerCancellation.Token);
+            await gatedReader.WaitUntilStartedAsync(TimeSpan.FromSeconds(5));
+            var second = service.TryEnsureArtifactAvailableAsync(outputPath, highPriority: true, CancellationToken.None);
+
+            await firstCallerCancellation.CancelAsync();
+            Assert.That(async () => await first, Throws.InstanceOf<OperationCanceledException>());
+            Assert.That(second.IsCompleted, Is.False);
+
+            gatedReader.Release();
+
+            Assert.That(await second.WaitAsync(TimeSpan.FromSeconds(10)), Is.True);
+            Assert.Multiple(() =>
+            {
+                Assert.That(File.ReadAllBytes(outputPath), Is.EqualTo(new byte[] { 1, 2, 3, 4 }));
+                Assert.That(artifactClient.ReadArtifactCallCount, Is.EqualTo(1));
+            });
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
     private static SessionProcessManager.SessionPaths CreateSessionPaths(string root)
     {
         var paths = new SessionProcessManager.SessionPaths
@@ -336,6 +386,47 @@ public partial class ArtifactUploadServiceTests
 
         public Task CompleteAsync()
             => new TaskCompletionSource().Task;
+    }
+
+    /// <summary>Returns the metadata frame, then holds the content until released.</summary>
+    private sealed class GatedReadArtifactStreamReader(byte[] content) : IAsyncStreamReader<RunnerArtifactServiceReadArtifactResponse>
+    {
+        private readonly TaskCompletionSource _started = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _released = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _frame;
+
+        public RunnerArtifactServiceReadArtifactResponse Current { get; private set; } = default!;
+
+        public async Task<bool> MoveNext(CancellationToken cancellationToken)
+        {
+            switch (_frame++)
+            {
+                case 0:
+                    _started.TrySetResult();
+                    Current = new RunnerArtifactServiceReadArtifactResponse
+                    {
+                        Metadata = new RunnerReadStreamMetadata
+                        {
+                            SizeBytes = content.LongLength,
+                            ModifiedUtc = Timestamp.FromDateTime(DateTime.UtcNow)
+                        }
+                    };
+                    return true;
+                case 1:
+                    await _released.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+                    Current = new RunnerArtifactServiceReadArtifactResponse
+                    {
+                        Chunk = Google.Protobuf.ByteString.CopyFrom(content)
+                    };
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        public Task WaitUntilStartedAsync(TimeSpan timeout) => _started.Task.WaitAsync(timeout);
+
+        public void Release() => _released.TrySetResult();
     }
 
     private static EditorArtifactMetadata CreateArtifact(string type, string subfolder, string filename, long sizeBytes = 4)

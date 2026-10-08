@@ -385,28 +385,48 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 return true;
             }
 
-            var downloadTask = _downloadTasks.GetOrAdd(state.LocalPath, _ => DownloadArtifactAsync(state, highPriority, cancellationToken));
+            // The fetch is shared by every caller for this artifact and runs for the uploader's
+            // lifetime, not under any one caller's token: a client that hangs up stops waiting
+            // without failing the others.
+            var downloadTask = GetOrStartArtifactDownload(state, highPriority);
             try
             {
-                await downloadTask.ConfigureAwait(false);
+                await downloadTask.WaitAsync(cancellationToken).ConfigureAwait(false);
                 return true;
             }
             catch (OperationCanceledException) when (_cts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
             {
                 return false;
             }
-            catch
+            catch (Exception) when (downloadTask.IsFaulted)
             {
                 if (dynamicState)
                 {
-                    _catalog.TryRemove(normalized, out _);
+                    ((ICollection<KeyValuePair<string, RemoteArtifactState>>)_catalog).Remove(new(normalized, state));
                 }
 
                 throw;
             }
-            finally
+        }
+
+        private Task GetOrStartArtifactDownload(RemoteArtifactState state, bool highPriority)
+        {
+            lock (_downloadTasks)
             {
-                _downloadTasks.TryRemove(state.LocalPath, out _);
+                if (_downloadTasks.TryGetValue(state.LocalPath, out var existing))
+                {
+                    return existing;
+                }
+
+                var download = Task.Run(() => DownloadArtifactAsync(state, highPriority, CancellationToken.None));
+                _downloadTasks[state.LocalPath] = download;
+                // Registered after the add, so an already finished download is still removed.
+                _ = download.ContinueWith(
+                    completed => ((ICollection<KeyValuePair<string, Task>>)_downloadTasks).Remove(new(state.LocalPath, completed)),
+                    CancellationToken.None,
+                    TaskContinuationOptions.ExecuteSynchronously,
+                    TaskScheduler.Default);
+                return download;
             }
         }
 

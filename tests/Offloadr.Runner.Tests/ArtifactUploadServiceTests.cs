@@ -1537,7 +1537,7 @@ public partial class ArtifactUploadServiceTests
         public string? ReadArtifactSha256 { get; set; }
         public Exception? ListArtifactsException { get; init; }
         public RpcException? ReadArtifactException { get; init; }
-        public BlockingReadArtifactStreamReader? BlockingReadArtifactReader { get; init; }
+        public IAsyncStreamReader<RunnerArtifactServiceReadArtifactResponse>? BlockingReadArtifactReader { get; init; }
         public RunnerArtifactServiceReadArtifactRequest? LastReadArtifactRequest { get; private set; }
         public int ListCallCount { get; private set; }
         public int ReadArtifactCallCount { get; private set; }
