@@ -202,6 +202,66 @@ public class WorkspaceMirrorServiceTests
         }
     }
 
+    [TestCase("short.png", "abc", 5L, null)]
+    [TestCase("digest.png", "abcde", 5L, "0000000000000000000000000000000000000000000000000000000000000000")]
+    public async Task TryEnsureWorkspaceFileAvailableAsync_DoesNotPublishAStreamThatFailsVerification(
+        string relativePath,
+        string content,
+        long declaredSize,
+        string? declaredSha256)
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            Assert.Ignore("Mirrored input publication uses Linux descriptor-relative syscalls.");
+        }
+
+        var tempRoot = CreateTempDirectory();
+        try
+        {
+            var paths = CreateSessionPaths(tempRoot);
+            var workspaceClient = new FakeRunnerWorkspaceClient
+            {
+                FileContentsByRelativePath = new Dictionary<string, string>(StringComparer.Ordinal) { [relativePath] = content },
+                DeclaredSizeByRelativePath = new Dictionary<string, long>(StringComparer.Ordinal) { [relativePath] = declaredSize },
+                DeclaredSha256ByRelativePath = declaredSha256 is null
+                    ? new Dictionary<string, string>(StringComparer.Ordinal)
+                    : new Dictionary<string, string>(StringComparer.Ordinal) { [relativePath] = declaredSha256 },
+            };
+            await using var service = new WorkspaceMirrorService(
+                workspaceClient,
+                "runner-secret-value",
+                NullLogger<WorkspaceMirrorService>.Instance);
+            await service.PrepareSessionAsync(
+                "session-verify",
+                paths,
+                "editor-1",
+                "comfyui",
+                [new WorkspaceFileMetadata { Root = WorkspaceRoot.Input, RelativePath = relativePath, SizeBytes = declaredSize }],
+                CancellationToken.None);
+            var localPath = Path.Combine(paths.InputDirectory, relativePath);
+
+            bool available;
+            try
+            {
+                available = await service.TryEnsureWorkspaceFileAvailableAsync(localPath, highPriority: true, CancellationToken.None);
+            }
+            catch (Exception)
+            {
+                available = false;
+            }
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(available, Is.False);
+                Assert.That(File.Exists(localPath) ? File.ReadAllText(localPath) : string.Empty, Is.Not.EqualTo(content));
+            });
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+        }
+    }
+
     [Test]
     public async Task PrepareSessionAsync_HydratesArchiveBackedRoots_WithoutPerFileMetadata()
     {
@@ -615,6 +675,9 @@ public class WorkspaceMirrorServiceTests
         public byte[] SeedArchiveBytes { get; init; } = CreateEmptyZipBytes();
         public IReadOnlyDictionary<string, string> FileContentsByRelativePath { get; init; } = new Dictionary<string, string>(StringComparer.Ordinal);
         public IReadOnlyDictionary<string, DateTime> FileModifiedUtcByRelativePath { get; init; } = new Dictionary<string, DateTime>(StringComparer.Ordinal);
+        /// <summary>Metadata sizes that differ from the streamed content, as a faulty server might send.</summary>
+        public IReadOnlyDictionary<string, long> DeclaredSizeByRelativePath { get; init; } = new Dictionary<string, long>(StringComparer.Ordinal);
+        public IReadOnlyDictionary<string, string> DeclaredSha256ByRelativePath { get; init; } = new Dictionary<string, string>(StringComparer.Ordinal);
         public bool ThrowArchiveRead { get; init; }
         public BlockingResponseStreamReader? BlockingInputReader { get; init; }
         public List<WorkspaceRoot> SeedArchiveRequests { get; } = [];
@@ -660,8 +723,14 @@ public class WorkspaceMirrorServiceTests
             {
                 var metadata = new RunnerReadStreamMetadata
                 {
-                    SizeBytes = content.Length
+                    SizeBytes = DeclaredSizeByRelativePath.TryGetValue(request.RelativePath, out var declaredSize)
+                        ? declaredSize
+                        : content.Length
                 };
+                if (DeclaredSha256ByRelativePath.TryGetValue(request.RelativePath, out var declaredSha256))
+                {
+                    metadata.Sha256 = declaredSha256;
+                }
                 if (FileModifiedUtcByRelativePath.TryGetValue(request.RelativePath, out var modifiedUtc))
                 {
                     metadata.ModifiedUtc = Google.Protobuf.WellKnownTypes.Timestamp.FromDateTime(

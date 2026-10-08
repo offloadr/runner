@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.IO.Compression;
+using System.Security.Cryptography;
 using Offloadr.Runner.V1;
 using Google.Protobuf.WellKnownTypes;
 using Grpc.Core;
@@ -541,6 +542,9 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
             EnsureSafeInputHydrationPath(state.LocalPath);
             using var publication = _secureInputRoot.CreatePublication(state.RelativePath);
             var sawMetadata = false;
+            string? expectedSha256 = null;
+            long written = 0;
+            using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
             await using (var destination = publication.OpenWriteStream())
             {
                 while (await responseStream.MoveNext(cancellationToken).ConfigureAwait(false))
@@ -561,6 +565,11 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                                 state.SizeBytes = response.Metadata.SizeBytes.Value;
                             }
 
+                            if (!string.IsNullOrWhiteSpace(response.Metadata.Sha256))
+                            {
+                                expectedSha256 = response.Metadata.Sha256.Trim();
+                            }
+
                             break;
                         case RunnerWorkspaceServiceReadWorkspaceFileResponse.PayloadOneofCase.Chunk:
                             if (!sawMetadata)
@@ -568,6 +577,14 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                                 throw new InvalidOperationException("Workspace file stream missing metadata frame.");
                             }
 
+                            written += response.Chunk.Length;
+                            if (state.SizeBytes is { } limit && written > limit)
+                            {
+                                throw new InvalidOperationException(
+                                    $"Workspace file stream exceeded its declared size of {limit} bytes.");
+                            }
+
+                            hash.AppendData(response.Chunk.Span);
                             await destination.WriteAsync(response.Chunk.Memory, cancellationToken).ConfigureAwait(false);
                             break;
                     }
@@ -576,6 +593,20 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                 if (!sawMetadata)
                 {
                     throw new InvalidOperationException("Workspace file stream completed without metadata.");
+                }
+
+                // A stream that ends early or carries other bytes must not become the input
+                // the editor reads: nothing is committed unless size and digest match.
+                if (state.SizeBytes is { } expectedSize && written != expectedSize)
+                {
+                    throw new InvalidOperationException(
+                        $"Workspace file stream size mismatch: expected {expectedSize} bytes but received {written} bytes.");
+                }
+
+                if (expectedSha256 is not null &&
+                    !string.Equals(Convert.ToHexString(hash.GetHashAndReset()), expectedSha256, StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidOperationException("Workspace file stream SHA-256 mismatch.");
                 }
 
                 await destination.FlushAsync(cancellationToken).ConfigureAwait(false);
