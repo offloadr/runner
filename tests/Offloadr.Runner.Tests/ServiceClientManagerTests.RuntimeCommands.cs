@@ -506,6 +506,78 @@ public partial class ServiceClientManagerTests
         });
     }
 
+    [Test]
+    public async Task TransientCancellation_StopRacingRequestsNeverThrowsAndReleasesEveryEntry()
+    {
+        using var shutdown = new CancellationTokenSource();
+        var registry = new ServiceClientManager.TransientCancellationRegistry(shutdown.Token);
+        using var stopRacing = new CancellationTokenSource(TimeSpan.FromMilliseconds(500));
+
+        var requests = Enumerable.Range(0, 4).Select(worker => Task.Run(() =>
+        {
+            while (!stopRacing.IsCancellationRequested)
+            {
+                using var lease = registry.Acquire(CommandSessionId, 7, 3, InstanceA);
+                _ = lease.Token.IsCancellationRequested;
+                lease.Token.Register(static () => { }).Dispose();
+            }
+        }));
+        var stops = Task.Run(() =>
+        {
+            while (!stopRacing.IsCancellationRequested)
+            {
+                registry.CancelSession(CommandSessionId);
+                registry.CancelRuntime(CommandSessionId, new RuntimeIdentity(7, 3, InstanceA));
+            }
+        });
+
+        await Task.WhenAll(requests.Append(stops)).WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.That(registry.Count, Is.Zero, "Entries are removed with their last request.");
+    }
+
+    [Test]
+    public void TransientCancellation_IsScopedToTheRuntimeAndRenewedAfterCancel()
+    {
+        using var shutdown = new CancellationTokenSource();
+        var registry = new ServiceClientManager.TransientCancellationRegistry(shutdown.Token);
+        using var oldRuntime = registry.Acquire(CommandSessionId, 7, 3, InstanceA);
+        using var sameRuntimeOtherSpelling = registry.Acquire(CommandSessionId, 7, 3, Guid.Parse(InstanceA).ToString("D"));
+        using var newRuntime = registry.Acquire(CommandSessionId, 7, 4, InstanceB);
+        Assert.That(registry.Count, Is.EqualTo(2));
+
+        registry.CancelRuntime(CommandSessionId, new RuntimeIdentity(7, 3, InstanceA));
+        Assert.Multiple(() =>
+        {
+            Assert.That(oldRuntime.Token.IsCancellationRequested, Is.True);
+            Assert.That(sameRuntimeOtherSpelling.Token.IsCancellationRequested, Is.True);
+            Assert.That(newRuntime.Token.IsCancellationRequested, Is.False);
+        });
+
+        using var later = registry.Acquire(CommandSessionId, 7, 3, InstanceA);
+        Assert.That(later.Token.IsCancellationRequested, Is.False);
+
+        registry.CancelSession(CommandSessionId);
+        Assert.Multiple(() =>
+        {
+            Assert.That(newRuntime.Token.IsCancellationRequested, Is.True);
+            Assert.That(later.Token.IsCancellationRequested, Is.True);
+            Assert.That(registry.Count, Is.Zero);
+        });
+    }
+
+    [Test]
+    public async Task Quiesce_CancelsOnlyTheQuiescedRuntimesTransientRequests()
+    {
+        var harness = RunningHarness(7, 3, InstanceA);
+        using var quiesced = harness.TransientCancellation.Acquire(CommandSessionId, 7, 3, InstanceA);
+        using var other = harness.TransientCancellation.Acquire(CommandSessionId, 7, 4, InstanceB);
+
+        await ServiceClientManager.HandleQuiesceRuntimeCommandAsync(Quiesce(7, 3, InstanceA, revision: 1), harness.Deps);
+
+        Assert.That(quiesced.Token.IsCancellationRequested, Is.True);
+        Assert.That(other.Token.IsCancellationRequested, Is.False);
+    }
+
     private static StopSessionCommand Stop(ulong generation, ulong epoch, string instance)
         => new()
         {
@@ -594,6 +666,7 @@ public partial class ServiceClientManagerTests
         public RuntimeCommandHarness()
         {
             WorkState = new ServiceClientManager.RunnerCommandWorkState(Shutdown.Token);
+            TransientCancellation = new ServiceClientManager.TransientCancellationRegistry(Shutdown.Token);
         }
 
         public CancellationTokenSource Shutdown { get; } = new();
@@ -601,7 +674,7 @@ public partial class ServiceClientManagerTests
         public ServiceClientManager.RunnerCommandWorkState WorkState { get; }
         public ServiceClientManager.LogicalSessionState Logical { get; } = new(string.Empty);
         public RuntimeIdentityRegistry Identities { get; } = new();
-        public ConcurrentDictionary<string, CancellationTokenSource> TransientCancellation { get; } = new(StringComparer.Ordinal);
+        public ServiceClientManager.TransientCancellationRegistry TransientCancellation { get; }
         public ConcurrentQueue<string> Calls { get; } = new();
 
         /// <summary>Runs before a start registers its runtime; may block or throw.</summary>
@@ -653,7 +726,7 @@ public partial class ServiceClientManagerTests
             WorkState = WorkState,
             LogicalSessionState = Logical,
             RuntimeIdentities = Identities,
-            TransientSessionCancellation = TransientCancellation,
+            TransientCancellation = TransientCancellation,
             GetActiveRuntimeSessionId = () => _tracked.Keys.FirstOrDefault() ?? string.Empty,
             StartRuntimeAndWaitForReady = StartAsync,
             StopRuntime = StopAsync,
