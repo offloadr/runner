@@ -147,6 +147,11 @@ internal sealed partial class SessionProcessManager : IDisposable
             Guid.TryParse(command.RuntimeInstanceId, out var instance) && instance != Guid.Empty ? instance.ToString("n") : string.Empty);
         if (!runtimeIdentity.IsValid)
             throw new ArgumentException("An exact lifecycle generation, runtime epoch and instance are required.", nameof(command));
+        // The image runs one editor; a start for another must fail before anything is provisioned.
+        var requestedRuntimeKind = command.EditorRuntimeKind?.Trim().ToLowerInvariant();
+        if (!string.IsNullOrEmpty(requestedRuntimeKind) && requestedRuntimeKind != _runtimeKind)
+            throw new ArgumentException(
+                $"This runner runs editor runtime '{_runtimeKind}', not '{requestedRuntimeKind}'.", nameof(command));
         if (_sessions.TryGetValue(sessionId, out var existing))
         {
             if (existing.RuntimeIdentity != runtimeIdentity || existing.StopInProgress || existing.Process.HasExited)

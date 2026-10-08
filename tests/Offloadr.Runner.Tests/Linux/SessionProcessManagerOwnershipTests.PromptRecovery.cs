@@ -249,6 +249,23 @@ public partial class SessionProcessManagerOwnershipTests
     }
 
     [Test]
+    public async Task StartForAnotherEditorRuntimeIsRejectedBeforeProvisioning()
+    {
+        await using var fixture = await PromptRuntimeFixture.CreateAsync();
+        var misrouted = fixture.Start.Clone();
+        misrouted.SessionId = Guid.NewGuid().ToString("n");
+        misrouted.EditorRuntimeKind = "forge-neo";
+
+        var error = Assert.ThrowsAsync<ArgumentException>(() => fixture.Manager.StartSessionAsync(misrouted, CancellationToken.None));
+        Assert.Multiple(() =>
+        {
+            Assert.That(error!.Message, Does.Contain("forge-neo"));
+            Assert.That(fixture.Manager.GetActiveSessionId(), Is.EqualTo(fixture.Start.SessionId));
+            Assert.That(fixture.Manager.TryGetRuntimeIdentity(misrouted.SessionId, out _), Is.False);
+        });
+    }
+
+    [Test]
     public async Task DuplicateStartMustMatchTheExactTrackedChild()
     {
         await using var fixture = await PromptRuntimeFixture.CreateAsync();
