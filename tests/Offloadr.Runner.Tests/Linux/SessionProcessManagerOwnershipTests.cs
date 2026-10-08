@@ -1263,6 +1263,72 @@ public partial class SessionProcessManagerOwnershipTests
     }
 
     [Test]
+    public async Task RunManagerUvSyncOnceAsync_SplitsOverlongOutputLines()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+
+        var tempRoot = Path.Combine(Path.GetTempPath(), $"runner-manager-sync-long-line-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempRoot);
+
+        var options = new SessionProcessOptions
+        {
+            SessionRoot = Path.Combine(tempRoot, "sessions"),
+            EntryPointPath = Path.Combine(tempRoot, "entrypoint.base.sh"),
+            WorkingDirectory = tempRoot,
+            BundledCustomNodesSeedPath = Path.Combine(tempRoot, "seed-custom_nodes"),
+            BundledInputSeedPath = Path.Combine(tempRoot, "seed-input"),
+            SeedVirtualEnvPath = CreateEmptySeedVirtualEnv(tempRoot),
+            UvBinaryPath = FakeUvBinaryPath(tempRoot),
+            ComfyPort = 8188,
+            ShutdownGracePeriod = TimeSpan.FromSeconds(5),
+            ReadyTimeout = TimeSpan.FromSeconds(5),
+            ReadyHost = "127.0.0.1"
+        };
+        var sessionVenv = Path.Combine(tempRoot, "session", ".venv");
+        var pythonPath = Path.Combine(sessionVenv, "bin", "python");
+        var identity = new PreparedSessionIdentity(string.Empty, Path.Combine(tempRoot, "session"), CleanupIdentity: true);
+        var paths = new SessionProcessManager.SessionPaths
+        {
+            HomeDirectory = identity.HomeDirectory,
+            VirtualEnvDirectory = sessionVenv,
+            UserDirectory = Path.Combine(identity.HomeDirectory, "user"),
+            CacheDirectory = Path.Combine(identity.HomeDirectory, ".cache"),
+            UvCacheDirectory = Path.Combine(identity.HomeDirectory, ".cache", "uv"),
+            ScratchDirectory = Path.Combine(identity.HomeDirectory, "tmp"),
+            TorchInductorCacheDirectory = Path.Combine(identity.HomeDirectory, "tmp", "torchinductor")
+        };
+
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(pythonPath)!);
+            File.WriteAllText(
+                pythonPath,
+                """
+                #!/bin/sh
+                head -c 50000 /dev/zero | tr '\0' 'x' >&2
+                printf '\nsync done\n' >&2
+                exit 3
+                """);
+            MakeExecutable(pythonPath);
+
+            using var manager = new SessionProcessManager(options, new RecordingIsolationStrategy(identity.UserName, identity.HomeDirectory), new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
+
+            var result = await manager.RunManagerUvSyncOnceAsync("session-sync", identity, paths, CancellationToken.None);
+            var lines = result.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries).Select(line => line.TrimEnd('\r')).ToArray();
+
+            Assert.That(result.ExitCode, Is.EqualTo(3));
+            Assert.That(lines[^1], Is.EqualTo("sync done"));
+            Assert.That(lines.Count(line => line.StartsWith(BoundedLineReader.ContinuationPrefix, StringComparison.Ordinal)), Is.GreaterThanOrEqualTo(2));
+            Assert.That(lines, Has.All.Length.LessThanOrEqualTo(BoundedLineReader.DefaultMaxLineChars + BoundedLineReader.ContinuationPrefix.Length));
+            Assert.That(string.Concat(lines[..^1]).Replace(BoundedLineReader.ContinuationPrefix, string.Empty, StringComparison.Ordinal), Is.EqualTo(new string('x', 50_000)));
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+        }
+    }
+
+    [Test]
     public async Task StartSessionAsync_PreparesManagerPathShimsForBootstrap()
     {
         LinuxTestPrerequisites.RequireLinux();

@@ -931,22 +931,6 @@ internal sealed partial class SessionProcessManager : IDisposable
             process = new Process { StartInfo = psi, EnableRaisingEvents = true };
             var exitTcs = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
 
-            process.OutputDataReceived += (_, e) =>
-            {
-                if (!string.IsNullOrWhiteSpace(e.Data))
-                {
-                    RunnerLog.Info(sessionCategory, e.Data);
-                    _processLogRelay?.Enqueue(sessionId, SessionProcessLogStream.Stdout, e.Data);
-                }
-            };
-            process.ErrorDataReceived += (_, e) =>
-            {
-                if (!string.IsNullOrWhiteSpace(e.Data))
-                {
-                    RunnerLog.Info(sessionCategory, e.Data);
-                    _processLogRelay?.Enqueue(sessionId, SessionProcessLogStream.Stderr, e.Data);
-                }
-            };
             process.Exited += (_, __) => exitTcs.TrySetResult(process.ExitCode);
 
             if (!process.Start())
@@ -954,8 +938,24 @@ internal sealed partial class SessionProcessManager : IDisposable
                 throw new InvalidOperationException($"Failed to start editor runtime '{_runtimeKind}' for session '{sessionId}'.");
             }
 
-            process.BeginOutputReadLine();
-            process.BeginErrorReadLine();
+            // Session output is untrusted: read it with a bounded line reader rather than
+            // BeginOutputReadLine, which buffers a line of any length.
+            _ = BoundedLineReader.PumpAsync(process.StandardOutput, line =>
+            {
+                if (!string.IsNullOrWhiteSpace(line))
+                {
+                    RunnerLog.Info(sessionCategory, line);
+                    _processLogRelay?.Enqueue(sessionId, SessionProcessLogStream.Stdout, line);
+                }
+            });
+            _ = BoundedLineReader.PumpAsync(process.StandardError, line =>
+            {
+                if (!string.IsNullOrWhiteSpace(line))
+                {
+                    RunnerLog.Info(sessionCategory, line);
+                    _processLogRelay?.Enqueue(sessionId, SessionProcessLogStream.Stderr, line);
+                }
+            });
 
             return Task.FromResult(new SessionContext(sessionId, runtimeIdentity, identity, paths, process, exitTcs.Task));
         }
@@ -1347,38 +1347,17 @@ internal sealed partial class SessionProcessManager : IDisposable
         };
 
         var exitTcs = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var stdoutClosedTcs = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var stderrClosedTcs = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
         var output = new StringBuilder();
         var outputLock = new object();
-        process.OutputDataReceived += (_, e) =>
+        void OnOutputLine(string line)
         {
-            if (e.Data is null)
+            if (!string.IsNullOrWhiteSpace(line))
             {
-                stdoutClosedTcs.TrySetResult(null);
-                return;
+                RunnerLog.Info(SessionLogCategory(sessionId), line);
+                CaptureProcessOutput(output, outputLock, line);
             }
+        }
 
-            if (!string.IsNullOrWhiteSpace(e.Data))
-            {
-                RunnerLog.Info(SessionLogCategory(sessionId), e.Data);
-                CaptureProcessOutput(output, outputLock, e.Data);
-            }
-        };
-        process.ErrorDataReceived += (_, e) =>
-        {
-            if (e.Data is null)
-            {
-                stderrClosedTcs.TrySetResult(null);
-                return;
-            }
-
-            if (!string.IsNullOrWhiteSpace(e.Data))
-            {
-                RunnerLog.Info(SessionLogCategory(sessionId), e.Data);
-                CaptureProcessOutput(output, outputLock, e.Data);
-            }
-        };
         process.Exited += (_, __) => exitTcs.TrySetResult(process.ExitCode);
 
         try
@@ -1395,8 +1374,9 @@ internal sealed partial class SessionProcessManager : IDisposable
             return new ProcessRunResult(1, ex.Message);
         }
 
-        process.BeginOutputReadLine();
-        process.BeginErrorReadLine();
+        // The sync runs session-controlled package builds; bound each line it prints.
+        var stdoutPump = BoundedLineReader.PumpAsync(process.StandardOutput, OnOutputLine);
+        var stderrPump = BoundedLineReader.PumpAsync(process.StandardError, OnOutputLine);
 
         using var registration = cancellationToken.Register(() =>
         {
@@ -1415,7 +1395,7 @@ internal sealed partial class SessionProcessManager : IDisposable
 
         var exitCode = await exitTcs.Task.ConfigureAwait(false);
         cancellationToken.ThrowIfCancellationRequested();
-        await Task.WhenAll(stdoutClosedTcs.Task, stderrClosedTcs.Task).WaitAsync(cancellationToken).ConfigureAwait(false);
+        await Task.WhenAll(stdoutPump, stderrPump).WaitAsync(cancellationToken).ConfigureAwait(false);
         cancellationToken.ThrowIfCancellationRequested();
         lock (outputLock)
         {
