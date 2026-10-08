@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -88,8 +89,22 @@ internal sealed class RunnerStatusFileWriter(
             Directory.CreateDirectory(directory);
         }
 
+        // The agent runs as root, so never write through an entry someone else placed at the
+        // temporary path: remove it (unlink does not follow links) and create the file exclusively.
+        // The final rename replaces a link at Path rather than following it.
         var temporary = Path + ".tmp";
-        File.WriteAllText(temporary, JsonSerializer.Serialize(snapshot, SerializerOptions));
+        File.Delete(temporary);
+        var options = new FileStreamOptions { Mode = FileMode.CreateNew, Access = FileAccess.Write };
+        if (!OperatingSystem.IsWindows())
+        {
+            options.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.GroupRead | UnixFileMode.OtherRead;
+        }
+
+        using (var writer = new StreamWriter(temporary, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false), options))
+        {
+            writer.Write(JsonSerializer.Serialize(snapshot, SerializerOptions));
+        }
+
         File.Move(temporary, Path, overwrite: true);
     }
 

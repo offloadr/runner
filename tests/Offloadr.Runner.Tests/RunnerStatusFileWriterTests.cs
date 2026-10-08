@@ -35,6 +35,30 @@ public class RunnerStatusFileWriterTests
     }
 
     [Test]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public void Write_DoesNotFollowLinkAtTemporaryPath()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+
+        var path = Path.Combine(_root, "status.json");
+        var victim = Path.Combine(_root, "victim.txt");
+        Directory.CreateDirectory(_root);
+        File.WriteAllText(victim, "keep");
+        File.CreateSymbolicLink(path + ".tmp", victim);
+
+        CreateWriter(path, () => "session-a").Write("session-a", DateTimeOffset.UnixEpoch);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(File.ReadAllText(victim), Is.EqualTo("keep"));
+            Assert.That(File.ReadAllText(path), Does.Contain("session-a"));
+            Assert.That(new FileInfo(path).LinkTarget, Is.Null);
+            Assert.That(File.GetUnixFileMode(path), Is.EqualTo(
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.GroupRead | UnixFileMode.OtherRead));
+        });
+    }
+
+    [Test]
     public void Write_CreatesDirectoryAndPublishesSnapshot()
     {
         var path = Path.Combine(_root, "nested", "status.json");
