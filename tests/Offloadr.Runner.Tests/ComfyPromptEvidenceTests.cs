@@ -154,6 +154,49 @@ public sealed class ComfyPromptEvidenceTests
     }
 
     [Test]
+    public async Task OversizedWebSocketMessageIsDroppedWithoutBlockingLaterMessages()
+    {
+        using var portReservation = new TcpListener(IPAddress.Loopback, 0);
+        portReservation.Start();
+        var port = ((IPEndPoint)portReservation.LocalEndpoint).Port;
+        portReservation.Stop();
+        using var listener = new HttpListener();
+        listener.Prefixes.Add($"http://127.0.0.1:{port}/");
+        listener.Start();
+        var command = Command();
+        var delivered = new System.Collections.Concurrent.ConcurrentQueue<SessionStreamEvent>();
+        await using var relay = new ComfySessionEventRelay(command.Target.RunnerId, "127.0.0.1", port);
+        relay.AttachSink(new EvidenceSink((_, _) => Task.CompletedTask, request =>
+        {
+            foreach (var frame in request.Events)
+                delivered.Enqueue(frame.Clone());
+            return Task.CompletedTask;
+        }));
+        await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", command.Target.GpuGeneration,
+            command.Target.RuntimeEpoch, command.Target.RuntimeInstanceId, [], CancellationToken.None);
+        var context = await listener.GetContextAsync().WaitAsync(TimeSpan.FromSeconds(3));
+        using var socket = (await context.AcceptWebSocketAsync(null)).WebSocket;
+
+        // One message just over the cap, sent in fragments, then a normal one.
+        var fragment = new byte[1024 * 1024];
+        var fragments = ComfySessionEventRelay.MaxRelayedMessageBytes / fragment.Length + 1;
+        for (var index = 0; index < fragments; index++)
+        {
+            await socket.SendAsync(fragment, WebSocketMessageType.Binary, endOfMessage: index == fragments - 1, CancellationToken.None);
+        }
+
+        await socket.SendAsync("{\"type\":\"status\"}"u8.ToArray(), WebSocketMessageType.Text, true, CancellationToken.None);
+
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+        while (delivered.IsEmpty && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(20);
+        }
+
+        Assert.That(delivered.Select(static frame => frame.Payload.ToStringUtf8()), Is.EqualTo(new[] { "{\"type\":\"status\"}" }));
+    }
+
+    [Test]
     public async Task MissedTerminalFramesRetainOnlyBoundedBodyFreeEvidenceIdentities()
     {
         var command = Command();

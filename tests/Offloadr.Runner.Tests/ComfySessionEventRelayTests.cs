@@ -57,6 +57,46 @@ public class ComfySessionEventRelayTests
     }
 
     [Test]
+    public async Task Enqueue_KeepsQueuedPayloadsWithinBudget_AndReportsWithinTheBatchLimit()
+    {
+        await using var relay = new ComfySessionEventRelay("runner-1", "127.0.0.1", 8188);
+        var sink = new BlockingThenRecordingSink();
+        relay.AttachSink(sink);
+        relay.Enqueue(new SessionStreamEvent { RunnerId = "runner-1", SessionId = "session-0", ClientId = "client-1" });
+        await WaitForAsync(sink.FirstInvocationStarted.Task, TimeSpan.FromSeconds(3));
+
+        var large = Google.Protobuf.UnsafeByteOperations.UnsafeWrap(new byte[ComfySessionEventRelay.MaxRelayedMessageBytes]);
+        var accepted = 0;
+        for (var index = 1; index <= 9; index++)
+        {
+            if (relay.Enqueue(new SessionStreamEvent { RunnerId = "runner-1", SessionId = $"session-{index}", ClientId = "client-1", Payload = large }))
+            {
+                accepted++;
+            }
+        }
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(accepted, Is.EqualTo(8));
+            Assert.That(relay.QueuedPayloadBytes, Is.LessThanOrEqualTo(ComfySessionEventRelay.MaxQueuedPayloadBytes));
+        });
+
+        sink.ReleaseFirstInvocation.TrySetResult(true);
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+        while (sink.DeliveredEvents < 9 && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(20);
+        }
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(sink.DeliveredEvents, Is.EqualTo(9));
+            Assert.That(sink.ReportPayloadBytes, Has.All.LessThanOrEqualTo(ComfySessionEventRelay.MaxBatchPayloadBytes));
+            Assert.That(relay.QueuedPayloadBytes, Is.Zero);
+        });
+    }
+
+    [Test]
     public async Task PermanentlyRejectedEvent_DoesNotBlockLaterValidEvents()
     {
         await using var relay = new ComfySessionEventRelay("runner-1", "127.0.0.1", 8188, queueCapacity: 8);
@@ -222,6 +262,11 @@ public class ComfySessionEventRelayTests
     {
         private readonly List<string> _deliveredSessions = [];
         private int _callCount;
+        private int _deliveredEvents;
+
+        public System.Collections.Concurrent.ConcurrentQueue<long> ReportPayloadBytes { get; } = new();
+
+        public int DeliveredEvents => Volatile.Read(ref _deliveredEvents);
 
         public TaskCompletionSource<bool> FirstInvocationStarted { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -269,6 +314,8 @@ public class ComfySessionEventRelayTests
                 await ReleaseFirstInvocation.Task.ConfigureAwait(false);
             }
 
+            ReportPayloadBytes.Enqueue(request.Events.Sum(static evt => (long)evt.Payload.Length));
+            Interlocked.Add(ref _deliveredEvents, request.Events.Count);
             _deliveredSessions.AddRange(request.Events.Select(evt => evt.SessionId));
             if (_deliveredSessions.Count >= 3)
             {

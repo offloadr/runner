@@ -32,6 +32,19 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
 
     private const int DefaultQueueCapacity = 4096;
     private const int MaxBatchSize = 32;
+
+    /// <summary>Largest relayed WebSocket message; larger ones are dropped.</summary>
+    internal const int MaxRelayedMessageBytes = ComfyRuntimeTransportLimits.MaxResponseBodyBytes;
+
+    /// <summary>Payload bytes waiting to be sent; events past it are dropped.</summary>
+    internal const long MaxQueuedPayloadBytes = 64L * 1024 * 1024;
+
+    /// <summary>Payload bytes per report, well below the gRPC message limit.</summary>
+    internal const int MaxBatchPayloadBytes = 16 * 1024 * 1024;
+
+    private static readonly TimeSpan OversizeWarningInterval = TimeSpan.FromMinutes(1);
+    private long _queuedPayloadBytes;
+    private long _lastOversizeWarningTicks = long.MinValue / 2;
     internal const int MaxRetainedPromptIdentities = 256;
     private static readonly TimeSpan FlushInterval = TimeSpan.FromMilliseconds(150);
 
@@ -72,12 +85,14 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
             throw new ArgumentOutOfRangeException(nameof(queueCapacity), "Queue capacity must be positive.");
         }
 
-        _queue = Channel.CreateBounded<SessionStreamEvent>(new BoundedChannelOptions(queueCapacity)
-        {
-            SingleReader = true,
-            SingleWriter = false,
-            FullMode = BoundedChannelFullMode.DropOldest
-        });
+        _queue = Channel.CreateBounded<SessionStreamEvent>(
+            new BoundedChannelOptions(queueCapacity)
+            {
+                SingleReader = true,
+                SingleWriter = false,
+                FullMode = BoundedChannelFullMode.DropOldest
+            },
+            dropped => Interlocked.Add(ref _queuedPayloadBytes, -PayloadBytes(dropped)));
 
         _senderTask = Task.Run(SenderLoopAsync);
     }
@@ -211,14 +226,51 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
 
     internal bool Enqueue(SessionStreamEvent evt)
     {
+        var bytes = PayloadBytes(evt);
+        if (Interlocked.Add(ref _queuedPayloadBytes, bytes) > MaxQueuedPayloadBytes)
+        {
+            Interlocked.Add(ref _queuedPayloadBytes, -bytes);
+            WarnRateLimited(
+                $"Session event queue is over its {MaxQueuedPayloadBytes} byte budget session={evt.SessionId ?? "-"}; dropping event.");
+            return false;
+        }
+
         if (!_queue.Writer.TryWrite(evt))
         {
+            Interlocked.Add(ref _queuedPayloadBytes, -bytes);
             RunnerLog.Error<ComfySessionEventRelay>(
                 $"Session event queue overflow session={evt.SessionId ?? "-"} client={evt.ClientId ?? "-"}; dropping event.");
             return false;
         }
 
         return true;
+    }
+
+    internal long QueuedPayloadBytes => Interlocked.Read(ref _queuedPayloadBytes);
+
+    internal void NoteOversizedMessage(string sessionId, long messageBytes)
+        => WarnRateLimited(
+            $"Dropped a session WebSocket message of {messageBytes} bytes session={sessionId}; the limit is {MaxRelayedMessageBytes} bytes.");
+
+    private static long PayloadBytes(SessionStreamEvent evt) => evt.Payload?.Length ?? 0;
+
+    private SessionStreamEvent Dequeued(SessionStreamEvent evt)
+    {
+        Interlocked.Add(ref _queuedPayloadBytes, -PayloadBytes(evt));
+        return evt;
+    }
+
+    private void WarnRateLimited(string message)
+    {
+        var now = Environment.TickCount64;
+        var last = Interlocked.Read(ref _lastOversizeWarningTicks);
+        if (now - last < OversizeWarningInterval.TotalMilliseconds ||
+            Interlocked.CompareExchange(ref _lastOversizeWarningTicks, now, last) != last)
+        {
+            return;
+        }
+
+        RunnerLog.Warning<ComfySessionEventRelay>(message);
     }
 
     private bool TryGetBridge(string sessionId, string clientId, RuntimeIdentity runtime, out SessionBridge bridge)
@@ -295,7 +347,7 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
             SessionStreamEvent evt;
             try
             {
-                evt = await _queue.Reader.ReadAsync(_shutdown.Token).ConfigureAwait(false);
+                evt = Dequeued(await _queue.Reader.ReadAsync(_shutdown.Token).ConfigureAwait(false));
             }
             catch (OperationCanceledException)
             {
@@ -303,13 +355,26 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
             }
 
             buffer.Add(evt);
+            var batchBytes = PayloadBytes(evt);
             var flushDelay = Task.Delay(FlushInterval, _shutdown.Token);
 
             while (buffer.Count < MaxBatchSize)
             {
-                if (_queue.Reader.TryRead(out var next))
+                // Peek first, so an event that would push the report past its byte budget
+                // starts the next report instead.
+                if (_queue.Reader.TryPeek(out var peeked))
                 {
-                    buffer.Add(next);
+                    if (batchBytes + PayloadBytes(peeked) > MaxBatchPayloadBytes)
+                    {
+                        break;
+                    }
+
+                    if (_queue.Reader.TryRead(out var next))
+                    {
+                        buffer.Add(Dequeued(next));
+                        batchBytes += PayloadBytes(next);
+                    }
+
                     continue;
                 }
 
@@ -336,7 +401,7 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
         // Drain remaining events best effort
         while (_queue.Reader.TryRead(out var remaining))
         {
-            buffer.Add(remaining);
+            buffer.Add(Dequeued(remaining));
             if (buffer.Count >= MaxBatchSize)
             {
                 await TryFlushBufferAsync(buffer).ConfigureAwait(false);
@@ -880,6 +945,7 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
                 {
                     using var ms = new MemoryStream();
                     WebSocketReceiveResult result;
+                    long messageBytes = 0;
                     do
                     {
                         result = await socket.ReceiveAsync(new ArraySegment<byte>(buffer), token).ConfigureAwait(false);
@@ -888,11 +954,21 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
                             await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "closing", token).ConfigureAwait(false);
                             return;
                         }
-                        if (result.Count > 0)
+
+                        // Session code controls message size: past the cap the rest of the
+                        // message is read and discarded instead of buffered.
+                        messageBytes += result.Count;
+                        if (result.Count > 0 && messageBytes <= MaxRelayedMessageBytes)
                         {
                             ms.Write(buffer, 0, result.Count);
                         }
                     } while (!result.EndOfMessage);
+
+                    if (messageBytes > MaxRelayedMessageBytes)
+                    {
+                        _owner.NoteOversizedMessage(_sessionId, messageBytes);
+                        continue;
+                    }
 
                     var payload = ms.ToArray();
                     var frameType = result.MessageType switch
