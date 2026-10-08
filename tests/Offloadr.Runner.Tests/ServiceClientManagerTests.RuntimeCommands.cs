@@ -206,6 +206,63 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
+    public async Task OlderAssignmentStart_DoesNotCancelTheNewerStartupOrItsPrompts()
+    {
+        const string olderSessionId = "33333333333343338333333333333333";
+        var harness = new RuntimeCommandHarness();
+        var prompt = harness.StartPrompt(8, 1, InstanceB);
+        var newerEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseNewer = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        harness.BeforeStart = async (start, token) =>
+        {
+            if (start.SessionId == CommandSessionId)
+            {
+                newerEntered.TrySetResult();
+                await releaseNewer.Task.WaitAsync(token);
+            }
+        };
+        var newerStart = Start(8, 1, InstanceB);
+        newerStart.AssignmentSequence = 10;
+        var olderStart = Start(1, 1, InstanceA, olderSessionId);
+        olderStart.AssignmentSequence = 9;
+
+        var newer = ServiceClientManager.HandleStartSessionCommand(newerStart, harness.Deps);
+        await newerEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await ServiceClientManager.HandleStartSessionCommand(olderStart, harness.Deps);
+        var olderAck = await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(olderAck.SessionId, Is.EqualTo(olderSessionId));
+            Assert.That(olderAck.Ready, Is.False);
+            Assert.That(prompt.IsCompleted, Is.False, "The newer session's prompt keeps running.");
+        });
+
+        releaseNewer.TrySetResult();
+        await newer.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Multiple(() =>
+        {
+            Assert.That(harness.Sink.StartAcks.Single(ack => ack.SessionId == CommandSessionId).Ready, Is.True);
+            Assert.That(harness.Tracked(olderSessionId), Is.Null);
+        });
+    }
+
+    [Test]
+    public void ObserveAssignment_FencesOlderStartsBeforeTheNewerOneIsAdopted()
+    {
+        var state = new ServiceClientManager.LogicalSessionState(string.Empty);
+
+        state.ObserveAssignment(10);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(state.IsStaleStart("session-a", new RuntimeIdentity(1, 1, "a-1"), 9), Is.True);
+            Assert.That(state.IsStaleStart("session-a", new RuntimeIdentity(1, 1, "a-1"), 10), Is.False);
+            Assert.That(state.IsStaleStart("session-a", new RuntimeIdentity(1, 1, "a-1"), 0), Is.False);
+        });
+    }
+
+    [Test]
     public async Task StopDuringStartup_CancelsTheStartupAndClearsItsState()
     {
         var harness = new RuntimeCommandHarness();

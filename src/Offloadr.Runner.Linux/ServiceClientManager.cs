@@ -520,6 +520,20 @@ internal static class ServiceClientManager
                Compare(candidate, restartRevision, current, currentRevision) == RuntimeOrder.Older;
 
         /// <summary>
+        /// True when a start is for a session that already ended here at that generation, or
+        /// is older than the newest assignment seen. Changes nothing, so it can run before any
+        /// tracked work is cancelled.
+        /// </summary>
+        public bool IsStaleStart(string? sessionId, RuntimeIdentity candidate, ulong assignmentSequence)
+            => IsRetired(sessionId?.Trim() ?? string.Empty, candidate) || IsOlderAssignment(assignmentSequence);
+
+        /// <summary>
+        /// Records an assignment as soon as its start arrives, so an older start delivered
+        /// afterwards is refused even while this one is still starting.
+        /// </summary>
+        public void ObserveAssignment(ulong assignmentSequence) => RecordAssignment(assignmentSequence);
+
+        /// <summary>
         /// Adopts the runtime only when it is the same as or newer than the current
         /// runtime of the same session. Another active session is replaced only when
         /// <paramref name="replaceOtherSession"/> is set.
@@ -2068,9 +2082,11 @@ internal static class ServiceClientManager
             RuntimeInstanceId = command.RuntimeInstanceId,
         };
 
-        // A delayed start for an older runtime of this session must not cancel
-        // or replace the newer one.
-        if (deps.LogicalSessionState.IsSuperseded(command.SessionId, runtimeIdentity, restartRevision: 0))
+        // A delayed start for an older runtime of this session, for a session that already
+        // ended here, or from an older assignment must not cancel or replace newer work.
+        // These checks run before any tracked startup or prompt is cancelled.
+        if (deps.LogicalSessionState.IsSuperseded(command.SessionId, runtimeIdentity, restartRevision: 0) ||
+            deps.LogicalSessionState.IsStaleStart(command.SessionId, runtimeIdentity, command.AssignmentSequence))
         {
             RunnerLog.Warning(nameof(ServiceClientManager), $"Rejecting stale start for session {command.SessionId}.");
             ack.Ready = false;
@@ -2081,6 +2097,8 @@ internal static class ServiceClientManager
                 command.SessionId,
                 deps.Shutdown);
         }
+
+        deps.LogicalSessionState.ObserveAssignment(command.AssignmentSequence);
 
         return RunTrackedStartupAsync(
             deps,
