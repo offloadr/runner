@@ -190,9 +190,10 @@ public sealed class LinuxUserIsolationStrategy : ISessionIsolationStrategy
 
     public async Task CleanupStaleAsync(string sessionRoot, CancellationToken cancellationToken)
     {
-        foreach (var (userName, userId) in LinuxSessionResidue.ReadUsers(_passwdPath))
+        foreach (var (userName, userId, homeDirectory) in LinuxSessionResidue.ReadUsers(_passwdPath))
         {
-            if (!userName.StartsWith(SessionUserPrefix, StringComparison.Ordinal) || userId == 0)
+            if (!userName.StartsWith(SessionUserPrefix, StringComparison.Ordinal) || userId == 0 ||
+                !IsRunnerSessionAccount(sessionRoot, userName, homeDirectory))
             {
                 continue;
             }
@@ -219,6 +220,23 @@ public sealed class LinuxUserIsolationStrategy : ISessionIsolationStrategy
         {
             RunnerLog.Warning<LinuxUserIsolationStrategy>($"Removed {removed} stale session home(s) from '{sessionRoot}'.");
         }
+    }
+
+    /// <summary>
+    /// True only for accounts this runner creates: the home is a session folder directly
+    /// beneath the session root, named by a session id that maps to this account name.
+    /// Other accounts that merely share the prefix are left alone.
+    /// </summary>
+    internal static bool IsRunnerSessionAccount(string sessionRoot, string userName, string homeDirectory)
+    {
+        if (!SessionHomePaths.IsDirectChildOf(sessionRoot, homeDirectory))
+        {
+            return false;
+        }
+
+        var sessionId = Path.GetFileName(Path.TrimEndingDirectorySeparator(homeDirectory));
+        return SessionHomePaths.IsValidSessionId(sessionId) &&
+               string.Equals(LinuxSessionIdentity.BuildUserName(sessionId), userName, StringComparison.Ordinal);
     }
 
     private void RemoveSharedResidue(string userName, uint userId)

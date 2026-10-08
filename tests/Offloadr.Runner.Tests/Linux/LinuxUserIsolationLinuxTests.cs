@@ -192,12 +192,13 @@ public class LinuxUserIsolationLinuxTests
         var outside = Path.Combine(root, "outside");
         Directory.CreateDirectory(sessionRoot);
         Directory.CreateDirectory(outside);
-        var staleUser = $"sess_st{Guid.NewGuid():N}"[..17];
+        var staleSessionId = Guid.NewGuid().ToString();
+        var staleUser = LinuxSessionIdentity.BuildUserName(staleSessionId);
         var commandRunner = new LinuxCommandRunner();
         uint staleUserId = 0;
         try
         {
-            var staleHome = Path.Combine(sessionRoot, "stale-session");
+            var staleHome = Path.Combine(sessionRoot, staleSessionId);
             await commandRunner.RunAsync(
                 new LinuxCommand("/usr/sbin/useradd", ["--home-dir", staleHome, "-m", "--shell", "/usr/sbin/nologin", staleUser]),
                 CancellationToken.None);

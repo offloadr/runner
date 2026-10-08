@@ -82,9 +82,9 @@ public static class LinuxSessionResidue
     }
 
     /// <summary>Reads (name, uid) pairs from a passwd-format file.</summary>
-    public static IReadOnlyList<(string UserName, uint UserId)> ReadUsers(string passwdPath)
+    public static IReadOnlyList<(string UserName, uint UserId, string HomeDirectory)> ReadUsers(string passwdPath)
     {
-        var users = new List<(string, uint)>();
+        var users = new List<(string, uint, string)>();
         string[] lines;
         try
         {
@@ -102,7 +102,7 @@ public static class LinuxSessionResidue
                 fields[0].Length > 0 &&
                 uint.TryParse(fields[2], NumberStyles.None, CultureInfo.InvariantCulture, out var userId))
             {
-                users.Add((fields[0], userId));
+                users.Add((fields[0], userId, fields.Length > 5 ? fields[5] : string.Empty));
             }
         }
 

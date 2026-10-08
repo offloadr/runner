@@ -56,6 +56,24 @@ public class SessionIsolationTests
     }
 
     [Test]
+    public void IsRunnerSessionAccount_AcceptsOnlyAccountsWithARunnerSessionHome()
+    {
+        var sessionRoot = Path.Combine(Path.GetTempPath(), "sessions-root");
+        var runnerHome = Path.Combine(sessionRoot, SessionId);
+        var runnerUser = LinuxSessionIdentity.BuildUserName(SessionId);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(LinuxUserIsolationStrategy.IsRunnerSessionAccount(sessionRoot, runnerUser, runnerHome), Is.True);
+            Assert.That(LinuxUserIsolationStrategy.IsRunnerSessionAccount(sessionRoot, runnerUser, "/home/" + runnerUser), Is.False);
+            Assert.That(LinuxUserIsolationStrategy.IsRunnerSessionAccount(sessionRoot, "sess_service", Path.Combine(sessionRoot, "service")), Is.False);
+            Assert.That(LinuxUserIsolationStrategy.IsRunnerSessionAccount(sessionRoot, "sess_other", runnerHome), Is.False);
+            Assert.That(LinuxUserIsolationStrategy.IsRunnerSessionAccount(sessionRoot, runnerUser, Path.Combine(runnerHome, "nested")), Is.False);
+            Assert.That(LinuxUserIsolationStrategy.IsRunnerSessionAccount(string.Empty, runnerUser, runnerHome), Is.False);
+        });
+    }
+
+    [Test]
     public async Task PrepareAsync_WithUuidSessionId_PreparesHomeBeneathSessionRoot()
     {
         var root = CreateTempDirectory();
