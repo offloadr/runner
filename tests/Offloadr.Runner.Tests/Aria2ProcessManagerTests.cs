@@ -84,4 +84,80 @@ public class Aria2ProcessManagerTests
             arguments,
             Has.None.StartsWith("--stop-with-process="));
     }
+
+    [Test]
+    public async Task BuildArguments_KeepsRpcOnLoopbackAndSecretOutOfArgv()
+    {
+        var settings = Aria2Settings.FromEnvironment(static _ => null, static () => "rpc-secret-value");
+        await using var manager = new Aria2ProcessManager(settings);
+        var buildArguments = typeof(Aria2ProcessManager).GetMethod(
+            "BuildArguments",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+
+        var arguments = ((IEnumerable<string>)buildArguments!.Invoke(manager, null)!).ToArray();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(arguments, Has.None.Contains("rpc-secret-value"));
+            Assert.That(arguments, Has.None.StartsWith("--rpc-secret"));
+            Assert.That(arguments, Does.Contain("--rpc-listen-all=false"));
+            Assert.That(arguments, Has.None.StartsWith("--rpc-allow-origin-all"));
+            Assert.That(arguments, Does.Contain($"--conf-path={manager.RpcConfigPath}"));
+        });
+    }
+
+    [Test]
+    public async Task WriteRpcConfig_WritesSecretToOwnerOnlyFile()
+    {
+        var stateDirectory = Path.Combine(Path.GetTempPath(), $"aria2-state-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(stateDirectory);
+        try
+        {
+            var settings = Aria2Settings.FromEnvironment(
+                name => name == "ARIA2_STATE_DIR" ? stateDirectory : null,
+                static () => "rpc-secret-value");
+            await using var manager = new Aria2ProcessManager(settings);
+            File.WriteAllText(manager.RpcConfigPath, "stale");
+
+            manager.WriteRpcConfig();
+
+            Assert.That(File.ReadAllText(manager.RpcConfigPath), Is.EqualTo("rpc-secret=rpc-secret-value\n"));
+            if (!OperatingSystem.IsWindows())
+            {
+                Assert.That(
+                    File.GetUnixFileMode(manager.RpcConfigPath),
+                    Is.EqualTo(UnixFileMode.UserRead | UnixFileMode.UserWrite));
+            }
+        }
+        finally
+        {
+            Directory.Delete(stateDirectory, recursive: true);
+        }
+    }
+
+    [Test]
+    public async Task WriteRpcConfig_RejectsMultiLineSecret()
+    {
+        var stateDirectory = Path.Combine(Path.GetTempPath(), $"aria2-state-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(stateDirectory);
+        try
+        {
+            var settings = Aria2Settings.FromEnvironment(
+                name => name switch
+                {
+                    "ARIA2_STATE_DIR" => stateDirectory,
+                    "ARIA2_RPC_SECRET" => "first\nrpc-listen-all=true",
+                    _ => null,
+                },
+                static () => "unused");
+            await using var manager = new Aria2ProcessManager(settings);
+
+            Assert.Throws<InvalidOperationException>(manager.WriteRpcConfig);
+            Assert.That(File.Exists(manager.RpcConfigPath), Is.False);
+        }
+        finally
+        {
+            Directory.Delete(stateDirectory, recursive: true);
+        }
+    }
 }

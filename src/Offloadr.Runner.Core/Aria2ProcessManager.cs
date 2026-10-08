@@ -56,6 +56,7 @@ internal sealed class Aria2ProcessManager : IAsyncDisposable
             Directory.CreateDirectory(_options.DownloadDirectory);
             Directory.CreateDirectory(_options.StateDirectory);
             EnsureSessionFileExists();
+            WriteRpcConfig();
 
             var psi = BuildStartInfo();
             var process = Process.Start(psi);
@@ -285,11 +286,11 @@ internal sealed class Aria2ProcessManager : IAsyncDisposable
 
     private IEnumerable<string> BuildArguments()
     {
+        // The RPC secret is read from a root-only file: argv is visible to every process.
+        yield return $"--conf-path={RpcConfigPath}";
         yield return "--enable-rpc=true";
-        yield return "--rpc-listen-all=true";
+        yield return "--rpc-listen-all=false";
         yield return $"--rpc-listen-port={_options.RpcPort}";
-        yield return $"--rpc-secret={_options.RpcSecret}";
-        yield return "--rpc-allow-origin-all=true";
         yield return $"--dir={_options.DownloadDirectory}";
         yield return $"--save-session={_options.SessionFilePath}";
         yield return $"--save-session-interval={_options.SaveSessionInterval}";
@@ -344,6 +345,26 @@ internal sealed class Aria2ProcessManager : IAsyncDisposable
         {
             Timeout = TimeSpan.FromSeconds(10)
         };
+    }
+
+    internal string RpcConfigPath => Path.Combine(_options.StateDirectory, "rpc.conf");
+
+    internal void WriteRpcConfig()
+    {
+        if (_options.RpcSecret.AsSpan().ContainsAny('\r', '\n'))
+        {
+            throw new InvalidOperationException("The aria2 RPC secret must be a single line.");
+        }
+
+        File.Delete(RpcConfigPath);
+        var fileOptions = new FileStreamOptions { Mode = FileMode.CreateNew, Access = FileAccess.Write };
+        if (!OperatingSystem.IsWindows())
+        {
+            fileOptions.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+        }
+
+        using var writer = new StreamWriter(RpcConfigPath, fileOptions);
+        writer.Write($"rpc-secret={_options.RpcSecret}\n");
     }
 
     private void EnsureSessionFileExists()
