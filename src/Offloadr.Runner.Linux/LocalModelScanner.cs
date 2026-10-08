@@ -93,33 +93,42 @@ internal sealed class LocalModelScanner
         }
 
         var items = new List<ModelInfo>();
-        IEnumerable<string> files;
+        // Enumeration is lazy, so traversal errors surface while iterating: the whole walk
+        // is guarded, and unreadable folders are skipped rather than failing the scan.
         try
         {
-            files = Directory.EnumerateFiles(_rootDirectory, "*", SearchOption.AllDirectories);
+            var files = Directory.EnumerateFiles(
+                _rootDirectory,
+                "*",
+                new EnumerationOptions
+                {
+                    RecurseSubdirectories = true,
+                    IgnoreInaccessible = true,
+                    // As SearchOption.AllDirectories did: dot-files are not skipped.
+                    AttributesToSkip = 0,
+                });
+            foreach (var path in files)
+            {
+                ModelInfo? model = null;
+                try
+                {
+                    model = BuildModelInfo(path);
+                }
+                catch (Exception ex)
+                {
+                    RunnerLog.Error<LocalModelScanner>(ex, $"Failed to index local model '{path}': {ex.Message}");
+                }
+
+                if (model is not null)
+                {
+                    items.Add(model);
+                }
+            }
         }
         catch (Exception ex)
         {
             RunnerLog.Error<LocalModelScanner>(ex, $"Failed enumerating local model directory '{_rootDirectory}': {ex.Message}");
             return CreateSnapshot(Array.Empty<ModelInfo>());
-        }
-
-        foreach (var path in files)
-        {
-            ModelInfo? model = null;
-            try
-            {
-                model = BuildModelInfo(path);
-            }
-            catch (Exception ex)
-            {
-                RunnerLog.Error<LocalModelScanner>(ex, $"Failed to index local model '{path}': {ex.Message}");
-            }
-
-            if (model is not null)
-            {
-                items.Add(model);
-            }
         }
 
         items.Sort(static (left, right) =>
