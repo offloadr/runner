@@ -592,7 +592,7 @@ internal sealed partial class SessionProcessManager : IDisposable
         void EnsureCurrent()
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (context.StopInProgress || context.Process.HasExited || context.RuntimeIdentity != expected
+            if (context.StopInProgress || context.Process.HasExited || !context.RuntimeIdentity.SameRuntime(expected)
                 || !_sessions.TryGetValue(sessionId, out var current) || !ReferenceEquals(current, context))
                 throw new InvalidOperationException("The captured relay runtime is stopped, replaced or mismatched.");
         }

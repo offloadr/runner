@@ -1085,6 +1085,37 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
+    public async Task HandleUnexpectedRuntimeExitAsync_ClearsAStartThatUsedAHyphenatedInstanceId()
+    {
+        var instance = Guid.NewGuid();
+        var logicalSession = new ServiceClientManager.LogicalSessionState(string.Empty);
+        // The start command carries the hyphenated spelling; the process manager keeps "n".
+        logicalSession.SetActiveRuntime("session-1", 7, 3, instance.ToString("D").ToUpperInvariant());
+        var runtimeIdentities = new RuntimeIdentityRegistry();
+        runtimeIdentities.Set("session-1", 7, 3, instance.ToString("D"));
+        var cleaned = new List<string>();
+
+        await ServiceClientManager.HandleUnexpectedRuntimeExitAsync(
+            "session-1",
+            new RuntimeIdentity(7, 3, instance.ToString("n")),
+            logicalSession,
+            runtimeIdentities,
+            (sessionId, _) =>
+            {
+                cleaned.Add(sessionId);
+                return Task.CompletedTask;
+            },
+            CancellationToken.None);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(logicalSession.GetActiveSessionId(), Is.Empty);
+            Assert.That(runtimeIdentities.TryGet("session-1", out _), Is.False);
+            Assert.That(cleaned, Is.EqualTo(new[] { "session-1" }));
+        });
+    }
+
+    [Test]
     public async Task HandleUnexpectedRuntimeExitAsync_LeavesAReplacementRuntimeAndItsSidecars()
     {
         var logicalSession = new ServiceClientManager.LogicalSessionState(string.Empty);

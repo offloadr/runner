@@ -71,7 +71,27 @@ public sealed class RuntimeIdentityRegistry
             lifecycleGeneration,
             runtimeEpoch,
             runtimeInstanceId?.Trim() ?? string.Empty);
-        return expected.IsValid && _identities.TryRemove(
-            new KeyValuePair<string, RuntimeIdentity>(sessionId.Trim(), expected));
+        if (!expected.IsValid)
+        {
+            return false;
+        }
+
+        // Instance ids can be spelled differently (hyphenated or compact GUIDs), so match
+        // on the normalized runtime, then remove exactly the stored entry.
+        var key = sessionId.Trim();
+        while (_identities.TryGetValue(key, out var current))
+        {
+            if (!current.SameRuntime(expected))
+            {
+                return false;
+            }
+
+            if (_identities.TryRemove(new KeyValuePair<string, RuntimeIdentity>(key, current)))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 }

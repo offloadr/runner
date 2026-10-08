@@ -500,7 +500,7 @@ internal static class ServiceClientManager
             {
                 var current = Volatile.Read(ref _state);
                 if (!string.Equals(current.SessionId, normalizedSessionId, StringComparison.Ordinal) ||
-                    current.RuntimeIdentity != expected)
+                    current.RuntimeIdentity is not { } currentRuntime || !currentRuntime.SameRuntime(expected))
                 {
                     return false;
                 }
@@ -649,7 +649,7 @@ internal static class ServiceClientManager
             {
                 var current = Volatile.Read(ref _state);
                 if (!string.Equals(current.SessionId, expectedSessionId, StringComparison.Ordinal) ||
-                    current.RuntimeIdentity != expectedRuntimeIdentity)
+                    current.RuntimeIdentity is not { } currentRuntime || !currentRuntime.SameRuntime(expectedRuntimeIdentity))
                 {
                     return;
                 }
