@@ -1508,8 +1508,35 @@ internal static class ServiceClientManager
         }
     }
 
+    /// <summary>
+    /// Handles Stop on the command stream. Physical cleanup is awaited; the
+    /// acknowledgement is retried detached with the identical request, so a lost
+    /// acknowledgement neither blocks later commands nor is dropped.
+    /// </summary>
     internal static async Task HandleStopSessionCommandAsync(StopSessionCommand command, RuntimeCommandDependencies deps)
     {
+        var ack = new AcknowledgeSessionStopRequest
+        {
+            SessionId = command.SessionId,
+            User = command.User,
+            CommandId = command.CommandId,
+            LifecycleGeneration = command.LifecycleGeneration,
+            RuntimeEpoch = command.RuntimeEpoch,
+            RuntimeInstanceId = command.RuntimeInstanceId,
+        };
+        var acknowledgementKey = string.IsNullOrWhiteSpace(command.CommandId) ? command.SessionId : command.CommandId;
+
+        if (IsStopSuperseded(command, deps))
+        {
+            // A delayed or redelivered Stop for an older runtime must not stop the
+            // newer one. The runtime it names is no longer running here.
+            RunnerLog.Warning(
+                nameof(ServiceClientManager),
+                $"Ignoring stale stop for session {command.SessionId}; a newer runtime is current.");
+            _ = AcknowledgeRuntimeCommandWithRetryAsync(deps.Sink.AckStopSessionAsync, ack, acknowledgementKey, deps.Shutdown);
+            return;
+        }
+
         await deps.WorkState.Prompts.CancelAndWaitAsync(
             prompt => prompt.SessionId == command.SessionId).ConfigureAwait(false);
 
@@ -1540,17 +1567,63 @@ internal static class ServiceClientManager
 
         deps.LogicalSessionState.ClearIfMatches(command.SessionId);
         deps.RuntimeIdentities.Remove(command.SessionId);
+        _ = AcknowledgeRuntimeCommandWithRetryAsync(deps.Sink.AckStopSessionAsync, ack, acknowledgementKey, deps.Shutdown);
+    }
 
-        try
+    /// <summary>
+    /// A Stop that carries a lifecycle generation is fenced: it is superseded when
+    /// the session's current runtime, tracked child or active startup is newer.
+    /// A Stop without one (an older control plane) is never fenced.
+    /// </summary>
+    private static bool IsStopSuperseded(StopSessionCommand command, RuntimeCommandDependencies deps)
+    {
+        if (command.LifecycleGeneration == 0)
         {
-            await deps.Sink.AckStopSessionAsync(
-                new AcknowledgeSessionStopRequest { SessionId = command.SessionId, User = command.User },
-                deps.Shutdown).ConfigureAwait(false);
+            return false;
         }
-        catch (Exception ex)
+
+        if (deps.LogicalSessionState.TryGetRuntime(command.SessionId, out var logical, out _) &&
+            IsNewerThanStop(logical, command))
         {
-            RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed stop ack: {ex.Message}");
+            return true;
         }
+
+        if (deps.GetTrackedRuntime(command.SessionId) is { } tracked && IsNewerThanStop(tracked, command))
+        {
+            return true;
+        }
+
+        return deps.WorkState.GetActiveStartup() is { } startup &&
+               string.Equals(startup.SessionId, command.SessionId, StringComparison.Ordinal) &&
+               IsNewerThanStop(startup.RuntimeIdentity, command);
+    }
+
+    private static bool IsNewerThanStop(RuntimeIdentity current, StopSessionCommand stop)
+    {
+        if (!current.IsValid)
+        {
+            return false;
+        }
+
+        if (current.LifecycleGeneration != stop.LifecycleGeneration)
+        {
+            return current.LifecycleGeneration > stop.LifecycleGeneration;
+        }
+
+        if (stop.RuntimeEpoch == 0)
+        {
+            return false;
+        }
+
+        if (current.RuntimeEpoch != stop.RuntimeEpoch)
+        {
+            return current.RuntimeEpoch > stop.RuntimeEpoch;
+        }
+
+        // Same position, different instance: the Stop names a runtime that is
+        // not this one, so it must not stop it.
+        return !string.IsNullOrWhiteSpace(stop.RuntimeInstanceId) &&
+               !current.SameRuntime(new RuntimeIdentity(stop.LifecycleGeneration, stop.RuntimeEpoch, stop.RuntimeInstanceId));
     }
 
     internal static Task HandleStartSessionCommand(StartSessionCommand command, RuntimeCommandDependencies deps)

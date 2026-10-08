@@ -41,6 +41,13 @@ message StartSessionCommand {
 message StopSessionCommand {
 	string session_id = 1;
 	string user = 2;
+	// Optional runtime identity of the Stop. When lifecycle_generation is set the
+	// runner ignores a Stop that is older than the session's current runtime;
+	// unset fields leave the Stop unfenced.
+	string command_id = 3;
+	uint64 lifecycle_generation = 4;
+	uint64 runtime_epoch = 5;
+	string runtime_instance_id = 6;
 }
 
 message QuiesceEditorRuntimeCommand {
@@ -290,6 +297,11 @@ message AcknowledgeEditorRuntimeLaunchRequest {
 message AcknowledgeSessionStopRequest {
     string session_id = 1;
     string user = 2;
+    // Echo of the Stop command's identity fields, unset when the Stop carried none.
+    string command_id = 3;
+    uint64 lifecycle_generation = 4;
+    uint64 runtime_epoch = 5;
+    string runtime_instance_id = 6;
 }
 
 message AcknowledgePromptResultRequest {

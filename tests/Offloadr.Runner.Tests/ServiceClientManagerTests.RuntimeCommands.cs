@@ -222,6 +222,7 @@ public partial class ServiceClientManagerTests
             new StopSessionCommand { SessionId = CommandSessionId, User = "alice" },
             harness.Deps).WaitAsync(TimeSpan.FromSeconds(5));
         await launch.WaitAsync(TimeSpan.FromSeconds(5));
+        await harness.Sink.WaitForAsync(harness.Sink.StopAcks, 1);
 
         Assert.Multiple(() =>
         {
@@ -391,6 +392,130 @@ public partial class ServiceClientManagerTests
             Assert.That(harness.Identities.TryGet(CommandSessionId, out _), Is.False);
         });
     }
+
+    [TestCase(6UL, 0UL, "")]
+    [TestCase(7UL, 2UL, "")]
+    [TestCase(7UL, 3UL, InstanceB)]
+    public async Task StaleStop_IsAcknowledgedWithoutStoppingTheNewerRuntime(ulong generation, ulong epoch, string instance)
+    {
+        var harness = RunningHarness(7, 3, InstanceA);
+        var prompt = harness.StartPrompt(7, 3, InstanceA);
+        var stop = Stop(generation, epoch, instance);
+
+        await ServiceClientManager.HandleStopSessionCommandAsync(stop, harness.Deps);
+
+        var ack = await harness.Sink.WaitForAsync(harness.Sink.StopAcks, 1);
+        Assert.Multiple(() =>
+        {
+            Assert.That(ack.CommandId, Is.EqualTo(stop.CommandId));
+            Assert.That(ack.LifecycleGeneration, Is.EqualTo(generation));
+            Assert.That(ack.RuntimeEpoch, Is.EqualTo(epoch));
+            Assert.That(ack.RuntimeInstanceId, Is.EqualTo(instance));
+            Assert.That(harness.Calls, Is.Empty);
+            Assert.That(prompt.IsCompleted, Is.False);
+            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(new RuntimeIdentity(7, 3, InstanceA)));
+            Assert.That(harness.Logical.GetActiveSessionId(), Is.EqualTo(CommandSessionId));
+            Assert.That(harness.Identities.TryGet(CommandSessionId, out _), Is.True);
+        });
+        await harness.Shutdown.CancelAsync();
+    }
+
+    [TestCase(7UL, 3UL, InstanceA)]
+    [TestCase(7UL, 0UL, "")]
+    [TestCase(8UL, 1UL, InstanceB)]
+    public async Task CurrentOrNewerStop_StopsTheRuntimeAndEchoesItsIdentity(ulong generation, ulong epoch, string instance)
+    {
+        var harness = RunningHarness(7, 3, InstanceA);
+        var stop = Stop(generation, epoch, instance);
+
+        await ServiceClientManager.HandleStopSessionCommandAsync(stop, harness.Deps);
+
+        var ack = await harness.Sink.WaitForAsync(harness.Sink.StopAcks, 1);
+        Assert.Multiple(() =>
+        {
+            Assert.That(ack.CommandId, Is.EqualTo(stop.CommandId));
+            Assert.That(ack.LifecycleGeneration, Is.EqualTo(generation));
+            Assert.That(harness.Tracked(CommandSessionId), Is.Null);
+            Assert.That(harness.Logical.GetActiveSessionId(), Is.Empty);
+            Assert.That(harness.Identities.TryGet(CommandSessionId, out _), Is.False);
+        });
+    }
+
+    [Test]
+    public async Task UnfencedStopFromAnOlderControlPlane_KeepsTodaysBehaviour()
+    {
+        var harness = RunningHarness(7, 3, InstanceA);
+
+        await ServiceClientManager.HandleStopSessionCommandAsync(
+            new StopSessionCommand { SessionId = CommandSessionId, User = "alice" },
+            harness.Deps);
+
+        var ack = await harness.Sink.WaitForAsync(harness.Sink.StopAcks, 1);
+        Assert.Multiple(() =>
+        {
+            Assert.That(ack.SessionId, Is.EqualTo(CommandSessionId));
+            Assert.That(ack.CommandId, Is.Empty);
+            Assert.That(ack.LifecycleGeneration, Is.Zero);
+            Assert.That(harness.Tracked(CommandSessionId), Is.Null);
+            Assert.That(harness.Logical.GetActiveSessionId(), Is.Empty);
+        });
+    }
+
+    [Test]
+    public async Task StaleStop_DoesNotCancelTheNewerStartup()
+    {
+        var harness = new RuntimeCommandHarness();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        harness.BeforeStart = async (_, token) =>
+        {
+            entered.TrySetResult();
+            await release.Task.WaitAsync(token);
+        };
+
+        var start = ServiceClientManager.HandleStartSessionCommand(Start(8, 1, InstanceB), harness.Deps);
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await ServiceClientManager.HandleStopSessionCommandAsync(Stop(7, 3, InstanceA), harness.Deps);
+        release.TrySetResult();
+        await start.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(harness.Sink.StartAcks.Single().Ready, Is.True);
+            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(new RuntimeIdentity(8, 1, InstanceB)));
+        });
+    }
+
+    [Test]
+    public async Task StopAcknowledgement_IsRetriedWithTheIdenticalRequest()
+    {
+        var harness = RunningHarness(7, 3, InstanceA);
+        harness.Sink.FailNextAcknowledgements(2);
+        var stop = Stop(7, 3, InstanceA);
+
+        await ServiceClientManager.HandleStopSessionCommandAsync(stop, harness.Deps);
+        await harness.Sink.WaitForAsync(harness.Sink.StopAcks, 1);
+
+        var attempts = harness.Sink.Attempts.OfType<AcknowledgeSessionStopRequest>().ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(attempts, Has.Count.EqualTo(3));
+            Assert.That(attempts.Distinct(), Has.Exactly(1).Items);
+            Assert.That(attempts[0].CommandId, Is.EqualTo(stop.CommandId));
+            Assert.That(harness.Calls.Count(call => call.StartsWith("stop:", StringComparison.Ordinal)), Is.EqualTo(1));
+        });
+    }
+
+    private static StopSessionCommand Stop(ulong generation, ulong epoch, string instance)
+        => new()
+        {
+            SessionId = CommandSessionId,
+            User = "alice",
+            CommandId = Guid.NewGuid().ToString("n"),
+            LifecycleGeneration = generation,
+            RuntimeEpoch = epoch,
+            RuntimeInstanceId = instance,
+        };
 
     private static async Task WaitUntilAsync(Func<bool> condition, TimeSpan? timeout = null)
     {
