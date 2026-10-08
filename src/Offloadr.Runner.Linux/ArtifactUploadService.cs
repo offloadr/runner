@@ -1574,6 +1574,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
                     await using var stream = opened;
                     var sizeBytes = stream.Length;
+                    var snapshotWriteUtc = LinuxSecureDirectoryRoot.GetOpenFileStatus(stream.SafeFileHandle, relPath).LastWriteTimeUtc;
                     if (sizeBytes > MaxUploadBytes)
                     {
                         _logger.LogWarning(
@@ -1654,13 +1655,38 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         throw new InvalidOperationException(string.IsNullOrWhiteSpace(response.Message) ? "upload failed" : response.Message);
                     }
 
-                    var createdUtc = DateTimeOffset.UtcNow;
+                    // A rewrite during the upload is dropped by the pending set, so compare the
+                    // file with the snapshot that was sent before recording it as uploaded.
+                    SecureFileStatus after;
+                    using (var secureRoot = new LinuxSecureDirectoryRoot(root))
+                    {
+                        after = secureRoot.GetStatus(relPath);
+                    }
+
+                    var changedDuringUpload = !after.IsRegularFile ||
+                                              after.Length != sizeBytes ||
+                                              after.LastWriteTimeUtc != snapshotWriteUtc;
+
+                    // When it changed, record the snapshot's time so a later scan sees a newer file.
+                    var createdUtc = changedDuringUpload
+                        ? new DateTimeOffset(snapshotWriteUtc, TimeSpan.Zero)
+                        : DateTimeOffset.UtcNow;
                     var localPath = NormalizePath(fullPath);
                     var remote = new RemoteArtifactState(_editorSid, type, subfolder, fileName, localPath, sizeBytes, null, createdUtc);
                     _catalog[remote.LocalPath] = remote;
                     remote.MarkDownloaded();
 
                     _logger.LogInformation("Uploaded artifact session={SessionId} type={Type} path={Relative}", _sessionId, type, relPath);
+                    if (changedDuringUpload && after.IsRegularFile && request.Attempt < 3)
+                    {
+                        _logger.LogInformation(
+                            "Artifact changed during upload; uploading it again session={SessionId} type={Type} path={Relative}",
+                            _sessionId,
+                            type,
+                            relPath);
+                        return request with { Attempt = request.Attempt + 1 };
+                    }
+
                     return null;
                 }
                 catch (UnauthorizedAccessException ex)

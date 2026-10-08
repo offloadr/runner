@@ -348,6 +348,47 @@ public partial class ArtifactUploadServiceTests
         }
     }
 
+    [Test]
+    public async Task Upload_IsRepeatedWhenTheFileChangesWhileItIsSent()
+    {
+        var root = CreateTempDirectory();
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
+        {
+            var paths = CreateSessionPaths(root);
+            var output = Path.Combine(paths.OutputDirectory, "image.png");
+            File.WriteAllBytes(output, [1, 2, 3, 4]);
+            var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse())
+            {
+                UploadGate = gate.Task
+            };
+            await using var service = new ArtifactUploadService(
+                runnerSecret: "runner-secret-value",
+                artifactClient,
+                NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+
+            var first = await artifactClient.WaitForUploadAsync(TimeSpan.FromSeconds(10));
+            // Same size, new content and time, while the first upload awaits its response.
+            File.WriteAllBytes(output, [5, 6, 7, 8]);
+            File.SetLastWriteTimeUtc(output, DateTime.UtcNow.AddMinutes(1));
+            gate.TrySetResult();
+            var second = await artifactClient.WaitForUploadAsync(TimeSpan.FromSeconds(10));
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(first.Metadata!.Filename, Is.EqualTo("image.png"));
+                Assert.That(second.Metadata!.Filename, Is.EqualTo("image.png"));
+            });
+        }
+        finally
+        {
+            gate.TrySetResult();
+            TryDelete(root);
+        }
+    }
+
     private static SessionProcessManager.SessionPaths CreateSessionPaths(string root)
     {
         var paths = new SessionProcessManager.SessionPaths

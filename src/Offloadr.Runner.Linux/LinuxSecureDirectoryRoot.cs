@@ -504,6 +504,10 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
         }
     }
 
+    /// <summary>Reads the status of a file that is already open, as <see cref="GetStatus(string)"/> would.</summary>
+    public static SecureFileStatus GetOpenFileStatus(SafeFileHandle file, string relativePath)
+        => ReadStatus(file, relativePath);
+
     private static SecureFileStatus ReadStatus(SafeFileHandle file, string relativePath)
     {
         var buffer = Marshal.AllocHGlobal(StatxBufferSize);
