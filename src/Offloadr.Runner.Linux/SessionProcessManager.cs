@@ -785,12 +785,46 @@ internal sealed partial class SessionProcessManager : IDisposable
 
             EnsurePromptContext(command, context, cancellationToken);
             onNativeRequestAttempt?.Invoke();
-            using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseContentRead, cancellationToken).ConfigureAwait(false);
+            // Only the status matters; the body is never read, so it is not buffered either.
+            using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
             if (!response.IsSuccessStatusCode)
             {
                 throw new InvalidOperationException($"Forge preflight failed with {(int)response.StatusCode}; its effect is uncertain.");
             }
         }
+    }
+
+    /// <summary>
+    /// Reads a small editor response as text without buffering more than the runtime
+    /// response limit: the editor runs session code and decides how much it returns.
+    /// </summary>
+    internal static async Task<string> ReadBoundedStringAsync(HttpClient client, Uri uri, CancellationToken cancellationToken)
+    {
+        using var response = await client.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+        response.EnsureSuccessStatusCode();
+        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+        using var body = new MemoryStream();
+        var buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
+        try
+        {
+            int read;
+            while ((read = await stream.ReadAsync(buffer, cancellationToken).ConfigureAwait(false)) > 0)
+            {
+                if (body.Length + read > ComfyRuntimeTransportLimits.MaxResponseBodyBytes)
+                {
+                    throw new InvalidOperationException(
+                        $"Editor response from '{uri.AbsolutePath}' exceeds {ComfyRuntimeTransportLimits.MaxResponseBodyBytes} bytes.");
+                }
+
+                body.Write(buffer, 0, read);
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
+
+        return Encoding.UTF8.GetString(body.GetBuffer(), 0, (int)body.Length);
     }
 
     private async Task<string> NormalizeForgeQueueJoinDataArityAsync(string promptJson, SubmitPromptCommand command, SessionContext context, CancellationToken cancellationToken)
@@ -799,7 +833,7 @@ internal sealed partial class SessionProcessManager : IDisposable
         {
             var builder = new UriBuilder("http", _readyHost, _comfyPort, "config");
             EnsurePromptContext(command, context, cancellationToken);
-            var configJson = await _httpClient.GetStringAsync(builder.Uri, cancellationToken).ConfigureAwait(false);
+            var configJson = await ReadBoundedStringAsync(_httpClient, builder.Uri, cancellationToken).ConfigureAwait(false);
             var normalized = NormalizeForgeQueueJoinDataArity(promptJson, configJson, out var adjustment);
             if (adjustment is not null)
             {
