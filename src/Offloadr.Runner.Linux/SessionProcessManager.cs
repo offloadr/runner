@@ -1733,11 +1733,26 @@ internal sealed partial class SessionProcessManager : IDisposable
             return false;
         }
 
+        // The sync ran session code as the session user, which owns the venv by now, while the
+        // detach below moves entries as root. Only act on site-packages reached through real
+        // directories, so a planted symlink cannot point root at the shared seed or other
+        // root-owned trees. The venv's parent is the session home, which the user cannot replace.
+        var trustedRoot = Path.GetDirectoryName(Path.GetFullPath(paths.VirtualEnvDirectory));
+        if (string.IsNullOrEmpty(trustedRoot) || !IsDirectoryChainWithoutLinks(trustedRoot, paths.VirtualEnvDirectory))
+        {
+            return false;
+        }
+
         var detached = false;
         foreach (var failedPath in ExtractBacktickPaths(processOutput))
         {
             foreach (var sitePackages in EnumerateSitePackagesDirectories(paths.VirtualEnvDirectory))
             {
+                if (!IsDirectoryChainWithoutLinks(trustedRoot, sitePackages))
+                {
+                    continue;
+                }
+
                 if (!TryGetSitePackagesRelativePath(sitePackages, failedPath, out var failedRelativePath, out var topLevelEntry))
                 {
                     continue;
@@ -1752,6 +1767,38 @@ internal sealed partial class SessionProcessManager : IDisposable
         }
 
         return detached;
+    }
+
+    /// <summary>
+    /// True when every component of <paramref name="path"/> below <paramref name="trustedRoot"/>
+    /// is an existing directory and none of them is a symbolic link.
+    /// </summary>
+    internal static bool IsDirectoryChainWithoutLinks(string trustedRoot, string path)
+    {
+        var root = Path.GetFullPath(trustedRoot);
+        var relative = Path.GetRelativePath(root, Path.GetFullPath(path));
+        if (string.Equals(relative, ".", StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        if (relative.StartsWith("..", StringComparison.Ordinal) || Path.IsPathFullyQualified(relative))
+        {
+            return false;
+        }
+
+        var current = root;
+        foreach (var segment in relative.Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries))
+        {
+            current = Path.Combine(current, segment);
+            var info = new DirectoryInfo(current);
+            if (info.LinkTarget is not null || !info.Exists)
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static IEnumerable<string> ExtractBacktickPaths(string text)
@@ -2025,7 +2072,7 @@ internal sealed partial class SessionProcessManager : IDisposable
         var remaining = normalizedPath[prefix.Length..];
         var separatorIndex = remaining.IndexOf('/');
         childName = separatorIndex < 0 ? remaining : remaining[..separatorIndex];
-        return !string.IsNullOrWhiteSpace(childName);
+        return !string.IsNullOrWhiteSpace(childName) && childName is not "." and not "..";
     }
 
     private static void RemoveMetadataEntries(IEnumerable<string> metadataEntries, SeedPayloadDetachTransaction detachTransaction)
@@ -2748,6 +2795,13 @@ internal sealed partial class SessionProcessManager : IDisposable
             }
 
             var backupPath = Path.Combine(_backupRoot, _entries.Count.ToString(CultureInfo.InvariantCulture));
+            var backupContainer = Path.GetDirectoryName(_backupRoot)!;
+            if (new DirectoryInfo(backupContainer).LinkTarget is not null)
+            {
+                // The session user owns the venv; never let root follow a planted link out of it.
+                throw new InvalidOperationException($"Seed detach backup directory '{backupContainer}' is a symbolic link.");
+            }
+
             Directory.CreateDirectory(Path.GetDirectoryName(backupPath)!);
             MoveEntry(path, backupPath);
             _entries.Add(new BackupEntry(path, backupPath));

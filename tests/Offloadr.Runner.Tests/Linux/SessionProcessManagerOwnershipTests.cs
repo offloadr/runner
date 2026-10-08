@@ -676,6 +676,82 @@ public partial class SessionProcessManagerOwnershipTests
     }
 
     [Test]
+    public void TryDetachSeedPayloadForFailedUvRemoval_IgnoresSitePackagesReachedThroughSymlink()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+
+        var tempRoot = Path.Combine(Path.GetTempPath(), $"runner-detach-linked-site-{Guid.NewGuid():N}");
+        var outsideSitePackages = Path.Combine(tempRoot, "outside", "site-packages");
+        var outsidePackage = Path.Combine(outsideSitePackages, "victim");
+        var outsideFile = Path.Combine(outsidePackage, "module.py");
+        var outsideMetadata = Path.Combine(outsideSitePackages, "victim-1.0.dist-info");
+        var sessionVenv = Path.Combine(tempRoot, "session", ".venv");
+        var sessionPythonDirectory = Path.Combine(sessionVenv, "lib", "python3.12");
+        var linkedSitePackages = Path.Combine(sessionPythonDirectory, "site-packages");
+
+        try
+        {
+            Directory.CreateDirectory(outsidePackage);
+            Directory.CreateDirectory(outsideMetadata);
+            File.WriteAllText(outsideFile, "# outside");
+            File.WriteAllText(Path.Combine(outsideMetadata, "RECORD"), "victim/module.py,,\n");
+            Directory.CreateDirectory(sessionPythonDirectory);
+            Directory.CreateSymbolicLink(linkedSitePackages, outsideSitePackages);
+
+            var paths = new SessionProcessManager.SessionPaths { VirtualEnvDirectory = sessionVenv };
+            var output = $"error: failed to remove file `{Path.Combine(linkedSitePackages, "victim", "module.py")}`: Permission denied";
+
+            var detached = SessionProcessManager.TryDetachSeedPayloadForFailedUvRemoval(paths, output);
+
+            Assert.That(detached, Is.False);
+            Assert.That(File.ReadAllText(outsideFile), Is.EqualTo("# outside"));
+            Assert.That(Directory.Exists(outsideMetadata), Is.True);
+            Assert.That(Directory.Exists(Path.Combine(sessionVenv, ".offloadr-seed-detach-backup")), Is.False);
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+        }
+    }
+
+    [Test]
+    public void TryDetachSeedPayloadForFailedUvRemoval_RefusesLinkedBackupDirectory()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+
+        var tempRoot = Path.Combine(Path.GetTempPath(), $"runner-detach-linked-backup-{Guid.NewGuid():N}");
+        var seedPackageDirectory = Path.Combine(tempRoot, "seed", "lib", "python3.12", "site-packages", "PIL");
+        var sessionVenv = Path.Combine(tempRoot, "session", ".venv");
+        var sessionSitePackages = Path.Combine(sessionVenv, "lib", "python3.12", "site-packages");
+        var sessionPackageDirectory = Path.Combine(sessionSitePackages, "PIL");
+        var sessionMetadataDirectory = Path.Combine(sessionSitePackages, "pillow-11.0.0.dist-info");
+        var outsideDirectory = Path.Combine(tempRoot, "outside");
+
+        try
+        {
+            Directory.CreateDirectory(seedPackageDirectory);
+            File.WriteAllText(Path.Combine(seedPackageDirectory, "__init__.py"), "# package");
+            Directory.CreateDirectory(sessionMetadataDirectory);
+            File.WriteAllText(Path.Combine(sessionMetadataDirectory, "RECORD"), "PIL/__init__.py,,\n");
+            Directory.CreateSymbolicLink(sessionPackageDirectory, seedPackageDirectory);
+            Directory.CreateDirectory(outsideDirectory);
+            Directory.CreateSymbolicLink(Path.Combine(sessionVenv, ".offloadr-seed-detach-backup"), outsideDirectory);
+
+            var paths = new SessionProcessManager.SessionPaths { VirtualEnvDirectory = sessionVenv };
+            var output = $"error: failed to remove file `{Path.Combine(sessionPackageDirectory, "__init__.py")}`: Permission denied";
+
+            Assert.Throws<InvalidOperationException>(() =>
+                SessionProcessManager.TryDetachSeedPayloadForFailedUvRemoval(paths, output));
+            Assert.That(Directory.EnumerateFileSystemEntries(outsideDirectory), Is.Empty);
+            Assert.That(new DirectoryInfo(sessionPackageDirectory).LinkTarget, Is.Not.Null);
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+        }
+    }
+
+    [Test]
     public void TryDetachSeedPayloadForFailedUvRemoval_PreservesUnrelatedNamespaceMetadata()
     {
         LinuxTestPrerequisites.RequireLinux();
