@@ -1052,7 +1052,7 @@ internal sealed partial class SessionProcessManager : IDisposable
                 if (!string.IsNullOrWhiteSpace(line))
                 {
                     RunnerLog.Info(sessionCategory, line);
-                    _processLogRelay?.Enqueue(sessionId, SessionProcessLogStream.Stdout, line);
+                    _processLogRelay?.Enqueue(sessionId, SessionProcessLogStream.Stdout, line, runtimeIdentity);
                 }
             });
             _ = BoundedLineReader.PumpAsync(process.StandardError, line =>
@@ -1060,7 +1060,7 @@ internal sealed partial class SessionProcessManager : IDisposable
                 if (!string.IsNullOrWhiteSpace(line))
                 {
                     RunnerLog.Info(sessionCategory, line);
-                    _processLogRelay?.Enqueue(sessionId, SessionProcessLogStream.Stderr, line);
+                    _processLogRelay?.Enqueue(sessionId, SessionProcessLogStream.Stderr, line, runtimeIdentity);
                 }
             });
 

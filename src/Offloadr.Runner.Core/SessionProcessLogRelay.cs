@@ -69,7 +69,12 @@ internal sealed class SessionProcessLogRelay : IAsyncDisposable
         }
     }
 
-    public void Enqueue(string sessionId, SessionProcessLogStream stream, string message)
+    /// <summary>
+    /// Queues one line of session process output. Pass the identity of the runtime that
+    /// wrote it: after a replacement under the same session id, the old process's buffered
+    /// output must not be labelled with the new runtime's identity.
+    /// </summary>
+    public void Enqueue(string sessionId, SessionProcessLogStream stream, string message, RuntimeIdentity? runtimeIdentity = null)
     {
         if (string.IsNullOrWhiteSpace(sessionId) || string.IsNullOrWhiteSpace(message))
         {
@@ -85,7 +90,13 @@ internal sealed class SessionProcessLogRelay : IAsyncDisposable
             CreatedUtc = Timestamp.FromDateTime(DateTime.UtcNow),
             Sequence = (ulong)Interlocked.Increment(ref _nextSequence)
         };
-        if (_runtimeIdentities?.TryGet(sessionId, out var identity) == true)
+        if (runtimeIdentity is { IsValid: true } writer)
+        {
+            entry.LifecycleGeneration = writer.LifecycleGeneration;
+            entry.RuntimeEpoch = writer.RuntimeEpoch;
+            entry.RuntimeInstanceId = writer.RuntimeInstanceId;
+        }
+        else if (_runtimeIdentities?.TryGet(sessionId, out var identity) == true)
         {
             entry.LifecycleGeneration = identity.LifecycleGeneration;
             entry.RuntimeEpoch = identity.RuntimeEpoch;

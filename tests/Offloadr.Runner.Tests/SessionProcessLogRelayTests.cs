@@ -29,6 +29,27 @@ public class SessionProcessLogRelayTests
     }
 
     [Test]
+    public async Task Enqueue_LabelsLinesWithTheWritingRuntimeAfterAReplacement()
+    {
+        var identities = new RuntimeIdentityRegistry();
+        // The registry already names the replacement while the old process still drains output.
+        identities.Set("session-1", 7, 4, "replacement");
+        await using var relay = new SessionProcessLogRelay("runner-1", identities);
+
+        relay.Enqueue("session-1", SessionProcessLogStream.Stdout, "old-runtime-line", new RuntimeIdentity(7, 3, "original"));
+        var client = new RecordingSink();
+        relay.AttachSink(client);
+
+        var request = await WaitForAsync(client.FirstRequest.Task, TimeSpan.FromSeconds(3));
+        var entry = request.Entries.Single();
+        Assert.Multiple(() =>
+        {
+            Assert.That(entry.RuntimeEpoch, Is.EqualTo(3));
+            Assert.That(entry.RuntimeInstanceId, Is.EqualTo("original"));
+        });
+    }
+
+    [Test]
     public async Task FlushRetries_TransientReportFailure()
     {
         var client = new FailingThenSucceedingSink(failuresBeforeSuccess: 1);
