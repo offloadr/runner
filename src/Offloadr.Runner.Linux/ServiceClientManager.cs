@@ -984,6 +984,10 @@ internal static class ServiceClientManager
             {
                 break;
             }
+            catch (RpcException ex) when (ex.StatusCode == StatusCode.Cancelled && shutdown.IsCancellationRequested)
+            {
+                break;
+            }
             catch (RpcException ex)
             {
                 if (ex.StatusCode == StatusCode.InvalidArgument && !lastRequestWasFullSnapshot)
@@ -1281,6 +1285,11 @@ internal static class ServiceClientManager
             }
             catch (OperationCanceledException) when (shutdown.IsCancellationRequested)
             {
+                break;
+            }
+            catch (RpcException ex) when (ex.StatusCode == StatusCode.Cancelled && shutdown.IsCancellationRequested)
+            {
+                // Host shutdown cancels the call; that is not a stream failure.
                 break;
             }
             catch (RpcException ex)
