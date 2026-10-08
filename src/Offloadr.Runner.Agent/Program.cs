@@ -2,6 +2,7 @@ using Offloadr.Runner.V1;
 using Grpc.Net.Client;
 using Microsoft.Extensions.Logging;
 using System.Reflection;
+using System.Runtime.InteropServices;
 
 var options = RunnerAgentOptions.FromEnvironment();
 await using var runnerLogRelay = new RunnerLogRelay(options.RunnerId);
@@ -51,6 +52,14 @@ Console.CancelKeyPress += (_, e) =>
     shutdown.Cancel();
     RunnerLog.Info("Cancellation requested (Ctrl+C)");
 };
+// Container stops send SIGTERM to PID 1; treat it as a host shutdown so commands drain
+// and sessions are cleaned up before the process exits.
+using var sigtermRegistration = PosixSignalRegistration.Create(PosixSignal.SIGTERM, context =>
+{
+    context.Cancel = true;
+    shutdown.Cancel();
+    RunnerLog.Info("Termination requested (SIGTERM)");
+});
 
 await using var sessionProcessLogRelay = new SessionProcessLogRelay(options.RunnerId, runtimeIdentities);
 await using var sessionRuntimeTelemetryRelay = new SessionRuntimeTelemetryRelay(options.RunnerId, runtimeIdentities);
