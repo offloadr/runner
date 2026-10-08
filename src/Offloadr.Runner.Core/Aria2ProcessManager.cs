@@ -11,6 +11,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 
 namespace Offloadr.Runner.Core;
 
@@ -74,8 +75,8 @@ internal sealed class Aria2ProcessManager : IAsyncDisposable
             };
 
             _process = process;
-            _stdoutPump = PumpOutputAsync(process.StandardOutput, line => RunnerLog.Info<Aria2ProcessManager>($"[aria2] {line}"), _pumpCancellation.Token);
-            _stderrPump = PumpOutputAsync(process.StandardError, line => RunnerLog.Error<Aria2ProcessManager>($"[aria2] {line}"), _pumpCancellation.Token);
+            _stdoutPump = PumpOutputAsync(process.StandardOutput, line => RunnerLog.Info<Aria2ProcessManager>($"[aria2] {RedactForLog(line, _options.RpcSecret)}"), _pumpCancellation.Token);
+            _stderrPump = PumpOutputAsync(process.StandardError, line => RunnerLog.Error<Aria2ProcessManager>($"[aria2] {RedactForLog(line, _options.RpcSecret)}"), _pumpCancellation.Token);
 
             _client = new Aria2NetClient(_options.RpcEndpoint, _options.RpcSecret, _httpClient);
 
@@ -580,7 +581,7 @@ internal sealed class Aria2ProcessManager : IAsyncDisposable
             if (_trace && request.Content != null)
             {
                 var payload = await request.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
-                RunnerLog.Info<Aria2ProcessManager>($"[aria2-rpc] -> {Sanitize(payload)}");
+                RunnerLog.Info<Aria2ProcessManager>($"[aria2-rpc] -> {RedactForLog(payload, _secret)}");
                 request.Content = new StringContent(payload, Encoding.UTF8, "application/json");
             }
 
@@ -589,18 +590,44 @@ internal sealed class Aria2ProcessManager : IAsyncDisposable
             if (_trace && response.Content != null)
             {
                 var body = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
-                RunnerLog.Info<Aria2ProcessManager>($"[aria2-rpc] <- {body}");
+                RunnerLog.Info<Aria2ProcessManager>($"[aria2-rpc] <- {RedactForLog(body, _secret)}");
                 response.Content = new StringContent(body, Encoding.UTF8, response.Content.Headers.ContentType?.MediaType ?? "application/json");
             }
 
             return response;
         }
+    }
 
-        private string Sanitize(string payload)
+    // Any scheme://authority/... run up to whitespace, a quote or an angle bracket. aria2 escapes
+    // '/' as \/ in its JSON, and JSON escapes such as & stay inside the match so no part of
+    // a query string survives.
+    private static readonly Regex UriPattern = new(
+        @"\b(?<scheme>[A-Za-z][A-Za-z0-9+.\-]*):(?<sep>//|\\/\\/)(?<authority>[^/\s""'<>?#\\]*)[^\s""'<>]*",
+        RegexOptions.CultureInvariant | RegexOptions.Compiled);
+
+    /// <summary>
+    /// Makes aria2 RPC payloads and console lines safe to log: download URIs are usually signed,
+    /// so each one keeps only its scheme and host, and the RPC secret is masked.
+    /// </summary>
+    internal static string RedactForLog(string text, string? secret)
+    {
+        if (string.IsNullOrEmpty(text))
         {
-            if (string.IsNullOrEmpty(payload) || string.IsNullOrEmpty(_secret)) return payload;
-            return payload.Replace(_secret, "***", StringComparison.Ordinal);
+            return text;
         }
+
+        if (!string.IsNullOrEmpty(secret))
+        {
+            text = text.Replace(secret, "***", StringComparison.Ordinal);
+        }
+
+        return UriPattern.Replace(text, match =>
+        {
+            var authority = match.Groups["authority"].Value;
+            var at = authority.LastIndexOf('@');
+            var host = at >= 0 ? authority[(at + 1)..] : authority;
+            return $"{match.Groups["scheme"].Value}:{match.Groups["sep"].Value}{host}/<redacted>";
+        });
     }
 }
 

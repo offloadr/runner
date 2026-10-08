@@ -27,6 +27,40 @@ public class Aria2ProcessManagerTests
     }
 
     [Test]
+    public void RedactForLog_RemovesSignedUriPathsAndQueries_AndMasksSecret()
+    {
+        const string addUri =
+            """{"jsonrpc":"2.0","method":"aria2.addUri","id":"1","params":["token:rpc-secret-value",["https://cdn.example.com/models/a.safetensors?X-Amz-Signature=abc123&X-Amz-Credential=key"],{"out":"a.safetensors"}]}""";
+        const string tellStatus =
+            """{"id":"2","result":{"files":[{"uris":[{"status":"used","uri":"https:\/\/user:pw@cdn.example.com:8443\/sig\/token-in-path?Expires=1&Signature=xyz"}]}]}}""";
+        const string consoleLine = "Exception: [AbstractCommand.cc:351] URI=http://mirror.example.org/file.bin?token=t0k3n";
+
+        var redactedAddUri = Aria2ProcessManager.RedactForLog(addUri, "rpc-secret-value");
+        var redactedStatus = Aria2ProcessManager.RedactForLog(tellStatus, "rpc-secret-value");
+        var redactedLine = Aria2ProcessManager.RedactForLog(consoleLine, "rpc-secret-value");
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(redactedAddUri, Does.Contain("https://cdn.example.com/<redacted>\""));
+            Assert.That(redactedAddUri, Does.Contain("token:***"));
+            Assert.That(redactedAddUri, Does.Contain("\"out\":\"a.safetensors\""));
+            Assert.That(redactedAddUri, Does.Not.Contain("rpc-secret-value"));
+            Assert.That(redactedAddUri, Does.Not.Contain("Signature"));
+            Assert.That(redactedAddUri, Does.Not.Contain("abc123"));
+            Assert.That(redactedAddUri, Does.Not.Contain("models/a.safetensors"));
+
+            Assert.That(redactedStatus, Does.Contain("https:\\/\\/cdn.example.com:8443/<redacted>\""));
+            Assert.That(redactedStatus, Does.Not.Contain("pw@"));
+            Assert.That(redactedStatus, Does.Not.Contain("token-in-path"));
+            Assert.That(redactedStatus, Does.Not.Contain("Signature"));
+            Assert.That(redactedStatus, Does.Not.Contain("xyz"));
+
+            Assert.That(redactedLine, Does.EndWith("URI=http://mirror.example.org/<redacted>"));
+            Assert.That(redactedLine, Does.Not.Contain("t0k3n"));
+        });
+    }
+
+    [Test]
     public async Task BuildArguments_UsesSingleQueueAndSuppressesRawConsoleOutput()
     {
         var settings = Aria2Settings.FromEnvironment(static _ => null, static () => "secret");
