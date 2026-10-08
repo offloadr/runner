@@ -578,6 +578,106 @@ public partial class ServiceClientManagerTests
         Assert.That(other.Token.IsCancellationRequested, Is.False);
     }
 
+    [Test]
+    public async Task EditorRequestRedeliveryAfterAcknowledgement_ReplaysTheResultWithItsDeliveryId()
+    {
+        var harness = new TransientRequestHarness();
+        var request = harness.Request("delivery-1");
+
+        await harness.DispatchAsync(request);
+        var redelivery = request.Clone();
+        redelivery.DeliveryId = "delivery-2";
+        await harness.DispatchAsync(redelivery);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(harness.Executions, Is.EqualTo(1));
+            Assert.That(harness.Acknowledgements.Select(ack => ack.DeliveryId), Is.EqualTo(new[] { "delivery-1", "delivery-2" }));
+            Assert.That(harness.Acknowledgements[1].Body, Is.EqualTo(harness.Acknowledgements[0].Body));
+            Assert.That(harness.Deliveries.InFlightCount, Is.Zero);
+        });
+    }
+
+    [Test]
+    public async Task EditorRequestRedeliveryWhileInFlight_AcknowledgesEveryDeliveryWithTheSameResult()
+    {
+        var harness = new TransientRequestHarness();
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        harness.BeforeResult = release.Task;
+        var request = harness.Request("delivery-1");
+
+        var first = harness.DispatchAsync(request);
+        var redelivery = request.Clone();
+        redelivery.DeliveryId = "delivery-2";
+        await harness.DispatchAsync(redelivery);
+        await harness.DispatchAsync(redelivery.Clone());
+        Assert.That(harness.Acknowledgements, Is.Empty);
+
+        release.TrySetResult();
+        await first.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(harness.Executions, Is.EqualTo(1));
+            Assert.That(harness.Acknowledgements.Select(ack => ack.DeliveryId).Order(), Is.EqualTo(new[] { "delivery-1", "delivery-2" }));
+            Assert.That(harness.Acknowledgements.Select(ack => ack.StatusCode).Distinct(), Is.EqualTo(new[] { 200 }));
+            Assert.That(harness.Deliveries.InFlightCount, Is.Zero);
+            Assert.That(harness.Cancellation.Count, Is.Zero);
+        });
+    }
+
+    private sealed class TransientRequestHarness
+    {
+        private int _executions;
+
+        public ServiceClientManager.TransientRequestDeliveries Deliveries { get; } = new(new ServiceClientManager.TransientAcknowledgementCache());
+        public ServiceClientManager.TransientCancellationRegistry Cancellation { get; } = new(CancellationToken.None);
+        public ConcurrentQueue<AcknowledgeEditorRuntimeRequestRequest> AcknowledgementQueue { get; } = new();
+        public List<AcknowledgeEditorRuntimeRequestRequest> Acknowledgements => [.. AcknowledgementQueue];
+        public int Executions => Volatile.Read(ref _executions);
+        public Task BeforeResult { get; set; } = Task.CompletedTask;
+
+        public RelayEditorRuntimeRequestCommand Request(string deliveryId) => new()
+        {
+            RequestId = "request-1",
+            DeliveryId = deliveryId,
+            RunnerId = CommandRunnerId,
+            SessionId = CommandSessionId,
+            LifecycleGeneration = 7,
+            RuntimeEpoch = 3,
+            RuntimeInstanceId = InstanceA,
+            Kind = Offloadr.EditorRuntime.V1.EditorRuntimeRequestKind.Read,
+        };
+
+        public Task DispatchAsync(RelayEditorRuntimeRequestCommand request)
+            => ServiceClientManager.DispatchTransientEditorRuntimeRequest(
+                request,
+                Deliveries,
+                Cancellation,
+                () => { },
+                async (command, token) =>
+                {
+                    var execution = Interlocked.Increment(ref _executions);
+                    await BeforeResult.WaitAsync(token).ConfigureAwait(false);
+                    return new AcknowledgeEditorRuntimeRequestRequest
+                    {
+                        RequestId = command.RequestId,
+                        DeliveryId = command.DeliveryId,
+                        RunnerId = CommandRunnerId,
+                        SessionId = command.SessionId,
+                        TransportSucceeded = true,
+                        StatusCode = 200,
+                        Body = Google.Protobuf.ByteString.CopyFromUtf8($"execution-{execution}"),
+                    };
+                },
+                (ack, _) =>
+                {
+                    AcknowledgementQueue.Enqueue(ack.Clone());
+                    return Task.CompletedTask;
+                },
+                CancellationToken.None);
+    }
+
     private static StopSessionCommand Stop(ulong generation, ulong epoch, string instance)
         => new()
         {

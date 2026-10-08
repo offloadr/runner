@@ -107,6 +107,84 @@ internal static class ServiceClientManager
         }
     }
 
+    internal enum TransientRequestAdmission
+    {
+        Execute,
+        Joined,
+        Replay,
+    }
+
+    /// <summary>
+    /// Tracks deliveries of transient editor requests by request id. Completed
+    /// results stay in the bounded acknowledgement cache, so a redelivery replays
+    /// the original result instead of executing again; deliveries that arrive while
+    /// the request runs are all acknowledged with its result.
+    /// </summary>
+    internal sealed class TransientRequestDeliveries(TransientAcknowledgementCache completed)
+    {
+        private readonly object _gate = new();
+        private readonly Dictionary<string, List<string>> _inFlight = new(StringComparer.Ordinal);
+
+        public int InFlightCount
+        {
+            get { lock (_gate) return _inFlight.Count; }
+        }
+
+        public TransientRequestAdmission Admit(
+            RelayEditorRuntimeRequestCommand request,
+            out AcknowledgeEditorRuntimeRequestRequest? replay)
+        {
+            lock (_gate)
+            {
+                if (completed.TryGet(request.RequestId, out var cached))
+                {
+                    cached.DeliveryId = request.DeliveryId;
+                    replay = cached;
+                    return TransientRequestAdmission.Replay;
+                }
+
+                replay = null;
+                if (_inFlight.TryGetValue(request.RequestId, out var deliveries))
+                {
+                    if (!deliveries.Contains(request.DeliveryId, StringComparer.Ordinal))
+                    {
+                        deliveries.Add(request.DeliveryId);
+                    }
+
+                    return TransientRequestAdmission.Joined;
+                }
+
+                _inFlight.Add(request.RequestId, [request.DeliveryId]);
+                return TransientRequestAdmission.Execute;
+            }
+        }
+
+        /// <summary>
+        /// Retains the result and returns one acknowledgement for every delivery
+        /// that awaited it, each with its own delivery id.
+        /// </summary>
+        public IReadOnlyList<AcknowledgeEditorRuntimeRequestRequest> Complete(AcknowledgeEditorRuntimeRequestRequest result)
+        {
+            lock (_gate)
+            {
+                completed.Set(result);
+                if (!_inFlight.Remove(result.RequestId, out var deliveries))
+                {
+                    deliveries = [result.DeliveryId];
+                }
+
+                return deliveries
+                    .Select(deliveryId =>
+                    {
+                        var acknowledgement = result.Clone();
+                        acknowledgement.DeliveryId = deliveryId;
+                        return acknowledgement;
+                    })
+                    .ToArray();
+            }
+        }
+    }
+
     internal sealed class RuntimeCommandDeduplicationCache(int maxEntries = 512)
     {
         private readonly object _gate = new();
@@ -1005,9 +1083,8 @@ internal static class ServiceClientManager
 
         var attempt = 0;
         var rng = new Random();
-        var completedTransientRequests = new TransientAcknowledgementCache();
+        var transientDeliveries = new TransientRequestDeliveries(new TransientAcknowledgementCache());
         var runtimeCommandDeduplication = new RuntimeCommandDeduplicationCache();
-        var inFlightTransientRequests = new ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
         var transientCancellation = new TransientCancellationRegistry(shutdown);
         using var ordinaryControlGate = new SemaphoreSlim(1, 1);
         using var readGate = new SemaphoreSlim(4, 4);
@@ -1119,44 +1196,28 @@ internal static class ServiceClientManager
                     if (evt.RelayEditorRuntimeRequest != null && !string.IsNullOrWhiteSpace(evt.RelayEditorRuntimeRequest.RequestId))
                     {
                         var runtimeRequest = evt.RelayEditorRuntimeRequest;
-                        if (completedTransientRequests.TryGet(runtimeRequest.RequestId, out var cachedAcknowledgement))
-                        {
-                            var replay = cachedAcknowledgement;
-                            replay.DeliveryId = runtimeRequest.DeliveryId;
-                            _ = AcknowledgeTransientRequestWithRetryAsync(
-                                sessionSink.AckEditorRuntimeRequestAsync,
-                                replay,
-                                shutdown);
-                            continue;
-                        }
-
-                        if (!inFlightTransientRequests.TryAdd(runtimeRequest.RequestId, 0))
-                        {
-                            continue;
-                        }
-
-                        if (runtimeRequest.Kind == EditorRuntimeRequestKind.Control &&
-                            ComfyRuntimeRoutes.IsGlobalInterrupt(runtimeRequest.Path, runtimeRequest.Body.Span))
-                        {
-                            commandWorkState.Prompts.Cancel(prompt =>
-                                TargetsPromptRuntime(runtimeRequest, prompt) && !ShouldStreamHttpResponse(prompt));
-                        }
-
-                        _ = HandleTransientEditorRuntimeRequestAsync(
+                        _ = DispatchTransientEditorRuntimeRequest(
                             runtimeRequest,
-                            runnerId,
-                            sessionManager,
-                            sessionEventRelay,
+                            transientDeliveries,
+                            transientCancellation,
+                            () =>
+                            {
+                                if (runtimeRequest.Kind == EditorRuntimeRequestKind.Control &&
+                                    ComfyRuntimeRoutes.IsGlobalInterrupt(runtimeRequest.Path, runtimeRequest.Body.Span))
+                                {
+                                    commandWorkState.Prompts.Cancel(prompt =>
+                                        TargetsPromptRuntime(runtimeRequest, prompt) && !ShouldStreamHttpResponse(prompt));
+                                }
+                            },
+                            (request, token) => ExecuteTransientEditorRuntimeRequestAsync(
+                                request,
+                                runnerId,
+                                sessionManager,
+                                sessionEventRelay,
+                                ordinaryControlGate,
+                                readGate,
+                                token),
                             sessionSink.AckEditorRuntimeRequestAsync,
-                            ordinaryControlGate,
-                            readGate,
-                            completedTransientRequests,
-                            inFlightTransientRequests,
-                            transientCancellation.Acquire(
-                                runtimeRequest.SessionId,
-                                runtimeRequest.LifecycleGeneration,
-                                runtimeRequest.RuntimeEpoch,
-                                runtimeRequest.RuntimeInstanceId),
                             shutdown);
                         continue;
                     }
@@ -2194,51 +2255,72 @@ internal static class ServiceClientManager
         }
     }
 
-    private static async Task HandleTransientEditorRuntimeRequestAsync(
-        RelayEditorRuntimeRequestCommand command,
-        string runnerId,
-        SessionProcessManager sessionManager,
-        ComfySessionEventRelay sessionEventRelay,
+    /// <summary>
+    /// Routes one delivery of a transient editor request. The first delivery
+    /// executes; a redelivery while it runs joins it and is acknowledged with the
+    /// same result under its own delivery id; a redelivery after completion
+    /// replays the retained result without executing again.
+    /// </summary>
+    internal static async Task DispatchTransientEditorRuntimeRequest(
+        RelayEditorRuntimeRequestCommand request,
+        TransientRequestDeliveries deliveries,
+        TransientCancellationRegistry cancellation,
+        Action beforeExecute,
+        Func<RelayEditorRuntimeRequestCommand, CancellationToken, Task<AcknowledgeEditorRuntimeRequestRequest>> execute,
         Func<AcknowledgeEditorRuntimeRequestRequest, CancellationToken, Task> acknowledge,
-        SemaphoreSlim ordinaryControlGate,
-        SemaphoreSlim readGate,
-        TransientAcknowledgementCache completedRequests,
-        ConcurrentDictionary<string, byte> inFlightRequests,
-        TransientCancellationRegistry.Lease cancellation,
         CancellationToken acknowledgementCancellationToken)
     {
+        switch (deliveries.Admit(request, out var replay))
+        {
+            case TransientRequestAdmission.Replay:
+                await AcknowledgeTransientRequestWithRetryAsync(acknowledge, replay!, acknowledgementCancellationToken).ConfigureAwait(false);
+                return;
+            case TransientRequestAdmission.Joined:
+                return;
+        }
+
+        AcknowledgeEditorRuntimeRequestRequest response;
         try
         {
-            await ExecuteTransientEditorRuntimeRequestAsync(
-                command,
-                runnerId,
-                sessionManager,
-                sessionEventRelay,
-                acknowledge,
-                ordinaryControlGate,
-                readGate,
-                completedRequests,
-                cancellation.Token,
-                acknowledgementCancellationToken).ConfigureAwait(false);
+            beforeExecute();
+            using var lease = cancellation.Acquire(
+                request.SessionId,
+                request.LifecycleGeneration,
+                request.RuntimeEpoch,
+                request.RuntimeInstanceId);
+            response = await execute(request, lease.Token).ConfigureAwait(false);
         }
-        finally
+        catch (Exception ex)
         {
-            cancellation.Dispose();
-            inFlightRequests.TryRemove(command.RequestId, out _);
+            RunnerLog.Error(nameof(ServiceClientManager), ex, $"Transient editor request {request.RequestId} failed: {ex.Message}");
+            response = new AcknowledgeEditorRuntimeRequestRequest
+            {
+                RequestId = request.RequestId,
+                DeliveryId = request.DeliveryId,
+                RunnerId = request.RunnerId,
+                SessionId = request.SessionId,
+                LifecycleGeneration = request.LifecycleGeneration,
+                RuntimeEpoch = request.RuntimeEpoch,
+                RuntimeInstanceId = request.RuntimeInstanceId,
+                Kind = request.Kind,
+                TransportSucceeded = false,
+                StatusCode = 502,
+                ErrorMessage = ex.Message,
+            };
         }
+
+        await Task.WhenAll(deliveries.Complete(response).Select(ack =>
+            AcknowledgeTransientRequestWithRetryAsync(acknowledge, ack, acknowledgementCancellationToken))).ConfigureAwait(false);
     }
 
-    private static async Task ExecuteTransientEditorRuntimeRequestAsync(
+    private static async Task<AcknowledgeEditorRuntimeRequestRequest> ExecuteTransientEditorRuntimeRequestAsync(
         RelayEditorRuntimeRequestCommand command,
         string runnerId,
         SessionProcessManager sessionManager,
         ComfySessionEventRelay sessionEventRelay,
-        Func<AcknowledgeEditorRuntimeRequestRequest, CancellationToken, Task> acknowledge,
         SemaphoreSlim ordinaryControlGate,
         SemaphoreSlim readGate,
-        TransientAcknowledgementCache completedRequests,
-        CancellationToken cancellationToken,
-        CancellationToken acknowledgementCancellationToken)
+        CancellationToken cancellationToken)
     {
         var response = new AcknowledgeEditorRuntimeRequestRequest
         {
@@ -2311,18 +2393,7 @@ internal static class ServiceClientManager
             }
         }
 
-        completedRequests.Set(response);
-        try
-        {
-            await AcknowledgeTransientRequestWithRetryAsync(
-                acknowledge,
-                response,
-                acknowledgementCancellationToken).ConfigureAwait(false);
-        }
-        finally
-        {
-            completedRequests.Remove(command.RequestId);
-        }
+        return response;
     }
 
     internal static async Task<bool> AcknowledgeTransientRequestWithRetryAsync(
