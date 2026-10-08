@@ -234,6 +234,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         private bool _activated;
         private bool _catalogLoaded;
         private long _droppedUploads;
+        private int _rescanOwed;
         private long _lastDropWarningTicks = long.MinValue / 2;
 
         public SessionUploader(string? runnerSecret, RunnerArtifactService.RunnerArtifactServiceClient artifactClient, Metadata? authHeaders, string sessionId, SessionProcessManager.SessionPaths paths, ILogger logger, RuntimeIdentityRegistry? runtimeIdentities = null, string? runnerId = null)
@@ -1409,8 +1410,30 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
         internal int PendingUploadCount => _pending.Count;
 
+        /// <summary>
+        /// Rescans the artifact folders once the queue has drained to half its cap after
+        /// files were dropped, so files that arrived while it was full are still uploaded.
+        /// </summary>
+        private void RescanIfOwed()
+        {
+            if (Volatile.Read(ref _rescanOwed) == 0 ||
+                _pending.Count > MaxPendingUploads / 2 ||
+                Interlocked.Exchange(ref _rescanOwed, 0) == 0)
+            {
+                return;
+            }
+
+            _logger.LogInformation(
+                "Rescanning artifacts after the upload queue drained session={SessionId}",
+                _sessionId);
+            EnqueueExistingFiles(_paths.OutputDirectory, "output");
+            EnqueueExistingFiles(_paths.TempDirectory, "temp");
+        }
+
         private void NoteDroppedUpload(string fullPath)
         {
+            // Dropped files may get no further filesystem event, so the queue owes a rescan.
+            Volatile.Write(ref _rescanOwed, 1);
             var dropped = Interlocked.Increment(ref _droppedUploads);
             var now = Environment.TickCount64;
             var last = Interlocked.Read(ref _lastDropWarningTicks);
@@ -1495,6 +1518,8 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                                 _pending.TryRemove(item.FullPath, out _);
                             }
                         }
+
+                        RescanIfOwed();
                     }
                 }
             }

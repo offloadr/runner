@@ -329,6 +329,16 @@ public partial class ArtifactUploadServiceTests
 
             Assert.That(service.GetPendingUploadCount("session-1"), Is.EqualTo(3));
             gate.TrySetResult();
+
+            // Files dropped at the cap are found again by the rescan once the queue drains.
+            var uploaded = new HashSet<string>(StringComparer.Ordinal);
+            for (var index = 0; index < 10; index++)
+            {
+                var upload = await artifactClient.WaitForUploadAsync(TimeSpan.FromSeconds(10));
+                uploaded.Add(upload.Metadata!.Filename);
+            }
+
+            Assert.That(uploaded, Has.Count.EqualTo(10));
         }
         finally
         {
