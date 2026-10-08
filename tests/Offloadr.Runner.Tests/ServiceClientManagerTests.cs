@@ -840,12 +840,12 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
-    public async Task StopSessionAndCleanupAsync_StopsSidecars_WhenStopSessionThrowsBeforeCallback()
+    public void StopSessionAndCleanupAsync_StopsSidecarsAndPropagates_WhenStopSessionThrowsBeforeCallback()
     {
         string? uploadStopped = null;
         string? mirrorStopped = null;
 
-        await ServiceClientManager.StopSessionAndCleanupAsync(
+        Assert.CatchAsync<OperationCanceledException>(() => ServiceClientManager.StopSessionAndCleanupAsync(
             "session-1",
             stopSession: (_, _, _) => throw new OperationCanceledException("stream dropped"),
             stopSessionRelay: _ => Task.CompletedTask,
@@ -862,7 +862,7 @@ public partial class ServiceClientManagerTests
             cancelSessionDownloads: _ => { },
             getDownloadActiveSessionId: () => "session-1",
             setDownloadActiveSessionId: _ => { },
-            cancellationToken: new CancellationToken(canceled: true));
+            cancellationToken: new CancellationToken(canceled: true)));
 
         Assert.That(uploadStopped, Is.EqualTo("session-1"));
         Assert.That(mirrorStopped, Is.EqualTo("session-1"));

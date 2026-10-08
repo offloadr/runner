@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Runtime.ExceptionServices;
 using Offloadr.Runner.V1;
 using Offloadr.Common.V1;
 using Offloadr.EditorRuntime.V1;
@@ -1153,6 +1154,7 @@ internal static class ServiceClientManager
             sidecarsStopped = true;
         }
 
+        ExceptionDispatchInfo? stopFailure = null;
         try
         {
             await stopSession(
@@ -1163,6 +1165,7 @@ internal static class ServiceClientManager
         catch (Exception ex)
         {
             RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed to stop session {normalizedSessionId}: {ex.Message}");
+            stopFailure = ExceptionDispatchInfo.Capture(ex);
         }
         finally
         {
@@ -1181,6 +1184,10 @@ internal static class ServiceClientManager
         {
             RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed to stop session websocket relay {normalizedSessionId}: {ex.Message}");
         }
+
+        // The child may still be alive: callers must not report it stopped or
+        // drop the logical state that keeps it visible to the control plane.
+        stopFailure?.Throw();
     }
 
     internal static async Task CleanupExitedSessionAsync(
@@ -1305,6 +1312,20 @@ internal static class ServiceClientManager
             deps.SetDownloadActiveSession,
             cancellationToken);
 
+    private static async Task<bool> TryStopSessionAndCleanupAsync(string sessionId, RuntimeCommandDependencies deps)
+    {
+        try
+        {
+            await StopSessionAndCleanupAsync(sessionId, deps, CancellationToken.None).ConfigureAwait(false);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            RunnerLog.Error(nameof(ServiceClientManager), ex, $"Cleanup after failed start of session {sessionId} did not complete; retaining its state.");
+            return false;
+        }
+    }
+
     internal static async Task HandleStopSessionCommandAsync(StopSessionCommand command, RuntimeCommandDependencies deps)
     {
         await deps.WorkState.Prompts.CancelAndWaitAsync(
@@ -1323,7 +1344,18 @@ internal static class ServiceClientManager
             transientCancellation.Dispose();
         }
 
-        await StopSessionAndCleanupAsync(command.SessionId, deps, deps.Shutdown).ConfigureAwait(false);
+        try
+        {
+            await StopSessionAndCleanupAsync(command.SessionId, deps, deps.Shutdown).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // Keep the heartbeat and identity of a child that may still be alive,
+            // and do not acknowledge: the control plane retains the Stop.
+            RunnerLog.Error(nameof(ServiceClientManager), ex, $"Stop of session {command.SessionId} did not complete; retaining its state.");
+            return;
+        }
+
         deps.LogicalSessionState.ClearIfMatches(command.SessionId);
         deps.RuntimeIdentities.Remove(command.SessionId);
 
@@ -1402,14 +1434,16 @@ internal static class ServiceClientManager
                 RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed to start session {command.SessionId}: {ex.Message}");
                 ack.Ready = false;
                 ack.Message = ex.Message;
-                ClearRuntimeSessionStateIfIdentityMatches(
-                    deps.LogicalSessionState,
-                    deps.RuntimeIdentities,
-                    command.SessionId,
-                    command.LifecycleGeneration,
-                    command.RuntimeEpoch,
-                    command.RuntimeInstanceId);
-                await StopSessionAndCleanupAsync(command.SessionId, deps, CancellationToken.None).ConfigureAwait(false);
+                if (await TryStopSessionAndCleanupAsync(command.SessionId, deps).ConfigureAwait(false))
+                {
+                    ClearRuntimeSessionStateIfIdentityMatches(
+                        deps.LogicalSessionState,
+                        deps.RuntimeIdentities,
+                        command.SessionId,
+                        command.LifecycleGeneration,
+                        command.RuntimeEpoch,
+                        command.RuntimeInstanceId);
+                }
             }
             finally
             {
@@ -1519,6 +1553,7 @@ internal static class ServiceClientManager
                 RestartRevision = command.RestartRevision,
                 Attempt = command.Attempt,
             };
+            var cleanedUp = true;
             try
             {
                 await deps.StartRuntimeAndWaitForReady(start, cancellationSource.Token).ConfigureAwait(false);
@@ -1530,11 +1565,11 @@ internal static class ServiceClientManager
                 ack.Ready = false;
                 ack.Message = ex.Message;
                 RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed launching runtime for restart {command.RestartId}: {ex.Message}");
-                await StopSessionAndCleanupAsync(command.SessionId, deps, CancellationToken.None).ConfigureAwait(false);
+                cleanedUp = await TryStopSessionAndCleanupAsync(command.SessionId, deps).ConfigureAwait(false);
             }
             finally
             {
-                if (!ack.Ready)
+                if (!ack.Ready && cleanedUp)
                 {
                     ClearRuntimeSessionStateIfIdentityMatches(
                         deps.LogicalSessionState,

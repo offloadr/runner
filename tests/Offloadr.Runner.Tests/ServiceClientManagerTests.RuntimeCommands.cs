@@ -30,6 +30,72 @@ public partial class ServiceClientManagerTests
         });
     }
 
+    [Test]
+    public async Task Quiesce_WhenStopFails_AcknowledgesNotQuiescedAndKeepsState()
+    {
+        var harness = RunningHarness(7, 3, InstanceA);
+        harness.BeforeStop = (_, _) => throw new IOException("signal failed");
+
+        await ServiceClientManager.HandleQuiesceRuntimeCommandAsync(Quiesce(7, 3, InstanceA, revision: 1), harness.Deps);
+
+        var ack = await harness.Sink.WaitForAsync(harness.Sink.QuiesceAcks, 1);
+        Assert.Multiple(() =>
+        {
+            Assert.That(ack.Quiesced, Is.False);
+            Assert.That(harness.Logical.GetActiveSessionId(), Is.EqualTo(CommandSessionId));
+            Assert.That(harness.Identities.TryGet(CommandSessionId, out _), Is.True);
+        });
+    }
+
+    [Test]
+    public async Task Stop_WhenStopFails_KeepsStateAndDoesNotAcknowledge()
+    {
+        var harness = RunningHarness(7, 3, InstanceA);
+        harness.BeforeStop = (_, _) => throw new IOException("signal failed");
+
+        await ServiceClientManager.HandleStopSessionCommandAsync(
+            new StopSessionCommand { SessionId = CommandSessionId, User = "alice" },
+            harness.Deps);
+        await Task.Delay(TimeSpan.FromMilliseconds(100));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(harness.Sink.StopAcks, Is.Empty);
+            Assert.That(harness.Logical.GetActiveSessionId(), Is.EqualTo(CommandSessionId));
+            Assert.That(harness.Identities.TryGet(CommandSessionId, out _), Is.True);
+            Assert.That(harness.Tracked(CommandSessionId), Is.Not.Null);
+        });
+    }
+
+    [Test]
+    public async Task FailedLaunch_WhenCleanupStopFails_KeepsStateUntilTheProcessExits()
+    {
+        var harness = new RuntimeCommandHarness
+        {
+            BeforeStart = (command, _) => throw new TimeoutException("not ready"),
+            BeforeStop = (_, _) => throw new IOException("signal failed"),
+        };
+
+        await ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 3, InstanceA, revision: 1), harness.Deps);
+
+        var ack = await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 1);
+        Assert.Multiple(() =>
+        {
+            Assert.That(ack.Ready, Is.False);
+            Assert.That(harness.Logical.GetActiveSessionId(), Is.EqualTo(CommandSessionId));
+            Assert.That(harness.Identities.TryGet(CommandSessionId, out _), Is.True);
+        });
+    }
+
+    private static RuntimeCommandHarness RunningHarness(ulong generation, ulong epoch, string instance)
+    {
+        var harness = new RuntimeCommandHarness();
+        harness.Logical.SetActiveRuntime(CommandSessionId, generation, epoch, instance);
+        harness.Identities.Set(CommandSessionId, generation, epoch, instance);
+        harness.Track(CommandSessionId, new RuntimeIdentity(generation, epoch, instance));
+        return harness;
+    }
+
     private static LaunchEditorRuntimeCommand Launch(ulong generation, ulong epoch, string instance, uint revision, string? commandId = null)
         => new()
         {
