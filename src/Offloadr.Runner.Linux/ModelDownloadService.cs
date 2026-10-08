@@ -134,6 +134,24 @@ internal sealed class ModelDownloadService : IAsyncDisposable
         SeedConventionalPlaceholders(sessionId, full, replaceExisting: true);
     }
 
+    private string? CreateConventionalPlaceholder(string path)
+    {
+        if (_destinationPolicy is null || !OperatingSystem.IsLinux())
+        {
+            return ModelPlaceholderFiles.TryCreate(path, expectedLength: 0);
+        }
+
+        try
+        {
+            return _destinationPolicy.CreatePlaceholder(path);
+        }
+        catch (Exception ex)
+        {
+            RunnerLog.Error(nameof(ModelDownloadService), ex, $"Failed creating placeholder for model path '{path}': {ex.Message}");
+            return null;
+        }
+    }
+
     private void SeedConventionalPlaceholders(
         string sessionId,
         IEnumerable<ModelDownloadRequest> downloads,
@@ -156,7 +174,7 @@ internal sealed class ModelDownloadService : IAsyncDisposable
 
             foreach (var path in paths)
             {
-                var created = ModelPlaceholderFiles.TryCreate(path, expectedLength: 0);
+                var created = CreateConventionalPlaceholder(path);
                 if (created is not null && LinuxFileIdentityReader.TryRead(created, out var identity))
                 {
                     _ownedConventionalPlaceholders[created] = identity;

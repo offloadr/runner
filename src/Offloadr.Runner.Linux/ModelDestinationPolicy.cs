@@ -80,6 +80,35 @@ internal sealed class ModelDestinationPolicy
     }
 
     /// <summary>
+    /// Creates an empty placeholder at a confined destination. Trusted links are resolved
+    /// once, and the file and its missing directories are then created beneath the canonical
+    /// root through a pinned descriptor that refuses links, so a link planted after the
+    /// check cannot redirect the root-owned write. Returns the destination when this call
+    /// created the file, or null when a regular file was already there.
+    /// </summary>
+    public string? CreatePlaceholder(string? destinationPath)
+    {
+        var normalized = Confine(destinationPath);
+        var existing = DeepestExistingPath(normalized);
+        var canonicalExisting = NormalizePath(LinuxPathCanonicalizer.ResolveExistingPath(existing));
+        var canonical = existing == normalized
+            ? canonicalExisting
+            : NormalizePath(Path.Combine(canonicalExisting, Path.GetRelativePath(existing, normalized)));
+        var root = _roots
+            .Select(static candidate => candidate.Canonical)
+            .Where(candidate => IsStrictlyBeneath(canonical, candidate))
+            .OrderByDescending(static candidate => candidate.Length)
+            .FirstOrDefault()
+            ?? throw new InvalidOperationException(
+                $"Model download destination '{normalized}' resolves outside the configured model roots.");
+
+        using var secureRoot = new LinuxSecureDirectoryRoot(root);
+        return secureRoot.EnsurePlaceholder(Path.GetRelativePath(root, canonical), modifiedUtc: null)
+            ? normalized
+            : null;
+    }
+
+    /// <summary>
     /// Validates a destination beneath a session-owned root: the root itself and every
     /// existing component below it must be a real directory, and an existing leaf must
     /// be a regular file.

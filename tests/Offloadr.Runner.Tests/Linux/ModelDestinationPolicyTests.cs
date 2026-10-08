@@ -213,6 +213,57 @@ public class ModelDestinationPolicyTests
         Assert.That(File.Exists(destination), Is.True);
     }
 
+    [Test]
+    public void CreatePlaceholder_CreatesAnEmptyFileAndItsDirectoriesOnce()
+    {
+        var policy = new ModelDestinationPolicy([_modelsRoot]);
+        var destination = Path.Combine(_modelsRoot, "checkpoints", "nested", "model.safetensors");
+
+        var created = policy.CreatePlaceholder(destination);
+        var again = policy.CreatePlaceholder(destination);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(created, Is.EqualTo(destination));
+            Assert.That(again, Is.Null);
+            Assert.That(new FileInfo(destination).Length, Is.Zero);
+        });
+    }
+
+    [Test]
+    public void CreatePlaceholder_CreatesThroughATrustedLinkAtItsCanonicalTarget()
+    {
+        var realVae = Directory.CreateDirectory(Path.Combine(_modelsRoot, "real-vae")).FullName;
+        Directory.CreateSymbolicLink(Path.Combine(_modelsRoot, "vae"), realVae);
+        var policy = new ModelDestinationPolicy([_modelsRoot]);
+
+        var created = policy.CreatePlaceholder(Path.Combine(_modelsRoot, "vae", "ae.safetensors"));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(created, Is.EqualTo(Path.Combine(_modelsRoot, "vae", "ae.safetensors")));
+            Assert.That(File.Exists(Path.Combine(realVae, "ae.safetensors")), Is.True);
+        });
+    }
+
+    [Test]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public void CreatePlaceholder_RefusesALinkInASharedWritableDirectory()
+    {
+        var shared = Directory.CreateDirectory(Path.Combine(_modelsRoot, "shared")).FullName;
+        File.SetUnixFileMode(shared, (UnixFileMode)Convert.ToInt32("777", 8));
+        Directory.CreateSymbolicLink(Path.Combine(shared, "loras"), _outside);
+        var policy = new ModelDestinationPolicy([_modelsRoot, _outside]);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(
+                () => policy.CreatePlaceholder(Path.Combine(shared, "loras", "model.safetensors")),
+                Throws.InvalidOperationException);
+            Assert.That(File.Exists(Path.Combine(_outside, "model.safetensors")), Is.False);
+        });
+    }
+
     [DllImport("libc", SetLastError = true)]
     private static extern int mkfifo(string path, uint mode);
 

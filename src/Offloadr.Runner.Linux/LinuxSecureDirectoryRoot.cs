@@ -66,7 +66,11 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
         _rootHandle = new SafeFileHandle((nint)descriptor, ownsHandle: true);
     }
 
-    public void EnsurePlaceholder(string relativePath, DateTime? modifiedUtc)
+    /// <summary>
+    /// Creates an empty regular file, and any missing parent directories, unless a regular
+    /// file already exists there. Returns true when this call created the file.
+    /// </summary>
+    public bool EnsurePlaceholder(string relativePath, DateTime? modifiedUtc)
     {
         var (parent, leafName) = OpenParent(relativePath, createDirectories: true);
         using (parent)
@@ -84,7 +88,7 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
                     SetModifiedUtc(created, modifiedUtc.Value);
                 }
 
-                return;
+                return true;
             }
 
             var error = Marshal.GetLastPInvokeError();
@@ -108,6 +112,8 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
             {
                 SetModifiedUtc(existing, modifiedUtc.Value, useEmptyPath: true);
             }
+
+            return false;
         }
     }
 
