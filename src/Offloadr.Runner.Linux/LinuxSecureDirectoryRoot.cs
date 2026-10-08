@@ -27,6 +27,7 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
     private const int EExists = 17;
     private const int ENotDirectory = 20;
     private const int EIsDirectory = 21;
+    private const int EInvalidArgument = 22;
     private const int ETooManySymbolicLinks = 40;
     private const int AtEmptyPath = 0x1000;
     private const int AtSymlinkNoFollow = 0x100;
@@ -240,6 +241,96 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
         finally
         {
             current.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Reads the symbolic link at <paramref name="relativePath"/> without following
+    /// any component. Returns <see cref="SecureLinkKind.Other"/> when the leaf is not
+    /// a symbolic link or a directory component is not a real directory.
+    /// </summary>
+    public SecureLinkKind ReadSymbolicLink(string relativePath, out string? target)
+    {
+        target = null;
+        var (kind, parent, leafName) = TryOpenExistingParent(relativePath);
+        if (parent is null)
+        {
+            return kind == SecureEntryKind.Missing ? SecureLinkKind.Missing : SecureLinkKind.Other;
+        }
+
+        using (parent)
+        {
+            var buffer = new byte[4096];
+            var length = readlinkat(GetDescriptor(parent), leafName, buffer, (nuint)buffer.Length);
+            if (length >= 0)
+            {
+                if (length >= buffer.Length)
+                {
+                    return SecureLinkKind.Other;
+                }
+
+                target = System.Text.Encoding.UTF8.GetString(buffer, 0, (int)length);
+                return SecureLinkKind.SymbolicLink;
+            }
+
+            var error = Marshal.GetLastPInvokeError();
+            return error switch
+            {
+                ENoEntry => SecureLinkKind.Missing,
+                EInvalidArgument => SecureLinkKind.Other,
+                _ => throw CreateException($"reading link '{relativePath}'", error)
+            };
+        }
+    }
+
+    /// <summary>
+    /// Creates a symbolic link at <paramref name="relativePath"/>, creating missing
+    /// directory components beneath the root without following symlinks.
+    /// </summary>
+    public void CreateSymbolicLink(string relativePath, string target)
+    {
+        var (parent, leafName) = OpenParent(relativePath, createDirectories: true);
+        using (parent)
+        {
+            if (symlinkat(target, GetDescriptor(parent), leafName) != 0)
+            {
+                throw CreateException($"creating link '{relativePath}'");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Removes <paramref name="relativePath"/> only when it is a symbolic link reached
+    /// through real directories. Returns false when nothing was removed.
+    /// </summary>
+    public bool DeleteSymbolicLink(string relativePath)
+    {
+        var (_, parent, leafName) = TryOpenExistingParent(relativePath);
+        if (parent is null)
+        {
+            return false;
+        }
+
+        using (parent)
+        {
+            var buffer = new byte[1];
+            if (readlinkat(GetDescriptor(parent), leafName, buffer, (nuint)buffer.Length) < 0)
+            {
+                return false;
+            }
+
+            if (unlinkat(GetDescriptor(parent), leafName, 0) != 0)
+            {
+                var error = Marshal.GetLastPInvokeError();
+                if (error == ENoEntry)
+                {
+                    return false;
+                }
+
+                throw CreateException($"removing link '{relativePath}'", error);
+            }
+
+            return true;
         }
     }
 
@@ -664,6 +755,19 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
 
     [DllImport("libc", SetLastError = true)]
     private static extern int ftruncate(int fileDescriptor, long length);
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern nint readlinkat(int directoryFileDescriptor, string path, byte[] buffer, nuint bufferSize);
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int symlinkat(string target, int directoryFileDescriptor, string linkPath);
+}
+
+internal enum SecureLinkKind
+{
+    Missing,
+    SymbolicLink,
+    Other
 }
 
 internal enum SecureEntryKind

@@ -247,37 +247,28 @@ internal sealed class LocalModelProjector
     {
         try
         {
-            var targetDirectory = Path.GetDirectoryName(targetPath);
-            if (string.IsNullOrWhiteSpace(targetDirectory))
-            {
-                return;
-            }
+            var relativePath = GetRelativeTargetPath(targetPath);
 
-            Directory.CreateDirectory(targetDirectory);
-
-            if (IsLinkToTarget(targetPath, sourcePath))
+            // The destination root can contain session-writable directories (Forge
+            // projects into session homes), so links are created and inspected
+            // relative to the root without following symlinked components.
+            Directory.CreateDirectory(_destinationRoot);
+            using var secureRoot = new LinuxSecureDirectoryRoot(_destinationRoot);
+            switch (secureRoot.ReadSymbolicLink(relativePath, out var existingTarget))
             {
-                _managedTargets.Add(targetPath);
-                return;
-            }
-
-            if (IsSymbolicLink(targetPath))
-            {
-                if (_managedTargets.Contains(targetPath))
-                {
-                    File.Delete(targetPath);
-                }
-                else
-                {
+                case SecureLinkKind.SymbolicLink when LinkPointsTo(targetPath, existingTarget!, sourcePath):
+                    _managedTargets.Add(targetPath);
+                    return;
+                case SecureLinkKind.SymbolicLink when _managedTargets.Contains(targetPath):
+                    secureRoot.DeleteSymbolicLink(relativePath);
+                    break;
+                case SecureLinkKind.SymbolicLink:
                     throw new InvalidOperationException($"Projection target '{targetPath}' already exists as an unmanaged symbolic link.");
-                }
-            }
-            else if (File.Exists(targetPath))
-            {
-                throw new InvalidOperationException($"Projection target '{targetPath}' already exists.");
+                case SecureLinkKind.Other:
+                    throw new InvalidOperationException($"Projection target '{targetPath}' already exists or is not beneath real directories.");
             }
 
-            File.CreateSymbolicLink(targetPath, sourcePath);
+            secureRoot.CreateSymbolicLink(relativePath, sourcePath);
             _managedTargets.Add(targetPath);
         }
         catch (Exception ex)
@@ -291,9 +282,10 @@ internal sealed class LocalModelProjector
     {
         try
         {
-            if (IsSymbolicLink(targetPath))
+            if (Directory.Exists(_destinationRoot))
             {
-                File.Delete(targetPath);
+                using var secureRoot = new LinuxSecureDirectoryRoot(_destinationRoot);
+                secureRoot.DeleteSymbolicLink(GetRelativeTargetPath(targetPath));
             }
         }
         catch (Exception ex)
@@ -311,46 +303,26 @@ internal sealed class LocalModelProjector
         return string.Equals(NormalizePath(left), NormalizePath(right), StringComparison.Ordinal);
     }
 
-    private static bool IsLinkToTarget(string path, string target)
+    private string GetRelativeTargetPath(string targetPath)
     {
-        if (!File.Exists(path) || !IsSymbolicLink(path))
+        var relative = Path.GetRelativePath(_destinationRoot, targetPath);
+        if (relative == "." ||
+            Path.IsPathRooted(relative) ||
+            relative == ".." ||
+            relative.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal))
         {
-            return false;
+            throw new InvalidOperationException($"Local model projection target '{targetPath}' escapes '{_destinationRoot}'.");
         }
 
-        try
-        {
-            var resolved = File.ResolveLinkTarget(path, returnFinalTarget: true);
-            if (resolved is null)
-            {
-                return false;
-            }
-
-            return PathsEqual(resolved.FullName, target);
-        }
-        catch
-        {
-            return false;
-        }
+        return relative.Replace(Path.DirectorySeparatorChar, '/');
     }
 
-    private static bool IsSymbolicLink(string path)
+    private static bool LinkPointsTo(string linkPath, string linkTarget, string expectedTarget)
     {
         try
         {
-            var fileInfo = new FileInfo(path);
-            if (fileInfo.LinkTarget is not null)
-            {
-                return true;
-            }
-
-            if (!fileInfo.Exists)
-            {
-                return false;
-            }
-
-            var attrs = fileInfo.Attributes;
-            return attrs.HasFlag(FileAttributes.ReparsePoint);
+            var linkDirectory = Path.GetDirectoryName(linkPath) ?? string.Empty;
+            return PathsEqual(Path.Combine(linkDirectory, linkTarget), expectedTarget);
         }
         catch
         {

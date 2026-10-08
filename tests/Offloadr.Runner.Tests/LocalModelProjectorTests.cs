@@ -6,6 +6,78 @@ namespace Offloadr.Runner.Tests;
 
 public class LocalModelProjectorTests
 {
+    // Projection links are created through descriptor-relative Linux syscalls.
+    [SetUp]
+    public void RequireLinuxProjection() => LinuxTestPrerequisites.RequireLinux();
+
+    [Test]
+    public void SetRequestedModels_RefusesSymlinkedDirectoryBelowDestinationRoot()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var sourceRoot = Path.Combine(root, "local");
+            var destinationRoot = Path.Combine(root, "sessions");
+            var outside = Directory.CreateDirectory(Path.Combine(root, "outside")).FullName;
+            Directory.CreateDirectory(Path.Combine(sourceRoot, "checkpoints"));
+            var sourceFile = Path.Combine(sourceRoot, "checkpoints", "demo.safetensors");
+            File.WriteAllText(sourceFile, "checkpoint");
+            var home = Directory.CreateDirectory(Path.Combine(destinationRoot, "home")).FullName;
+            Directory.CreateSymbolicLink(Path.Combine(home, "models"), outside);
+            var projected = Path.Combine(home, "models", "checkpoints", "demo.safetensors");
+
+            var projector = new LocalModelProjector(sourceRoot, destinationRoot, "forge-neo");
+            projector.UpdateSnapshot(CreateSnapshot(CreateModel(sourceFile, ModelCategory.Checkpoint)));
+
+            Assert.That(
+                () => projector.SetRequestedModels([CreateLocalProjectionRequest(sourceFile, ModelCategory.Checkpoint, projected)]),
+                Throws.InvalidOperationException.Or.InstanceOf<IOException>());
+            Assert.That(Directory.EnumerateFileSystemEntries(outside), Is.Empty);
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
+    public void SetRequestedModels_DoesNotRemoveLinksThroughSymlinkedDirectory()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var sourceRoot = Path.Combine(root, "local");
+            var destinationRoot = Path.Combine(root, "sessions");
+            Directory.CreateDirectory(Path.Combine(sourceRoot, "checkpoints"));
+            var sourceFile = Path.Combine(sourceRoot, "checkpoints", "demo.safetensors");
+            File.WriteAllText(sourceFile, "checkpoint");
+            var modelsDirectory = Path.Combine(destinationRoot, "home", "models");
+            var projected = Path.Combine(modelsDirectory, "checkpoints", "demo.safetensors");
+
+            var projector = new LocalModelProjector(sourceRoot, destinationRoot, "forge-neo");
+            projector.UpdateSnapshot(CreateSnapshot(CreateModel(sourceFile, ModelCategory.Checkpoint)));
+            projector.SetRequestedModels([CreateLocalProjectionRequest(sourceFile, ModelCategory.Checkpoint, projected)]);
+            Assert.That(File.Exists(projected), Is.True);
+
+            // Replace the session-owned directory with a link to a directory holding an
+            // unrelated symlink at the same relative name.
+            var outside = Path.Combine(root, "outside");
+            Directory.CreateDirectory(Path.Combine(outside, "checkpoints"));
+            var unrelatedLink = Path.Combine(outside, "checkpoints", "demo.safetensors");
+            File.CreateSymbolicLink(unrelatedLink, sourceFile);
+            Directory.Delete(modelsDirectory, recursive: true);
+            Directory.CreateSymbolicLink(modelsDirectory, outside);
+
+            projector.SetRequestedModels([]);
+
+            Assert.That(new FileInfo(unrelatedLink).LinkTarget, Is.EqualTo(sourceFile));
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
     [Test]
     public void UpdateSnapshot_DoesNotProjectUnrequestedModels()
     {
