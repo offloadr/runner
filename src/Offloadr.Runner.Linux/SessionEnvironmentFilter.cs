@@ -53,7 +53,7 @@ internal static class SessionEnvironmentFilter
         "TORCH_CUDA_ARCH_LIST",
         "XFORMERS_IGNORE_FLASH_VERSION_CHECK",
 
-        // uv and the image's torch stack pins (no index credentials).
+        // uv and the image's torch stack pins. Index URLs are left out: they can carry credentials.
         "UV_LINK_MODE",
         "UV_PYTHON_INSTALL_DIR",
         "UV_PYTHON_BIN_DIR",
@@ -62,7 +62,6 @@ internal static class SessionEnvironmentFilter
         "OFFLOADR_TORCH_VERSION",
         "OFFLOADR_TORCHVISION_VERSION",
         "OFFLOADR_TORCH_FLAVOR",
-        "OFFLOADR_TORCH_INDEX_URL",
 
         // Editor settings; OFFLOADR_FORCE_CPU is read by the editor entrypoints.
         "OFFLOADR_FORCE_CPU",

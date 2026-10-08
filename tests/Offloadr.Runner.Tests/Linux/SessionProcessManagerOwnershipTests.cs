@@ -1167,7 +1167,7 @@ public partial class SessionProcessManagerOwnershipTests
     {
         var tempRoot = Path.Combine(Path.GetTempPath(), $"runner-session-env-{Guid.NewGuid():N}");
         Directory.CreateDirectory(tempRoot);
-        string[] withheld = ["RUNNER_SECRET", "ARIA2_RPC_SECRET", "OFFLOADR_API_GRPC", "HOSTING_PROVIDER_API_KEY", "HF_TOKEN", "UV_INDEX_URL", "NVIDIA_API_KEY", "COMFY_API_TOKEN", "PYTHONSTARTUP", "TORCH_HOME_TOKEN"];
+        string[] withheld = ["RUNNER_SECRET", "ARIA2_RPC_SECRET", "OFFLOADR_API_GRPC", "HOSTING_PROVIDER_API_KEY", "HF_TOKEN", "UV_INDEX_URL", "NVIDIA_API_KEY", "COMFY_API_TOKEN", "PYTHONSTARTUP", "TORCH_HOME_TOKEN", "OFFLOADR_TORCH_INDEX_URL"];
         string[] inherited = ["NVIDIA_VISIBLE_DEVICES", "CUDA_VERSION", "LD_LIBRARY_PATH", "UV_LINK_MODE", "LC_ALL", "GRADIO_ANALYTICS_ENABLED", "OFFLOADR_FORCE_CPU"];
         var previous = withheld.Concat(inherited).ToDictionary(name => name, Environment.GetEnvironmentVariable);
 
