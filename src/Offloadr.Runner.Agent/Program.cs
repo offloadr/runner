@@ -65,7 +65,26 @@ catch (OperationCanceledException) when (shutdown.IsCancellationRequested)
     return 0;
 }
 var logicalSessionState = new ServiceClientManager.LogicalSessionState(sessionManager.GetActiveSessionId());
-await using IModelTransferBackend downloadBackend = new Aria2DownloadBackend(options.Aria2);
+var hydrationCapabilities = ModelHydrationRuntimeCapabilities.FromEnvironment(
+    options.Session.RuntimeKind);
+var modelProjectionRoot = string.Equals(options.Session.RuntimeKind, "forge-neo", StringComparison.OrdinalIgnoreCase)
+    ? options.Session.SessionRoot
+    : "/comfyui/models";
+string[] modelRoots = [options.Aria2.DownloadDirectory, modelProjectionRoot, .. hydrationCapabilities.PersistentModelRoots];
+LinuxAria2FileAccess aria2FileAccess;
+try
+{
+    // aria2 runs unprivileged and writes in place only beneath model roots no session can
+    // write; destinations inside session homes are staged and published by the agent.
+    aria2FileAccess = LinuxAria2FileAccess.Create(options.Aria2, modelRoots, options.Session.SessionRoot);
+}
+catch (Exception ex)
+{
+    RunnerLog.Error(ex.Message);
+    return 1;
+}
+
+await using IModelTransferBackend downloadBackend = new Aria2DownloadBackend(options.Aria2, fileAccess: aria2FileAccess);
 using var artifactGrpcChannel = GrpcChannelManager.CreateChannel(
     options.OffloadrApiUrl,
     options.TraceGrpcHttp);
@@ -82,17 +101,12 @@ await using var workspaceMirrorService = new WorkspaceMirrorService(
     workspaceCatalogClient,
     options.RunnerSecret,
     loggerFactory.CreateLogger<WorkspaceMirrorService>());
-var hydrationCapabilities = ModelHydrationRuntimeCapabilities.FromEnvironment(
-    options.Session.RuntimeKind);
-var modelProjectionRoot = string.Equals(options.Session.RuntimeKind, "forge-neo", StringComparison.OrdinalIgnoreCase)
-    ? options.Session.SessionRoot
-    : "/comfyui/models";
 await using var downloadService = new ModelDownloadService(
     downloadBackend,
     options.Aria2,
     hydrationCapabilities,
-    new ModelDestinationPolicy(
-        [options.Aria2.DownloadDirectory, modelProjectionRoot, .. hydrationCapabilities.PersistentModelRoots]));
+    new ModelDestinationPolicy(modelRoots),
+    new SessionModelDownloadStaging(options.Session.SessionRoot, options.Aria2.StagingDirectory));
 await using var sessionEventRelay = new ComfySessionEventRelay(
     options.RunnerId,
     sessionManager.ComfyHost,

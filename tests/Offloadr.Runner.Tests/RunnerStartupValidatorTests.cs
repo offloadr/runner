@@ -49,6 +49,34 @@ public class RunnerStartupValidatorTests
     }
 
     [Test]
+    public void ValidateOrThrow_RequiresTheAria2AccountWhenConfigured()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            Assert.Ignore("Runner startup validation is Linux-specific.");
+        }
+
+        var tempRoot = Path.Combine(Path.GetTempPath(), $"runner-validator-{Guid.NewGuid():N}");
+        try
+        {
+            var options = BuildOptions(tempRoot, "/bin/sh", requireAria2User: true);
+            var passwd = Path.Combine(tempRoot, "passwd");
+            File.WriteAllText(passwd, "root:x:0:0:root:/root:/bin/bash\n");
+
+            var ex = Assert.Throws<InvalidOperationException>(
+                () => new RunnerStartupValidator(new NoopIsolationStrategy(), passwd).ValidateOrThrow(options));
+            Assert.That(ex!.Message, Does.Contain("ARIA2_USER"));
+
+            File.AppendAllText(passwd, "offloadr-aria2:x:62000:62000::/var/lib/aria2:/usr/sbin/nologin\n");
+            Assert.DoesNotThrow(() => new RunnerStartupValidator(new NoopIsolationStrategy(), passwd).ValidateOrThrow(options));
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+        }
+    }
+
+    [Test]
     public void ValidateOrThrow_ThrowsWhenRunnerSecretMissing()
     {
         if (!OperatingSystem.IsLinux())
@@ -385,7 +413,8 @@ public class RunnerStartupValidatorTests
         string? localModelsDirectory = null,
         string? runnerId = null,
         string? seedVirtualEnvPath = null,
-        string? uvBinaryPath = null)
+        string? uvBinaryPath = null,
+        bool requireAria2User = false)
     {
         var sessionRoot = Path.Combine(tempRoot, "sessions");
         var workingDirectory = Path.Combine(tempRoot, "comfy");
@@ -437,6 +466,7 @@ public class RunnerStartupValidatorTests
                 "ARIA2_BINARY" => ariaBinaryPath,
                 "ARIA2_DOWNLOAD_DIR" => downloadDirectory,
                 "ARIA2_STATE_DIR" => stateDirectory,
+                "ARIA2_REQUIRE_USER" => requireAria2User ? "1" : null,
                 _ => null
             })
         };

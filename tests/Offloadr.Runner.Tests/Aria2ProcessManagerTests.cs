@@ -141,6 +141,90 @@ public class Aria2ProcessManagerTests
     }
 
     [Test]
+    public async Task BuildStartInfo_RunsAsServiceAccountWithoutAgentEnvironment()
+    {
+        var settings = Aria2Settings.FromEnvironment(
+            name => name == "ARIA2_STATE_DIR" ? "/var/lib/aria2-test" : null,
+            static () => "secret");
+        var account = new Aria2ServiceAccount("offloadr-aria2", 62000, 62000);
+        await using var manager = new Aria2ProcessManager(settings, fileAccess: new FixedFileAccess(account));
+        const string agentOnlyVariable = "RUNNER_SECRET";
+        var previous = Environment.GetEnvironmentVariable(agentOnlyVariable);
+        Environment.SetEnvironmentVariable(agentOnlyVariable, "runner-secret-value");
+        try
+        {
+            var startInfo = manager.BuildStartInfo();
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(startInfo.UserName, Is.EqualTo("offloadr-aria2"));
+                Assert.That(startInfo.WorkingDirectory, Is.EqualTo("/var/lib/aria2-test"));
+                Assert.That(startInfo.Environment.ContainsKey(agentOnlyVariable), Is.False);
+                Assert.That(startInfo.Environment["HOME"], Is.EqualTo("/var/lib/aria2-test"));
+                Assert.That(startInfo.Environment["USER"], Is.EqualTo("offloadr-aria2"));
+                Assert.That(startInfo.ArgumentList, Does.Contain($"--stop-with-process={Environment.ProcessId}"));
+                Assert.That(startInfo.ArgumentList, Does.Contain($"--conf-path={manager.RpcConfigPath}"));
+                Assert.That(startInfo.ArgumentList, Does.Contain("--rpc-listen-all=false"));
+            });
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(agentOnlyVariable, previous);
+        }
+    }
+
+    [Test]
+    public async Task BuildStartInfo_WithoutServiceAccount_RunsAsAgentUser()
+    {
+        var settings = Aria2Settings.FromEnvironment(static _ => null, static () => "secret");
+        await using var manager = new Aria2ProcessManager(settings, fileAccess: new FixedFileAccess(null));
+
+        var startInfo = manager.BuildStartInfo();
+
+        Assert.That(startInfo.UserName, Is.Empty);
+    }
+
+    [Test]
+    public void ReadSessionTargets_ReturnsEachEntrysDirectoryAndOutput()
+    {
+        string[] lines =
+        [
+            "https://cdn.example.com/a.safetensors\thttps://mirror.example.com/a.safetensors",
+            " dir=/comfyui/models/checkpoints",
+            " gid=0123456789abcdef",
+            " out=a.safetensors",
+            "https://cdn.example.com/b.bin",
+            " out=b.bin",
+            "https://cdn.example.com/c.bin",
+            " dir=/models",
+            " out=c.bin"
+        ];
+
+        var targets = Aria2ProcessManager.ReadSessionTargets(lines).ToArray();
+
+        Assert.That(
+            targets,
+            Is.EqualTo(new[]
+            {
+                Path.Combine("/comfyui/models/checkpoints", "a.safetensors"),
+                Path.Combine("/models", "c.bin")
+            }));
+    }
+
+    private sealed class FixedFileAccess(Aria2ServiceAccount? account) : IAria2FileAccess
+    {
+        public Aria2ServiceAccount? Account => account;
+
+        public void PrepareStateDirectory(Aria2Settings settings, string rpcConfigPath)
+        {
+        }
+
+        public void PrepareTransferTarget(string destinationPath)
+        {
+        }
+    }
+
+    [Test]
     public async Task WriteRpcConfig_WritesSecretToOwnerOnlyFile()
     {
         var stateDirectory = Path.Combine(Path.GetTempPath(), $"aria2-state-{Guid.NewGuid():N}");

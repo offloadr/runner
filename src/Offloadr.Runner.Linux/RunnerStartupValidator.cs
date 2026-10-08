@@ -6,10 +6,12 @@ namespace Offloadr.Runner.Linux;
 public sealed class RunnerStartupValidator
 {
     private readonly ISessionIsolationStrategy _sessionIsolationStrategy;
+    private readonly string _passwdPath;
 
-    public RunnerStartupValidator(ISessionIsolationStrategy sessionIsolationStrategy)
+    public RunnerStartupValidator(ISessionIsolationStrategy sessionIsolationStrategy, string passwdPath = "/etc/passwd")
     {
         _sessionIsolationStrategy = sessionIsolationStrategy ?? throw new ArgumentNullException(nameof(sessionIsolationStrategy));
+        _passwdPath = passwdPath;
     }
 
     public void ValidateOrThrow(RunnerAgentOptions options)
@@ -62,6 +64,12 @@ public sealed class RunnerStartupValidator
         }
 
         ValidateBinary(options.Aria2.BinaryPath, "ARIA2_BINARY", errors);
+        if (options.Aria2.RequireUser &&
+            LinuxAria2FileAccess.TryReadAccount(options.Aria2.User, _passwdPath) is null)
+        {
+            errors.Add($"ARIA2_USER account '{options.Aria2.User}' does not exist; ARIA2_REQUIRE_USER forbids running aria2 as root.");
+        }
+
         ValidateBinary(options.Session.UvBinaryPath, "RUNNER_UV_BINARY", errors);
         _sessionIsolationStrategy.ValidatePrerequisites(errors);
 

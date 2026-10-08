@@ -116,6 +116,92 @@ public class DownloadCoordinatorTests
     }
 
     [Test]
+    public async Task EnsureDownloadedAsync_StagedDestination_DownloadsToStagingAndPublishes()
+    {
+        const string destination = "/sessions/home/models/model.safetensors";
+        const string staged = "/state/staging/key/model.safetensors";
+        var fileSystem = new FakeFileSystem();
+        var aria = new FakeAria2Client
+        {
+            OnAddUri = () => fileSystem.SetFileSize(staged, 8)
+        };
+        var staging = new FakeStaging(destination, staged, fileSystem);
+        var sut = new DownloadCoordinator(
+            aria,
+            Aria2Settings.FromEnvironment(static _ => null, static () => "unused"),
+            fileSystem,
+            staging: staging);
+        sut.SetActiveSession("session-1");
+        sut.RegisterDownloads("session-1", [new ModelDownloadRequest
+        {
+            ModelId = "model-1",
+            Filename = "model.safetensors",
+            DestinationPath = destination,
+            SizeBytes = 8,
+            SourceUrl = "https://example.com/model"
+        }]);
+
+        await sut.EnsureDownloadedAsync(destination, CancellationToken.None, highPriority: false);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(aria.LastCreateRequest!.DestinationPath, Is.EqualTo(staged));
+            Assert.That(staging.Published, Is.EqualTo([(staged, destination)]));
+            Assert.That(fileSystem.FileExists(destination), Is.True);
+        });
+    }
+
+    [Test]
+    public async Task EnsureDownloadedAsync_CompleteStagedFile_IsPublishedWithoutNewTransfer()
+    {
+        const string destination = "/sessions/home/models/model.safetensors";
+        const string staged = "/state/staging/key/model.safetensors";
+        var fileSystem = new FakeFileSystem();
+        fileSystem.SetFileSize(staged, 8);
+        var aria = new FakeAria2Client();
+        var staging = new FakeStaging(destination, staged, fileSystem);
+        var sut = new DownloadCoordinator(
+            aria,
+            Aria2Settings.FromEnvironment(static _ => null, static () => "unused"),
+            fileSystem,
+            staging: staging);
+        sut.RegisterDownloads("session-1", [new ModelDownloadRequest
+        {
+            ModelId = "model-1",
+            Filename = "model.safetensors",
+            DestinationPath = destination,
+            SizeBytes = 8,
+            SourceUrl = "https://example.com/model"
+        }]);
+
+        await sut.EnsureDownloadedAsync(destination, CancellationToken.None, highPriority: false);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(aria.AddUriCalls, Is.EqualTo(0));
+            Assert.That(staging.Published, Is.EqualTo([(staged, destination)]));
+        });
+    }
+
+    private sealed class FakeStaging(string destination, string staged, FakeFileSystem fileSystem) : IModelDownloadStaging
+    {
+        public List<(string Staged, string Destination)> Published { get; } = [];
+
+        public string? GetStagingPath(string destinationPath)
+            => string.Equals(destinationPath, destination, StringComparison.Ordinal) ? staged : null;
+
+        public void Publish(string stagingPath, string destinationPath)
+        {
+            Published.Add((stagingPath, destinationPath));
+            fileSystem.SetFileSize(destinationPath, fileSystem.GetFileSize(stagingPath));
+        }
+
+        public void Discard(string destinationPath)
+        {
+        }
+    }
+
+    [Test]
     public async Task EnsureDownloadedAsync_PassesMetalinkContent_ToBackend()
     {
         var fileSystem = new FakeFileSystem();

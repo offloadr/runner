@@ -13,15 +13,20 @@ internal sealed class Aria2DownloadBackend : IModelTransferBackend
     private const int ManagedPieceLengthBytes = 1024 * 1024;
     private const string ManagedPieceLength = "1M";
     private readonly Aria2ProcessManager _manager;
+    private readonly IAria2FileAccess? _fileAccess;
 
     public Aria2DownloadBackend(
         Aria2Settings settings,
-        bool useProcessWatchdog = true)
+        bool useProcessWatchdog = true,
+        IAria2FileAccess? fileAccess = null)
     {
-        _manager = new Aria2ProcessManager(settings, useProcessWatchdog);
+        _fileAccess = fileAccess;
+        _manager = new Aria2ProcessManager(settings, useProcessWatchdog, fileAccess);
     }
 
     public string Name => "aria2";
+
+    internal int? ProcessId => _manager.ProcessId;
 
     public Task StartAsync(CancellationToken cancellationToken)
     {
@@ -43,6 +48,8 @@ internal sealed class Aria2DownloadBackend : IModelTransferBackend
 
         var options = BuildOptions(request, destination, directory);
         PrepareResumeState(request, destination);
+        // Every transfer aria2 writes is created here, after the agent prepared its target.
+        _fileAccess?.PrepareTransferTarget(destination);
 
         var requiresDeterministicHandle = !string.IsNullOrWhiteSpace(request.PreferredIdentifier);
         if (ShouldUseMetalink(request))

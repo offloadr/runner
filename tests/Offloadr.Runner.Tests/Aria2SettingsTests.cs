@@ -22,6 +22,29 @@ public class Aria2SettingsTests
         Assert.That(settings.ModelDownloadRetryMaxDelay, Is.EqualTo(TimeSpan.FromSeconds(60)));
         Assert.That(settings.CheckIntegrity, Is.True);
         Assert.That(settings.DisableIpv6, Is.True);
+        Assert.That(settings.User, Is.EqualTo("offloadr-aria2"));
+        Assert.That(settings.RequireUser, Is.False);
+        Assert.That(settings.StagingDirectory, Is.EqualTo("/var/lib/aria2/staging"));
+    }
+
+    [Test]
+    public void FromEnvironment_ReadsServiceAccountSettings()
+    {
+        var env = new Dictionary<string, string?>
+        {
+            ["ARIA2_USER"] = " downloader ",
+            ["ARIA2_REQUIRE_USER"] = "1",
+            ["ARIA2_STATE_DIR"] = "/state/"
+        };
+
+        var settings = Aria2Settings.FromEnvironment(name => env.TryGetValue(name, out var value) ? value : null, () => "generated-secret");
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(settings.User, Is.EqualTo("downloader"));
+            Assert.That(settings.RequireUser, Is.True);
+            Assert.That(settings.StagingDirectory, Is.EqualTo("/state/staging"));
+        });
     }
 
     [Test]

@@ -8,6 +8,7 @@ public sealed class Aria2Settings
     private const string DefaultBinary = "aria2c";
     private const string DefaultDownloadDir = "/models";
     private const string DefaultStateDir = "/var/lib/aria2";
+    private const string DefaultUser = "offloadr-aria2";
     private const int DefaultRpcPort = 6801;
     private const int DefaultSaveInterval = 5;
     private const int DefaultAutoSaveInterval = 5;
@@ -50,7 +51,9 @@ public sealed class Aria2Settings
         TimeSpan modelDownloadRetryMaxDelay,
         bool checkIntegrity,
         TimeSpan shutdownTimeout,
-        bool disableIpv6)
+        bool disableIpv6,
+        string user,
+        bool requireUser)
     {
         BinaryPath = binaryPath;
         DownloadDirectory = downloadDirectory;
@@ -71,6 +74,8 @@ public sealed class Aria2Settings
         CheckIntegrity = checkIntegrity;
         ShutdownTimeout = shutdownTimeout;
         DisableIpv6 = disableIpv6;
+        User = user;
+        RequireUser = requireUser;
     }
 
     public string BinaryPath { get; }
@@ -92,6 +97,15 @@ public sealed class Aria2Settings
     public bool CheckIntegrity { get; }
     public TimeSpan ShutdownTimeout { get; }
     public bool DisableIpv6 { get; }
+
+    /// <summary>The unprivileged account aria2 runs as when the agent runs as root.</summary>
+    public string User { get; }
+
+    /// <summary>When set, a missing <see cref="User"/> is a startup error instead of a fallback to the agent's user.</summary>
+    public bool RequireUser { get; }
+
+    /// <summary>Where aria2 writes downloads whose destination an untrusted user controls.</summary>
+    public string StagingDirectory => CombinePosixPath(StateDirectory, "staging");
 
     public string RpcEndpoint => $"http://127.0.0.1:{RpcPort}/jsonrpc";
 
@@ -133,6 +147,8 @@ public sealed class Aria2Settings
         var checkIntegrity = ParseBool(env, "ARIA2_CHECK_INTEGRITY", defaultValue: true);
         var shutdownTimeout = ParseTimeSpan(env, "ARIA2_SHUTDOWN_TIMEOUT_SEC", DefaultShutdownTimeout, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(30));
         var disableIpv6 = ParseBool(env, "ARIA2_DISABLE_IPV6", defaultValue: true);
+        var user = ParseString(env, "ARIA2_USER", DefaultUser);
+        var requireUser = ParseBool(env, "ARIA2_REQUIRE_USER", defaultValue: false);
 
         return new Aria2Settings(
             binary,
@@ -153,7 +169,9 @@ public sealed class Aria2Settings
             modelDownloadRetryMaxDelay,
             checkIntegrity,
             shutdownTimeout,
-            disableIpv6);
+            disableIpv6,
+            user,
+            requireUser);
     }
 
     private static string NormalizeDirectory(string? value, string fallback)

@@ -14,7 +14,7 @@ The agent is the container's entry point and runs as root. It:
 2. Holds a `CommandStream` open and executes start, stop, prompt, restart, relay and GPU power commands with exact identities, acknowledging each one idempotently.
 3. Starts the editor (ComfyUI or Forge Neo) per session as a child process under a dedicated Linux user, with a private virtualenv layered on the image's root-owned one.
 4. Relays editor HTTP requests and websocket frames over the command and event lanes, uploads outputs, and mirrors workspace files (`user`, `custom_nodes`, inputs) from the control plane.
-5. Downloads models with aria2. For ComfyUI, model files start as sparse placeholders; `liboffloadr_model_vfs.so` is preloaded into the editor and blocks each read until aria2 has the bytes it needs (demand-aware hydration).
+5. Downloads models with aria2, which runs as an unprivileged account and writes only to directories prepared for it; downloads into a session home are staged outside it and moved in by the agent. For ComfyUI, model files start as sparse placeholders; `liboffloadr_model_vfs.so` is preloaded into the editor and blocks each read until aria2 has the bytes it needs (demand-aware hydration).
 6. Writes `/run/offloadr/status.json` so a local supervisor can tell whether a session is active.
 
 ## Projects

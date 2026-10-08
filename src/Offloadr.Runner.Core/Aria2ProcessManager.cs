@@ -22,6 +22,7 @@ internal sealed class Aria2ProcessManager : IAsyncDisposable
     private readonly CancellationTokenSource _pumpCancellation = new();
     private readonly bool _traceRpc;
     private readonly bool _useProcessWatchdog;
+    private readonly IAria2FileAccess? _fileAccess;
     private int _disposed;
 
     private Process? _process;
@@ -35,10 +36,11 @@ internal sealed class Aria2ProcessManager : IAsyncDisposable
     {
     }
 
-    public Aria2ProcessManager(Aria2Settings options, bool useProcessWatchdog = true)
+    public Aria2ProcessManager(Aria2Settings options, bool useProcessWatchdog = true, IAria2FileAccess? fileAccess = null)
     {
         _options = options ?? throw new ArgumentNullException(nameof(options));
         _useProcessWatchdog = useProcessWatchdog;
+        _fileAccess = fileAccess;
         _traceRpc = string.Equals(Environment.GetEnvironmentVariable("ARIA2_RPC_TRACE"), "1", StringComparison.OrdinalIgnoreCase);
         _httpClient = CreateHttpClient();
     }
@@ -46,6 +48,8 @@ internal sealed class Aria2ProcessManager : IAsyncDisposable
     public Aria2Settings Options => _options;
 
     public bool IsRunning => _process != null && !_process.HasExited;
+
+    internal int? ProcessId => _process?.Id;
 
     public async Task StartAsync(CancellationToken cancellationToken)
     {
@@ -58,6 +62,8 @@ internal sealed class Aria2ProcessManager : IAsyncDisposable
             Directory.CreateDirectory(_options.StateDirectory);
             EnsureSessionFileExists();
             WriteRpcConfig();
+            _fileAccess?.PrepareStateDirectory(_options, RpcConfigPath);
+            PrepareRestoredTargets();
 
             var psi = BuildStartInfo();
             var process = Process.Start(psi);
@@ -266,7 +272,7 @@ internal sealed class Aria2ProcessManager : IAsyncDisposable
         _pumpCancellation.Dispose();
     }
 
-    private ProcessStartInfo BuildStartInfo()
+    internal ProcessStartInfo BuildStartInfo()
     {
         var psi = new ProcessStartInfo
         {
@@ -274,8 +280,28 @@ internal sealed class Aria2ProcessManager : IAsyncDisposable
             UseShellExecute = false,
             RedirectStandardError = true,
             RedirectStandardOutput = true,
-            CreateNoWindow = true
+            CreateNoWindow = true,
+            WorkingDirectory = _options.StateDirectory
         };
+
+        // aria2 needs none of the agent's configuration, which includes the runner secret.
+        var inherited = psi.Environment.ToArray();
+        psi.Environment.Clear();
+        foreach (var (name, value) in inherited)
+        {
+            if (InheritedEnvironment.Contains(name))
+            {
+                psi.Environment[name] = value;
+            }
+        }
+
+        if (_fileAccess?.Account is { } account)
+        {
+            psi.UserName = account.UserName;
+            psi.Environment["HOME"] = _options.StateDirectory;
+            psi.Environment["USER"] = account.UserName;
+            psi.Environment["LOGNAME"] = account.UserName;
+        }
 
         foreach (var arg in BuildArguments())
         {
@@ -285,9 +311,18 @@ internal sealed class Aria2ProcessManager : IAsyncDisposable
         return psi;
     }
 
+    private static readonly HashSet<string> InheritedEnvironment = new(StringComparer.Ordinal)
+    {
+        "PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TZ",
+        "http_proxy", "https_proxy", "ftp_proxy", "all_proxy", "no_proxy",
+        "HTTP_PROXY", "HTTPS_PROXY", "FTP_PROXY", "ALL_PROXY", "NO_PROXY",
+        "SSL_CERT_FILE", "SSL_CERT_DIR"
+    };
+
     private IEnumerable<string> BuildArguments()
     {
-        // The RPC secret is read from a root-only file: argv is visible to every process.
+        // The RPC secret is read from a file only aria2's account and root can read: argv is
+        // visible to every process.
         yield return $"--conf-path={RpcConfigPath}";
         yield return "--enable-rpc=true";
         yield return "--rpc-listen-all=false";
@@ -366,6 +401,63 @@ internal sealed class Aria2ProcessManager : IAsyncDisposable
 
         using var writer = new StreamWriter(RpcConfigPath, fileOptions);
         writer.Write($"rpc-secret={_options.RpcSecret}\n");
+    }
+
+    /// <summary>
+    /// aria2 resumes the transfers in its session file as soon as it starts. Their targets were
+    /// prepared when they were created, unless an earlier version ran aria2 as root.
+    /// </summary>
+    private void PrepareRestoredTargets()
+    {
+        if (_fileAccess?.Account is null || !File.Exists(_options.SessionFilePath))
+        {
+            return;
+        }
+
+        foreach (var target in ReadSessionTargets(File.ReadLines(_options.SessionFilePath)))
+        {
+            try
+            {
+                _fileAccess.PrepareTransferTarget(target);
+            }
+            catch (Exception ex) when (ex is IOException or InvalidOperationException or UnauthorizedAccessException)
+            {
+                RunnerLog.Warning<Aria2ProcessManager>(
+                    $"Could not prepare restored aria2 transfer target '{target}': {ex.Message}");
+            }
+        }
+    }
+
+    /// <summary>Reads the dir/out target of each entry in an aria2 session file.</summary>
+    internal static IEnumerable<string> ReadSessionTargets(IEnumerable<string> lines)
+    {
+        string? directory = null;
+        string? output = null;
+        foreach (var line in lines.Append(string.Empty))
+        {
+            if (line.Length > 0 && char.IsWhiteSpace(line[0]))
+            {
+                var option = line.Trim();
+                if (option.StartsWith("dir=", StringComparison.Ordinal))
+                {
+                    directory = option["dir=".Length..];
+                }
+                else if (option.StartsWith("out=", StringComparison.Ordinal))
+                {
+                    output = option["out=".Length..];
+                }
+
+                continue;
+            }
+
+            if (!string.IsNullOrEmpty(directory) && !string.IsNullOrEmpty(output) && Path.IsPathRooted(directory))
+            {
+                yield return Path.Combine(directory, output);
+            }
+
+            directory = null;
+            output = null;
+        }
     }
 
     private void EnsureSessionFileExists()

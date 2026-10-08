@@ -54,6 +54,52 @@ public class ModelDownloadServiceTests
     }
 
     [Test]
+    public async Task InitializeAsync_RemovesTransfersAndFilesStagedByAnEarlierRun()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var stagingDirectory = Path.Combine(root, "staging");
+            var staging = new SessionModelDownloadStaging(Path.Combine(root, "sessions"), stagingDirectory);
+            var staged = staging.GetStagingPath(Path.Combine(root, "sessions", "home", "models", "a.bin"))!;
+            Directory.CreateDirectory(Path.GetDirectoryName(staged)!);
+            File.WriteAllBytes(staged, [1, 2]);
+            var backend = new ListingBackend(
+            [
+                TestModelTransferBackend.Snapshot(new("0000000000000001"), "active", 1, 2, files: [new(staged, 2, 1, [])]),
+                TestModelTransferBackend.Snapshot(new("0000000000000002"), "active", 1, 2, files: [new(Path.Combine(root, "models", "b.bin"), 2, 1, [])])
+            ]);
+            await using var service = new ModelDownloadService(backend, DefaultAria2Settings, staging: staging);
+
+            await service.InitializeAsync(CancellationToken.None);
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(backend.Removed, Is.EqualTo(new[] { "0000000000000001" }));
+                Assert.That(Directory.EnumerateFileSystemEntries(stagingDirectory), Is.Empty);
+            });
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    private sealed class ListingBackend(IReadOnlyList<ModelTransferSnapshot> snapshots) : TestModelTransferBackend
+    {
+        public List<string> Removed { get; } = [];
+
+        public override Task<IReadOnlyList<ModelTransferSnapshot>> ListAsync(CancellationToken cancellationToken)
+            => Task.FromResult(snapshots);
+
+        public override Task RemoveAsync(ModelTransferHandle handle, CancellationToken cancellationToken)
+        {
+            Removed.Add(handle.ToString());
+            return Task.CompletedTask;
+        }
+    }
+
+    [Test]
     public async Task SeedDownloads_ConventionalDestination_RemainsConventionalWithRicherMetadata()
     {
         var root = CreateTempDirectory();

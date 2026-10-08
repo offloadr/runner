@@ -80,6 +80,8 @@ For non-prod environments, add `-e OFFLOADR_API_GRPC=<environment-origin>`.
 
 Aria2 baseline notes:
 
+- aria2 runs as the unprivileged `ARIA2_USER` (default `offloadr-aria2`, uid/gid 62000 in the published images), never as root. Before each transfer the agent gives that account's group write access to the directory the download lands in and hands it the placeholder and control file. The state directory (`ARIA2_STATE_DIR`, default `/var/lib/aria2`) is `root:offloadr-aria2` mode `1770`; the RPC secret file in it is readable only by the aria2 account. If you mount it or the model directories from the host, the agent adjusts their group and mode at startup and per transfer. `ARIA2_REQUIRE_USER=1` (set in the images) makes a missing account a startup error; without it the agent falls back to running aria2 as its own user and logs a warning.
+- Downloads into a session home (Forge Neo models) are written to `ARIA2_STATE_DIR/staging` and moved into the home by the agent when complete, so a session cannot redirect aria2's writes. Keep the state directory on the same filesystem as `SESSION_ROOT` to avoid a copy.
 - The runner now defaults to a single-mirror same-file profile of `16/16/8M/falloc`.
 - Queue-level download concurrency is fixed at `1`; the connection and split settings only parallelize pieces within that one active model transfer.
 - Raw aria2 console output is suppressed because per-connection retries are not authoritative for the overall transfer and redirected source URLs may contain signed query parameters. RunnerAgent reports structured transfer progress and terminal failures through aria2 RPC state instead.

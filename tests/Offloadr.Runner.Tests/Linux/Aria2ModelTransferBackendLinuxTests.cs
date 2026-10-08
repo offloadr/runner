@@ -8,7 +8,7 @@ using Offloadr.Runner.V1;
 
 namespace Offloadr.Runner.Tests;
 
-public class Aria2ModelTransferBackendLinuxTests
+public partial class Aria2ModelTransferBackendLinuxTests
 {
     [Test]
     [Category("RealAria2")]

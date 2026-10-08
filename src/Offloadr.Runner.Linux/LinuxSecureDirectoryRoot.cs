@@ -25,6 +25,7 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
     private const int ENoEntry = 2;
     private const int ENoDeviceOrAddress = 6;
     private const int EExists = 17;
+    private const int ECrossDevice = 18;
     private const int ENotDirectory = 20;
     private const int EIsDirectory = 21;
     private const int EInvalidArgument = 22;
@@ -331,6 +332,76 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
             }
 
             return true;
+        }
+    }
+
+    /// <summary>
+    /// Moves the regular file at <paramref name="sourcePath"/> to <paramref name="relativePath"/>
+    /// beneath this root, replacing what is there and creating missing directories. The source
+    /// must be in a directory untrusted users cannot write. Files on another filesystem are copied.
+    /// </summary>
+    public void MoveFileInto(string sourcePath, string relativePath)
+    {
+        var fullSourcePath = Path.GetFullPath(sourcePath);
+        var sourceName = Path.GetFileName(fullSourcePath);
+        var sourceDirectoryPath = Path.GetDirectoryName(fullSourcePath);
+        if (string.IsNullOrEmpty(sourceName) || string.IsNullOrEmpty(sourceDirectoryPath))
+        {
+            throw new IOException($"Cannot move '{sourcePath}': it has no parent directory.");
+        }
+
+        var descriptor = open(sourceDirectoryPath, OPath | ODirectory | ONoFollow | OCloseOnExec);
+        if (descriptor < 0)
+        {
+            throw CreateException($"opening source directory '{sourceDirectoryPath}'");
+        }
+
+        using var sourceDirectory = new SafeFileHandle((nint)descriptor, ownsHandle: true);
+        descriptor = openat(
+            GetDescriptor(sourceDirectory),
+            sourceName,
+            OReadOnly | ONoFollow | ONonBlock | ONoControllingTerminal | OCloseOnExec);
+        if (descriptor < 0)
+        {
+            throw CreateException($"opening source file '{fullSourcePath}'");
+        }
+
+        using var sourceFile = new SafeFileHandle((nint)descriptor, ownsHandle: true);
+        if (ReadStatus(sourceFile, fullSourcePath).Kind != SecureEntryKind.RegularFile)
+        {
+            throw NotRegularFile(fullSourcePath);
+        }
+
+        var (parent, leafName) = OpenParent(relativePath, createDirectories: true);
+        using (parent)
+        {
+            if (renameat(GetDescriptor(sourceDirectory), sourceName, GetDescriptor(parent), leafName) == 0)
+            {
+                return;
+            }
+
+            var error = Marshal.GetLastPInvokeError();
+            if (error != ECrossDevice)
+            {
+                throw CreateException($"moving '{fullSourcePath}' to '{relativePath}'", error);
+            }
+        }
+
+        using (var publication = CreatePublication(relativePath))
+        {
+            using (var input = new FileStream(sourceFile, FileAccess.Read, 1024 * 1024, isAsync: false))
+            using (var output = publication.OpenWriteStream())
+            {
+                input.CopyTo(output);
+                output.Flush(flushToDisk: true);
+            }
+
+            publication.Commit();
+        }
+
+        if (unlinkat(GetDescriptor(sourceDirectory), sourceName, 0) != 0)
+        {
+            throw CreateException($"removing moved source file '{fullSourcePath}'");
         }
     }
 

@@ -14,17 +14,23 @@ internal sealed class ModelDownloadService : IAsyncDisposable
     private readonly Dictionary<string, LinuxFileIdentity> _ownedConventionalPlaceholders = new(StringComparer.Ordinal);
     private readonly Dictionary<string, HashSet<Task>> _conventionalOperations = new(StringComparer.Ordinal);
     private readonly ModelDestinationPolicy? _destinationPolicy;
+    private readonly IModelTransferBackend _transferBackend;
+    private readonly SessionModelDownloadStaging? _staging;
 
     public ModelDownloadService(
         IModelTransferBackend transferBackend,
         Aria2Settings settings,
         ModelHydrationRuntimeCapabilities? capabilities = null,
-        ModelDestinationPolicy? destinationPolicy = null)
+        ModelDestinationPolicy? destinationPolicy = null,
+        SessionModelDownloadStaging? staging = null)
     {
         _destinationPolicy = destinationPolicy;
+        _transferBackend = transferBackend ?? throw new ArgumentNullException(nameof(transferBackend));
+        _staging = staging;
         _fullDownloadCoordinator = new DownloadCoordinator(
-            transferBackend ?? throw new ArgumentNullException(nameof(transferBackend)),
-            settings ?? throw new ArgumentNullException(nameof(settings)));
+            transferBackend,
+            settings ?? throw new ArgumentNullException(nameof(settings)),
+            staging: staging);
         if (capabilities?.SupportsPersistentRangeHydration == true)
         {
             _hydrationCoordinator = new DemandAwareModelHydrationCoordinator(
@@ -48,8 +54,41 @@ internal sealed class ModelDownloadService : IAsyncDisposable
         }
     }
 
-    public Task InitializeAsync(CancellationToken cancellationToken)
-        => _hydrationCoordinator?.InitializeAsync(cancellationToken) ?? Task.CompletedTask;
+    public async Task InitializeAsync(CancellationToken cancellationToken)
+    {
+        await DiscardStagedDownloadsAsync(cancellationToken).ConfigureAwait(false);
+        if (_hydrationCoordinator is not null)
+        {
+            await _hydrationCoordinator.InitializeAsync(cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Staged downloads belong to session homes, which an agent restart removes; drop the
+    /// transfers aria2 restored for them and their partial files.
+    /// </summary>
+    private async Task DiscardStagedDownloadsAsync(CancellationToken cancellationToken)
+    {
+        if (_staging is null)
+        {
+            return;
+        }
+
+        var snapshots = await _transferBackend.ListAsync(cancellationToken).ConfigureAwait(false);
+        foreach (var snapshot in snapshots.Where(snapshot => snapshot.Files.Any(file => _staging.IsStagingPath(file.Path))))
+        {
+            try
+            {
+                await _transferBackend.RemoveAsync(snapshot.Handle, cancellationToken).ConfigureAwait(false);
+            }
+            catch (ModelTransferStatusUnavailableException)
+            {
+                // Already gone.
+            }
+        }
+
+        _staging.DiscardAll();
+    }
 
     public void SetActiveSession(string? sessionId)
     {
@@ -216,8 +255,15 @@ internal sealed class ModelDownloadService : IAsyncDisposable
     {
         foreach (var path in candidates)
         {
-            if (_conventionalPathsBySession.Values.Any(paths => paths.Contains(path)) ||
-                !_ownedConventionalPlaceholders.TryGetValue(path, out var ownedIdentity))
+            if (_conventionalPathsBySession.Values.Any(paths => paths.Contains(path)))
+            {
+                continue;
+            }
+
+            // Transfers for the path were removed before this runs, so nothing writes the
+            // staged file any more.
+            _staging?.Discard(path);
+            if (!_ownedConventionalPlaceholders.TryGetValue(path, out var ownedIdentity))
             {
                 continue;
             }

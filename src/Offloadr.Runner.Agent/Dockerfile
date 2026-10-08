@@ -76,6 +76,14 @@ ENV DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1
 RUN apt-get update && apt-get install -y --no-install-recommends aria2 \
   && rm -rf /var/lib/apt/lists/*
 
+# aria2 runs as this account, never as root. The uid/gid sit above the range useradd hands
+# out to session users. The state directory is root-owned and sticky: aria2 adds its session
+# file there but cannot replace what the agent keeps in it.
+RUN groupadd --gid 62000 offloadr-aria2 \
+  && useradd --uid 62000 --gid offloadr-aria2 --no-create-home --home-dir /var/lib/aria2 \
+       --shell /usr/sbin/nologin offloadr-aria2 \
+  && install -d -o root -g offloadr-aria2 -m 1770 /var/lib/aria2
+
 RUN mkdir -p /opt/offloadr/lib /opt/offloadr/seed/custom_nodes /opt/offloadr/seed/input \
   && if [ -d /comfyui/custom_nodes ]; then cp -a /comfyui/custom_nodes/. /opt/offloadr/seed/custom_nodes/; fi \
   && if [ -d /comfyui/input ]; then cp -a /comfyui/input/. /opt/offloadr/seed/input/; fi \
@@ -86,6 +94,8 @@ COPY --from=build /app/publish/vfs /opt/offloadr/lib
 ENV RUNNER_VFS_LIB=/opt/offloadr/lib/liboffloadr_model_vfs.so \
     RUNNER_MODEL_FETCH_SOCKET=/tmp/runner-agent/model-fetch.sock \
     RUNNER_STATUS_FILE=/run/offloadr/status.json \
+    ARIA2_USER=offloadr-aria2 \
+    ARIA2_REQUIRE_USER=1 \
     EDITOR_RUNTIME=${EDITOR_RUNTIME} \
     EDITOR_READY_PATH=${EDITOR_READY_PATH} \
     RUNNER_SUPPORTED_EDITOR_TEMPLATES=${RUNNER_SUPPORTED_EDITOR_TEMPLATES} \

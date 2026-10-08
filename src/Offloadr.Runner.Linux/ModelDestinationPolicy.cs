@@ -4,9 +4,9 @@ namespace Offloadr.Runner.Linux;
 
 /// <summary>
 /// Confines model download destinations to the configured model roots. The agent
-/// and aria2 run as root, so a destination must stay beneath a root after
-/// canonical resolution and must not pass through a symbolic link that a
-/// non-root user could have planted.
+/// runs as root and creates placeholders there, so a destination must stay beneath
+/// a root after canonical resolution and must not pass through a symbolic link that
+/// a non-root user, including aria2's account, could have planted.
 /// </summary>
 internal sealed class ModelDestinationPolicy
 {

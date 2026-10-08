@@ -20,6 +20,22 @@ public interface IAsyncDelay
     Task DelayAsync(TimeSpan delay, CancellationToken cancellationToken);
 }
 
+/// <summary>
+/// Routes downloads whose destination directory an untrusted user controls through a staging
+/// file that only the downloader writes; the agent moves the completed file into place.
+/// </summary>
+public interface IModelDownloadStaging
+{
+    /// <summary>Returns where the downloader writes <paramref name="destinationPath"/>, or null to write it in place.</summary>
+    string? GetStagingPath(string destinationPath);
+
+    /// <summary>Moves the completed <paramref name="stagingPath"/> to <paramref name="destinationPath"/>.</summary>
+    void Publish(string stagingPath, string destinationPath);
+
+    /// <summary>Removes any staged data for <paramref name="destinationPath"/>.</summary>
+    void Discard(string destinationPath);
+}
+
 public sealed class DownloadCoordinator
 {
     private const double MinProgressDeltaPercent = 0.5;
@@ -33,6 +49,7 @@ public sealed class DownloadCoordinator
     private readonly TimeSpan _downloadTimeout;
     private readonly TimeSpan _progressInterval;
     private readonly Aria2Settings _settings;
+    private readonly IModelDownloadStaging? _staging;
     private readonly ConcurrentDictionary<string, TrackedDownload> _registry = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _locks = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, CancellationTokenSource> _sessionCancellations = new(StringComparer.Ordinal);
@@ -67,8 +84,10 @@ public sealed class DownloadCoordinator
         IAsyncDelay? delay = null,
         TimeProvider? timeProvider = null,
         TimeSpan? downloadTimeout = null,
-        TimeSpan? progressInterval = null)
+        TimeSpan? progressInterval = null,
+        IModelDownloadStaging? staging = null)
     {
+        _staging = staging;
         _transferBackend = transferBackend ?? throw new ArgumentNullException(nameof(transferBackend));
         _settings = settings ?? throw new ArgumentNullException(nameof(settings));
         _fileSystem = fileSystem ?? new SystemFileSystem();
@@ -292,7 +311,11 @@ public sealed class DownloadCoordinator
             throw new InvalidOperationException("Download request missing destination_path.");
         }
 
-        var directory = _fileSystem.GetDirectoryName(normalized);
+        // A staged download is written where only the downloader can write and published
+        // into its destination once complete.
+        var stagingPath = _staging?.GetStagingPath(normalized);
+        var transferPath = stagingPath ?? normalized;
+        var directory = _fileSystem.GetDirectoryName(transferPath);
         if (string.IsNullOrWhiteSpace(directory))
         {
             throw new InvalidOperationException($"Download destination '{normalized}' does not contain a directory.");
@@ -320,6 +343,13 @@ public sealed class DownloadCoordinator
             if (IsFileSatisfied(normalized, tracked.Request.SizeBytes))
             {
                 await ReportProgressAsync(tracked, ModelDownloadState.Complete, tracked.Request.SizeBytes, tracked.Request.SizeBytes, 100, "already present").ConfigureAwait(false);
+                return;
+            }
+
+            if (stagingPath is not null && IsFileSatisfied(stagingPath, tracked.Request.SizeBytes))
+            {
+                _staging!.Publish(stagingPath, normalized);
+                await ReportProgressAsync(tracked, ModelDownloadState.Complete, tracked.Request.SizeBytes, tracked.Request.SizeBytes, 100, "complete").ConfigureAwait(false);
                 return;
             }
 
@@ -352,7 +382,7 @@ public sealed class DownloadCoordinator
                     handles = await _transferBackend
                         .CreateAsync(
                             new ModelTransferCreateRequest(
-                                normalized,
+                                transferPath,
                                 tracked.Request.SizeBytes,
                                 string.IsNullOrWhiteSpace(sourceUrl) ? [] : [sourceUrl],
                                 metalinkBytes,
@@ -381,7 +411,12 @@ public sealed class DownloadCoordinator
                 try
                 {
                     latestProgress = await WaitForHandlesAsync(tracked, handles, tracked.Request.SizeBytes, effectiveCancellationToken).ConfigureAwait(false);
-                    await WaitForDownloadAsync(normalized, tracked.Request.SizeBytes, effectiveCancellationToken).ConfigureAwait(false);
+                    await WaitForDownloadAsync(transferPath, tracked.Request.SizeBytes, effectiveCancellationToken).ConfigureAwait(false);
+                    if (stagingPath is not null)
+                    {
+                        _staging!.Publish(stagingPath, normalized);
+                    }
+
                     await ReportProgressAsync(tracked, ModelDownloadState.Complete, tracked.Request.SizeBytes, tracked.Request.SizeBytes, 100, "complete").ConfigureAwait(false);
                     return;
                 }
