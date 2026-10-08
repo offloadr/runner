@@ -925,36 +925,7 @@ internal sealed partial class SessionProcessManager : IDisposable
         try
         {
             var sessionCategory = SessionLogCategory(sessionId);
-            var psi = new ProcessStartInfo
-            {
-                FileName = _entryPointPath,
-                WorkingDirectory = _workingDirectory,
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                RedirectStandardInput = false,
-                UserName = identity.UserName,
-                CreateNoWindow = true
-            };
-
-            AddRuntimeArguments(psi, paths);
-
-            foreach (var kvp in BuildSessionEnvironment(sessionId, identity, paths))
-            {
-                psi.Environment[kvp.Key] = kvp.Value;
-            }
-
-            var vfsEnvironment = _vfsEnvironmentBuilder.Build(
-                new RunnerVfsSessionPaths(
-                    paths.ModelsDirectory,
-                    paths.OutputDirectory,
-                    paths.InputDirectory,
-                    paths.TempDirectory),
-                sessionId: sessionId);
-            foreach (var kvp in vfsEnvironment)
-            {
-                psi.Environment[kvp.Key] = kvp.Value;
-            }
+            var psi = BuildEditorStartInfo(sessionId, identity, paths);
 
             process = new Process { StartInfo = psi, EnableRaisingEvents = true };
             var exitTcs = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -1430,6 +1401,46 @@ internal sealed partial class SessionProcessManager : IDisposable
     private static string GetSessionPythonExecutable(SessionPaths paths)
         => CombineRuntimePath(paths.VirtualEnvDirectory, "bin", "python");
 
+    internal ProcessStartInfo BuildEditorStartInfo(
+        string sessionId,
+        PreparedSessionIdentity identity,
+        SessionPaths paths)
+    {
+        var psi = new ProcessStartInfo
+        {
+            FileName = _entryPointPath,
+            WorkingDirectory = _workingDirectory,
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            RedirectStandardInput = false,
+            UserName = identity.UserName,
+            CreateNoWindow = true
+        };
+
+        AddRuntimeArguments(psi, paths);
+
+        SessionEnvironmentFilter.RemoveNonInheritable(psi.Environment);
+        foreach (var kvp in BuildSessionEnvironment(sessionId, identity, paths))
+        {
+            psi.Environment[kvp.Key] = kvp.Value;
+        }
+
+        var vfsEnvironment = _vfsEnvironmentBuilder.Build(
+            new RunnerVfsSessionPaths(
+                paths.ModelsDirectory,
+                paths.OutputDirectory,
+                paths.InputDirectory,
+                paths.TempDirectory),
+            sessionId: sessionId);
+        foreach (var kvp in vfsEnvironment)
+        {
+            psi.Environment[kvp.Key] = kvp.Value;
+        }
+
+        return psi;
+    }
+
     internal ProcessStartInfo BuildManagerUvSyncStartInfo(
         string sessionId,
         PreparedSessionIdentity identity,
@@ -1453,6 +1464,7 @@ internal sealed partial class SessionProcessManager : IDisposable
         psi.ArgumentList.Add("--user-directory");
         psi.ArgumentList.Add(paths.UserDirectory);
 
+        SessionEnvironmentFilter.RemoveNonInheritable(psi.Environment);
         foreach (var kvp in BuildSessionEnvironment(sessionId, identity, paths))
         {
             psi.Environment[kvp.Key] = kvp.Value;

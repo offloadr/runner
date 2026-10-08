@@ -967,6 +967,90 @@ public partial class SessionProcessManagerOwnershipTests
     }
 
     [Test]
+    public void SessionStartInfos_DoNotInheritAgentSecretsOrHostVariables()
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), $"runner-session-env-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempRoot);
+        string[] withheld = ["RUNNER_SECRET", "ARIA2_RPC_SECRET", "OFFLOADR_API_GRPC", "HOSTING_PROVIDER_API_KEY", "HF_TOKEN"];
+        string[] inherited = ["NVIDIA_VISIBLE_DEVICES", "CUDA_VERSION", "LD_LIBRARY_PATH", "UV_LINK_MODE", "LC_ALL", "GRADIO_ANALYTICS_ENABLED"];
+        var previous = withheld.Concat(inherited).ToDictionary(name => name, Environment.GetEnvironmentVariable);
+
+        var options = new SessionProcessOptions
+        {
+            SessionRoot = Path.Combine(tempRoot, "sessions"),
+            EntryPointPath = Path.Combine(tempRoot, "entrypoint.base.sh"),
+            WorkingDirectory = tempRoot,
+            BundledCustomNodesSeedPath = Path.Combine(tempRoot, "seed-custom_nodes"),
+            BundledInputSeedPath = Path.Combine(tempRoot, "seed-input"),
+            SeedVirtualEnvPath = CreateEmptySeedVirtualEnv(tempRoot),
+            UvBinaryPath = FakeUvBinaryPath(tempRoot),
+            ComfyPort = 8188,
+            ShutdownGracePeriod = TimeSpan.FromSeconds(5),
+            ReadyTimeout = TimeSpan.FromSeconds(5),
+            ReadyHost = "127.0.0.1"
+        };
+        var identity = new PreparedSessionIdentity("sess_env", "/sessions/session-env", CleanupIdentity: true);
+        var paths = new SessionProcessManager.SessionPaths
+        {
+            HomeDirectory = "/sessions/session-env",
+            UserDirectory = "/sessions/session-env/user",
+            CustomNodesDirectory = "/sessions/session-env/custom_nodes",
+            ModelsDirectory = "/sessions/session-env/models",
+            VirtualEnvDirectory = "/sessions/session-env/.venv",
+            OutputDirectory = "/sessions/session-env/output",
+            InputDirectory = "/sessions/session-env/input",
+            TempDirectory = "/sessions/session-env/temp",
+            ScratchDirectory = "/sessions/session-env/tmp",
+            CacheDirectory = "/sessions/session-env/.cache",
+            UvCacheDirectory = "/sessions/session-env/.cache/uv",
+            TorchInductorCacheDirectory = "/sessions/session-env/tmp/torchinductor",
+            LogsDirectory = "/sessions/session-env/logs"
+        };
+
+        try
+        {
+            foreach (var name in withheld.Concat(inherited))
+            {
+                Environment.SetEnvironmentVariable(name, $"value-of-{name}");
+            }
+
+            using var manager = new SessionProcessManager(options, new RecordingIsolationStrategy(identity.UserName, identity.HomeDirectory), new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
+
+            foreach (var psi in new[]
+            {
+                manager.BuildEditorStartInfo("session-env", identity, paths),
+                manager.BuildManagerUvSyncStartInfo("session-env", identity, paths),
+            })
+            {
+                Assert.Multiple(() =>
+                {
+                    foreach (var name in withheld)
+                    {
+                        Assert.That(psi.Environment.ContainsKey(name), Is.False, name);
+                    }
+
+                    foreach (var name in inherited)
+                    {
+                        Assert.That(psi.Environment[name], Is.EqualTo($"value-of-{name}"), name);
+                    }
+
+                    Assert.That(psi.Environment["HOME"], Is.EqualTo(paths.HomeDirectory));
+                    Assert.That(psi.Environment["COMFYUI_SESSION_ID"], Is.EqualTo("session-env"));
+                });
+            }
+        }
+        finally
+        {
+            foreach (var (name, value) in previous)
+            {
+                Environment.SetEnvironmentVariable(name, value);
+            }
+
+            TryDelete(tempRoot);
+        }
+    }
+
+    [Test]
     public async Task RunManagerUvSyncOnceAsync_WaitsForRedirectedOutputBeforeReturning()
     {
         LinuxTestPrerequisites.RequireLinux();
