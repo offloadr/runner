@@ -1670,6 +1670,8 @@ public class ServiceClientManagerTests
     [Test]
     public void PrepareForgePromptJson_RewritesArtifactPlaceholdersToSessionTempPaths()
     {
+        LinuxTestPrerequisites.RequireLinux();
+
         var paths = new SessionProcessManager.SessionPaths
         {
             TempDirectory = "/tmp/offloadr-session/temp",
@@ -1696,6 +1698,8 @@ public class ServiceClientManagerTests
     [Test]
     public void PrepareForgePromptJson_DoesNotCascadePrefixArtifactPlaceholders()
     {
+        LinuxTestPrerequisites.RequireLinux();
+
         var tempRoot = Path.Combine(Path.GetTempPath(), $"forge-placeholder-{Guid.NewGuid():N}");
         try
         {

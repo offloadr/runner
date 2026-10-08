@@ -10,9 +10,12 @@ namespace Offloadr.Runner.Linux;
 /// </summary>
 internal sealed class LinuxSecureDirectoryRoot : IDisposable
 {
+    private const int OReadOnly = 0x0;
+    private const int OWriteOnly = 0x1;
     private const int OReadWrite = 0x2;
     private const int OCreate = 0x40;
     private const int OExclusive = 0x80;
+    private const int ONoControllingTerminal = 0x100;
     private const int ONonBlock = 0x800;
     private const int ODirectory = 0x10000;
     private const int ONoFollow = 0x20000;
@@ -20,11 +23,23 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
     private const int OPath = 0x200000;
     private const int FDuplicateCloseOnExec = 1030;
     private const int ENoEntry = 2;
+    private const int ENoDeviceOrAddress = 6;
     private const int EExists = 17;
+    private const int ENotDirectory = 20;
+    private const int EIsDirectory = 21;
+    private const int ETooManySymbolicLinks = 40;
     private const int AtEmptyPath = 0x1000;
     private const int AtSymlinkNoFollow = 0x100;
     private const uint StatxType = 0x0001;
+    private const uint StatxNlink = 0x0004;
+    private const uint StatxMtime = 0x0040;
+    private const uint StatxSize = 0x0200;
     private const int StatxBufferSize = 256;
+    private const int StatxNlinkOffset = 16;
+    private const int StatxModeOffset = 28;
+    private const int StatxSizeOffset = 40;
+    private const int StatxMtimeSecondsOffset = 112;
+    private const int StatxMtimeNanosecondsOffset = 120;
     private const ushort FileTypeMask = 0xF000;
     private const ushort RegularFileType = 0x8000;
     private const long UTimeOmit = (1L << 30) - 2;
@@ -133,7 +148,232 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
         }
     }
 
+    /// <summary>
+    /// Describes <paramref name="relativePath"/> without following symlinks or
+    /// opening it for I/O. Only a single-link regular file reached through real
+    /// directories is reported as <see cref="SecureEntryKind.RegularFile"/>.
+    /// </summary>
+    public SecureFileStatus GetStatus(string relativePath)
+    {
+        var (kind, parent, leafName) = TryOpenExistingParent(relativePath);
+        if (parent is null)
+        {
+            return new SecureFileStatus(kind, 0, default);
+        }
+
+        using (parent)
+        {
+            var descriptor = openat(
+                GetDescriptor(parent),
+                leafName,
+                OPath | ONoFollow | OCloseOnExec);
+            if (descriptor < 0)
+            {
+                var error = Marshal.GetLastPInvokeError();
+                if (error == ENoEntry)
+                {
+                    return new SecureFileStatus(SecureEntryKind.Missing, 0, default);
+                }
+
+                throw CreateException($"inspecting '{relativePath}'", error);
+            }
+
+            using var entry = new SafeFileHandle((nint)descriptor, ownsHandle: true);
+            return ReadStatus(entry, relativePath);
+        }
+    }
+
+    /// <summary>
+    /// Opens an existing single-link regular file for reading without following
+    /// symlinks or blocking on FIFOs and devices. Returns null when it is missing.
+    /// </summary>
+    public FileStream? OpenRegularFileForRead(string relativePath)
+    {
+        var handle = OpenExistingRegularFile(relativePath, OReadOnly, out _);
+        return handle is null
+            ? null
+            : new FileStream(handle, FileAccess.Read, 64 * 1024, isAsync: false);
+    }
+
+    /// <summary>
+    /// Truncates an existing single-link regular file to zero bytes and optionally
+    /// sets its modification time. Returns false when it is missing.
+    /// </summary>
+    public bool TruncateRegularFile(string relativePath, DateTime? modifiedUtc)
+    {
+        using var handle = OpenExistingRegularFile(relativePath, OWriteOnly, out _);
+        if (handle is null)
+        {
+            return false;
+        }
+
+        if (ftruncate(GetDescriptor(handle), 0) != 0)
+        {
+            throw CreateException($"truncating '{relativePath}'");
+        }
+
+        if (modifiedUtc.HasValue)
+        {
+            SetModifiedUtc(handle, modifiedUtc.Value);
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Creates every directory component of <paramref name="relativeDirectory"/>
+    /// beneath the root without following symlinks.
+    /// </summary>
+    public void EnsureDirectory(string relativeDirectory)
+    {
+        var parts = SplitRelativePath(relativeDirectory);
+        var current = DuplicateDirectory(_rootHandle);
+        try
+        {
+            foreach (var part in parts)
+            {
+                var next = OpenDirectory(current, part, createDirectory: true);
+                current.Dispose();
+                current = next;
+            }
+        }
+        finally
+        {
+            current.Dispose();
+        }
+    }
+
     public void Dispose() => _rootHandle.Dispose();
+
+    private SafeFileHandle? OpenExistingRegularFile(
+        string relativePath,
+        int accessMode,
+        out SecureFileStatus status)
+    {
+        status = default;
+        var (kind, parent, leafName) = TryOpenExistingParent(relativePath);
+        if (parent is null)
+        {
+            if (kind == SecureEntryKind.Missing)
+            {
+                return null;
+            }
+
+            throw NotRegularFile(relativePath);
+        }
+
+        using (parent)
+        {
+            var descriptor = openat(
+                GetDescriptor(parent),
+                leafName,
+                accessMode | ONoFollow | ONonBlock | ONoControllingTerminal | OCloseOnExec);
+            if (descriptor < 0)
+            {
+                var error = Marshal.GetLastPInvokeError();
+                return error switch
+                {
+                    ENoEntry => null,
+                    ETooManySymbolicLinks or ENoDeviceOrAddress or EIsDirectory or ENotDirectory
+                        => throw NotRegularFile(relativePath),
+                    _ => throw CreateException($"opening '{relativePath}'", error)
+                };
+            }
+
+            var handle = new SafeFileHandle((nint)descriptor, ownsHandle: true);
+            try
+            {
+                status = ReadStatus(handle, relativePath);
+                if (status.Kind != SecureEntryKind.RegularFile)
+                {
+                    throw NotRegularFile(relativePath);
+                }
+
+                return handle;
+            }
+            catch
+            {
+                handle.Dispose();
+                throw;
+            }
+        }
+    }
+
+    private (SecureEntryKind Kind, SafeFileHandle? Parent, string LeafName) TryOpenExistingParent(string relativePath)
+    {
+        var parts = SplitRelativePath(relativePath);
+        var current = DuplicateDirectory(_rootHandle);
+        try
+        {
+            for (var index = 0; index < parts.Length - 1; index++)
+            {
+                var descriptor = openat(
+                    GetDescriptor(current),
+                    parts[index],
+                    OPath | ODirectory | ONoFollow | OCloseOnExec);
+                if (descriptor < 0)
+                {
+                    var error = Marshal.GetLastPInvokeError();
+                    current.Dispose();
+                    return error switch
+                    {
+                        ENoEntry => (SecureEntryKind.Missing, null, string.Empty),
+                        ENotDirectory or ETooManySymbolicLinks => (SecureEntryKind.Other, null, string.Empty),
+                        _ => throw CreateException($"opening directory component '{parts[index]}'", error)
+                    };
+                }
+
+                current.Dispose();
+                current = new SafeFileHandle((nint)descriptor, ownsHandle: true);
+            }
+
+            return (SecureEntryKind.RegularFile, current, parts[^1]);
+        }
+        catch
+        {
+            current.Dispose();
+            throw;
+        }
+    }
+
+    private static SecureFileStatus ReadStatus(SafeFileHandle file, string relativePath)
+    {
+        var buffer = Marshal.AllocHGlobal(StatxBufferSize);
+        try
+        {
+            if (statx(
+                    GetDescriptor(file),
+                    string.Empty,
+                    AtEmptyPath | AtSymlinkNoFollow,
+                    StatxType | StatxNlink | StatxSize | StatxMtime,
+                    buffer) != 0)
+            {
+                throw CreateException($"inspecting '{relativePath}'");
+            }
+
+            var mode = unchecked((ushort)Marshal.ReadInt16(buffer, StatxModeOffset));
+            var links = unchecked((uint)Marshal.ReadInt32(buffer, StatxNlinkOffset));
+            if ((mode & FileTypeMask) != RegularFileType || links > 1)
+            {
+                // Hard links can make a file outside the tree appear inside it.
+                return new SecureFileStatus(SecureEntryKind.Other, 0, default);
+            }
+
+            var size = Marshal.ReadInt64(buffer, StatxSizeOffset);
+            var seconds = Marshal.ReadInt64(buffer, StatxMtimeSecondsOffset);
+            var nanoseconds = unchecked((uint)Marshal.ReadInt32(buffer, StatxMtimeNanosecondsOffset));
+            var modifiedUtc = DateTime.UnixEpoch.AddTicks(
+                (seconds * TimeSpan.TicksPerSecond) + (nanoseconds / 100));
+            return new SecureFileStatus(SecureEntryKind.RegularFile, size, modifiedUtc);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
+    }
+
+    private static UnauthorizedAccessException NotRegularFile(string relativePath)
+        => new($"Path is not a regular file beneath its trusted root: '{relativePath}'.");
 
     private (SafeFileHandle Parent, string LeafName) OpenParent(
         string relativePath,
@@ -421,4 +661,19 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
         int flags,
         uint mask,
         nint buffer);
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int ftruncate(int fileDescriptor, long length);
+}
+
+internal enum SecureEntryKind
+{
+    Missing,
+    RegularFile,
+    Other
+}
+
+internal readonly record struct SecureFileStatus(SecureEntryKind Kind, long Length, DateTime LastWriteTimeUtc)
+{
+    public bool IsRegularFile => Kind == SecureEntryKind.RegularFile;
 }

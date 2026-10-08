@@ -18,6 +18,9 @@ namespace Offloadr.Runner.Linux;
 
 internal sealed class ArtifactUploadService : IAsyncDisposable
 {
+    /// <summary>Largest session file the uploader will send; larger files are skipped.</summary>
+    internal const long MaxUploadBytes = 4L * 1024 * 1024 * 1024;
+
     private readonly string? _runnerSecret;
     private readonly RunnerArtifactService.RunnerArtifactServiceClient _artifactClient;
     private readonly Metadata? _authHeaders;
@@ -929,7 +932,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             => (!type.Equals("input", StringComparison.OrdinalIgnoreCase) || _inputSeeds.ContainsKey(NormalizePath(path)))
                && HasMaterializedLocalFile(path);
 
-        private static void ClearUncatalogedInputFile(string type, string path)
+        private void ClearUncatalogedInputFile(string type, string path)
         {
             if (!type.Equals("input", StringComparison.OrdinalIgnoreCase))
             {
@@ -938,13 +941,13 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
             try
             {
-                if (!File.Exists(path))
+                if (!TryResolveSecureLocation(type, path, out var root, out var relativePath))
                 {
                     return;
                 }
 
-                using var fs = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.Read);
-                fs.SetLength(0);
+                using var secureRoot = new LinuxSecureDirectoryRoot(root);
+                secureRoot.TruncateRegularFile(relativePath, modifiedUtc: null);
             }
             catch
             {
@@ -1031,6 +1034,32 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             return true;
         }
 
+        private string? GetArtifactTypeRoot(string type)
+            => type.ToLowerInvariant() switch
+            {
+                "input" => _paths.InputDirectory,
+                "output" => _paths.OutputDirectory,
+                "temp" => _paths.TempDirectory,
+                _ => null
+            };
+
+        /// <summary>
+        /// Maps a session artifact path to its type root and a relative path so file
+        /// operations can run through <see cref="LinuxSecureDirectoryRoot"/>.
+        /// </summary>
+        private bool TryResolveSecureLocation(string type, string path, out string root, out string relativePath)
+        {
+            root = GetArtifactTypeRoot(type) ?? string.Empty;
+            relativePath = string.Empty;
+            if (!TryResolveArtifactPath(path, root, out var subfolder, out var filename))
+            {
+                return false;
+            }
+
+            relativePath = subfolder.Length == 0 ? filename : $"{subfolder}/{filename}";
+            return true;
+        }
+
         private static string NormalizePath(string path)
         {
             try
@@ -1055,13 +1084,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
         private string? ResolveLocalPath(string type, string? subfolder, string filename)
         {
-            string? root = type.ToLowerInvariant() switch
-            {
-                "input" => _paths.InputDirectory,
-                "output" => _paths.OutputDirectory,
-                "temp" => _paths.TempDirectory,
-                _ => null
-            };
+            var root = GetArtifactTypeRoot(type);
 
             if (string.IsNullOrWhiteSpace(root) || string.IsNullOrWhiteSpace(filename))
             {
@@ -1084,44 +1107,37 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
         private void EnsurePlaceholder(RemoteArtifactState state, RemoteArtifactState? previousState)
         {
-            var directory = Path.GetDirectoryName(state.LocalPath);
-            if (!string.IsNullOrWhiteSpace(directory))
+            if (!TryResolveSecureLocation(state.Type, state.LocalPath, out var root, out var relativePath))
             {
-                Directory.CreateDirectory(directory);
+                throw new InvalidOperationException($"Artifact path is outside its session root: '{state.LocalPath}'.");
             }
 
-            if (!File.Exists(state.LocalPath))
+            using var secureRoot = new LinuxSecureDirectoryRoot(root);
+            var status = secureRoot.GetStatus(relativePath);
+            switch (status.Kind)
             {
-                using var fs = new FileStream(state.LocalPath, FileMode.CreateNew, FileAccess.Write, FileShare.Read);
-                fs.SetLength(0);
-            }
-            else
-            {
-                var info = new FileInfo(state.LocalPath);
-                if (info.Length > 0)
-                {
-                    if (ShouldKeepExistingArtifactFile(state, previousState, info))
-                    {
-                        state.MarkDownloaded();
-                        return;
-                    }
-                }
-
-                using var fs = new FileStream(state.LocalPath, FileMode.Open, FileAccess.Write, FileShare.Read);
-                fs.SetLength(0);
+                case SecureEntryKind.Missing:
+                    secureRoot.EnsurePlaceholder(relativePath, state.CreatedUtc.UtcDateTime);
+                    return;
+                case SecureEntryKind.Other:
+                    throw new UnauthorizedAccessException($"Artifact path is not a regular file: '{state.LocalPath}'.");
             }
 
-            try
+            if (status.Length > 0 && ShouldKeepExistingArtifactFile(state, previousState, status.Length, secureRoot, relativePath))
             {
-                File.SetLastWriteTimeUtc(state.LocalPath, state.CreatedUtc.UtcDateTime);
+                state.MarkDownloaded();
+                return;
             }
-            catch
-            {
-                // best effort
-            }
+
+            secureRoot.TruncateRegularFile(relativePath, state.CreatedUtc.UtcDateTime);
         }
 
-        private static bool ShouldKeepExistingArtifactFile(RemoteArtifactState state, RemoteArtifactState? previousState, FileInfo fileInfo)
+        private static bool ShouldKeepExistingArtifactFile(
+            RemoteArtifactState state,
+            RemoteArtifactState? previousState,
+            long length,
+            LinuxSecureDirectoryRoot secureRoot,
+            string relativePath)
         {
             if (!string.Equals(state.Type, "input", StringComparison.OrdinalIgnoreCase))
             {
@@ -1130,12 +1146,16 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
             return previousState is { Downloaded: true }
                    && previousState.HasSameCatalogGeneration(state)
-                   && ExistingFileMatchesCatalogMetadata(state, fileInfo);
+                   && ExistingFileMatchesCatalogMetadata(state, length, secureRoot, relativePath);
         }
 
-        private static bool ExistingFileMatchesCatalogMetadata(RemoteArtifactState state, FileInfo fileInfo)
+        private static bool ExistingFileMatchesCatalogMetadata(
+            RemoteArtifactState state,
+            long length,
+            LinuxSecureDirectoryRoot secureRoot,
+            string relativePath)
         {
-            if (state.SizeBytes.HasValue && fileInfo.Length != state.SizeBytes.Value)
+            if (state.SizeBytes.HasValue && length != state.SizeBytes.Value)
             {
                 return false;
             }
@@ -1144,7 +1164,12 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             {
                 try
                 {
-                    using var stream = new FileStream(fileInfo.FullName, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 64 * 1024, FileOptions.SequentialScan);
+                    using var stream = secureRoot.OpenRegularFileForRead(relativePath);
+                    if (stream is null)
+                    {
+                        return false;
+                    }
+
                     var actualSha = Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
                     return string.Equals(actualSha, state.Sha256, StringComparison.OrdinalIgnoreCase);
                 }
@@ -1187,19 +1212,20 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
         private async Task FetchToFileAsync(RemoteArtifactState state, IAsyncStreamReader<RunnerArtifactServiceReadArtifactResponse> responseStream, CancellationToken cancellationToken)
         {
-            var directory = Path.GetDirectoryName(state.LocalPath);
-            if (!string.IsNullOrWhiteSpace(directory))
+            if (!TryResolveSecureLocation(state.Type, state.LocalPath, out var root, out var relativePath))
             {
-                Directory.CreateDirectory(directory);
+                throw new InvalidOperationException($"Artifact path is outside its session root: '{state.LocalPath}'.");
             }
 
-            var tempPath = Path.Combine(directory ?? Path.GetTempPath(), $".{Path.GetRandomFileName()}.part");
-            try
+            // Write and publish relative to a pinned directory descriptor so that a
+            // swapped symlink in the session tree cannot redirect the root-owned write.
+            using var secureRoot = new LinuxSecureDirectoryRoot(root);
+            using (var publication = secureRoot.CreatePublication(relativePath))
             {
                 long bytesWritten = 0;
                 long? expectedSizeBytes = null;
                 string? expectedSha256 = null;
-                await using (var destination = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None, 64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan))
+                await using (var destination = publication.OpenWriteStream())
                 using (var hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA256))
                 {
                     var sawMetadata = false;
@@ -1251,29 +1277,17 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     }
                 }
 
-                File.Move(tempPath, state.LocalPath, overwrite: true);
                 try
                 {
-                    File.SetLastWriteTimeUtc(state.LocalPath, state.CreatedUtc.UtcDateTime);
+                    publication.SetModifiedUtc(state.CreatedUtc.UtcDateTime);
                 }
                 catch
                 {
                     // ignore timestamp failures
                 }
-            }
-            finally
-            {
-                try
-                {
-                    if (File.Exists(tempPath))
-                    {
-                        File.Delete(tempPath);
-                    }
-                }
-                catch
-                {
-                    // ignore cleanup failures
-                }
+
+                // Disposing an uncommitted publication removes its temporary file.
+                publication.Commit();
             }
         }
 
@@ -1282,24 +1296,48 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             if (string.IsNullOrWhiteSpace(fullPath)) return;
             try
             {
-                if (!File.Exists(fullPath))
+                if (!TryResolveSecureLocation(type, fullPath, out var root, out var relativePath))
                 {
                     return;
                 }
 
-                var fileInfo = new FileInfo(fullPath);
-                if (!fileInfo.Exists)
+                // Inspect without following symlinks: only plain regular files in the
+                // session tree are uploaded; links, FIFOs, devices and directories are not.
+                SecureFileStatus status;
+                using (var secureRoot = new LinuxSecureDirectoryRoot(root))
+                {
+                    status = secureRoot.GetStatus(relativePath);
+                }
+
+                if (status.Kind == SecureEntryKind.Missing)
                 {
                     return;
                 }
 
-                if (TryGetCatalogEntry(fullPath, out var knownState) && ShouldSkipCatalogBackedUpload(fileInfo, knownState))
+                if (!status.IsRegularFile)
+                {
+                    _logger.LogDebug(
+                        "Skipping non-regular artifact path session={SessionId} type={Type} path={Path}",
+                        _sessionId,
+                        type,
+                        fullPath);
+                    return;
+                }
+
+                if (TryGetCatalogEntry(fullPath, out var knownState) && ShouldSkipCatalogBackedUpload(status, knownState))
                 {
                     return;
                 }
-                var attr = File.GetAttributes(fullPath);
-                if ((attr & FileAttributes.Directory) != 0)
+
+                if (status.Length > MaxUploadBytes)
                 {
+                    _logger.LogWarning(
+                        "Skipping artifact larger than the upload limit session={SessionId} type={Type} path={Path} bytes={Bytes} limit={Limit}",
+                        _sessionId,
+                        type,
+                        fullPath,
+                        status.Length,
+                        MaxUploadBytes);
                     return;
                 }
 
@@ -1314,7 +1352,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     type,
                     source,
                     fullPath,
-                    fileInfo.Length);
+                    status.Length);
 
                 var request = new UploadRequest(type, fullPath, 0);
                 if (!_queue.Writer.TryWrite(request))
@@ -1328,7 +1366,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             }
         }
 
-        private static bool ShouldSkipCatalogBackedUpload(FileInfo fileInfo, RemoteArtifactState? knownState)
+        private static bool ShouldSkipCatalogBackedUpload(SecureFileStatus status, RemoteArtifactState? knownState)
         {
             if (knownState is null)
             {
@@ -1336,7 +1374,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             }
 
             // Ignore catalog placeholders (0-byte files) and only upload once the local file has real content.
-            if (fileInfo.Length <= 0)
+            if (status.Length <= 0)
             {
                 return true;
             }
@@ -1347,13 +1385,13 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             }
 
             var knownSize = knownState.SizeBytes;
-            if (!knownSize.HasValue || knownSize.Value != fileInfo.Length)
+            if (!knownSize.HasValue || knownSize.Value != status.Length)
             {
                 return false;
             }
 
             // If size and mtime still match catalog metadata, nothing changed locally.
-            return fileInfo.LastWriteTimeUtc <= knownState.CreatedUtc.UtcDateTime;
+            return status.LastWriteTimeUtc <= knownState.CreatedUtc.UtcDateTime;
         }
 
         private async Task ProcessQueueAsync()
@@ -1400,17 +1438,22 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         private async Task UploadAsync(UploadRequest request)
         {
             var (type, fullPath, attempt) = request;
-            var (root, relPath) = ResolveRelativePath(type, fullPath);
-            if (root is null || relPath is null)
+            if (!type.Equals("output", StringComparison.OrdinalIgnoreCase) &&
+                !type.Equals("temp", StringComparison.OrdinalIgnoreCase))
             {
                 return;
             }
 
-            await WaitForFileStableAsync(fullPath, _cts.Token).ConfigureAwait(false);
+            if (!TryResolveSecureLocation(type, fullPath, out var root, out var relPath))
+            {
+                return;
+            }
 
-            var fileName = Path.GetFileName(relPath);
-            var subfolder = Path.GetDirectoryName(relPath);
-            subfolder = string.IsNullOrWhiteSpace(subfolder) ? string.Empty : subfolder.Replace(Path.DirectorySeparatorChar, '/');
+            await WaitForFileStableAsync(root, relPath, _cts.Token).ConfigureAwait(false);
+
+            var separatorIndex = relPath.LastIndexOf('/');
+            var fileName = separatorIndex < 0 ? relPath : relPath[(separatorIndex + 1)..];
+            var subfolder = separatorIndex < 0 ? string.Empty : relPath[..separatorIndex];
 
             for (var tries = 0; tries < 5; tries++)
             {
@@ -1424,13 +1467,33 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         return;
                     }
 
-                    var fileInfo = new FileInfo(fullPath);
-                    if (!fileInfo.Exists)
+                    // Open without following symlinks or blocking on FIFOs; the agent
+                    // runs as root and must only read plain files from the session tree.
+                    FileStream? opened;
+                    using (var secureRoot = new LinuxSecureDirectoryRoot(root))
+                    {
+                        opened = secureRoot.OpenRegularFileForRead(relPath);
+                    }
+
+                    if (opened is null)
                     {
                         return;
                     }
 
-                    await using var stream = new FileStream(fullPath, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
+                    await using var stream = opened;
+                    var sizeBytes = stream.Length;
+                    if (sizeBytes > MaxUploadBytes)
+                    {
+                        _logger.LogWarning(
+                            "Skipping artifact larger than the upload limit session={SessionId} type={Type} path={Relative} bytes={Bytes} limit={Limit}",
+                            _sessionId,
+                            type,
+                            relPath,
+                            sizeBytes,
+                            MaxUploadBytes);
+                        return;
+                    }
+
                     var contentType = ResolveContentType(fileName);
 
                     var metadata = new RunnerArtifactUploadMetadata
@@ -1441,7 +1504,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         Type = type,
                         Subfolder = subfolder,
                         ContentType = string.IsNullOrWhiteSpace(contentType) ? null : contentType,
-                        SizeBytes = stream.Length
+                        SizeBytes = sizeBytes
                     };
 
                     if (!string.IsNullOrWhiteSpace(_owner))
@@ -1465,7 +1528,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         _editorSid,
                         type,
                         relPath,
-                        stream.Length);
+                        sizeBytes);
 
                     var call = _artifactClient.UploadArtifact(headers: _authHeaders, cancellationToken: _cts.Token);
                     await call.RequestStream.WriteAsync(new RunnerArtifactServiceUploadArtifactRequest { Metadata = metadata }).ConfigureAwait(false);
@@ -1473,9 +1536,13 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     var buffer = ArrayPool<byte>.Shared.Rent(128 * 1024);
                     try
                     {
+                        // Send at most the size declared in the metadata, even if the file grows.
+                        var remaining = sizeBytes;
                         int read;
-                        while ((read = await stream.ReadAsync(buffer.AsMemory(0, buffer.Length), _cts.Token).ConfigureAwait(false)) > 0)
+                        while (remaining > 0 &&
+                               (read = await stream.ReadAsync(buffer.AsMemory(0, (int)Math.Min(buffer.Length, remaining)), _cts.Token).ConfigureAwait(false)) > 0)
                         {
+                            remaining -= read;
                             await call.RequestStream.WriteAsync(new RunnerArtifactServiceUploadArtifactRequest
                             {
                                 Chunk = Google.Protobuf.ByteString.CopyFrom(buffer, 0, read)
@@ -1497,11 +1564,17 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
                     var createdUtc = DateTimeOffset.UtcNow;
                     var localPath = NormalizePath(fullPath);
-                    var remote = new RemoteArtifactState(_editorSid, type, subfolder, fileName, localPath, fileInfo.Length, null, createdUtc);
+                    var remote = new RemoteArtifactState(_editorSid, type, subfolder, fileName, localPath, sizeBytes, null, createdUtc);
                     _catalog[remote.LocalPath] = remote;
                     remote.MarkDownloaded();
 
                     _logger.LogInformation("Uploaded artifact session={SessionId} type={Type} path={Relative}", _sessionId, type, relPath);
+                    return;
+                }
+                catch (UnauthorizedAccessException ex)
+                {
+                    // The path became a symlink, FIFO or other non-regular file; never retry it.
+                    _logger.LogWarning(ex, "Skipping non-regular artifact path session={SessionId} type={Type} path={Relative}", _sessionId, type, relPath);
                     return;
                 }
                 catch (IOException ex) when (tries < 4)
@@ -1512,30 +1585,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             }
         }
 
-        private (string? Root, string? RelativePath) ResolveRelativePath(string type, string fullPath)
-        {
-            string? root = type.Equals("output", StringComparison.OrdinalIgnoreCase)
-                ? _paths.OutputDirectory
-                : type.Equals("temp", StringComparison.OrdinalIgnoreCase)
-                    ? _paths.TempDirectory
-                    : null;
-
-            if (string.IsNullOrWhiteSpace(root)) return (null, null);
-
-            try
-            {
-                var relative = Path.GetRelativePath(root, fullPath);
-                if (relative.StartsWith("..")) return (null, null);
-
-                return (root, relative);
-            }
-            catch
-            {
-                return (null, null);
-            }
-        }
-
-        private static async Task WaitForFileStableAsync(string path, CancellationToken token)
+        private static async Task WaitForFileStableAsync(string root, string relativePath, CancellationToken token)
         {
             const int MaxChecks = 10;
             const int DelayMs = 150;
@@ -1548,8 +1598,13 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 token.ThrowIfCancellationRequested();
                 try
                 {
-                    var info = new FileInfo(path);
-                    if (!info.Exists)
+                    SecureFileStatus info;
+                    using (var secureRoot = new LinuxSecureDirectoryRoot(root))
+                    {
+                        info = secureRoot.GetStatus(relativePath);
+                    }
+
+                    if (!info.IsRegularFile)
                     {
                         await Task.Delay(DelayMs, token).ConfigureAwait(false);
                         continue;

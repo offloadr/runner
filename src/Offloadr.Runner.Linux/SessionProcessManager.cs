@@ -547,11 +547,15 @@ internal sealed partial class SessionProcessManager : IDisposable
                 continue;
             }
 
-            var localPath = ResolvePromptArtifactPath(paths, reference);
-            var directory = Path.GetDirectoryName(localPath);
-            if (!string.IsNullOrWhiteSpace(directory))
+            var (artifactRoot, relativePath, localPath) = ResolvePromptArtifactPath(paths, reference);
+            var separatorIndex = relativePath.LastIndexOf('/');
+            if (separatorIndex > 0)
             {
-                Directory.CreateDirectory(directory);
+                // The session owns its artifact roots; create subfolders without
+                // following symlinks so they stay beneath the root.
+                Directory.CreateDirectory(artifactRoot);
+                using var secureRoot = new LinuxSecureDirectoryRoot(artifactRoot);
+                secureRoot.EnsureDirectory(relativePath[..separatorIndex]);
             }
 
             replacements[reference.Placeholder] = localPath;
@@ -792,7 +796,7 @@ internal sealed partial class SessionProcessManager : IDisposable
             : null;
     }
 
-    private static string ResolvePromptArtifactPath(SessionPaths paths, PromptArtifactReference reference)
+    private static (string Root, string RelativePath, string FullPath) ResolvePromptArtifactPath(SessionPaths paths, PromptArtifactReference reference)
     {
         var root = string.Equals(reference.Type, "output", StringComparison.OrdinalIgnoreCase)
             ? paths.OutputDirectory
@@ -802,12 +806,12 @@ internal sealed partial class SessionProcessManager : IDisposable
             throw new InvalidOperationException("Prompt artifact filename is required.");
         }
 
-        if (!SessionArtifactPaths.TryResolve(root, reference.Subfolder, reference.Filename, out var candidate, out _))
+        if (!SessionArtifactPaths.TryResolve(root, reference.Subfolder, reference.Filename, out var candidate, out var relativePath))
         {
             throw new InvalidOperationException("Prompt artifact path escapes the session root.");
         }
 
-        return candidate;
+        return (root, relativePath, candidate);
     }
 
     private static bool IsForgeRuntime(SubmitPromptCommand command)

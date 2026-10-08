@@ -51,6 +51,50 @@ public class SessionArtifactPathsTests
             Is.False);
     }
 
+    [Test]
+    public void PrepareForgePromptJson_DoesNotCreateDirectoriesThroughSymlinkedSubfolder()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+
+        var tempRoot = Path.Combine(Path.GetTempPath(), $"forge-reference-{Guid.NewGuid():N}");
+        try
+        {
+            var paths = new SessionProcessManager.SessionPaths
+            {
+                TempDirectory = Path.Combine(tempRoot, "temp"),
+                OutputDirectory = Path.Combine(tempRoot, "output")
+            };
+            var outside = Directory.CreateDirectory(Path.Combine(tempRoot, "outside")).FullName;
+            Directory.CreateDirectory(paths.TempDirectory);
+            Directory.CreateSymbolicLink(Path.Combine(paths.TempDirectory, "forge-queue"), outside);
+            var references = new[]
+            {
+                new PromptArtifactReference
+                {
+                    Placeholder = "offloadr://forge-artifact/submission-1/0",
+                    Filename = "image.png",
+                    Type = "temp",
+                    Subfolder = "forge-queue/submission-1"
+                }
+            };
+
+            Assert.That(
+                () => SessionProcessManager.PrepareForgePromptJson(
+                    """{"path":"offloadr://forge-artifact/submission-1/0"}""",
+                    references,
+                    paths),
+                Throws.InstanceOf<IOException>());
+            Assert.That(Directory.EnumerateFileSystemEntries(outside), Is.Empty);
+        }
+        finally
+        {
+            if (Directory.Exists(tempRoot))
+            {
+                Directory.Delete(tempRoot, recursive: true);
+            }
+        }
+    }
+
     [TestCase("../outside", "image.png")]
     [TestCase("", "/etc/passwd")]
     [TestCase("", "../image.png")]
