@@ -21,6 +21,11 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
     /// <summary>Largest session file the uploader will send; larger files are skipped.</summary>
     internal const long MaxUploadBytes = 4L * 1024 * 1024 * 1024;
 
+    /// <summary>Most session files waiting for upload at once; more wait for the next scan.</summary>
+    internal static int MaxPendingUploads { get; set; } = 4096;
+
+    private static readonly TimeSpan DropWarningInterval = TimeSpan.FromMinutes(1);
+
     /// <summary>How long Stop waits for cancelled upload and download work before moving on.</summary>
     internal static TimeSpan StopWaitTimeout { get; set; } = TimeSpan.FromSeconds(10);
 
@@ -88,6 +93,9 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             await uploader.SeedSnapshotAsync(editorSid, owner, initialArtifacts, cancellationToken).ConfigureAwait(false);
         }
     }
+
+    internal int GetPendingUploadCount(string sessionId)
+        => _sessions.TryGetValue(sessionId, out var uploader) ? uploader.PendingUploadCount : 0;
 
     public void RegisterInputSeeds(string sessionId)
     {
@@ -214,10 +222,10 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         private readonly string _runnerId;
         private readonly Channel<UploadRequest> _queue;
         private readonly CancellationTokenSource _cts = new();
-        private readonly ConcurrentDictionary<string, byte> _pending = new(StringComparer.OrdinalIgnoreCase);
-        private readonly ConcurrentDictionary<string, RemoteArtifactState> _catalog = new(StringComparer.OrdinalIgnoreCase);
-        private readonly ConcurrentDictionary<string, Task> _downloadTasks = new(StringComparer.OrdinalIgnoreCase);
-        private readonly ConcurrentDictionary<string, byte> _inputSeeds = new(StringComparer.OrdinalIgnoreCase);
+        private readonly ConcurrentDictionary<string, byte> _pending = new(StringComparer.Ordinal);
+        private readonly ConcurrentDictionary<string, RemoteArtifactState> _catalog = new(StringComparer.Ordinal);
+        private readonly ConcurrentDictionary<string, Task> _downloadTasks = new(StringComparer.Ordinal);
+        private readonly ConcurrentDictionary<string, byte> _inputSeeds = new(StringComparer.Ordinal);
         private readonly object _watcherGate = new();
         private FileSystemWatcher? _homeWatcher;
         private FileSystemWatcher? _outputWatcher;
@@ -225,6 +233,8 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         private Task? _worker;
         private bool _activated;
         private bool _catalogLoaded;
+        private long _droppedUploads;
+        private long _lastDropWarningTicks = long.MinValue / 2;
 
         public SessionUploader(string? runnerSecret, RunnerArtifactService.RunnerArtifactServiceClient artifactClient, Metadata? authHeaders, string sessionId, SessionProcessManager.SessionPaths paths, ILogger logger, RuntimeIdentityRegistry? runtimeIdentities = null, string? runnerId = null)
         {
@@ -704,13 +714,13 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             }
 
             var normalized = NormalizePath(path ?? string.Empty);
-            if (string.Equals(normalized, NormalizePath(_paths.OutputDirectory), StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(normalized, NormalizePath(_paths.OutputDirectory), StringComparison.Ordinal))
             {
                 type = "output";
                 return true;
             }
 
-            if (string.Equals(normalized, NormalizePath(_paths.TempDirectory), StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(normalized, NormalizePath(_paths.TempDirectory), StringComparison.Ordinal))
             {
                 type = "temp";
                 return true;
@@ -785,7 +795,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 };
 
                 var response = await _artifactClient.ListArtifactsAsync(request, headers: _authHeaders, cancellationToken: token).ConfigureAwait(false);
-                var currentPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var currentPaths = new HashSet<string>(StringComparer.Ordinal);
                 foreach (var item in response.Artifacts)
                 {
                     var appliedPath = ApplyCatalogEntry(item, editorSid);
@@ -833,7 +843,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 return false;
             }
 
-            var currentPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var currentPaths = new HashSet<string>(StringComparer.Ordinal);
             foreach (var item in artifacts)
             {
                 var appliedPath = ApplyCatalogEntry(item, editorSid);
@@ -1364,6 +1374,14 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     return;
                 }
 
+                // Session code decides how many files appear; past the cap new files wait
+                // for the next refresh scan instead of growing the agent's memory.
+                if (_pending.Count >= MaxPendingUploads)
+                {
+                    NoteDroppedUpload(fullPath);
+                    return;
+                }
+
                 if (!_pending.TryAdd(fullPath, 0))
                 {
                     return;
@@ -1387,6 +1405,27 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             {
                 _logger.LogDebug(ex, "Failed to queue artifact for session {SessionId}", _sessionId);
             }
+        }
+
+        internal int PendingUploadCount => _pending.Count;
+
+        private void NoteDroppedUpload(string fullPath)
+        {
+            var dropped = Interlocked.Increment(ref _droppedUploads);
+            var now = Environment.TickCount64;
+            var last = Interlocked.Read(ref _lastDropWarningTicks);
+            if (now - last < DropWarningInterval.TotalMilliseconds ||
+                Interlocked.CompareExchange(ref _lastDropWarningTicks, now, last) != last)
+            {
+                return;
+            }
+
+            _logger.LogWarning(
+                "Artifact upload queue is full session={SessionId} limit={Limit} dropped={Dropped} latest={Path}; dropped files are retried on the next scan",
+                _sessionId,
+                MaxPendingUploads,
+                dropped,
+                fullPath);
         }
 
         private static bool ShouldSkipCatalogBackedUpload(SecureFileStatus status, RemoteArtifactState? knownState)
@@ -1425,9 +1464,12 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 {
                     while (_queue.Reader.TryRead(out var item))
                     {
+                        // A retried item keeps its pending entry, so the queue never holds
+                        // more items than the pending cap admits.
+                        UploadRequest? retry = null;
                         try
                         {
-                            await UploadAsync(item).ConfigureAwait(false);
+                            retry = await UploadAsync(item).ConfigureAwait(false);
                         }
                         catch (OperationCanceledException) when (_cts.IsCancellationRequested)
                         {
@@ -1437,18 +1479,21 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         {
                             if (item.Attempt < 3)
                             {
-                                var retry = item with { Attempt = item.Attempt + 1 };
-                                _logger.LogDebug(ex, "Retrying artifact upload {Path} attempt {Attempt}", item.FullPath, retry.Attempt);
+                                retry = item with { Attempt = item.Attempt + 1 };
+                                _logger.LogDebug(ex, "Retrying artifact upload {Path} attempt {Attempt}", item.FullPath, item.Attempt + 1);
                                 await Task.Delay(TimeSpan.FromMilliseconds(200 * (item.Attempt + 1)), _cts.Token).ConfigureAwait(false);
-                                _queue.Writer.TryWrite(retry);
-                                continue;
                             }
-
-                            _logger.LogWarning(ex, "Failed to upload artifact {Path} after retries", item.FullPath);
+                            else
+                            {
+                                _logger.LogWarning(ex, "Failed to upload artifact {Path} after retries", item.FullPath);
+                            }
                         }
                         finally
                         {
-                            _pending.TryRemove(item.FullPath, out _);
+                            if (retry is not { } next || !_queue.Writer.TryWrite(next))
+                            {
+                                _pending.TryRemove(item.FullPath, out _);
+                            }
                         }
                     }
                 }
@@ -1458,18 +1503,18 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             }
         }
 
-        private async Task UploadAsync(UploadRequest request)
+        private async Task<UploadRequest?> UploadAsync(UploadRequest request)
         {
             var (type, fullPath, attempt) = request;
             if (!type.Equals("output", StringComparison.OrdinalIgnoreCase) &&
                 !type.Equals("temp", StringComparison.OrdinalIgnoreCase))
             {
-                return;
+                return null;
             }
 
             if (!TryResolveSecureLocation(type, fullPath, out var root, out var relPath))
             {
-                return;
+                return null;
             }
 
             await WaitForFileStableAsync(root, relPath, _cts.Token).ConfigureAwait(false);
@@ -1486,8 +1531,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     if (string.IsNullOrWhiteSpace(_editorSid))
                     {
                         await Task.Delay(InitialRetryDelay * (tries + 1), _cts.Token).ConfigureAwait(false);
-                        _queue.Writer.TryWrite(request with { Attempt = request.Attempt + 1 });
-                        return;
+                        return request with { Attempt = request.Attempt + 1 };
                     }
 
                     // Open without following symlinks or blocking on FIFOs; the agent
@@ -1500,7 +1544,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
                     if (opened is null)
                     {
-                        return;
+                        return null;
                     }
 
                     await using var stream = opened;
@@ -1514,7 +1558,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                             relPath,
                             sizeBytes,
                             MaxUploadBytes);
-                        return;
+                        return null;
                     }
 
                     var contentType = ResolveContentType(fileName);
@@ -1592,13 +1636,13 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     remote.MarkDownloaded();
 
                     _logger.LogInformation("Uploaded artifact session={SessionId} type={Type} path={Relative}", _sessionId, type, relPath);
-                    return;
+                    return null;
                 }
                 catch (UnauthorizedAccessException ex)
                 {
                     // The path became a symlink, FIFO or other non-regular file; never retry it.
                     _logger.LogWarning(ex, "Skipping non-regular artifact path session={SessionId} type={Type} path={Relative}", _sessionId, type, relPath);
-                    return;
+                    return null;
                 }
                 catch (IOException ex) when (tries < 4)
                 {
@@ -1606,6 +1650,8 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     await Task.Delay(InitialRetryDelay * (tries + 1), _cts.Token).ConfigureAwait(false);
                 }
             }
+
+            return null;
         }
 
         private static async Task WaitForFileStableAsync(string root, string relativePath, CancellationToken token)

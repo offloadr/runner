@@ -300,6 +300,44 @@ public partial class ArtifactUploadServiceTests
         }
     }
 
+    [Test]
+    public async Task PendingUploads_StayWithinTheCapWhileTheArtifactApiStalls()
+    {
+        var root = CreateTempDirectory();
+        var previousCap = ArtifactUploadService.MaxPendingUploads;
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
+        {
+            ArtifactUploadService.MaxPendingUploads = 3;
+            var paths = CreateSessionPaths(root);
+            for (var index = 0; index < 10; index++)
+            {
+                File.WriteAllBytes(Path.Combine(paths.OutputDirectory, $"image-{index}.png"), [1, 2, 3]);
+            }
+
+            var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse())
+            {
+                UploadGate = gate.Task
+            };
+            await using var service = new ArtifactUploadService(
+                runnerSecret: "runner-secret-value",
+                artifactClient,
+                NullLogger<ArtifactUploadService>.Instance);
+
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+
+            Assert.That(service.GetPendingUploadCount("session-1"), Is.EqualTo(3));
+            gate.TrySetResult();
+        }
+        finally
+        {
+            ArtifactUploadService.MaxPendingUploads = previousCap;
+            gate.TrySetResult();
+            TryDelete(root);
+        }
+    }
+
     private static SessionProcessManager.SessionPaths CreateSessionPaths(string root)
     {
         var paths = new SessionProcessManager.SessionPaths

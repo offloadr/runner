@@ -1538,6 +1538,16 @@ public partial class ArtifactUploadServiceTests
         public Exception? ListArtifactsException { get; init; }
         public RpcException? ReadArtifactException { get; init; }
         public IAsyncStreamReader<RunnerArtifactServiceReadArtifactResponse>? BlockingReadArtifactReader { get; init; }
+        /// <summary>When set, upload responses wait for this task, as on a stalled artifact API.</summary>
+        public Task? UploadGate { get; init; }
+
+        private static async Task<RunnerArtifactServiceUploadArtifactResponse> WaitForGateAsync(
+            Task gate,
+            Task<RunnerArtifactServiceUploadArtifactResponse> response)
+        {
+            await gate.ConfigureAwait(false);
+            return await response.ConfigureAwait(false);
+        }
         public RunnerArtifactServiceReadArtifactRequest? LastReadArtifactRequest { get; private set; }
         public int ListCallCount { get; private set; }
         public int ReadArtifactCallCount { get; private set; }
@@ -1567,10 +1577,11 @@ public partial class ArtifactUploadServiceTests
                 _uploadSignals.Writer.TryWrite(captured);
                 response.TrySetResult(new RunnerArtifactServiceUploadArtifactResponse { Success = true });
             });
+            var gate = UploadGate;
 
             return new AsyncClientStreamingCall<RunnerArtifactServiceUploadArtifactRequest, RunnerArtifactServiceUploadArtifactResponse>(
                 writer,
-                response.Task,
+                gate is null ? response.Task : WaitForGateAsync(gate, response.Task),
                 Task.FromResult(new Metadata()),
                 () => Status.DefaultSuccess,
                 () => new Metadata(),
