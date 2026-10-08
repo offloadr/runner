@@ -112,7 +112,12 @@ sessionManager.UnexpectedSessionExitCleanup = async (sessionId, exitCode, token)
         token).ConfigureAwait(false);
 };
 
-await using var downloadIpcServer = new ModelDownloadIpcServer(options.ModelFetchSocket, downloadService, artifactUploadService, workspaceMirrorService);
+await using var downloadIpcServer = new ModelDownloadIpcServer(
+    options.ModelFetchSocket,
+    downloadService,
+    artifactUploadService,
+    workspaceMirrorService,
+    sessionManager.GetSessionUserId);
 
 try
 {

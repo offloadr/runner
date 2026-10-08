@@ -484,7 +484,8 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
         long observedEpoch,
         long offset,
         long length,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string? requiredSessionId = null)
     {
         if (offset < 0 || length < 0)
         {
@@ -495,7 +496,7 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
         DescriptorLease lease;
         lock (_sync)
         {
-            if (!_descriptorLeases.TryGetValue(leaseId, out lease!))
+            if (!TryGetDescriptorLeaseLocked(leaseId, requiredSessionId, out lease))
             {
                 return Task.FromException<ModelHydrationEnsureResult>(
                     new ModelHydrationIOException($"Descriptor lease '{leaseId}' is not active."));
@@ -552,12 +553,13 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
         ulong leaseId,
         long observedEpoch,
         string reason,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string? requiredSessionId = null)
     {
         DescriptorLease lease;
         lock (_sync)
         {
-            if (!_descriptorLeases.TryGetValue(leaseId, out lease!))
+            if (!TryGetDescriptorLeaseLocked(leaseId, requiredSessionId, out lease))
             {
                 return Task.FromException<ModelHydrationEnsureResult>(
                     new ModelHydrationIOException($"Descriptor lease '{leaseId}' is not active."));
@@ -592,15 +594,37 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
         }
     }
 
-    public Task ReleaseAsync(ulong leaseId)
+    /// <summary>
+    /// Looks up an active lease. With <paramref name="requiredSessionId"/>, a lease owned by
+    /// another session is reported exactly like a missing one.
+    /// </summary>
+    private bool TryGetDescriptorLeaseLocked(
+        ulong leaseId,
+        string? requiredSessionId,
+        out DescriptorLease lease)
+    {
+        if (!_descriptorLeases.TryGetValue(leaseId, out lease!) ||
+            requiredSessionId is not null &&
+            !string.Equals(lease.SessionId, requiredSessionId, StringComparison.Ordinal))
+        {
+            lease = null!;
+            return false;
+        }
+
+        return true;
+    }
+
+    public Task ReleaseAsync(ulong leaseId, string? requiredSessionId = null)
     {
         HydrationWaiter[] canceledWaiters;
         lock (_sync)
         {
-            if (!_descriptorLeases.Remove(leaseId, out var lease))
+            if (!TryGetDescriptorLeaseLocked(leaseId, requiredSessionId, out var lease))
             {
                 return Task.CompletedTask;
             }
+
+            _descriptorLeases.Remove(leaseId);
 
             lease.State.DescriptorLeaseCount = Math.Max(0, lease.State.DescriptorLeaseCount - 1);
             canceledWaiters = RemoveLeaseWaitersLocked(lease.State, leaseId);

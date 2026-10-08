@@ -31,6 +31,15 @@ internal static class LinuxTestPrerequisites
         }
     }
 
+    public static void RequireRoot()
+    {
+        RequireLinux();
+        if (VfsIpcPeerCredentials.CurrentEffectiveUserId != 0)
+        {
+            FailOrIgnore("Test needs root to create Linux users and run processes as them.");
+        }
+    }
+
     public static void RequireCommand(string fullPath)
     {
         if (!File.Exists(fullPath))

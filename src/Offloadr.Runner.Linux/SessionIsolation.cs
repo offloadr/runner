@@ -1,6 +1,7 @@
 namespace Offloadr.Runner.Linux;
 
-public readonly record struct PreparedSessionIdentity(string UserName, string HomeDirectory, bool CleanupIdentity);
+/// <param name="UserId">The numeric uid of <paramref name="UserName"/>, when the strategy created a dedicated user.</param>
+public readonly record struct PreparedSessionIdentity(string UserName, string HomeDirectory, bool CleanupIdentity, uint? UserId = null);
 
 public interface ISessionIsolationStrategy
 {
@@ -75,12 +76,15 @@ public sealed class LinuxUserIsolationStrategy : ISessionIsolationStrategy
             {
                 await _commandRunner.RunAsync(LinuxCommandFactory.CreateUser(userName, homeDirectory), cancellationToken).ConfigureAwait(false);
                 userCreated = true;
+                exists = await _commandRunner.RunAsync(LinuxCommandFactory.CheckUserExists(userName), cancellationToken).ConfigureAwait(false);
             }
+
+            var userId = ParseUserId(userName, exists);
 
             Directory.CreateDirectory(homeDirectory);
             await _commandRunner.RunAsync(LinuxCommandFactory.ChownRecursive(userName, homeDirectory), cancellationToken).ConfigureAwait(false);
 
-            return new PreparedSessionIdentity(userName, homeDirectory, CleanupIdentity: true);
+            return new PreparedSessionIdentity(userName, homeDirectory, CleanupIdentity: true, userId);
         }
         catch
         {
@@ -98,6 +102,20 @@ public sealed class LinuxUserIsolationStrategy : ISessionIsolationStrategy
 
             throw;
         }
+    }
+
+    private static uint ParseUserId(string userName, LinuxCommandResult result)
+    {
+        // The IPC socket authenticates session processes by uid, so a session never runs
+        // as root or without a known uid.
+        if (result.ExitCode != 0 ||
+            !uint.TryParse(result.Stdout.Trim(), System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var userId) ||
+            userId == 0)
+        {
+            throw new InvalidOperationException($"Could not resolve a non-root uid for session user '{userName}'.");
+        }
+
+        return userId;
     }
 
     public async Task CleanupAsync(PreparedSessionIdentity identity, CancellationToken cancellationToken)

@@ -35,6 +35,9 @@ internal sealed partial class SessionProcessManager : IDisposable
     };
 
     private readonly ConcurrentDictionary<string, SessionContext> _sessions = new();
+    // Prepared identities, from user creation until isolation cleanup. Unlike _sessions this
+    // covers the window before launch, so the editor can use the IPC socket as soon as it runs.
+    private readonly ConcurrentDictionary<string, PreparedSessionIdentity> _preparedIdentities = new(StringComparer.Ordinal);
     private readonly string _sessionRoot;
     private readonly string _entryPointPath;
     private readonly string _workingDirectory;
@@ -168,6 +171,7 @@ internal sealed partial class SessionProcessManager : IDisposable
             RemoveStaleSessionHome(sessionId);
             identity = await _sessionIsolationStrategy.PrepareAsync(sessionId, _sessionRoot, cancellationToken).ConfigureAwait(false);
             prepared = true;
+            _preparedIdentities[sessionId] = identity;
             var paths = await PrepareSessionDirectoriesAsync(sessionId, identity.HomeDirectory, cancellationToken).ConfigureAwait(false);
 
             // Copy bundled input seeds before the initializer can create input catalog placeholders.
@@ -328,6 +332,17 @@ internal sealed partial class SessionProcessManager : IDisposable
     public string GetActiveSessionId()
     {
         return _sessions.Keys.FirstOrDefault() ?? string.Empty;
+    }
+
+    /// <summary>The uid of the Linux user prepared for <paramref name="sessionId"/>, if any.</summary>
+    public uint? GetSessionUserId(string sessionId)
+    {
+        if (string.IsNullOrWhiteSpace(sessionId))
+        {
+            return null;
+        }
+
+        return _preparedIdentities.TryGetValue(sessionId.Trim(), out var identity) ? identity.UserId : null;
     }
 
     public async Task WaitForSessionReadyAsync(string sessionId, CancellationToken cancellationToken)
@@ -1134,6 +1149,12 @@ internal sealed partial class SessionProcessManager : IDisposable
 
     private async Task CleanupPreparedStartupAsync(PreparedSessionIdentity identity)
     {
+        // Stop authorizing the uid before its processes are killed and the user is removed.
+        foreach (var prepared in _preparedIdentities.Where(pair => pair.Value == identity).ToArray())
+        {
+            ((ICollection<KeyValuePair<string, PreparedSessionIdentity>>)_preparedIdentities).Remove(prepared);
+        }
+
         try
         {
             await _sessionIsolationStrategy.CleanupAsync(identity, CancellationToken.None).ConfigureAwait(false);

@@ -530,6 +530,68 @@ public class DemandAwareModelHydrationCoordinatorTests
     }
 
     [Test]
+    public async Task DescriptorLease_CannotBeUsedOrReleasedByAnotherSession()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var backend = new DemandBackend();
+            await using var coordinator = CreateCoordinator(backend, root);
+            await coordinator.InitializeAsync(CancellationToken.None);
+            var request = CreateRequest(root, "session-bound.bin");
+            coordinator.RegisterDownloads("session-1", [request], replaceExisting: true);
+            var opened = await coordinator.OpenAsync(
+                request.DestinationPath,
+                "session-1",
+                CancellationToken.None);
+
+            Assert.That(
+                async () => await coordinator.EnsureRangeAsync(
+                    opened.LeaseId,
+                    opened.TransferEpoch,
+                    0,
+                    4,
+                    CancellationToken.None,
+                    requiredSessionId: "session-2"),
+                Throws.InstanceOf<ModelHydrationIOException>());
+            Assert.That(
+                async () => await coordinator.EnsureCompleteAsync(
+                    opened.LeaseId,
+                    opened.TransferEpoch,
+                    "mapping",
+                    CancellationToken.None,
+                    requiredSessionId: "session-2"),
+                Throws.InstanceOf<ModelHydrationIOException>());
+
+            await coordinator.ReleaseAsync(opened.LeaseId, requiredSessionId: "session-2");
+
+            var ensured = await coordinator.EnsureRangeAsync(
+                    opened.LeaseId,
+                    opened.TransferEpoch,
+                    0,
+                    4,
+                    CancellationToken.None,
+                    requiredSessionId: "session-1")
+                .WaitAsync(TimeSpan.FromSeconds(2));
+            Assert.That(ensured.TransferEpoch, Is.EqualTo(opened.TransferEpoch));
+
+            await coordinator.ReleaseAsync(opened.LeaseId, requiredSessionId: "session-1");
+            Assert.That(
+                async () => await coordinator.EnsureRangeAsync(
+                    opened.LeaseId,
+                    opened.TransferEpoch,
+                    0,
+                    4,
+                    CancellationToken.None),
+                Throws.InstanceOf<ModelHydrationIOException>());
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
     public async Task PromptDependencies_RunInDeclaredOrdinalOrder()
     {
         var root = CreateTempDirectory();

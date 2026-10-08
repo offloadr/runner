@@ -478,13 +478,15 @@ internal sealed class ModelDownloadService : IAsyncDisposable
         long observedEpoch,
         long offset,
         long length,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string? requiredSessionId = null)
         => _hydrationCoordinator?.EnsureRangeAsync(
                leaseId,
                observedEpoch,
                offset,
                length,
-               cancellationToken)
+               cancellationToken,
+               requiredSessionId)
            ?? Task.FromException<ModelHydrationEnsureResult>(
                new ModelHydrationIOException("Range-managed hydration is disabled for this runtime."));
 
@@ -492,17 +494,19 @@ internal sealed class ModelDownloadService : IAsyncDisposable
         ulong leaseId,
         long observedEpoch,
         string reason,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string? requiredSessionId = null)
         => _hydrationCoordinator?.EnsureCompleteAsync(
                leaseId,
                observedEpoch,
                reason,
-               cancellationToken)
+               cancellationToken,
+               requiredSessionId)
            ?? Task.FromException<ModelHydrationEnsureResult>(
                new ModelHydrationIOException("Range-managed hydration is disabled for this runtime."));
 
-    public Task ReleaseAsync(ulong leaseId)
-        => _hydrationCoordinator?.ReleaseAsync(leaseId) ?? Task.CompletedTask;
+    public Task ReleaseAsync(ulong leaseId, string? requiredSessionId = null)
+        => _hydrationCoordinator?.ReleaseAsync(leaseId, requiredSessionId) ?? Task.CompletedTask;
 
     private bool IsRangeManaged(string? path)
         => _hydrationCoordinator?.IsRangeManaged(path) == true;

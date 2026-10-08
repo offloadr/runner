@@ -10,7 +10,8 @@ public sealed class VfsIpcServer : IAsyncDisposable
     private static readonly TimeSpan DefaultOpenAcknowledgementTimeout = TimeSpan.FromSeconds(10);
 
     private readonly string _socketPath;
-    private readonly Func<VfsIpcRequest, CancellationToken, Task<VfsIpcResponse>> _requestHandler;
+    private readonly Func<VfsIpcRequest, VfsIpcPeerCredentials, CancellationToken, Task<VfsIpcResponse>> _requestHandler;
+    private readonly Func<VfsIpcPeerCredentials, bool> _authorizePeer;
     private readonly bool _logEnabled;
     private readonly TimeSpan _requestReadTimeout;
     private readonly TimeSpan _openAcknowledgementTimeout;
@@ -31,7 +32,31 @@ public sealed class VfsIpcServer : IAsyncDisposable
         bool logEnabled = false,
         TimeSpan? requestReadTimeout = null,
         int maxConcurrentClients = DefaultMaxConcurrentClients,
-        TimeSpan? openAcknowledgementTimeout = null)
+        TimeSpan? openAcknowledgementTimeout = null,
+        Func<VfsIpcPeerCredentials, bool>? authorizePeer = null)
+        : this(
+            socketPath,
+            IgnorePeer(requestHandler),
+            logEnabled,
+            requestReadTimeout,
+            maxConcurrentClients,
+            openAcknowledgementTimeout,
+            authorizePeer)
+    {
+    }
+
+    /// <param name="authorizePeer">
+    /// Decides, from the kernel-reported peer credentials, whether a connection may issue
+    /// requests. When omitted only root and this process's own uid are accepted.
+    /// </param>
+    public VfsIpcServer(
+        string socketPath,
+        Func<VfsIpcRequest, VfsIpcPeerCredentials, CancellationToken, Task<VfsIpcResponse>> requestHandler,
+        bool logEnabled = false,
+        TimeSpan? requestReadTimeout = null,
+        int maxConcurrentClients = DefaultMaxConcurrentClients,
+        TimeSpan? openAcknowledgementTimeout = null,
+        Func<VfsIpcPeerCredentials, bool>? authorizePeer = null)
     {
         if (string.IsNullOrWhiteSpace(socketPath))
         {
@@ -40,6 +65,7 @@ public sealed class VfsIpcServer : IAsyncDisposable
 
         _socketPath = socketPath;
         _requestHandler = requestHandler ?? throw new ArgumentNullException(nameof(requestHandler));
+        _authorizePeer = authorizePeer ?? IsRootOrCurrentUser;
         _logEnabled = logEnabled;
         _requestReadTimeout = requestReadTimeout ?? DefaultRequestReadTimeout;
         if (_requestReadTimeout <= TimeSpan.Zero)
@@ -63,6 +89,20 @@ public sealed class VfsIpcServer : IAsyncDisposable
     }
 
     public string SocketPath => _socketPath;
+
+    private static Func<VfsIpcRequest, VfsIpcPeerCredentials, CancellationToken, Task<VfsIpcResponse>> IgnorePeer(
+        Func<VfsIpcRequest, CancellationToken, Task<VfsIpcResponse>> requestHandler)
+    {
+        ArgumentNullException.ThrowIfNull(requestHandler);
+        return (request, _, cancellationToken) => requestHandler(request, cancellationToken);
+    }
+
+    /// <summary>Credentials passed to the handler for releases the server itself initiates.</summary>
+    private static VfsIpcPeerCredentials ServerPeer
+        => new(Environment.ProcessId, VfsIpcPeerCredentials.CurrentEffectiveUserId ?? VfsIpcPeerCredentials.RootUserId, 0);
+
+    private static bool IsRootOrCurrentUser(VfsIpcPeerCredentials peer)
+        => peer.IsRoot || peer.UserId == VfsIpcPeerCredentials.CurrentEffectiveUserId;
 
     public void Start()
     {
@@ -97,6 +137,8 @@ public sealed class VfsIpcServer : IAsyncDisposable
 
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
+            // Session users must be able to connect; who may issue requests is decided
+            // per connection from the kernel-reported peer credentials.
             try
             {
                 File.SetUnixFileMode(
@@ -243,6 +285,14 @@ public sealed class VfsIpcServer : IAsyncDisposable
                 client.ReceiveTimeout = 10000;
                 client.SendTimeout = 10000;
 
+                if (!TryAuthorizePeer(client, out var peer))
+                {
+                    await VfsIpcProtocol
+                        .WriteResponseAsync(client, VfsIpcResponse.Error(VfsIpcStatus.IoError), cancellationToken)
+                        .ConfigureAwait(false);
+                    return;
+                }
+
                 using var requestReadCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                 requestReadCancellation.CancelAfter(_requestReadTimeout);
                 var parsed = await VfsIpcProtocol
@@ -264,11 +314,11 @@ public sealed class VfsIpcServer : IAsyncDisposable
                             $"[vfs-ipc] operation={parsed.Request.Operation} path='{parsed.Request.Path}'");
                     }
 
-                    var response = await DispatchRequestAsync(parsed.Request, cancellationToken)
+                    var response = await DispatchRequestAsync(parsed.Request, peer, cancellationToken)
                         .ConfigureAwait(false);
                     if (IsProvisionalOpenResponse(parsed.Request, response))
                     {
-                        RegisterProvisionalOpenLease(response.LeaseId);
+                        RegisterProvisionalOpenLease(response.LeaseId, peer.UserId);
                     }
 
                     try
@@ -334,13 +384,41 @@ public sealed class VfsIpcServer : IAsyncDisposable
         }
     }
 
+    private bool TryAuthorizePeer(Socket client, out VfsIpcPeerCredentials peer)
+    {
+        if (!VfsIpcPeerCredentials.TryRead(client, out peer))
+        {
+            RunnerLog.Warning<VfsIpcServer>("[vfs-ipc] Rejected a client whose peer credentials could not be read.");
+            return false;
+        }
+
+        bool authorized;
+        try
+        {
+            authorized = _authorizePeer(peer);
+        }
+        catch (Exception ex)
+        {
+            RunnerLog.Error<VfsIpcServer>(ex, $"[vfs-ipc] Peer authorization failed: {ex.Message}");
+            authorized = false;
+        }
+
+        if (!authorized)
+        {
+            RunnerLog.Warning<VfsIpcServer>($"[vfs-ipc] Rejected unauthorized client {peer}.");
+        }
+
+        return authorized;
+    }
+
     private async Task<VfsIpcResponse> DispatchRequestAsync(
         VfsIpcRequest request,
+        VfsIpcPeerCredentials peer,
         CancellationToken cancellationToken)
     {
         if (request.Operation == VfsIpcOperation.AcknowledgeOpen)
         {
-            return await AcknowledgeOpenLeaseAsync(request.LeaseId).ConfigureAwait(false);
+            return await AcknowledgeOpenLeaseAsync(request.LeaseId, peer.UserId).ConfigureAwait(false);
         }
 
         if ((request.Operation is VfsIpcOperation.EnsureRange or VfsIpcOperation.EnsureComplete) &&
@@ -351,10 +429,10 @@ public sealed class VfsIpcServer : IAsyncDisposable
 
         if (request.Operation == VfsIpcOperation.Release)
         {
-            await CancelProvisionalOpenLeaseAsync(request.LeaseId).ConfigureAwait(false);
+            await CancelProvisionalOpenLeaseAsync(request.LeaseId, peer.UserId).ConfigureAwait(false);
         }
 
-        return await _requestHandler(request, cancellationToken).ConfigureAwait(false);
+        return await _requestHandler(request, peer, cancellationToken).ConfigureAwait(false);
     }
 
     private static bool IsProvisionalOpenResponse(
@@ -373,10 +451,11 @@ public sealed class VfsIpcServer : IAsyncDisposable
         }
     }
 
-    private void RegisterProvisionalOpenLease(ulong leaseId)
+    private void RegisterProvisionalOpenLease(ulong leaseId, uint ownerUserId)
     {
         var provisional = new ProvisionalOpenLease(
             leaseId,
+            ownerUserId,
             CancellationTokenSource.CreateLinkedTokenSource(_shutdown.Token));
         lock (_provisionalLeasesGate)
         {
@@ -435,9 +514,9 @@ public sealed class VfsIpcServer : IAsyncDisposable
         }
     }
 
-    private async Task<VfsIpcResponse> AcknowledgeOpenLeaseAsync(ulong leaseId)
+    private async Task<VfsIpcResponse> AcknowledgeOpenLeaseAsync(ulong leaseId, uint peerUserId)
     {
-        if (!TryTakeProvisionalOpenLease(leaseId, expected: null, out var provisional))
+        if (!TryTakeProvisionalOpenLease(leaseId, expected: null, out var provisional, peerUserId))
         {
             return VfsIpcResponse.Error(VfsIpcStatus.IoError);
         }
@@ -446,9 +525,9 @@ public sealed class VfsIpcServer : IAsyncDisposable
         return VfsIpcResponse.Success();
     }
 
-    private async Task CancelProvisionalOpenLeaseAsync(ulong leaseId)
+    private async Task CancelProvisionalOpenLeaseAsync(ulong leaseId, uint peerUserId)
     {
-        if (TryTakeProvisionalOpenLease(leaseId, expected: null, out var provisional))
+        if (TryTakeProvisionalOpenLease(leaseId, expected: null, out var provisional, peerUserId))
         {
             await CancelExpirationAsync(provisional).ConfigureAwait(false);
         }
@@ -470,12 +549,15 @@ public sealed class VfsIpcServer : IAsyncDisposable
     private bool TryTakeProvisionalOpenLease(
         ulong leaseId,
         ProvisionalOpenLease? expected,
-        out ProvisionalOpenLease provisional)
+        out ProvisionalOpenLease provisional,
+        uint? peerUserId = null)
     {
         lock (_provisionalLeasesGate)
         {
+            // A client may only acknowledge or release the provisional leases it opened itself.
             if (!_provisionalLeases.TryGetValue(leaseId, out provisional!) ||
-                expected is not null && !ReferenceEquals(provisional, expected))
+                expected is not null && !ReferenceEquals(provisional, expected) ||
+                peerUserId is { } userId && userId != provisional.OwnerUserId)
             {
                 provisional = null!;
                 return false;
@@ -513,7 +595,7 @@ public sealed class VfsIpcServer : IAsyncDisposable
     {
         try
         {
-            await _requestHandler(VfsIpcRequest.Release(leaseId), CancellationToken.None)
+            await _requestHandler(VfsIpcRequest.Release(leaseId), ServerPeer, CancellationToken.None)
                 .ConfigureAwait(false);
         }
         catch (Exception ex)
@@ -598,9 +680,11 @@ public sealed class VfsIpcServer : IAsyncDisposable
 
     private sealed class ProvisionalOpenLease(
         ulong leaseId,
+        uint ownerUserId,
         CancellationTokenSource expirationCancellation)
     {
         public ulong LeaseId { get; } = leaseId;
+        public uint OwnerUserId { get; } = ownerUserId;
         public CancellationTokenSource ExpirationCancellation { get; } = expirationCancellation;
         public Task ExpirationTask { get; set; } = Task.CompletedTask;
     }
