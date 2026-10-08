@@ -50,11 +50,11 @@ public sealed class DownloadCoordinator
     private readonly TimeSpan _progressInterval;
     private readonly Aria2Settings _settings;
     private readonly IModelDownloadStaging? _staging;
-    private readonly ConcurrentDictionary<string, TrackedDownload> _registry = new(StringComparer.OrdinalIgnoreCase);
-    private readonly ConcurrentDictionary<string, SemaphoreSlim> _locks = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, TrackedDownload> _registry = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _locks = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, CancellationTokenSource> _sessionCancellations = new(StringComparer.Ordinal);
     private readonly object _pendingRemovalGate = new();
-    private readonly Dictionary<string, Task<bool>> _pendingRemovals = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, Task<bool>> _pendingRemovals = new(StringComparer.Ordinal);
     private readonly CancellationTokenSource _removalShutdown = new();
 
     private string? _activeSessionId;
@@ -188,7 +188,7 @@ public sealed class DownloadCoordinator
         {
             var registeredPaths = registrations
                 .Select(static download => download.DestinationPath)
-                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+                .ToHashSet(StringComparer.Ordinal);
             foreach (var entry in _registry)
             {
                 if (string.Equals(entry.Value.SessionId, normalizedSessionId, StringComparison.Ordinal) &&

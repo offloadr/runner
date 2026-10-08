@@ -89,6 +89,49 @@ public class DownloadCoordinatorTests
     }
 
     [Test]
+    public async Task RegisterDownloads_KeepsDestinationsThatDifferOnlyInCase()
+    {
+        var fileSystem = new FakeFileSystem();
+        FakeAria2Client? aria = null;
+        aria = new FakeAria2Client
+        {
+            OnAddUri = () => fileSystem.SetFileSize(aria!.LastCreateRequest!.DestinationPath, 8)
+        };
+        var sut = new DownloadCoordinator(aria, fileSystem);
+        sut.SetActiveSession("session-1");
+        sut.RegisterDownloads("session-1",
+        [
+            new ModelDownloadRequest
+            {
+                ModelId = "model-upper",
+                Filename = "Model.safetensors",
+                DestinationPath = "/tmp/Model.safetensors",
+                SizeBytes = 8,
+                SourceUrl = "https://example.com/upper"
+            },
+            new ModelDownloadRequest
+            {
+                ModelId = "model-lower",
+                Filename = "model.safetensors",
+                DestinationPath = "/tmp/model.safetensors",
+                SizeBytes = 8,
+                SourceUrl = "https://example.com/lower"
+            }
+        ]);
+
+        await sut.EnsureDownloadedAsync("/tmp/Model.safetensors", CancellationToken.None, highPriority: true);
+        var upperSource = aria.LastCreateRequest!.SourceUris.Single();
+        await sut.EnsureDownloadedAsync("/tmp/model.safetensors", CancellationToken.None, highPriority: true);
+        var lowerSource = aria.LastCreateRequest!.SourceUris.Single();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(upperSource, Is.EqualTo("https://example.com/upper"));
+            Assert.That(lowerSource, Is.EqualTo("https://example.com/lower"));
+        });
+    }
+
+    [Test]
     public async Task EnsureDownloadedAsync_DownloadsAgain_WhenExistingFileIsLargerThanExpected()
     {
         var fileSystem = new FakeFileSystem();
@@ -1011,10 +1054,10 @@ public class DownloadCoordinatorTests
 
     private sealed class FakeFileSystem(IEnumerable<string>? exists = null, IReadOnlyDictionary<string, long>? fileSizes = null) : IFileSystem
     {
-        private readonly HashSet<string> _existing = new(exists ?? Enumerable.Empty<string>(), StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> _existing = new(exists ?? Enumerable.Empty<string>(), StringComparer.Ordinal);
         private readonly Dictionary<string, long> _fileSizes = fileSizes is null
-            ? new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase)
-            : new Dictionary<string, long>(fileSizes, StringComparer.OrdinalIgnoreCase);
+            ? new Dictionary<string, long>(StringComparer.Ordinal)
+            : new Dictionary<string, long>(fileSizes, StringComparer.Ordinal);
 
         public string? NormalizePath(string? path)
         {
