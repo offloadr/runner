@@ -1006,6 +1006,26 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
+    public void TryAdoptRuntime_RefusesAStartOlderThanTheNewestAssignment()
+    {
+        var state = new ServiceClientManager.LogicalSessionState(string.Empty);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(state.TryAdoptRuntime("session-a", new RuntimeIdentity(1, 1, "a-1"), 0, replaceOtherSession: true, assignmentSequence: 5), Is.True);
+            Assert.That(state.TryAdoptRuntime("session-b", new RuntimeIdentity(1, 1, "b-1"), 0, replaceOtherSession: true, assignmentSequence: 7), Is.True);
+            // Session c never ran here, but its assignment predates b's.
+            Assert.That(state.TryAdoptRuntime("session-c", new RuntimeIdentity(1, 1, "c-1"), 0, replaceOtherSession: true, assignmentSequence: 6), Is.False);
+            Assert.That(state.GetActiveSessionId(), Is.EqualTo("session-b"));
+            // A redelivered start of the current assignment is still the same runtime.
+            Assert.That(state.TryAdoptRuntime("session-b", new RuntimeIdentity(1, 1, "b-1"), 0, replaceOtherSession: true, assignmentSequence: 7), Is.True);
+            Assert.That(state.TryAdoptRuntime("session-d", new RuntimeIdentity(1, 1, "d-1"), 0, replaceOtherSession: true, assignmentSequence: 8), Is.True);
+            // Without a sequence (an older control plane) starts are not ordered across sessions.
+            Assert.That(state.TryAdoptRuntime("session-e", new RuntimeIdentity(1, 1, "e-1"), 0, replaceOtherSession: true), Is.True);
+        });
+    }
+
+    [Test]
     public void ClearAndRetire_RefusesALateStartForTheStoppedGeneration()
     {
         var state = new ServiceClientManager.LogicalSessionState(string.Empty);

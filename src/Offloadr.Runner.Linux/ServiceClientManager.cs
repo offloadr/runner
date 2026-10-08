@@ -528,11 +528,13 @@ internal static class ServiceClientManager
             string? sessionId,
             RuntimeIdentity candidate,
             uint restartRevision,
-            bool replaceOtherSession)
+            bool replaceOtherSession,
+            ulong assignmentSequence = 0)
         {
             var normalizedSessionId = sessionId?.Trim() ?? string.Empty;
             candidate = candidate with { RuntimeInstanceId = candidate.RuntimeInstanceId?.Trim() ?? string.Empty };
-            if (normalizedSessionId.Length == 0 || !candidate.IsValid || IsRetired(normalizedSessionId, candidate))
+            if (normalizedSessionId.Length == 0 || !candidate.IsValid || IsRetired(normalizedSessionId, candidate) ||
+                IsOlderAssignment(assignmentSequence))
             {
                 return false;
             }
@@ -553,6 +555,7 @@ internal static class ServiceClientManager
                     {
                         // The replaced session has ended here; a late start for it must not return.
                         Retire(current);
+                        RecordAssignment(assignmentSequence);
                         return true;
                     }
 
@@ -568,12 +571,14 @@ internal static class ServiceClientManager
 
                     if (order == RuntimeOrder.Same)
                     {
+                        RecordAssignment(assignmentSequence);
                         return true;
                     }
                 }
 
                 if (ReferenceEquals(Interlocked.CompareExchange(ref _state, next, current), current))
                 {
+                    RecordAssignment(assignmentSequence);
                     return true;
                 }
             }
@@ -704,6 +709,28 @@ internal static class ServiceClientManager
                 {
                     _retiredGenerations.Remove(_retiredOrder.Dequeue());
                 }
+            }
+        }
+
+        // Newest session assignment seen on this runner. Zero until the control plane sends
+        // assignment sequences; starts without one are not ordered across sessions.
+        private ulong _newestAssignment;
+
+        private bool IsOlderAssignment(ulong assignmentSequence)
+            => assignmentSequence > 0 && assignmentSequence < Interlocked.Read(ref _newestAssignment);
+
+        private void RecordAssignment(ulong assignmentSequence)
+        {
+            var newest = Interlocked.Read(ref _newestAssignment);
+            while (assignmentSequence > newest)
+            {
+                var observed = Interlocked.CompareExchange(ref _newestAssignment, assignmentSequence, newest);
+                if (observed == newest)
+                {
+                    return;
+                }
+
+                newest = observed;
             }
         }
 
@@ -2074,7 +2101,8 @@ internal static class ServiceClientManager
                                 command.SessionId,
                                 runtimeIdentity,
                                 restartRevision: 0,
-                                replaceOtherSession: true))
+                                replaceOtherSession: true,
+                                command.AssignmentSequence))
                         {
                             throw new InvalidOperationException(StaleRuntimeCommandMessage);
                         }

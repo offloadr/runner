@@ -35,6 +35,10 @@ message StartSessionCommand {
     uint64 lifecycle_generation = 9;
     uint64 runtime_epoch = 10;
     string runtime_instance_id = 11;
+    // Optional. Increases each time the control plane assigns a session to this runner,
+    // across sessions. When set, the runner refuses a start older than the newest
+    // assignment it has seen, so a delayed start cannot replace a newer session.
+    uint64 assignment_sequence = 13;
 }
 
 // Command instructing runner to stop a session (graceful cleanup + release).
