@@ -73,6 +73,70 @@ public partial class SessionProcessManagerOwnershipTests
     }
 
     [Test]
+    public async Task StartSessionAsync_RemovesStaleHomeBeforePreparingSession()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+
+        var tempRoot = Path.Combine(Path.GetTempPath(), $"runner-session-stale-home-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempRoot);
+        var options = new SessionProcessOptions
+        {
+            SessionRoot = Path.Combine(tempRoot, "sessions"),
+            EntryPointPath = Path.Combine(tempRoot, "missing-entrypoint.sh"),
+            WorkingDirectory = tempRoot,
+            BundledCustomNodesSeedPath = Path.Combine(tempRoot, "missing-custom-nodes-seed"),
+            BundledInputSeedPath = Path.Combine(tempRoot, "missing-input-seed"),
+            SeedVirtualEnvPath = CreateEmptySeedVirtualEnv(tempRoot),
+            UvBinaryPath = FakeUvBinaryPath(tempRoot),
+            ComfyPort = 8188,
+            ShutdownGracePeriod = TimeSpan.FromSeconds(5),
+            ReadyTimeout = TimeSpan.FromSeconds(5),
+            ReadyHost = "127.0.0.1"
+        };
+
+        const string sessionId = "session-stale-home";
+        var homeDirectory = Path.Combine(options.SessionRoot, sessionId);
+        var victim = Path.Combine(tempRoot, "victim.ini");
+        File.WriteAllText(victim, "untouched");
+        Directory.CreateDirectory(Path.Combine(homeDirectory, "user", "__manager"));
+        File.WriteAllText(Path.Combine(homeDirectory, "left-behind.txt"), "previous session");
+        File.CreateSymbolicLink(Path.Combine(homeDirectory, "user", "__manager", "config.ini"), victim);
+
+        var isolation = new RecordingIsolationStrategy("sess_stale", homeDirectory);
+        var sawLeftBehindFile = true;
+
+        try
+        {
+            using var manager = new SessionProcessManager(options, isolation, new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
+
+            Exception? launchError = null;
+            try
+            {
+                await manager.StartSessionAsync(
+                    new StartSessionCommand { SessionId = sessionId, User = "user-1", LifecycleGeneration = 1, RuntimeEpoch = 1, RuntimeInstanceId = "33333333333343338333333333333333" },
+                    (paths, _) =>
+                    {
+                        sawLeftBehindFile = File.Exists(Path.Combine(paths.HomeDirectory, "left-behind.txt"));
+                        return Task.CompletedTask;
+                    },
+                    CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                launchError = ex;
+            }
+
+            Assert.That(launchError, Is.Not.Null);
+            Assert.That(sawLeftBehindFile, Is.False);
+            Assert.That(File.ReadAllText(victim), Is.EqualTo("untouched"));
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+        }
+    }
+
+    [Test]
     public async Task StartSessionAsync_DoesNotCopyBundledCustomNodesWhenInitializerHydratesCustomNodes()
     {
         LinuxTestPrerequisites.RequireLinux();

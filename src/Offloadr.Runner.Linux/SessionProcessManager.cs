@@ -165,6 +165,7 @@ internal sealed partial class SessionProcessManager : IDisposable
         try
         {
             Directory.CreateDirectory(_sessionRoot);
+            RemoveStaleSessionHome(sessionId);
             identity = await _sessionIsolationStrategy.PrepareAsync(sessionId, _sessionRoot, cancellationToken).ConfigureAwait(false);
             prepared = true;
             var paths = await PrepareSessionDirectoriesAsync(sessionId, identity.HomeDirectory, cancellationToken).ConfigureAwait(false);
@@ -1157,6 +1158,43 @@ internal sealed partial class SessionProcessManager : IDisposable
         }
 
         DeleteSessionHomeDirectory(identity.HomeDirectory);
+    }
+
+    /// <summary>
+    /// Session homes are removed when their session ends, so an existing home for an untracked
+    /// session was left behind by an earlier agent process. Its session user could write to it
+    /// and may have planted links that root would follow while seeding and configuring the new
+    /// session, so the new session always starts from an empty home.
+    /// </summary>
+    private void RemoveStaleSessionHome(string sessionId)
+    {
+        if (sessionId is "." or ".." || sessionId.IndexOfAny(['/', '\\', '\0']) >= 0)
+        {
+            return;
+        }
+
+        var root = Path.GetFullPath(_sessionRoot).TrimEnd(Path.DirectorySeparatorChar);
+        var home = Path.Combine(root, sessionId);
+        if (!string.Equals(Path.GetDirectoryName(home), root, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        var info = new DirectoryInfo(home);
+        if (info.LinkTarget is not null)
+        {
+            LogSessionWarning(sessionId, "Removing a session home link left by an earlier runner process.");
+            File.Delete(home);
+        }
+        else if (info.Exists)
+        {
+            LogSessionWarning(sessionId, "Removing a session home left by an earlier runner process.");
+            Directory.Delete(home, recursive: true);
+        }
+        else if (File.Exists(home))
+        {
+            File.Delete(home);
+        }
     }
 
     private void DeleteSessionHomeDirectory(string homeDirectory)
