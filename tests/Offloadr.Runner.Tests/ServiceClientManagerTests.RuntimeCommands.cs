@@ -87,6 +87,209 @@ public partial class ServiceClientManagerTests
         });
     }
 
+    [Test]
+    public async Task ConcurrentLaunches_CancelAndAwaitThePreviousStartupBeforeStarting()
+    {
+        var harness = new RuntimeCommandHarness();
+        var firstEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        harness.BeforeStart = async (command, token) =>
+        {
+            if (command.RuntimeEpoch == 3)
+            {
+                firstEntered.TrySetResult();
+                await Task.Delay(Timeout.Infinite, token);
+            }
+        };
+
+        var first = ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 3, InstanceA, revision: 1), harness.Deps);
+        await firstEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var second = ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 4, InstanceB, revision: 2), harness.Deps);
+        await Task.WhenAll(first, second).WaitAsync(TimeSpan.FromSeconds(10));
+
+        var calls = harness.Calls.ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(harness.Sink.LaunchAcks.Single(ack => ack.RuntimeEpoch == 3).Ready, Is.False);
+            Assert.That(harness.Sink.LaunchAcks.Single(ack => ack.RuntimeEpoch == 4).Ready, Is.True);
+            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(new RuntimeIdentity(7, 4, InstanceB)));
+            Assert.That(harness.Logical.TryGetRuntime(CommandSessionId, out var logical, out var revision), Is.True);
+            Assert.That(logical, Is.EqualTo(new RuntimeIdentity(7, 4, InstanceB)));
+            Assert.That(revision, Is.EqualTo(2));
+            Assert.That(harness.Identities.TryGet(CommandSessionId, out var identity), Is.True);
+            Assert.That(identity, Is.EqualTo(new RuntimeIdentity(7, 4, InstanceB)));
+            // The superseded startup finished its cleanup before the newer one started.
+            Assert.That(calls.IndexOf("start:4"), Is.GreaterThan(calls.IndexOf("stop:" + CommandSessionId)));
+            Assert.That(calls.IndexOf("stop:" + CommandSessionId), Is.GreaterThan(calls.IndexOf("start:3")));
+        });
+    }
+
+    [Test]
+    public async Task StaleLaunch_DoesNotReplaceTheNewerRuntimeOrItsIdentity()
+    {
+        var harness = RunningHarness(7, 4, InstanceB);
+
+        await ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 3, InstanceA, revision: 1), harness.Deps);
+
+        var ack = await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 1);
+        Assert.Multiple(() =>
+        {
+            Assert.That(ack.Ready, Is.False);
+            Assert.That(ack.RuntimeEpoch, Is.EqualTo(3));
+            Assert.That(harness.Calls, Is.Empty);
+            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(new RuntimeIdentity(7, 4, InstanceB)));
+            Assert.That(harness.Logical.TryGetRuntime(CommandSessionId, out var logical, out _), Is.True);
+            Assert.That(logical, Is.EqualTo(new RuntimeIdentity(7, 4, InstanceB)));
+            Assert.That(harness.Identities.TryGet(CommandSessionId, out var identity), Is.True);
+            Assert.That(identity, Is.EqualTo(new RuntimeIdentity(7, 4, InstanceB)));
+        });
+    }
+
+    [Test]
+    public async Task StaleLaunch_DoesNotCancelTheNewerStartup()
+    {
+        var harness = new RuntimeCommandHarness();
+        var newerEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseNewer = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        harness.BeforeStart = async (_, token) =>
+        {
+            newerEntered.TrySetResult();
+            await releaseNewer.Task.WaitAsync(token);
+        };
+
+        var newer = ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 4, InstanceB, revision: 2), harness.Deps);
+        await newerEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 3, InstanceA, revision: 1), harness.Deps);
+        releaseNewer.TrySetResult();
+        await newer.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(harness.Sink.LaunchAcks.Single(ack => ack.RuntimeEpoch == 3).Ready, Is.False);
+            Assert.That(harness.Sink.LaunchAcks.Single(ack => ack.RuntimeEpoch == 4).Ready, Is.True);
+            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(new RuntimeIdentity(7, 4, InstanceB)));
+        });
+    }
+
+    [Test]
+    public async Task Launch_ForAnotherRunner_IsRejectedWithoutTouchingState()
+    {
+        var harness = new RuntimeCommandHarness();
+        var launch = Launch(7, 3, InstanceA, revision: 1);
+        launch.RunnerId = "99999999999949998999999999999999";
+
+        await ServiceClientManager.HandleLaunchRuntimeCommand(launch, harness.Deps);
+
+        var ack = await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 1);
+        Assert.Multiple(() =>
+        {
+            Assert.That(ack.Ready, Is.False);
+            Assert.That(harness.Calls, Is.Empty);
+            Assert.That(harness.Logical.GetActiveSessionId(), Is.Empty);
+            Assert.That(harness.Identities.TryGet(CommandSessionId, out _), Is.False);
+        });
+    }
+
+    [Test]
+    public async Task StaleStart_DoesNotReplaceTheNewerRuntime()
+    {
+        var harness = RunningHarness(8, 1, InstanceB);
+
+        await ServiceClientManager.HandleStartSessionCommand(Start(7, 1, InstanceA), harness.Deps);
+
+        var ack = await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
+        Assert.Multiple(() =>
+        {
+            Assert.That(ack.Ready, Is.False);
+            Assert.That(harness.Calls, Is.Empty);
+            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(new RuntimeIdentity(8, 1, InstanceB)));
+        });
+    }
+
+    [Test]
+    public async Task StopDuringStartup_CancelsTheStartupAndClearsItsState()
+    {
+        var harness = new RuntimeCommandHarness();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        harness.BeforeStart = async (_, token) =>
+        {
+            entered.TrySetResult();
+            await Task.Delay(Timeout.Infinite, token);
+        };
+
+        var launch = ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 3, InstanceA, revision: 1), harness.Deps);
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await ServiceClientManager.HandleStopSessionCommandAsync(
+            new StopSessionCommand { SessionId = CommandSessionId, User = "alice" },
+            harness.Deps).WaitAsync(TimeSpan.FromSeconds(5));
+        await launch.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(harness.Sink.LaunchAcks.Single().Ready, Is.False);
+            Assert.That(harness.Sink.StopAcks, Has.Count.EqualTo(1));
+            Assert.That(harness.Tracked(CommandSessionId), Is.Null);
+            Assert.That(harness.Logical.GetActiveSessionId(), Is.Empty);
+            Assert.That(harness.Identities.TryGet(CommandSessionId, out _), Is.False);
+            Assert.That(harness.WorkState.GetActiveStartup(), Is.Null);
+        });
+    }
+
+    [Test]
+    public async Task Stop_IsNotBlockedByStartupAcknowledgementRetries()
+    {
+        var harness = new RuntimeCommandHarness();
+        harness.Sink.FailWhen = request => request is AcknowledgeEditorRuntimeLaunchRequest;
+
+        var launch = ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 3, InstanceA, revision: 1), harness.Deps);
+        await WaitUntilAsync(() => harness.Sink.Attempts.OfType<AcknowledgeEditorRuntimeLaunchRequest>().Any());
+
+        await ServiceClientManager.HandleStopSessionCommandAsync(
+            new StopSessionCommand { SessionId = CommandSessionId, User = "alice" },
+            harness.Deps).WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(launch.IsCompleted, Is.False, "The launch acknowledgement keeps retrying independently.");
+            Assert.That(harness.Tracked(CommandSessionId), Is.Null);
+        });
+        await harness.Shutdown.CancelAsync();
+        await launch.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Test]
+    public async Task LaunchAcknowledgementRetry_ResendsTheIdenticalResultWithoutRelaunching()
+    {
+        var harness = new RuntimeCommandHarness();
+        harness.Sink.FailNextAcknowledgements(2);
+
+        await ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 3, InstanceA, revision: 1), harness.Deps)
+            .WaitAsync(TimeSpan.FromSeconds(10));
+
+        var attempts = harness.Sink.Attempts.OfType<AcknowledgeEditorRuntimeLaunchRequest>().ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(attempts, Has.Count.EqualTo(3));
+            Assert.That(attempts.Distinct(), Has.Exactly(1).Items);
+            Assert.That(attempts[0].Ready, Is.True);
+            Assert.That(harness.Sink.LaunchAcks, Has.Count.EqualTo(1));
+            Assert.That(harness.Calls.Count(call => call.StartsWith("start:", StringComparison.Ordinal)), Is.EqualTo(1));
+        });
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> condition, TimeSpan? timeout = null)
+    {
+        var deadline = DateTime.UtcNow + (timeout ?? TimeSpan.FromSeconds(10));
+        while (!condition())
+        {
+            if (DateTime.UtcNow > deadline)
+            {
+                Assert.Fail("Timed out waiting for condition.");
+            }
+
+            await Task.Delay(10);
+        }
+    }
+
     private static RuntimeCommandHarness RunningHarness(ulong generation, ulong epoch, string instance)
     {
         var harness = new RuntimeCommandHarness();
@@ -243,6 +446,9 @@ public partial class ServiceClientManagerTests
         /// <summary>Fails the next acknowledgement attempts with a retryable status.</summary>
         public void FailNextAcknowledgements(int count) => Volatile.Write(ref _failuresRemaining, count);
 
+        /// <summary>Fails every matching acknowledgement attempt with a retryable status.</summary>
+        public Func<object, bool> FailWhen { get; set; } = _ => false;
+
         public async Task<T> WaitForAsync<T>(ConcurrentQueue<T> queue, int count, TimeSpan? timeout = null)
         {
             var deadline = DateTime.UtcNow + (timeout ?? TimeSpan.FromSeconds(10));
@@ -262,7 +468,7 @@ public partial class ServiceClientManagerTests
         private Task Record<T>(ConcurrentQueue<T> queue, T request) where T : Google.Protobuf.IMessage<T>
         {
             Attempts.Enqueue(request.Clone());
-            if (Interlocked.Decrement(ref _failuresRemaining) >= 0)
+            if (FailWhen(request) || Interlocked.Decrement(ref _failuresRemaining) >= 0)
             {
                 return Task.FromException(new RpcException(new Status(StatusCode.Unavailable, "controlled lost acknowledgement")));
             }

@@ -145,6 +145,19 @@ internal static class ServiceClientManager
         public Task? Task { get; set; }
         public required CancellationTokenSource CancellationSource { get; init; }
         public required string SessionId { get; init; }
+        public RuntimeIdentity RuntimeIdentity { get; init; }
+
+        public void Cancel()
+        {
+            try
+            {
+                CancellationSource.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+                // The work already finished and released its source.
+            }
+        }
     }
 
     /// <summary>
@@ -186,19 +199,25 @@ internal static class ServiceClientManager
             }
         }
 
-        public void SetActiveStartup(TrackedCommandWork work)
+        /// <summary>
+        /// Publishes the new startup and returns the unfinished one it supersedes,
+        /// which the caller must cancel and await before touching the runtime.
+        /// </summary>
+        public TrackedCommandWork? ReplaceActiveStartup(TrackedCommandWork work)
         {
             lock (_gate)
             {
+                var previous = _activeStartup?.Task is { IsCompleted: false } ? _activeStartup : null;
                 _activeStartup = work;
+                return previous;
             }
         }
 
-        public void ClearActiveStartup(Task completedTask)
+        public void ClearActiveStartup(TrackedCommandWork work)
         {
             lock (_gate)
             {
-                if (ReferenceEquals(_activeStartup?.Task, completedTask))
+                if (ReferenceEquals(_activeStartup, work))
                 {
                     _activeStartup = null;
                 }
@@ -206,13 +225,115 @@ internal static class ServiceClientManager
         }
     }
 
+    internal enum RuntimeOrder
+    {
+        Older,
+        Same,
+        Newer,
+    }
+
     internal sealed class LogicalSessionState(string initialSessionId)
     {
-        private sealed record State(string SessionId, RuntimeIdentity? RuntimeIdentity);
+        private sealed record State(string SessionId, RuntimeIdentity? RuntimeIdentity, uint RestartRevision = 0);
 
         private State _state = new(initialSessionId?.Trim() ?? string.Empty, null);
 
         public string GetActiveSessionId() => Volatile.Read(ref _state).SessionId;
+
+        public bool TryGetRuntime(string? sessionId, out RuntimeIdentity runtimeIdentity, out uint restartRevision)
+        {
+            var current = Volatile.Read(ref _state);
+            if (current.RuntimeIdentity is { } identity &&
+                string.Equals(current.SessionId, sessionId?.Trim() ?? string.Empty, StringComparison.Ordinal))
+            {
+                runtimeIdentity = identity;
+                restartRevision = current.RestartRevision;
+                return true;
+            }
+
+            runtimeIdentity = default;
+            restartRevision = 0;
+            return false;
+        }
+
+        /// <summary>
+        /// Orders a candidate runtime against an existing one by lifecycle generation,
+        /// then runtime epoch, then restart revision. An equal position is the same
+        /// runtime only when the instance matches; otherwise it is a conflicting,
+        /// therefore older, delivery.
+        /// </summary>
+        public static RuntimeOrder Compare(
+            RuntimeIdentity candidate,
+            uint candidateRevision,
+            RuntimeIdentity existing,
+            uint existingRevision)
+        {
+            var order = candidate.LifecycleGeneration.CompareTo(existing.LifecycleGeneration);
+            if (order == 0) order = candidate.RuntimeEpoch.CompareTo(existing.RuntimeEpoch);
+            if (order == 0) order = candidateRevision.CompareTo(existingRevision);
+            return order switch
+            {
+                > 0 => RuntimeOrder.Newer,
+                < 0 => RuntimeOrder.Older,
+                _ => candidate.SameRuntime(existing) ? RuntimeOrder.Same : RuntimeOrder.Older,
+            };
+        }
+
+        /// <summary>True when the same session already holds a runtime newer than the candidate.</summary>
+        public bool IsSuperseded(string? sessionId, RuntimeIdentity candidate, uint restartRevision)
+            => TryGetRuntime(sessionId, out var current, out var currentRevision) &&
+               Compare(candidate, restartRevision, current, currentRevision) == RuntimeOrder.Older;
+
+        /// <summary>
+        /// Adopts the runtime only when it is the same as or newer than the current
+        /// runtime of the same session. Another active session is replaced only when
+        /// <paramref name="replaceOtherSession"/> is set.
+        /// </summary>
+        public bool TryAdoptRuntime(
+            string? sessionId,
+            RuntimeIdentity candidate,
+            uint restartRevision,
+            bool replaceOtherSession)
+        {
+            var normalizedSessionId = sessionId?.Trim() ?? string.Empty;
+            candidate = candidate with { RuntimeInstanceId = candidate.RuntimeInstanceId?.Trim() ?? string.Empty };
+            if (normalizedSessionId.Length == 0 || !candidate.IsValid)
+            {
+                return false;
+            }
+
+            while (true)
+            {
+                var current = Volatile.Read(ref _state);
+                var next = new State(normalizedSessionId, candidate, restartRevision);
+                if (current.SessionId.Length > 0 &&
+                    !string.Equals(current.SessionId, normalizedSessionId, StringComparison.Ordinal))
+                {
+                    if (!replaceOtherSession)
+                    {
+                        return false;
+                    }
+                }
+                else if (current.RuntimeIdentity is { } existing)
+                {
+                    var order = Compare(candidate, restartRevision, existing, current.RestartRevision);
+                    if (order == RuntimeOrder.Older)
+                    {
+                        return false;
+                    }
+
+                    if (order == RuntimeOrder.Same)
+                    {
+                        return true;
+                    }
+                }
+
+                if (ReferenceEquals(Interlocked.CompareExchange(ref _state, next, current), current))
+                {
+                    return true;
+                }
+            }
+        }
 
         public void SetActiveRuntime(
             string? sessionId,
@@ -1373,90 +1494,95 @@ internal static class ServiceClientManager
 
     internal static Task HandleStartSessionCommand(StartSessionCommand command, RuntimeCommandDependencies deps)
     {
-        var commandWorkState = deps.WorkState;
-        var previousStartup = commandWorkState.GetActiveStartup();
-        var cancellationSource = CancellationTokenSource.CreateLinkedTokenSource(deps.Shutdown);
-        var tracked = new TrackedCommandWork
+        var runtimeIdentity = new RuntimeIdentity(command.LifecycleGeneration, command.RuntimeEpoch, command.RuntimeInstanceId);
+        var ack = new AcknowledgeSessionStartRequest
         {
-            CancellationSource = cancellationSource,
             SessionId = command.SessionId,
+            User = command.User,
+            LifecycleGeneration = command.LifecycleGeneration,
+            RuntimeEpoch = command.RuntimeEpoch,
+            RuntimeInstanceId = command.RuntimeInstanceId,
         };
-        Task? task = null;
-        task = RunAsync();
-        tracked.Task = task;
-        commandWorkState.SetActiveStartup(tracked);
-        return task;
 
-        async Task RunAsync()
+        // A delayed start for an older runtime of this session must not cancel
+        // or replace the newer one.
+        if (deps.LogicalSessionState.IsSuperseded(command.SessionId, runtimeIdentity, restartRevision: 0))
         {
-            var ack = new AcknowledgeSessionStartRequest
-            {
-                SessionId = command.SessionId,
-                User = command.User,
-                LifecycleGeneration = command.LifecycleGeneration,
-                RuntimeEpoch = command.RuntimeEpoch,
-                RuntimeInstanceId = command.RuntimeInstanceId,
-            };
-            try
-            {
-                await CancelTrackedWorkAsync(previousStartup).ConfigureAwait(false);
-                await commandWorkState.Prompts.CancelAndWaitAsync(
-                    prompt => prompt.SessionId != command.SessionId).ConfigureAwait(false);
-
-                // This wait belongs to cancellable startup work, never the
-                // command stream: Stop must still preempt a queued replacement.
-                await deps.ActivateSession(() =>
-                {
-                    deps.LogicalSessionState.SetActiveRuntime(command.SessionId, command.LifecycleGeneration,
-                        command.RuntimeEpoch, command.RuntimeInstanceId);
-                    deps.RuntimeIdentities.Set(command.SessionId, command.LifecycleGeneration,
-                        command.RuntimeEpoch, command.RuntimeInstanceId);
-                }, cancellationSource.Token).ConfigureAwait(false);
-
-                var preemptedSessionId = await PreemptActiveSessionIfNeededAsync(
-                    command.SessionId,
-                    deps.GetActiveRuntimeSessionId,
-                    deps.StopRuntime,
-                    deps.StopSessionRelay,
-                    deps.StopArtifactUploads,
-                    deps.StopWorkspaceMirrors,
-                    deps.CancelSessionDownloads,
-                    deps.GetDownloadActiveSessionId,
-                    deps.SetDownloadActiveSession,
-                    cancellationSource.Token).ConfigureAwait(false);
-                deps.RuntimeIdentities.Remove(preemptedSessionId);
-                await deps.StartRuntimeAndWaitForReady(command, cancellationSource.Token).ConfigureAwait(false);
-                ack.Ready = true;
-                ack.Message = IsComfyRuntime(command.EditorRuntimeKind) ? "ComfyUI ready" : "GPU runtime ready";
-            }
-            catch (Exception ex)
-            {
-                RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed to start session {command.SessionId}: {ex.Message}");
-                ack.Ready = false;
-                ack.Message = ex.Message;
-                if (await TryStopSessionAndCleanupAsync(command.SessionId, deps).ConfigureAwait(false))
-                {
-                    ClearRuntimeSessionStateIfIdentityMatches(
-                        deps.LogicalSessionState,
-                        deps.RuntimeIdentities,
-                        command.SessionId,
-                        command.LifecycleGeneration,
-                        command.RuntimeEpoch,
-                        command.RuntimeInstanceId);
-                }
-            }
-            finally
-            {
-                commandWorkState.ClearActiveStartup(task!);
-                cancellationSource.Dispose();
-            }
-
-            await AcknowledgeRuntimeCommandWithRetryAsync(
+            RunnerLog.Warning(nameof(ServiceClientManager), $"Rejecting stale start for session {command.SessionId}.");
+            ack.Ready = false;
+            ack.Message = StaleRuntimeCommandMessage;
+            return AcknowledgeRuntimeCommandWithRetryAsync(
                 deps.Sink.AckStartSessionAsync,
                 ack,
                 command.SessionId,
-                deps.Shutdown).ConfigureAwait(false);
+                deps.Shutdown);
         }
+
+        return RunTrackedStartupAsync(
+            deps,
+            command.SessionId,
+            runtimeIdentity,
+            async cancellationToken =>
+            {
+                try
+                {
+                    await deps.WorkState.Prompts.CancelAndWaitAsync(
+                        prompt => prompt.SessionId != command.SessionId).ConfigureAwait(false);
+
+                    // This wait belongs to cancellable startup work, never the
+                    // command stream: Stop must still preempt a queued replacement.
+                    await deps.ActivateSession(() =>
+                    {
+                        if (!deps.LogicalSessionState.TryAdoptRuntime(
+                                command.SessionId,
+                                runtimeIdentity,
+                                restartRevision: 0,
+                                replaceOtherSession: true))
+                        {
+                            throw new InvalidOperationException(StaleRuntimeCommandMessage);
+                        }
+
+                        deps.RuntimeIdentities.Set(command.SessionId, command.LifecycleGeneration,
+                            command.RuntimeEpoch, command.RuntimeInstanceId);
+                    }, cancellationToken).ConfigureAwait(false);
+
+                    var preemptedSessionId = await PreemptActiveSessionIfNeededAsync(
+                        command.SessionId,
+                        deps.GetActiveRuntimeSessionId,
+                        deps.StopRuntime,
+                        deps.StopSessionRelay,
+                        deps.StopArtifactUploads,
+                        deps.StopWorkspaceMirrors,
+                        deps.CancelSessionDownloads,
+                        deps.GetDownloadActiveSessionId,
+                        deps.SetDownloadActiveSession,
+                        cancellationToken).ConfigureAwait(false);
+                    deps.RuntimeIdentities.Remove(preemptedSessionId);
+                    await deps.StartRuntimeAndWaitForReady(command, cancellationToken).ConfigureAwait(false);
+                    ack.Ready = true;
+                    ack.Message = IsComfyRuntime(command.EditorRuntimeKind) ? "ComfyUI ready" : "GPU runtime ready";
+                }
+                catch (Exception ex)
+                {
+                    RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed to start session {command.SessionId}: {ex.Message}");
+                    ack.Ready = false;
+                    ack.Message = ex.Message;
+                    if (await TryStopSessionAndCleanupAsync(command.SessionId, deps).ConfigureAwait(false))
+                    {
+                        ClearRuntimeSessionStateIfIdentityMatches(
+                            deps.LogicalSessionState,
+                            deps.RuntimeIdentities,
+                            command.SessionId,
+                            command.LifecycleGeneration,
+                            command.RuntimeEpoch,
+                            command.RuntimeInstanceId);
+                    }
+                }
+
+                return ack;
+            },
+            deps.Sink.AckStartSessionAsync,
+            command.SessionId);
     }
 
     internal static async Task HandleQuiesceRuntimeCommandAsync(
@@ -1506,69 +1632,83 @@ internal static class ServiceClientManager
         LaunchEditorRuntimeCommand command,
         RuntimeCommandDependencies deps)
     {
-        var commandWorkState = deps.WorkState;
-        deps.LogicalSessionState.SetActiveRuntime(
-            command.SessionId,
-            command.LifecycleGeneration,
-            command.RuntimeEpoch,
-            command.RuntimeInstanceId);
+        var runtimeIdentity = new RuntimeIdentity(command.LifecycleGeneration, command.RuntimeEpoch, command.RuntimeInstanceId);
+        var ack = new AcknowledgeEditorRuntimeLaunchRequest
+        {
+            CommandId = command.CommandId,
+            RestartId = command.RestartId,
+            RunnerId = deps.RunnerId,
+            SessionId = command.SessionId,
+            LifecycleGeneration = command.LifecycleGeneration,
+            RuntimeEpoch = command.RuntimeEpoch,
+            RuntimeInstanceId = command.RuntimeInstanceId,
+            RestartRevision = command.RestartRevision,
+            Attempt = command.Attempt,
+        };
+
+        // Adopt the identity on receipt, but only for this runner and only when
+        // it is not older than the session's current runtime. A delayed launch
+        // must neither replace the heartbeat identity nor cancel newer startup.
+        if (!RunnerIdMatches(command.RunnerId, deps.RunnerId) ||
+            !deps.LogicalSessionState.TryAdoptRuntime(
+                command.SessionId,
+                runtimeIdentity,
+                command.RestartRevision,
+                replaceOtherSession: false))
+        {
+            RunnerLog.Warning(
+                nameof(ServiceClientManager),
+                $"Rejecting stale or foreign launch {command.CommandId} for session {command.SessionId}.");
+            ack.Ready = false;
+            ack.Message = StaleRuntimeCommandMessage;
+            return AcknowledgeRuntimeCommandWithRetryAsync(
+                deps.Sink.AckEditorRuntimeLaunchAsync,
+                ack,
+                command.CommandId,
+                deps.Shutdown);
+        }
+
         deps.RuntimeIdentities.Set(
             command.SessionId,
             command.LifecycleGeneration,
             command.RuntimeEpoch,
             command.RuntimeInstanceId);
-        var cancellationSource = CancellationTokenSource.CreateLinkedTokenSource(deps.Shutdown);
-        var tracked = new TrackedCommandWork { CancellationSource = cancellationSource, SessionId = command.SessionId };
-        Task? task = null;
-        task = RunAsync();
-        tracked.Task = task;
-        commandWorkState.SetActiveStartup(tracked);
-        return task;
-
-        async Task RunAsync()
+        var start = new StartSessionCommand
         {
-            var start = new StartSessionCommand
+            SessionId = command.SessionId,
+            User = command.User,
+            EditorSid = command.EditorSid,
+            EditorTemplate = command.EditorTemplate,
+            EditorRuntimeKind = command.EditorRuntimeKind,
+            LifecycleGeneration = command.LifecycleGeneration,
+            RuntimeEpoch = command.RuntimeEpoch,
+            RuntimeInstanceId = command.RuntimeInstanceId,
+        };
+        start.InitialModels.AddRange(command.InitialModels);
+        start.InitialArtifacts.AddRange(command.InitialArtifacts);
+        start.InitialWorkspaceFiles.AddRange(command.InitialWorkspaceFiles);
+
+        return RunTrackedStartupAsync(
+            deps,
+            command.SessionId,
+            runtimeIdentity,
+            async cancellationToken =>
             {
-                SessionId = command.SessionId,
-                User = command.User,
-                EditorSid = command.EditorSid,
-                EditorTemplate = command.EditorTemplate,
-                EditorRuntimeKind = command.EditorRuntimeKind,
-                LifecycleGeneration = command.LifecycleGeneration,
-                RuntimeEpoch = command.RuntimeEpoch,
-                RuntimeInstanceId = command.RuntimeInstanceId,
-            };
-            start.InitialModels.AddRange(command.InitialModels);
-            start.InitialArtifacts.AddRange(command.InitialArtifacts);
-            start.InitialWorkspaceFiles.AddRange(command.InitialWorkspaceFiles);
-            var ack = new AcknowledgeEditorRuntimeLaunchRequest
-            {
-                CommandId = command.CommandId,
-                RestartId = command.RestartId,
-                RunnerId = deps.RunnerId,
-                SessionId = command.SessionId,
-                LifecycleGeneration = command.LifecycleGeneration,
-                RuntimeEpoch = command.RuntimeEpoch,
-                RuntimeInstanceId = command.RuntimeInstanceId,
-                RestartRevision = command.RestartRevision,
-                Attempt = command.Attempt,
-            };
-            var cleanedUp = true;
-            try
-            {
-                await deps.StartRuntimeAndWaitForReady(start, cancellationSource.Token).ConfigureAwait(false);
-                ack.Ready = true;
-                ack.Message = IsComfyRuntime(command.EditorRuntimeKind) ? "ComfyUI ready" : "GPU runtime ready";
-            }
-            catch (Exception ex)
-            {
-                ack.Ready = false;
-                ack.Message = ex.Message;
-                RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed launching runtime for restart {command.RestartId}: {ex.Message}");
-                cleanedUp = await TryStopSessionAndCleanupAsync(command.SessionId, deps).ConfigureAwait(false);
-            }
-            finally
-            {
+                var cleanedUp = true;
+                try
+                {
+                    await deps.StartRuntimeAndWaitForReady(start, cancellationToken).ConfigureAwait(false);
+                    ack.Ready = true;
+                    ack.Message = IsComfyRuntime(command.EditorRuntimeKind) ? "ComfyUI ready" : "GPU runtime ready";
+                }
+                catch (Exception ex)
+                {
+                    ack.Ready = false;
+                    ack.Message = ex.Message;
+                    RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed launching runtime for restart {command.RestartId}: {ex.Message}");
+                    cleanedUp = await TryStopSessionAndCleanupAsync(command.SessionId, deps).ConfigureAwait(false);
+                }
+
                 if (!ack.Ready && cleanedUp)
                 {
                     ClearRuntimeSessionStateIfIdentityMatches(
@@ -1580,14 +1720,73 @@ internal static class ServiceClientManager
                         command.RuntimeInstanceId);
                 }
 
-                commandWorkState.ClearActiveStartup(task!);
+                return ack;
+            },
+            deps.Sink.AckEditorRuntimeLaunchAsync,
+            command.CommandId);
+    }
+
+    private const string StaleRuntimeCommandMessage = "The command targets a superseded runtime or another runner.";
+
+    internal static bool RunnerIdMatches(string? commandRunnerId, string runnerId)
+        => Guid.TryParse(commandRunnerId, out var commandRunner) && Guid.TryParse(runnerId, out var runner)
+            ? commandRunner == runner
+            : !string.IsNullOrWhiteSpace(commandRunnerId) &&
+              string.Equals(commandRunnerId.Trim(), runnerId?.Trim(), StringComparison.Ordinal);
+
+    /// <summary>
+    /// Runs one startup in the single startup slot. The superseded startup is
+    /// cancelled and awaited before this one touches the runtime, so two startups
+    /// never overlap. The tracked task covers only the physical work; the
+    /// acknowledgement retry runs after it, detached, so Stop never waits for it.
+    /// </summary>
+    private static Task RunTrackedStartupAsync<TAck>(
+        RuntimeCommandDependencies deps,
+        string sessionId,
+        RuntimeIdentity runtimeIdentity,
+        Func<CancellationToken, Task<TAck>> startup,
+        Func<TAck, CancellationToken, Task> acknowledge,
+        string acknowledgementKey)
+    {
+        TrackedCommandWork? previous = null;
+        var cancellationSource = CancellationTokenSource.CreateLinkedTokenSource(deps.Shutdown);
+        var tracked = new TrackedCommandWork
+        {
+            CancellationSource = cancellationSource,
+            SessionId = sessionId,
+            RuntimeIdentity = runtimeIdentity,
+        };
+
+        // Publish a joinable task before it starts, so Stop and Quiesce can never
+        // observe the slot without the work that owns it.
+        var starter = new Task<Task<TAck>>(RunPhysicalAsync);
+        var physical = starter.Unwrap();
+        tracked.Task = physical;
+        previous = deps.WorkState.ReplaceActiveStartup(tracked);
+        starter.Start(TaskScheduler.Default);
+        return AcknowledgeAsync();
+
+        async Task<TAck> RunPhysicalAsync()
+        {
+            try
+            {
+                await CancelTrackedWorkAsync(previous).ConfigureAwait(false);
+                return await startup(cancellationSource.Token).ConfigureAwait(false);
+            }
+            finally
+            {
+                deps.WorkState.ClearActiveStartup(tracked);
                 cancellationSource.Dispose();
             }
+        }
 
+        async Task AcknowledgeAsync()
+        {
+            var ack = await physical.ConfigureAwait(false);
             await AcknowledgeRuntimeCommandWithRetryAsync(
-                deps.Sink.AckEditorRuntimeLaunchAsync,
+                acknowledge,
                 ack,
-                command.CommandId,
+                acknowledgementKey,
                 deps.Shutdown).ConfigureAwait(false);
         }
     }
@@ -1660,11 +1859,11 @@ internal static class ServiceClientManager
 
         if (work.Task is null)
         {
-            work.CancellationSource.Cancel();
+            work.Cancel();
             return;
         }
 
-        work.CancellationSource.Cancel();
+        work.Cancel();
         try
         {
             await work.Task.ConfigureAwait(false);

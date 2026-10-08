@@ -5,6 +5,22 @@ namespace Offloadr.Runner.Core;
 public readonly record struct RuntimeIdentity(ulong LifecycleGeneration, ulong RuntimeEpoch, string RuntimeInstanceId)
 {
     public bool IsValid => LifecycleGeneration > 0 && RuntimeEpoch > 0 && !string.IsNullOrWhiteSpace(RuntimeInstanceId);
+
+    /// <summary>
+    /// The same identity with a GUID instance id in one canonical spelling, so that
+    /// identities captured from different messages compare equal.
+    /// </summary>
+    public RuntimeIdentity Normalized()
+        => this with { RuntimeInstanceId = NormalizeInstanceId(RuntimeInstanceId) };
+
+    /// <summary>True when both identities name the same runtime, however the instance id is spelled.</summary>
+    public bool SameRuntime(RuntimeIdentity other)
+        => Normalized() == other.Normalized();
+
+    public static string NormalizeInstanceId(string? runtimeInstanceId)
+        => Guid.TryParse(runtimeInstanceId, out var instance)
+            ? instance.ToString("n")
+            : runtimeInstanceId?.Trim() ?? string.Empty;
 }
 
 public sealed class RuntimeIdentityRegistry
