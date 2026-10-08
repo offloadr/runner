@@ -991,6 +991,51 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
+    public void TryAdoptRuntime_RefusesAReplacedSessionAtTheGenerationItRanAt()
+    {
+        var state = new ServiceClientManager.LogicalSessionState(string.Empty);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(state.TryAdoptRuntime("session-a", new RuntimeIdentity(1, 1, "a-1"), 0, replaceOtherSession: true), Is.True);
+            Assert.That(state.TryAdoptRuntime("session-b", new RuntimeIdentity(1, 1, "b-1"), 0, replaceOtherSession: true), Is.True);
+            Assert.That(state.TryAdoptRuntime("session-a", new RuntimeIdentity(1, 2, "a-2"), 0, replaceOtherSession: true), Is.False);
+            Assert.That(state.GetActiveSessionId(), Is.EqualTo("session-b"));
+            Assert.That(state.TryAdoptRuntime("session-a", new RuntimeIdentity(2, 1, "a-3"), 0, replaceOtherSession: true), Is.True);
+        });
+    }
+
+    [Test]
+    public void ClearAndRetire_RefusesALateStartForTheStoppedGeneration()
+    {
+        var state = new ServiceClientManager.LogicalSessionState(string.Empty);
+        state.TryAdoptRuntime("session-a", new RuntimeIdentity(3, 1, "a-1"), 0, replaceOtherSession: true);
+
+        state.ClearAndRetire("session-a");
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(state.GetActiveSessionId(), Is.Empty);
+            Assert.That(state.TryAdoptRuntime("session-a", new RuntimeIdentity(3, 2, "a-2"), 0, replaceOtherSession: true), Is.False);
+            Assert.That(state.TryAdoptRuntime("session-a", new RuntimeIdentity(4, 1, "a-3"), 0, replaceOtherSession: true), Is.True);
+        });
+    }
+
+    [Test]
+    public void ClearAndRetire_UsesTheStopGenerationWhenTheStartWasNotAdoptedYet()
+    {
+        var state = new ServiceClientManager.LogicalSessionState(string.Empty);
+
+        state.ClearAndRetire("session-a", stoppedGeneration: 5);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(state.TryAdoptRuntime("session-a", new RuntimeIdentity(5, 1, "a-1"), 0, replaceOtherSession: true), Is.False);
+            Assert.That(state.TryAdoptRuntime("session-a", new RuntimeIdentity(6, 1, "a-2"), 0, replaceOtherSession: true), Is.True);
+        });
+    }
+
+    [Test]
     public async Task HandleUnexpectedRuntimeExitAsync_ClearsStateAndSidecarsOfTheExitedRuntime()
     {
         var logicalSession = new ServiceClientManager.LogicalSessionState(string.Empty);

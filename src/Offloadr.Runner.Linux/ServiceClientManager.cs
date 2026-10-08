@@ -532,7 +532,7 @@ internal static class ServiceClientManager
         {
             var normalizedSessionId = sessionId?.Trim() ?? string.Empty;
             candidate = candidate with { RuntimeInstanceId = candidate.RuntimeInstanceId?.Trim() ?? string.Empty };
-            if (normalizedSessionId.Length == 0 || !candidate.IsValid)
+            if (normalizedSessionId.Length == 0 || !candidate.IsValid || IsRetired(normalizedSessionId, candidate))
             {
                 return false;
             }
@@ -548,6 +548,15 @@ internal static class ServiceClientManager
                     {
                         return false;
                     }
+
+                    if (ReferenceEquals(Interlocked.CompareExchange(ref _state, next, current), current))
+                    {
+                        // The replaced session has ended here; a late start for it must not return.
+                        Retire(current);
+                        return true;
+                    }
+
+                    continue;
                 }
                 else if (current.RuntimeIdentity is { } existing)
                 {
@@ -632,6 +641,78 @@ internal static class ServiceClientManager
                 {
                     return;
                 }
+            }
+        }
+
+        /// <summary>
+        /// Clears the session after a Stop and remembers it as ended, so a delayed or
+        /// redelivered start for the same lifecycle generation cannot bring it back.
+        /// </summary>
+        public void ClearAndRetire(string? sessionId, ulong stoppedGeneration = 0)
+        {
+            var expected = sessionId?.Trim() ?? string.Empty;
+            if (expected.Length > 0 && stoppedGeneration > 0)
+            {
+                // The Stop may arrive before its session's start was adopted here.
+                Retire(new State(expected, new RuntimeIdentity(stoppedGeneration, 1, "stopped")));
+            }
+
+            while (true)
+            {
+                var current = Volatile.Read(ref _state);
+                if (!string.Equals(current.SessionId, expected, StringComparison.Ordinal))
+                {
+                    return;
+                }
+
+                if (ReferenceEquals(
+                    Interlocked.CompareExchange(ref _state, new State(string.Empty, null), current),
+                    current))
+                {
+                    Retire(current);
+                    return;
+                }
+            }
+        }
+
+        // Sessions that ended on this runner, by the highest lifecycle generation they ran
+        // at. A start is only fenced against its own session's generations: ordering across
+        // different sessions needs an allocation order only the control plane has.
+        private const int MaxRetiredSessions = 256;
+        private readonly object _retiredGate = new();
+        private readonly Dictionary<string, ulong> _retiredGenerations = new(StringComparer.Ordinal);
+        private readonly Queue<string> _retiredOrder = new();
+
+        private void Retire(State ended)
+        {
+            if (ended.SessionId.Length == 0 || ended.RuntimeIdentity is not { } runtime)
+            {
+                return;
+            }
+
+            lock (_retiredGate)
+            {
+                if (_retiredGenerations.TryGetValue(ended.SessionId, out var known))
+                {
+                    _retiredGenerations[ended.SessionId] = Math.Max(known, runtime.LifecycleGeneration);
+                    return;
+                }
+
+                _retiredGenerations[ended.SessionId] = runtime.LifecycleGeneration;
+                _retiredOrder.Enqueue(ended.SessionId);
+                while (_retiredOrder.Count > MaxRetiredSessions)
+                {
+                    _retiredGenerations.Remove(_retiredOrder.Dequeue());
+                }
+            }
+        }
+
+        private bool IsRetired(string sessionId, RuntimeIdentity candidate)
+        {
+            lock (_retiredGate)
+            {
+                return _retiredGenerations.TryGetValue(sessionId, out var retired) &&
+                       candidate.LifecycleGeneration <= retired;
             }
         }
     }
@@ -1887,7 +1968,7 @@ internal static class ServiceClientManager
             return;
         }
 
-        deps.LogicalSessionState.ClearIfMatches(command.SessionId);
+        deps.LogicalSessionState.ClearAndRetire(command.SessionId, command.LifecycleGeneration);
         deps.RuntimeIdentities.Remove(command.SessionId);
         _ = AcknowledgeRuntimeCommandWithRetryAsync(deps.Sink.AckStopSessionAsync, ack, acknowledgementKey, deps.Shutdown);
     }
