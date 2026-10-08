@@ -45,6 +45,26 @@ public partial class SessionProcessManagerOwnershipTests
         Assert.That(fixture.Http.Requests, Is.Empty);
     }
 
+    [TestCase("target-session")]
+    [TestCase("target-instance")]
+    [TestCase("command-session")]
+    public async Task MalformedIdentityIsRejectedAsValidationFailureBeforeHttp(string malformed)
+    {
+        await using var fixture = await PromptRuntimeFixture.CreateAsync();
+        var command = fixture.Command();
+        if (malformed == "target-session") command.Target.RunnerSessionId = "not-a-uuid";
+        else if (malformed == "target-instance") command.Target.RuntimeInstanceId = "not-a-uuid";
+        else command.SessionId = "not-a-uuid";
+
+        var failure = Assert.CatchAsync(() => fixture.Manager.SubmitEditorActionAsync(command, CancellationToken.None));
+        var recoveryFailure = Assert.CatchAsync(() => fixture.Manager.RecoverPromptAsync(
+            command, "runner-1", (_, _) => Task.CompletedTask, CancellationToken.None));
+
+        Assert.That(failure, Is.InstanceOf<InvalidOperationException>().Or.InstanceOf<ArgumentException>());
+        Assert.That(recoveryFailure, Is.InstanceOf<InvalidOperationException>().Or.InstanceOf<ArgumentException>());
+        Assert.That(fixture.Http.Requests, Is.Empty);
+    }
+
     [Test]
     public async Task ForgeLocalPreparationFailureDoesNotMarkNativeRequestAttempt()
     {
