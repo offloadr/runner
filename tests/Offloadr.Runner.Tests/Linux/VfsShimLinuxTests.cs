@@ -2591,6 +2591,100 @@ public class VfsShimLinuxTests
             identity.DeviceId,
             identity.Inode);
 
+    [Test]
+    public async Task Vfork_AndPosixSpawn_RunChildrenFromPreloadedProcess()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        LinuxTestPrerequisites.RequireUnixDomainSockets();
+        LinuxTestPrerequisites.RequireCommand("/usr/bin/gcc");
+
+        var root = Path.Combine(Path.GetTempPath(), "runneragent-vfs-shim-tests", Guid.NewGuid().ToString("n"));
+        Directory.CreateDirectory(root);
+
+        try
+        {
+            var modelsRoot = Path.Combine(root, "models");
+            Directory.CreateDirectory(modelsRoot);
+            var shimPath = Path.Combine(root, "liboffloadr_model_vfs.so");
+            var probeSourcePath = Path.Combine(root, "spawn-probe.c");
+            var probePath = Path.Combine(root, "spawn-probe");
+            var socketPath = Path.Combine(root, "model-fetch.sock");
+
+            await CompileShimAsync(shimPath);
+            await File.WriteAllTextAsync(probeSourcePath, """
+                #define _GNU_SOURCE
+                #include <spawn.h>
+                #include <stdio.h>
+                #include <sys/wait.h>
+                #include <unistd.h>
+
+                extern char **environ;
+
+                /* Not inlined, so the vfork caller has a frame of its own to lose. */
+                __attribute__((noinline)) static int run_with_vfork(int round) {
+                    volatile unsigned long canary = 0x5a5a5a5aUL + (unsigned long)round;
+                    char *arguments[] = {"/bin/sh", "-c", "exit 7", NULL};
+                    pid_t child = vfork();
+                    if (child == 0) {
+                        execve("/bin/sh", arguments, environ);
+                        _exit(127);
+                    }
+                    if (child < 0) return 20;
+                    int status = 0;
+                    if (waitpid(child, &status, 0) != child) return 21;
+                    if (!WIFEXITED(status) || WEXITSTATUS(status) != 7) return 22;
+                    if (canary != 0x5a5a5a5aUL + (unsigned long)round) return 23;
+                    return 0;
+                }
+
+                int main(void) {
+                    for (int round = 0; round < 200; round++) {
+                        int result = run_with_vfork(round);
+                        if (result != 0) return result;
+                    }
+
+                    pid_t child = -1;
+                    char *arguments[] = {"/bin/sh", "-c", "exit 5", NULL};
+                    if (posix_spawn(&child, "/bin/sh", NULL, NULL, arguments, environ) != 0) return 30;
+                    int status = 0;
+                    if (waitpid(child, &status, 0) != child) return 31;
+                    if (!WIFEXITED(status) || WEXITSTATUS(status) != 5) return 32;
+
+                    puts("ok");
+                    return 0;
+                }
+                """);
+            await RunProcessAsync("/usr/bin/gcc", ["-O2", probeSourcePath, "-o", probePath], root);
+
+            await using var server = new VfsIpcServer(
+                socketPath,
+                (_, _) => Task.FromResult(VfsIpcResponse.Error(VfsIpcStatus.NotManaged)));
+            server.Start();
+
+            var result = await RunProcessAsync(
+                probePath,
+                [],
+                root,
+                new Dictionary<string, string?>
+                {
+                    ["LD_PRELOAD"] = shimPath,
+                    ["VFS_SOCKET"] = socketPath,
+                    ["VFS_ROOTS"] = modelsRoot,
+                    ["VFS_EXTS"] = ".bin",
+                    ["VFS_LOG"] = "0"
+                });
+
+            Assert.That(result.Stdout.Trim(), Is.EqualTo("ok"));
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
     internal static async Task CompileShimAsync(string outputPath)
     {
         var sourcePath = FindRepoFile("src/Offloadr.Runner.Linux/VfsShim/model_vfs.c");

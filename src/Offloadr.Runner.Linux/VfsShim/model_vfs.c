@@ -150,7 +150,6 @@ static int (*real_dup3_fn)(int, int, int) = NULL;
 static int (*real_fcntl_fn)(int, int, ...) = NULL;
 static int (*real_fcntl64_fn)(int, int, ...) = NULL;
 static pid_t (*real_fork_fn)(void) = NULL;
-static pid_t (*real_vfork_fn)(void) = NULL;
 static int (*real_clone_fn)(int (*)(void *), void *, int, void *, ...) = NULL;
 static int (*real_posix_spawn_fn)(
     pid_t *,
@@ -274,7 +273,6 @@ static void init_syms(void) {
     if (!real_fcntl_fn) real_fcntl_fn = dlsym(RTLD_NEXT, "fcntl");
     if (!real_fcntl64_fn) real_fcntl64_fn = dlsym(RTLD_NEXT, "fcntl64");
     if (!real_fork_fn) real_fork_fn = dlsym(RTLD_NEXT, "fork");
-    if (!real_vfork_fn) real_vfork_fn = dlsym(RTLD_NEXT, "vfork");
     if (!real_clone_fn) real_clone_fn = dlsym(RTLD_NEXT, "clone");
     if (!real_posix_spawn_fn) real_posix_spawn_fn = dlsym(RTLD_NEXT, "posix_spawn");
     if (!real_posix_spawnp_fn) real_posix_spawnp_fn = dlsym(RTLD_NEXT, "posix_spawnp");
@@ -2268,23 +2266,14 @@ pid_t fork(void) {
     return result;
 }
 
+/*
+ * A vfork child shares the parent's stack until it execs or exits, so it must never return
+ * from the function that called vfork. A C wrapper around the real vfork does exactly that,
+ * which corrupts the parent's stack. POSIX allows vfork to behave like fork, so route it
+ * through the fork wrapper: same gating, and the child gets its own address space.
+ */
 pid_t vfork(void) {
-    init_syms();
-    if (!real_vfork_fn) {
-        errno = ENOSYS;
-        return -1;
-    }
-
-    pthread_mutex_lock(&inheritance_lock);
-    if (managed_descriptor_seen) {
-        pthread_mutex_unlock(&inheritance_lock);
-        errno = EOPNOTSUPP;
-        return -1;
-    }
-
-    pid_t result = real_vfork_fn();
-    if (result != 0) pthread_mutex_unlock(&inheritance_lock);
-    return result;
+    return fork();
 }
 
 int clone(int (*function)(void *), void *child_stack, int flags, void *argument, ...) {
