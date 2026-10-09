@@ -116,8 +116,11 @@ internal static class ServiceClientManager
         /// <summary>The request already ran here, but its result is no longer retained.</summary>
         AlreadyExecuted,
 
-        /// <summary>The request's deadline passed before it could run.</summary>
+        /// <summary>The request had no deadline, or it passed before the request could run.</summary>
         Expired,
+
+        /// <summary>Too many requests are remembered as executed to admit another safely.</summary>
+        Saturated,
     }
 
     /// <summary>
@@ -128,16 +131,17 @@ internal static class ServiceClientManager
     /// </summary>
     internal sealed class TransientRequestDeliveries(TransientAcknowledgementCache completed)
     {
-        /// <summary>Executed requests remembered after their result is evicted, until their deadline.</summary>
-        internal const int MaxExecutedMarkers = 16_384;
-
-        /// <summary>How long a request without a deadline is remembered as executed.</summary>
-        internal static readonly TimeSpan MarkerLifetimeWithoutDeadline = TimeSpan.FromMinutes(15);
+        /// <summary>
+        /// Requests remembered as executed until their deadline. A request is never admitted
+        /// after its deadline, so remembering it until then is enough to never run it twice.
+        /// Markers are never evicted early: at this limit new requests are refused instead.
+        /// </summary>
+        internal static int MaxExecutedMarkers { get; set; } = 16_384;
 
         private readonly object _gate = new();
         private readonly Dictionary<string, List<string>> _inFlight = new(StringComparer.Ordinal);
         private readonly Dictionary<string, DateTime> _executedUntil = new(StringComparer.Ordinal);
-        private readonly Queue<string> _executedOrder = new();
+        private readonly PriorityQueue<string, DateTime> _executedByDeadline = new();
         private readonly Dictionary<string, DateTime> _deadlines = new(StringComparer.Ordinal);
 
         public int InFlightCount
@@ -188,51 +192,40 @@ internal static class ServiceClientManager
                     return TransientRequestAdmission.Expired;
                 }
 
+                if (_executedUntil.Count + _inFlight.Count >= MaxExecutedMarkers)
+                {
+                    return TransientRequestAdmission.Saturated;
+                }
+
                 _inFlight.Add(request.RequestId, [request.DeliveryId]);
-                _deadlines[request.RequestId] = DeadlineOf(request, now);
+                _deadlines[request.RequestId] = request.ExpiresUtc.ToDateTime();
                 return TransientRequestAdmission.Execute;
             }
         }
 
+        /// <summary>
+        /// True when the request's deadline has passed or it has none. The control plane
+        /// sets a deadline on every request and treats one without it as expired.
+        /// </summary>
         public static bool IsExpired(RelayEditorRuntimeRequestCommand request, DateTime nowUtc)
-            => request.ExpiresUtc is { } expires &&
-               (expires.Seconds != 0 || expires.Nanos != 0) &&
+            => request.ExpiresUtc is not { } expires ||
+               (expires.Seconds == 0 && expires.Nanos == 0) ||
                expires.ToDateTime() <= nowUtc;
-
-        private static DateTime DeadlineOf(RelayEditorRuntimeRequestCommand request, DateTime nowUtc)
-            => request.ExpiresUtc is { } expires && (expires.Seconds != 0 || expires.Nanos != 0)
-                ? expires.ToDateTime()
-                : nowUtc + MarkerLifetimeWithoutDeadline;
 
         private void RememberExecuted(string requestId, DateTime until)
         {
-            if (_executedUntil.ContainsKey(requestId))
+            if (_executedUntil.TryAdd(requestId, until))
             {
-                return;
-            }
-
-            _executedUntil[requestId] = until;
-            _executedOrder.Enqueue(requestId);
-            while (_executedUntil.Count > MaxExecutedMarkers)
-            {
-                _executedUntil.Remove(_executedOrder.Dequeue());
+                _executedByDeadline.Enqueue(requestId, until);
             }
         }
 
         private void PruneExecutedMarkers(DateTime nowUtc)
         {
-            while (_executedOrder.TryPeek(out var oldest))
+            while (_executedByDeadline.TryPeek(out var requestId, out var until) && until <= nowUtc)
             {
-                if (_executedUntil.TryGetValue(oldest, out var until) && until > nowUtc)
-                {
-                    return;
-                }
-
-                _executedOrder.Dequeue();
-                if (_executedUntil.TryGetValue(oldest, out until) && until <= nowUtc)
-                {
-                    _executedUntil.Remove(oldest);
-                }
+                _executedByDeadline.Dequeue();
+                _executedUntil.Remove(requestId);
             }
         }
 
@@ -245,11 +238,10 @@ internal static class ServiceClientManager
             lock (_gate)
             {
                 completed.Set(result);
-                RememberExecuted(
-                    result.RequestId,
-                    _deadlines.Remove(result.RequestId, out var deadline)
-                        ? deadline
-                        : DateTime.UtcNow + MarkerLifetimeWithoutDeadline);
+                if (_deadlines.Remove(result.RequestId, out var deadline))
+                {
+                    RememberExecuted(result.RequestId, deadline);
+                }
                 if (!_inFlight.Remove(result.RequestId, out var deliveries))
                 {
                     deliveries = [result.DeliveryId];
@@ -2633,7 +2625,13 @@ internal static class ServiceClientManager
                 // Nothing runs for an expired request, including the work done before execution.
                 await AcknowledgeTransientRequestWithRetryAsync(
                     acknowledge,
-                    TransientRequestFailure(request, 504, "The request expired before it could run."),
+                    TransientRequestFailure(request, 504, "The request has no deadline or expired before it could run."),
+                    acknowledgementCancellationToken).ConfigureAwait(false);
+                return;
+            case TransientRequestAdmission.Saturated:
+                await AcknowledgeTransientRequestWithRetryAsync(
+                    acknowledge,
+                    TransientRequestFailure(request, 503, "Too many recent requests to admit another safely."),
                     acknowledgementCancellationToken).ConfigureAwait(false);
                 return;
         }

@@ -726,6 +726,54 @@ public partial class ServiceClientManagerTests
         });
     }
 
+    [Test]
+    public async Task EditorRequestWithoutADeadline_IsRefusedWithoutRunning()
+    {
+        var harness = new TransientRequestHarness();
+        var request = harness.Request("delivery-1");
+        request.ExpiresUtc = null;
+
+        await harness.DispatchAsync(request);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(harness.Executions, Is.Zero);
+            Assert.That(harness.BeforeExecuteCalls, Is.Zero);
+            Assert.That(harness.Acknowledgements.Single().StatusCode, Is.EqualTo(504));
+        });
+    }
+
+    [Test]
+    public async Task EditorRequestsPastTheMarkerLimit_AreRefusedRatherThanForgettingExecutedOnes()
+    {
+        var previousLimit = ServiceClientManager.TransientRequestDeliveries.MaxExecutedMarkers;
+        ServiceClientManager.TransientRequestDeliveries.MaxExecutedMarkers = 1;
+        try
+        {
+            var harness = new TransientRequestHarness(retainedResults: 1);
+            var first = harness.Request("delivery-1");
+            await harness.DispatchAsync(first);
+
+            await harness.DispatchAsync(harness.Request("delivery-other", requestId: "request-2"));
+            var redelivery = first.Clone();
+            redelivery.DeliveryId = "delivery-2";
+            await harness.DispatchAsync(redelivery);
+
+            var acknowledgements = harness.Acknowledgements;
+            Assert.Multiple(() =>
+            {
+                Assert.That(harness.Executions, Is.EqualTo(1));
+                Assert.That(acknowledgements.Single(ack => ack.DeliveryId == "delivery-other").StatusCode, Is.EqualTo(503));
+                // The first request's result is still retained, so its redelivery replays it.
+                Assert.That(acknowledgements.Single(ack => ack.DeliveryId == "delivery-2").StatusCode, Is.EqualTo(200));
+            });
+        }
+        finally
+        {
+            ServiceClientManager.TransientRequestDeliveries.MaxExecutedMarkers = previousLimit;
+        }
+    }
+
     private sealed class TransientRequestHarness(int retainedResults = 256)
     {
         private int _executions;
@@ -750,6 +798,7 @@ public partial class ServiceClientManagerTests
             RuntimeEpoch = 3,
             RuntimeInstanceId = InstanceA,
             Kind = Offloadr.EditorRuntime.V1.EditorRuntimeRequestKind.Read,
+            ExpiresUtc = Google.Protobuf.WellKnownTypes.Timestamp.FromDateTime(DateTime.UtcNow.AddMinutes(1)),
         };
 
         public Task DispatchAsync(RelayEditorRuntimeRequestCommand request)
