@@ -7,7 +7,11 @@ internal sealed class TraceHttpHandler(HttpMessageHandler inner) : DelegatingHan
 {
     protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
-        RunnerLog.Info<TraceHttpHandler>($"[grpc-http] -> {request.Method} {request.RequestUri} v{request.Version}");
+        // The gRPC method path is useful in traces; user info and query are not logged.
+        var target = request.RequestUri is { IsAbsoluteUri: true } uri
+            ? $"{GrpcChannelManager.RedactForLog(uri.OriginalString)}{uri.AbsolutePath}"
+            : "(relative uri)";
+        RunnerLog.Info<TraceHttpHandler>($"[grpc-http] -> {request.Method} {target} v{request.Version}");
         var response = await base.SendAsync(request, cancellationToken).ConfigureAwait(false);
         RunnerLog.Info<TraceHttpHandler>($"[grpc-http] <- {(int)response.StatusCode} v{response.Version}");
         return response;
