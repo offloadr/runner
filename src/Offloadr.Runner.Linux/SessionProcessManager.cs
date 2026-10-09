@@ -1386,7 +1386,7 @@ internal sealed partial class SessionProcessManager : IDisposable
         return false;
     }
 
-    private async Task<bool> ProbeRuntimeAsync(CancellationToken cancellationToken)
+    internal async Task<bool> ProbeRuntimeAsync(CancellationToken cancellationToken)
     {
         try
         {
@@ -1395,7 +1395,9 @@ internal sealed partial class SessionProcessManager : IDisposable
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             cts.CancelAfter(TimeSpan.FromSeconds(2));
             using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cts.Token).ConfigureAwait(false);
-            return response.IsSuccessStatusCode || response.StatusCode == HttpStatusCode.NotFound;
+            // Each image configures a route that answers success once its editor is usable; a
+            // not-found means the route, or the editor serving it, is not up yet.
+            return response.IsSuccessStatusCode;
         }
         catch (OperationCanceledException)
         {

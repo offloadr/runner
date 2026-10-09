@@ -27,6 +27,51 @@ public class EditorResponseLimitTests
         Assert.That(stream.BytesRead, Is.LessThanOrEqualTo(ComfyRuntimeTransportLimits.MaxResponseBodyBytes + (64 * 1024)));
     }
 
+    [TestCase(HttpStatusCode.OK, true)]
+    [TestCase(HttpStatusCode.NotFound, false)]
+    [TestCase(HttpStatusCode.ServiceUnavailable, false)]
+    public async Task ProbeRuntimeAsync_IsReadyOnlyOnASuccessfulResponse(HttpStatusCode status, bool ready)
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"runner-ready-{Guid.NewGuid():N}");
+        try
+        {
+            var options = new SessionProcessOptions
+            {
+                SessionRoot = Path.Combine(root, "sessions"),
+                EntryPointPath = Path.Combine(root, "entrypoint.sh"),
+                WorkingDirectory = root,
+                BundledCustomNodesSeedPath = Path.Combine(root, "seed-custom_nodes"),
+                BundledInputSeedPath = Path.Combine(root, "seed-input"),
+                ComfyPort = 8188,
+                ReadyHost = "127.0.0.1",
+                ReadyPath = "/system_stats",
+                ShutdownGracePeriod = TimeSpan.FromSeconds(1),
+                ReadyTimeout = TimeSpan.FromSeconds(1),
+            };
+            using var manager = new SessionProcessManager(
+                options,
+                new LinuxUserIsolationStrategy(new LinuxCommandRunner()),
+                new RunnerVfsEnvironmentBuilder(),
+                new LinuxCommandRunner(),
+                httpMessageHandler: new StatusHandler(status));
+
+            Assert.That(await manager.ProbeRuntimeAsync(CancellationToken.None), Is.EqualTo(ready));
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    private sealed class StatusHandler(HttpStatusCode status) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+            => Task.FromResult(new HttpResponseMessage(status));
+    }
+
     private sealed class StreamHandler(Func<Stream> body) : HttpMessageHandler
     {
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
