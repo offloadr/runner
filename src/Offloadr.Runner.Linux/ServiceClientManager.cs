@@ -3137,6 +3137,11 @@ internal static class ServiceClientManager
             };
         }
 
+        // ackSubmitPrompt must retain this exact acknowledgement and retry it until it is
+        // delivered or the host shuts down, independently of the prompt's own cancellation:
+        // a redelivered prompt is denied execution and recovery cannot rebuild an arbitrary
+        // native result. The command loop wires it to AcknowledgeRuntimeCommandWithRetryAsync
+        // on the host shutdown token, so this only sees a failure to hand it over.
         try
         {
             var ackCancellationToken = cancellationToken.IsCancellationRequested
