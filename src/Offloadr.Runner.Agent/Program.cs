@@ -40,7 +40,7 @@ var version = typeof(RunnerAgentOptions).Assembly
 var instanceId = Guid.NewGuid().ToString("n");
 
 RunnerLog.Info(
-    $"Runner starting id={options.RunnerId} version={version} offloadr-api={options.OffloadrApiUrl} " +
+    $"Runner starting id={options.RunnerId} version={version} offloadr-api={GrpcChannelManager.RedactForLog(options.OffloadrApiUrl)} " +
     $"instance={instanceId} mode=grpc grpc-trace={(options.TraceGrpcHttp ? "on" : "off")}");
 RunnerLog.Info("Offloadr runner is free software under AGPL-3.0-only; source: https://github.com/offloadr/runner");
 

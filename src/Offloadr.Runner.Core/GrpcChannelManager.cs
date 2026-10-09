@@ -18,6 +18,15 @@ public static class GrpcChannelManager
 {
     private const int MaxGrpcMessageSizeBytes = Offloadr.Common.V1.PromptTransportLimits.MaxRunnerMessageBytes;
 
+    /// <summary>
+    /// The control-plane address as it may be logged: scheme, host and port only. User
+    /// info, path and query are left out, since deployments may put credentials there.
+    /// </summary>
+    public static string RedactForLog(string? url)
+        => Uri.TryCreate(url?.Trim(), UriKind.Absolute, out var uri)
+            ? $"{uri.Scheme}://{uri.Authority}"
+            : "(unparsable url)";
+
     public static GrpcChannel CreateChannel(
         string offloadrApiUrl,
         bool traceHttp)
@@ -40,7 +49,7 @@ public static class GrpcChannelManager
             handler = new TraceHttpHandler(handler);
         }
 
-        RunnerLog.Info(nameof(GrpcChannelManager), $"[grpc] Creating native HTTP/2 channel url={offloadrApiUrl}");
+        RunnerLog.Info(nameof(GrpcChannelManager), $"[grpc] Creating native HTTP/2 channel url={RedactForLog(offloadrApiUrl)}");
         return GrpcChannel.ForAddress(offloadrApiUrl, new GrpcChannelOptions
         {
             HttpHandler = handler,
