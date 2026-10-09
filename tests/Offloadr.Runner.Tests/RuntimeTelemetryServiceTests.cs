@@ -243,7 +243,7 @@ public class RuntimeTelemetryServiceTests
                 sampleCalls++;
                 return new RunnerRuntimeTelemetrySnapshot();
             },
-            (sessionId, snapshot) => enqueued.Add((sessionId, snapshot)),
+            (sessionId, snapshot, _) => enqueued.Add((sessionId, snapshot)),
             TimeSpan.FromMilliseconds(20));
 
         using var cts = new CancellationTokenSource();
@@ -258,6 +258,49 @@ public class RuntimeTelemetryServiceTests
         Assert.That(sampleCalls, Is.GreaterThanOrEqualTo(1));
         Assert.That(enqueued, Is.Not.Empty);
         Assert.That(enqueued.All(entry => entry.SessionId == "session-1"), Is.True);
+    }
+
+    [Test]
+    public async Task ActiveSessionRuntimeTelemetryReporter_DropsASampleTakenAcrossARuntimeReplacement()
+    {
+        var original = new RuntimeIdentity(7, 3, "original");
+        var replacement = new RuntimeIdentity(7, 4, "replacement");
+        var current = original;
+        var samples = 0;
+        var enqueued = new List<RuntimeIdentity?>();
+        var reporter = new ActiveSessionRuntimeTelemetryReporter(
+            () => "session-1",
+            () =>
+            {
+                // The first sample is still running when the runtime is replaced.
+                if (Interlocked.Increment(ref samples) == 1)
+                {
+                    current = replacement;
+                }
+
+                return new RunnerRuntimeTelemetrySnapshot();
+            },
+            (_, _, runtime) => enqueued.Add(runtime),
+            TimeSpan.FromMilliseconds(10),
+            _ => current);
+
+        using var cts = new CancellationTokenSource();
+        var runTask = reporter.RunAsync(cts.Token);
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+        while (enqueued.Count == 0 && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(10);
+        }
+
+        cts.Cancel();
+        await runTask;
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(enqueued, Is.Not.Empty);
+            Assert.That(enqueued, Has.None.EqualTo(original));
+            Assert.That(enqueued, Has.All.EqualTo(replacement));
+        });
     }
 
     private sealed class FakeProbe : IRuntimeTelemetryProbe

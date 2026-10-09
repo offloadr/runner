@@ -128,7 +128,8 @@ var runtimeTelemetryReporter = new ActiveSessionRuntimeTelemetryReporter(
     logicalSessionState.GetActiveSessionId,
     runtimeTelemetryService.TryCaptureSnapshot,
     sessionRuntimeTelemetryRelay.Enqueue,
-    options.RuntimeTelemetryInterval);
+    options.RuntimeTelemetryInterval,
+    sessionId => runtimeIdentities.TryGet(sessionId, out var identity) ? identity : null);
 sessionManager.UnexpectedSessionExitCleanup = async (sessionId, exitedRuntime, exitCode, token) =>
 {
     var exitSummary = exitCode.HasValue ? $" code={exitCode.Value}" : string.Empty;

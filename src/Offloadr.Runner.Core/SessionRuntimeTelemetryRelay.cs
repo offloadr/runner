@@ -66,7 +66,11 @@ internal sealed class SessionRuntimeTelemetryRelay : IAsyncDisposable
         }
     }
 
-    public void Enqueue(string sessionId, RunnerRuntimeTelemetrySnapshot stats)
+    /// <summary>
+    /// Queues one telemetry sample. Pass the identity of the runtime it was taken for, so a
+    /// sample is not labelled with a replacement that became current while it was taken.
+    /// </summary>
+    public void Enqueue(string sessionId, RunnerRuntimeTelemetrySnapshot stats, RuntimeIdentity? runtimeIdentity = null)
     {
         if (string.IsNullOrWhiteSpace(sessionId) || stats is null)
         {
@@ -79,7 +83,13 @@ internal sealed class SessionRuntimeTelemetryRelay : IAsyncDisposable
             SessionId = sessionId.Trim(),
             Telemetry = stats.Clone()
         };
-        if (_runtimeIdentities?.TryGet(sessionId, out var identity) == true)
+        if (runtimeIdentity is { IsValid: true } sampled)
+        {
+            entry.LifecycleGeneration = sampled.LifecycleGeneration;
+            entry.RuntimeEpoch = sampled.RuntimeEpoch;
+            entry.RuntimeInstanceId = sampled.RuntimeInstanceId;
+        }
+        else if (_runtimeIdentities?.TryGet(sessionId, out var identity) == true)
         {
             entry.LifecycleGeneration = identity.LifecycleGeneration;
             entry.RuntimeEpoch = identity.RuntimeEpoch;
