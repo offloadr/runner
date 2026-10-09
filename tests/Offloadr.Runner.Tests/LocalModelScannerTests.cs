@@ -35,6 +35,27 @@ public class LocalModelScannerTests
     }
 
     [Test]
+    public void Scan_GivesCaseDistinctFilesDistinctModelIds()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = CreateTempDirectory();
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(root, "checkpoints"));
+            File.WriteAllText(Path.Combine(root, "checkpoints", "Foo.safetensors"), "same");
+            File.WriteAllText(Path.Combine(root, "checkpoints", "foo.safetensors"), "same");
+
+            var snapshot = new LocalModelScanner("runner-1", root).Scan();
+
+            Assert.That(snapshot.Models.Select(static model => model.ModelId).Distinct().Count(), Is.EqualTo(2));
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
     public void Scan_SkipsSymbolicLinksToFilesAndFolders()
     {
         LinuxTestPrerequisites.RequireLinux();

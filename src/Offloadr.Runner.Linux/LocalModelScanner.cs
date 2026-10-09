@@ -212,7 +212,8 @@ internal sealed class LocalModelScanner
 
     private static string DeterministicModelId(string runnerId, string relativePath)
     {
-        var raw = $"{runnerId}:{relativePath}".ToLowerInvariant();
+        // Linux paths are case-sensitive, so only the runner id is case-normalized.
+        var raw = $"{runnerId.ToLowerInvariant()}:{relativePath}";
         var hash = SHA256.HashData(Encoding.UTF8.GetBytes(raw));
         var guidBytes = hash[..16].ToArray();
         // Set RFC 4122 UUID metadata on top of deterministic hash bytes:

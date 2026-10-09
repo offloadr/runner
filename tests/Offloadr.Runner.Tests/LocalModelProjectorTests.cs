@@ -158,6 +158,36 @@ public class LocalModelProjectorTests
     }
 
     [Test]
+    public void SetRequestedModels_ProjectsTheFileWhoseNameMatchesExactly()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var sourceRoot = Path.Combine(root, "local");
+            var destinationRoot = Path.Combine(root, "comfy", "models");
+            Directory.CreateDirectory(Path.Combine(sourceRoot, "checkpoints"));
+            var upper = Path.Combine(sourceRoot, "checkpoints", "Foo.safetensors");
+            var lower = Path.Combine(sourceRoot, "checkpoints", "foo.safetensors");
+            File.WriteAllText(upper, "aaaa");
+            File.WriteAllText(lower, "bbbb");
+            var projected = Path.Combine(destinationRoot, "checkpoints", "foo.safetensors");
+
+            var projector = new LocalModelProjector(sourceRoot, destinationRoot);
+            // The upper-case file is indexed first; both share a case-insensitive selection hash.
+            projector.UpdateSnapshot(CreateSnapshot(
+                CreateModel(upper, ModelCategory.Checkpoint),
+                CreateModel(lower, ModelCategory.Checkpoint)));
+            projector.SetRequestedModels([CreateLocalProjectionRequest(lower, ModelCategory.Checkpoint, projected)]);
+
+            Assert.That(new FileInfo(projected).LinkTarget, Is.EqualTo(lower));
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
     public void SetRequestedModels_RefusesAModelWhoseRealFileIsOutsideTheLocalRoot()
     {
         var root = CreateTempDirectory();

@@ -245,6 +245,7 @@ internal sealed class LocalModelProjector
                 throw new InvalidOperationException($"Registered local model '{projection.Filename}' is no longer present in the runner local inventory.");
             }
 
+            model = PreferExactFilename(model, projection);
             var sourcePath = BuildSourcePath(model);
             if (string.IsNullOrWhiteSpace(sourcePath) || !File.Exists(sourcePath))
             {
@@ -269,6 +270,24 @@ internal sealed class LocalModelProjector
 
             RemoveManagedLink(stale);
         }
+    }
+
+    /// <summary>
+    /// The selection hash ignores filename case, but Linux does not: when files differ only
+    /// in case, project the one whose name matches the request exactly.
+    /// </summary>
+    private ModelInfo PreferExactFilename(ModelInfo model, LocalProjectionRequest projection)
+    {
+        if (string.Equals(model.Filename, projection.Filename, StringComparison.Ordinal) ||
+            !_modelsByNormalizedFilename.TryGetValue(LocalModelSelectionHash.NormalizeFileName(projection.Filename), out var candidates))
+        {
+            return model;
+        }
+
+        return candidates.FirstOrDefault(candidate =>
+                   string.Equals(candidate.Filename, projection.Filename, StringComparison.Ordinal) &&
+                   string.Equals(ComputeSelectionHash(candidate), projection.SelectionHash, StringComparison.Ordinal))
+               ?? model;
     }
 
     private static string? ComputeSelectionHash(ModelInfo model)
