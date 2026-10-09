@@ -1403,6 +1403,7 @@ internal static class ServiceClientManager
                         var runtimeRequest = evt.RelayEditorRuntimeRequest;
                         _ = DispatchTransientEditorRuntimeRequest(
                             runtimeRequest,
+                            runnerId,
                             transientDeliveries,
                             transientCancellation,
                             () =>
@@ -2601,6 +2602,7 @@ internal static class ServiceClientManager
     /// </summary>
     internal static async Task DispatchTransientEditorRuntimeRequest(
         RelayEditorRuntimeRequestCommand request,
+        string runnerId,
         TransientRequestDeliveries deliveries,
         TransientCancellationRegistry cancellation,
         Action beforeExecute,
@@ -2608,6 +2610,17 @@ internal static class ServiceClientManager
         Func<AcknowledgeEditorRuntimeRequestRequest, CancellationToken, Task> acknowledge,
         CancellationToken acknowledgementCancellationToken)
     {
+        // A request for another runner must not reach this runner's editor, nor cancel its
+        // prompts before execution, even if it names a session that exists here.
+        if (!RunnerIdMatches(request.RunnerId, runnerId))
+        {
+            await AcknowledgeTransientRequestWithRetryAsync(
+                acknowledge,
+                TransientRequestFailure(request, 403, StaleRuntimeCommandMessage),
+                acknowledgementCancellationToken).ConfigureAwait(false);
+            return;
+        }
+
         switch (deliveries.Admit(request, out var replay))
         {
             case TransientRequestAdmission.Replay:

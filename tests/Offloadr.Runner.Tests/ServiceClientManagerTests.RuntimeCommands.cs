@@ -727,6 +727,24 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
+    public async Task EditorRequestForAnotherRunner_IsRefusedWithoutRunning()
+    {
+        var harness = new TransientRequestHarness();
+        var request = harness.Request("delivery-1");
+        request.RunnerId = "99999999999949998999999999999999";
+
+        await harness.DispatchAsync(request);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(harness.Executions, Is.Zero);
+            Assert.That(harness.BeforeExecuteCalls, Is.Zero);
+            Assert.That(harness.Acknowledgements.Single().StatusCode, Is.EqualTo(403));
+            Assert.That(harness.Deliveries.InFlightCount, Is.Zero);
+        });
+    }
+
+    [Test]
     public async Task EditorRequestWithoutADeadline_IsRefusedWithoutRunning()
     {
         var harness = new TransientRequestHarness();
@@ -804,6 +822,7 @@ public partial class ServiceClientManagerTests
         public Task DispatchAsync(RelayEditorRuntimeRequestCommand request)
             => ServiceClientManager.DispatchTransientEditorRuntimeRequest(
                 request,
+                CommandRunnerId,
                 Deliveries,
                 Cancellation,
                 () => Interlocked.Increment(ref _beforeExecuteCalls),
