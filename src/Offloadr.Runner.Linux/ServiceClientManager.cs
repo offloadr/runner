@@ -259,7 +259,7 @@ internal static class ServiceClientManager
         }
     }
 
-    internal sealed class RuntimeCommandDeduplicationCache(int maxEntries = 512)
+    internal sealed class RuntimeCommandDeduplicationCache(int maxEntries = 16_384)
     {
         private readonly object _gate = new();
         private readonly HashSet<string> _commandIds = new(StringComparer.Ordinal);
@@ -2468,6 +2468,19 @@ internal static class ServiceClientManager
         Func<TAck, CancellationToken, Task> acknowledge,
         string acknowledgementKey)
     {
+        // A redelivery of the startup already in progress joins it: replacing it would cancel
+        // the work starting this very runtime, and that work's failure cleanup would stop it.
+        // The running startup acknowledges with the same command and identity.
+        if (deps.WorkState.GetActiveStartup() is { Task: { } inProgress } active &&
+            string.Equals(active.SessionId, sessionId, StringComparison.Ordinal) &&
+            active.RuntimeIdentity.SameRuntime(runtimeIdentity))
+        {
+            RunnerLog.Info(
+                nameof(ServiceClientManager),
+                $"Startup {acknowledgementKey} for session {sessionId} is already in progress; joining it.");
+            return inProgress.ContinueWith(static _ => { }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        }
+
         TrackedCommandWork? previous = null;
         var cancellationSource = CancellationTokenSource.CreateLinkedTokenSource(deps.Shutdown);
         var tracked = new TrackedCommandWork

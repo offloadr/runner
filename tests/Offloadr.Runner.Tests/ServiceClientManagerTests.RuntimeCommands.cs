@@ -171,6 +171,35 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
+    public async Task DuplicateLaunchDuringItsStartup_JoinsItInsteadOfRestarting()
+    {
+        var harness = new RuntimeCommandHarness();
+        var starts = 0;
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        harness.BeforeStart = async (_, token) =>
+        {
+            Interlocked.Increment(ref starts);
+            entered.TrySetResult();
+            await release.Task.WaitAsync(token);
+        };
+
+        var original = ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 4, InstanceB, revision: 2), harness.Deps);
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        // The same command again, as after its id left the duplicate cache.
+        var duplicate = ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 4, InstanceB, revision: 2), harness.Deps);
+        release.TrySetResult();
+        await Task.WhenAll(original, duplicate).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(starts, Is.EqualTo(1));
+            Assert.That(harness.Sink.LaunchAcks, Has.All.Property(nameof(AcknowledgeEditorRuntimeLaunchRequest.Ready)).True);
+            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(new RuntimeIdentity(7, 4, InstanceB)));
+        });
+    }
+
+    [Test]
     public async Task Launch_ForAnotherRunner_IsRejectedWithoutTouchingState()
     {
         var harness = new RuntimeCommandHarness();
