@@ -35,6 +35,33 @@ public class LocalModelScannerTests
     }
 
     [Test]
+    public void Scan_SkipsSymbolicLinksToFilesAndFolders()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = CreateTempDirectory();
+        var outside = CreateTempDirectory();
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(root, "loras"));
+            File.WriteAllText(Path.Combine(root, "loras", "real.safetensors"), "lora");
+            File.WriteAllText(Path.Combine(outside, "host-secret.safetensors"), "secret");
+            Directory.CreateDirectory(Path.Combine(outside, "vae"));
+            File.WriteAllText(Path.Combine(outside, "vae", "aliased.pt"), "secret");
+            File.CreateSymbolicLink(Path.Combine(root, "loras", "linked.safetensors"), Path.Combine(outside, "host-secret.safetensors"));
+            Directory.CreateSymbolicLink(Path.Combine(root, "vae"), Path.Combine(outside, "vae"));
+
+            var snapshot = new LocalModelScanner("runner-1", root).Scan();
+
+            Assert.That(snapshot.Models.Select(static model => model.Filename), Is.EqualTo(new[] { "real.safetensors" }));
+        }
+        finally
+        {
+            TryDelete(root);
+            TryDelete(outside);
+        }
+    }
+
+    [Test]
     public void Scan_ProducesStableDigestAndModelIds_ForUnchangedFiles()
     {
         var root = CreateTempDirectory();

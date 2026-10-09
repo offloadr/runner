@@ -297,6 +297,15 @@ internal sealed class LocalModelProjector
             return null;
         }
 
+        // A link in the local tree could alias a host file outside it into the session, so
+        // the file's real location must be inside the local model root as well.
+        var canonicalSource = NormalizePath(LinuxPathCanonicalizer.ResolveExistingPath(sourcePath));
+        var canonicalRoot = NormalizePath(LinuxPathCanonicalizer.ResolveExistingPath(_sourceRoot));
+        if (!IsUnderRoot(canonicalSource, canonicalRoot))
+        {
+            return null;
+        }
+
         return sourcePath;
     }
 

@@ -104,8 +104,9 @@ internal sealed class LocalModelScanner
                 {
                     RecurseSubdirectories = true,
                     IgnoreInaccessible = true,
-                    // As SearchOption.AllDirectories did: dot-files are not skipped.
-                    AttributesToSkip = 0,
+                    // Dot-files are scanned as before. Symbolic links are skipped and never followed:
+                    // a link could alias a host file outside the local model root into sessions.
+                    AttributesToSkip = FileAttributes.ReparsePoint,
                 });
             foreach (var path in files)
             {
