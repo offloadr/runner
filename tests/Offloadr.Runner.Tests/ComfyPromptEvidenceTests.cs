@@ -197,6 +197,39 @@ public sealed class ComfyPromptEvidenceTests
     }
 
     [Test]
+    public async Task ClientMessageIsSentOnceAndNotReplayedAfterAReconnect()
+    {
+        using var portReservation = new TcpListener(IPAddress.Loopback, 0);
+        portReservation.Start();
+        var port = ((IPEndPoint)portReservation.LocalEndpoint).Port;
+        portReservation.Stop();
+        using var listener = new HttpListener();
+        listener.Prefixes.Add($"http://127.0.0.1:{port}/");
+        listener.Start();
+        var command = Command();
+        await using var relay = new ComfySessionEventRelay(command.Target.RunnerId, "127.0.0.1", port);
+
+        var send = relay.SendClientMessageAsync(command.SessionId, command.EditorSid, "client", command.Target.GpuGeneration,
+            command.Target.RuntimeEpoch, command.Target.RuntimeInstanceId, "{\"action\":\"once\"}"u8.ToArray(), CancellationToken.None);
+        var first = await listener.GetContextAsync().WaitAsync(TimeSpan.FromSeconds(3));
+        var firstSocket = (await first.AcceptWebSocketAsync(null)).WebSocket;
+        await send.WaitAsync(TimeSpan.FromSeconds(5));
+        var buffer = new byte[1024];
+        var received = await firstSocket.ReceiveAsync(buffer, CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(3));
+        Assert.That(System.Text.Encoding.UTF8.GetString(buffer, 0, received.Count), Is.EqualTo("{\"action\":\"once\"}"));
+
+        // Drop the connection; the bridge reconnects but must not send the message again.
+        firstSocket.Abort();
+        firstSocket.Dispose();
+        var second = await listener.GetContextAsync().WaitAsync(TimeSpan.FromSeconds(10));
+        using var secondSocket = (await second.AcceptWebSocketAsync(null)).WebSocket;
+        using var quiet = new CancellationTokenSource(TimeSpan.FromMilliseconds(750));
+        Assert.That(
+            async () => await secondSocket.ReceiveAsync(buffer, quiet.Token),
+            Throws.InstanceOf<OperationCanceledException>().Or.InstanceOf<WebSocketException>());
+    }
+
+    [Test]
     public async Task MissedTerminalFramesRetainOnlyBoundedBodyFreeEvidenceIdentities()
     {
         var command = Command();

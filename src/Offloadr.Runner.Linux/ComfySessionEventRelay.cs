@@ -43,6 +43,9 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
     internal const int MaxBatchPayloadBytes = 16 * 1024 * 1024;
 
     private static readonly TimeSpan OversizeWarningInterval = TimeSpan.FromMinutes(1);
+
+    /// <summary>How long a one-off client message waits for a new bridge to connect.</summary>
+    internal static TimeSpan ClientMessageConnectWait { get; set; } = TimeSpan.FromSeconds(5);
     private long _queuedPayloadBytes;
     private long _lastOversizeWarningTicks = long.MinValue / 2;
     internal const int MaxRetainedPromptIdentities = 256;
@@ -173,11 +176,15 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
         byte[] payload,
         CancellationToken cancellationToken)
     {
-        await EnsureBridgeAsync(sessionId, editorSid, clientId, lifecycleGeneration, runtimeEpoch, runtimeInstanceId, payload, cancellationToken).ConfigureAwait(false);
-        if (TryGetBridge(sessionId, clientId, new RuntimeIdentity(lifecycleGeneration, runtimeEpoch, runtimeInstanceId), out var bridge))
+        // A browser-originated message is sent once. It is not the bridge's connection
+        // handshake, so it must not be retained and replayed on later reconnects.
+        await EnsureBridgeAsync(sessionId, editorSid, clientId, lifecycleGeneration, runtimeEpoch, runtimeInstanceId, [], cancellationToken).ConfigureAwait(false);
+        if (!TryGetBridge(sessionId, clientId, new RuntimeIdentity(lifecycleGeneration, runtimeEpoch, runtimeInstanceId), out var bridge))
         {
-            await bridge.SendClientMessageAsync(payload, cancellationToken).ConfigureAwait(false);
+            throw new InvalidOperationException("The editor WebSocket bridge for this client is not available.");
         }
+
+        await bridge.SendClientMessageAsync(payload, cancellationToken).ConfigureAwait(false);
     }
 
     public void RegisterSubmission(string sessionId, string clientId, SubmitPromptCommand command)
@@ -683,21 +690,39 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
             }
         }
 
+        /// <summary>
+        /// Sends a one-off client message on the current connection, waiting briefly for a new
+        /// bridge to connect. It is never retained: if no connection opens in time the send
+        /// fails, so its request is acknowledged as failed rather than replayed later.
+        /// </summary>
         public async Task SendClientMessageAsync(byte[] payload, CancellationToken cancellationToken)
         {
             if (payload is not { Length: > 0 })
             {
                 return;
             }
-            _clientMessage = payload.ToArray();
-            ClientWebSocket? socket;
-            lock (_socketGate)
+
+            var deadline = DateTime.UtcNow + ClientMessageConnectWait;
+            while (true)
             {
-                socket = _activeSocket;
-            }
-            if (socket is { State: WebSocketState.Open })
-            {
-                await SendPayloadAsync(socket, payload, cancellationToken).ConfigureAwait(false);
+                ClientWebSocket? socket;
+                lock (_socketGate)
+                {
+                    socket = _activeSocket;
+                }
+
+                if (socket is { State: WebSocketState.Open })
+                {
+                    await SendPayloadAsync(socket, payload, cancellationToken).ConfigureAwait(false);
+                    return;
+                }
+
+                if (DateTime.UtcNow >= deadline)
+                {
+                    throw new InvalidOperationException("The editor WebSocket is not connected; the client message was not sent.");
+                }
+
+                await Task.Delay(TimeSpan.FromMilliseconds(50), cancellationToken).ConfigureAwait(false);
             }
         }
 
