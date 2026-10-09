@@ -8,6 +8,50 @@ namespace Offloadr.Runner.Tests;
 public class VfsIpcServerLinuxTests
 {
     [Test]
+    [SupportedOSPlatform("linux")]
+    public void EnsureSocketPathAncestorsAccessible_RefusesAProtectedAncestorWithoutChangingIt()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = Path.Combine(Path.GetTempPath(), $"vfs-socket-ancestors-{Guid.NewGuid():N}");
+        var protectedDirectory = Directory.CreateDirectory(Path.Combine(root, "private")).FullName;
+        var socketDirectory = Directory.CreateDirectory(Path.Combine(protectedDirectory, "runner-agent")).FullName;
+        var protectedMode = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
+        File.SetUnixFileMode(protectedDirectory, protectedMode);
+        try
+        {
+            Assert.That(
+                () => VfsIpcServer.EnsureSocketPathAncestorsAccessible(socketDirectory, createdByAgent: true),
+                Throws.InvalidOperationException.With.Message.Contains(protectedDirectory));
+            Assert.That(File.GetUnixFileMode(protectedDirectory), Is.EqualTo(protectedMode));
+        }
+        finally
+        {
+            File.SetUnixFileMode(protectedDirectory, protectedMode | UnixFileMode.OtherExecute);
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Test]
+    [SupportedOSPlatform("linux")]
+    public void EnsureSocketPathAncestorsAccessible_MakesADirectoryItCreatedSearchable()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = Path.Combine(Path.GetTempPath(), $"vfs-socket-created-{Guid.NewGuid():N}");
+        var socketDirectory = Directory.CreateDirectory(Path.Combine(root, "runner-agent")).FullName;
+        File.SetUnixFileMode(socketDirectory, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        try
+        {
+            VfsIpcServer.EnsureSocketPathAncestorsAccessible(socketDirectory, createdByAgent: true);
+
+            Assert.That(File.GetUnixFileMode(socketDirectory) & UnixFileMode.OtherExecute, Is.EqualTo(UnixFileMode.OtherExecute));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Test]
     public async Task Start_ValidRequest_InvokesHandlerAndReturnsSuccess()
     {
         LinuxTestPrerequisites.RequireLinux();
@@ -664,40 +708,27 @@ public class VfsIpcServerLinuxTests
         LinuxTestPrerequisites.RequireLinux();
         LinuxTestPrerequisites.RequireUnixDomainSockets();
 
-        var socketPath = CreateNestedSocketPath();
-        var socketDirectory = Path.GetDirectoryName(socketPath)!;
-        var socketParentDirectory = Directory.GetParent(socketDirectory)!.FullName;
-        File.SetUnixFileMode(
-            socketParentDirectory,
-            UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
-        File.SetUnixFileMode(
-            socketDirectory,
-            UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        // The server creates its own socket directory beneath a world-searchable parent.
+        var root = Path.Combine(Path.GetTempPath(), "runneragent-tests", Guid.NewGuid().ToString("n"));
+        Directory.CreateDirectory(root);
+        var socketDirectory = Path.Combine(root, "runner-agent");
+        var socketPath = Path.Combine(socketDirectory, "model-fetch.sock");
 
         await using var server = new VfsIpcServer(
             socketPath,
             (_, _) => Task.FromResult(VfsIpcResponse.Success()));
         server.Start();
 
-        var parentDirectoryMode = File.GetUnixFileMode(socketParentDirectory);
         var directoryMode = File.GetUnixFileMode(socketDirectory);
         var socketMode = File.GetUnixFileMode(socketPath);
 
         Assert.Multiple(() =>
         {
             Assert.That(
-                parentDirectoryMode & (UnixFileMode.GroupExecute | UnixFileMode.OtherExecute),
-                Is.EqualTo(UnixFileMode.GroupExecute | UnixFileMode.OtherExecute));
-            Assert.That(
-                parentDirectoryMode & (UnixFileMode.GroupRead | UnixFileMode.GroupWrite |
-                                       UnixFileMode.OtherRead | UnixFileMode.OtherWrite),
-                Is.EqualTo((UnixFileMode)0));
-            Assert.That(
                 directoryMode & (UnixFileMode.GroupExecute | UnixFileMode.OtherExecute),
                 Is.EqualTo(UnixFileMode.GroupExecute | UnixFileMode.OtherExecute));
             Assert.That(
-                directoryMode & (UnixFileMode.GroupRead | UnixFileMode.GroupWrite |
-                                 UnixFileMode.OtherRead | UnixFileMode.OtherWrite),
+                directoryMode & (UnixFileMode.GroupWrite | UnixFileMode.OtherWrite),
                 Is.EqualTo((UnixFileMode)0));
             Assert.That(
                 socketMode & (UnixFileMode.UserRead | UnixFileMode.UserWrite |
@@ -733,14 +764,6 @@ public class VfsIpcServerLinuxTests
         var root = Path.Combine(Path.GetTempPath(), "runneragent-tests", Guid.NewGuid().ToString("n"));
         Directory.CreateDirectory(root);
         return Path.Combine(root, "model-fetch.sock");
-    }
-
-    private static string CreateNestedSocketPath()
-    {
-        var root = Path.Combine(Path.GetTempPath(), "runneragent-tests", Guid.NewGuid().ToString("n"));
-        var socketDirectory = Path.Combine(root, "runner-agent", "ipc");
-        Directory.CreateDirectory(socketDirectory);
-        return Path.Combine(socketDirectory, "model-fetch.sock");
     }
 
     private static async Task<Socket> ConnectAsync(string socketPath)

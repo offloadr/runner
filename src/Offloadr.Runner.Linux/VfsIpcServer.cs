@@ -116,8 +116,9 @@ public sealed class VfsIpcServer : IAsyncDisposable
         var directory = Path.GetDirectoryName(_socketPath);
         if (!string.IsNullOrWhiteSpace(directory))
         {
+            var created = !Directory.Exists(directory);
             Directory.CreateDirectory(directory);
-            EnsureSocketPathAncestorsAccessible(directory);
+            EnsureSocketPathAncestorsAccessible(directory, created);
         }
 
         if (File.Exists(_socketPath))
@@ -158,7 +159,13 @@ public sealed class VfsIpcServer : IAsyncDisposable
         _acceptLoop = Task.Run(() => AcceptLoopAsync(_shutdown.Token));
     }
 
-    private static void EnsureSocketPathAncestorsAccessible(string directory)
+    /// <summary>
+    /// Session users must be able to reach the socket. Only a directory the agent created
+    /// for it is made searchable; existing directories, including every ancestor, are
+    /// checked but never changed, so a misplaced socket path cannot open up protected
+    /// directories (or, through bind mounts, host directories).
+    /// </summary>
+    internal static void EnsureSocketPathAncestorsAccessible(string directory, bool createdByAgent)
     {
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
@@ -175,9 +182,19 @@ public sealed class VfsIpcServer : IAsyncDisposable
             current = directory;
         }
 
-        while (!string.IsNullOrWhiteSpace(current))
+        if (createdByAgent)
         {
             EnsureSocketDirectorySearchable(current);
+        }
+
+        while (!string.IsNullOrWhiteSpace(current))
+        {
+            if ((File.GetUnixFileMode(current) & UnixFileMode.OtherExecute) == 0)
+            {
+                throw new InvalidOperationException(
+                    $"The model fetch socket directory '{directory}' is not reachable by session users because '{current}' is not searchable by others. " +
+                    "Place the socket in a dedicated directory under a world-searchable path such as /tmp.");
+            }
 
             var parent = Directory.GetParent(current)?.FullName;
             if (string.IsNullOrWhiteSpace(parent) ||
