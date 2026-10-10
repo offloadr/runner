@@ -31,7 +31,6 @@ target "_comfyui" {
   inherits = ["_runner"]
   args = {
     EDITOR_RUNTIME                     = "comfyui"
-    RUNNER_SUPPORTED_EDITOR_TEMPLATES  = "comfyui-latest,comfyui-master"
     COMFY_ENTRYPOINT                   = "/comfyui/entrypoint.base.sh"
     COMFY_WORKDIR                      = "/comfyui"
     COMFY_PORT                         = "8188"
@@ -45,7 +44,6 @@ target "_forge-neo" {
   inherits = ["_runner"]
   args = {
     EDITOR_RUNTIME                     = "forge-neo"
-    RUNNER_SUPPORTED_EDITOR_TEMPLATES  = "forge-neo:neo,forge-neo:latest"
     COMFY_ENTRYPOINT                   = "/sd-webui-forge-neo/entrypoint.sh"
     COMFY_WORKDIR                      = "/sd-webui-forge-neo"
     COMFY_PORT                         = "7860"
@@ -57,24 +55,37 @@ target "_forge-neo" {
 
 target "comfyui-latest" {
   inherits = ["_comfyui"]
-  args     = { FINAL_BASE_IMAGE = "${BASE_REGISTRY}/comfyui-extensions:latest" }
+  # Each image advertises only the editor template it is built from.
+  args = {
+    FINAL_BASE_IMAGE                  = "${BASE_REGISTRY}/comfyui-extensions:latest"
+    RUNNER_SUPPORTED_EDITOR_TEMPLATES = "comfyui-latest"
+  }
   tags     = ["${REGISTRY}/runner-comfyui:latest"]
 }
 
 target "comfyui-master" {
   inherits = ["_comfyui"]
-  args     = { FINAL_BASE_IMAGE = "${BASE_REGISTRY}/comfyui-extensions:master" }
+  args = {
+    FINAL_BASE_IMAGE                  = "${BASE_REGISTRY}/comfyui-extensions:master"
+    RUNNER_SUPPORTED_EDITOR_TEMPLATES = "comfyui-master"
+  }
   tags     = ["${REGISTRY}/runner-comfyui:master"]
 }
 
 target "forge-neo-neo" {
   inherits = ["_forge-neo"]
-  args     = { FINAL_BASE_IMAGE = "${BASE_REGISTRY}/sd-webui-forge-neo:neo" }
+  args = {
+    FINAL_BASE_IMAGE                  = "${BASE_REGISTRY}/sd-webui-forge-neo:neo"
+    RUNNER_SUPPORTED_EDITOR_TEMPLATES = "forge-neo:neo"
+  }
   tags     = ["${REGISTRY}/runner-forge-neo:neo"]
 }
 
 target "forge-neo-latest" {
   inherits = ["_forge-neo"]
-  args     = { FINAL_BASE_IMAGE = "${BASE_REGISTRY}/sd-webui-forge-neo:latest" }
+  args = {
+    FINAL_BASE_IMAGE                  = "${BASE_REGISTRY}/sd-webui-forge-neo:latest"
+    RUNNER_SUPPORTED_EDITOR_TEMPLATES = "forge-neo:latest"
+  }
   tags     = ["${REGISTRY}/runner-forge-neo:latest"]
 }

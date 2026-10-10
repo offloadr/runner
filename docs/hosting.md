@@ -27,7 +27,7 @@ User-facing image:
 - `ghcr.io/offloadr/runner-comfyui:latest`
 - `ghcr.io/offloadr/runner-forge-neo:neo`
 
-`latest` matches the stable ComfyUI editor channel and `master` the ComfyUI master channel. Forge Neo uses `ghcr.io/offloadr/runner-forge-neo:neo` for the default Forge route and `:latest` for the latest Forge template. Hosted runners use the same images. Runner registration advertises supported editor templates, so a ComfyUI runner is not offered for a Forge editor and a Forge runner is not offered for ComfyUI.
+`latest` matches the stable ComfyUI editor channel and `master` the ComfyUI master channel. Forge Neo uses `ghcr.io/offloadr/runner-forge-neo:neo` for the default Forge route and `:latest` for the latest Forge template. Hosted runners use the same images. Each image advertises only the editor template it is built from, so a runner is offered only for workspaces on that exact editor build: a `runner-comfyui:latest` runner serves `comfyui-latest` workspaces, not `comfyui-master` or Forge ones.
 
 Linux (bash):
 
@@ -185,7 +185,7 @@ The image sets `RUNNER_STATUS_FILE=/run/offloadr/status.json`. The agent rewrite
   "runner_id": "…",
   "instance_id": "…",
   "version": "0.1.0+<commit>",
-  "supported_editor_templates": ["comfyui-latest", "comfyui-master"],
+  "supported_editor_templates": ["comfyui-latest"],
   "active_session_id": "",
   "updated_utc": "2026-10-06T12:00:00+00:00"
 }

@@ -4,7 +4,7 @@
 
 ARG FINAL_BASE_IMAGE=ghcr.io/radiatingreverberations/comfyui-extensions:latest
 ARG EDITOR_RUNTIME=comfyui
-ARG RUNNER_SUPPORTED_EDITOR_TEMPLATES=comfyui-latest,comfyui-master
+ARG RUNNER_SUPPORTED_EDITOR_TEMPLATES=comfyui-latest
 ARG COMFY_ENTRYPOINT=/comfyui/entrypoint.base.sh
 ARG COMFY_WORKDIR=/comfyui
 ARG COMFY_PORT=8188
