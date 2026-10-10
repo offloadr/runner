@@ -118,7 +118,9 @@ public sealed class LinuxUserIsolationStrategy : ISessionIsolationStrategy
             // useradd may hand out a uid that an earlier, incompletely cleaned session used, and
             // a pre-existing user may still have processes. Nothing may run as the session uid
             // before the editor starts.
-            await KillUserProcessesAsync(userName, userId, cancellationToken).ConfigureAwait(false);
+            // A process that survives SIGKILL would be authorized as this session by uid, so
+            // preparation fails rather than hand the uid to the new session.
+            await KillUserProcessesAsync(userName, userId, cancellationToken, requireNoSurvivors: true).ConfigureAwait(false);
 
             Directory.CreateDirectory(homeDirectory);
             await _commandRunner.RunAsync(LinuxCommandFactory.ChownRecursive(userName, homeDirectory), cancellationToken).ConfigureAwait(false);
@@ -269,12 +271,23 @@ public sealed class LinuxUserIsolationStrategy : ISessionIsolationStrategy
         }
     }
 
-    private async Task KillUserProcessesAsync(string userName, uint userId, CancellationToken cancellationToken)
+    private async Task KillUserProcessesAsync(
+        string userName,
+        uint userId,
+        CancellationToken cancellationToken,
+        bool requireNoSurvivors = false)
     {
-        if (!await _killUserProcesses(userId, cancellationToken).ConfigureAwait(false))
+        if (await _killUserProcesses(userId, cancellationToken).ConfigureAwait(false))
         {
-            RunnerLog.Warning<LinuxUserIsolationStrategy>(
-                $"Processes of session user '{userName}' (uid {userId}) were still running after SIGKILL.");
+            return;
         }
+
+        var message = $"Processes of session user '{userName}' (uid {userId}) were still running after SIGKILL.";
+        if (requireNoSurvivors)
+        {
+            throw new InvalidOperationException($"{message} The session cannot use this account.");
+        }
+
+        RunnerLog.Warning<LinuxUserIsolationStrategy>(message);
     }
 }

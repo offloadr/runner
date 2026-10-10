@@ -109,6 +109,34 @@ public class SessionIsolationTests
     }
 
     [Test]
+    public void PrepareAsync_FailsWhenAProcessOfTheUidSurvivesSigkill()
+    {
+        // passwd fields are colon-separated, so the home must be a Linux path.
+        LinuxTestPrerequisites.RequireLinux();
+        var root = CreateTempDirectory();
+        try
+        {
+            var sessionRoot = Path.Combine(root, "sessions");
+            var expectedHome = Path.Combine(Path.GetFullPath(sessionRoot), SessionId);
+            var runner = new RecordingCommandRunner(userExists: true);
+            var strategy = new LinuxUserIsolationStrategy(
+                runner,
+                static (_, _) => Task.FromResult(false),
+                residueRoots: [],
+                passwdPath: WritePasswd(root, LinuxSessionIdentity.BuildUserName(SessionId), expectedHome));
+
+            Assert.That(
+                async () => await strategy.PrepareAsync(SessionId, sessionRoot, CancellationToken.None),
+                Throws.InvalidOperationException.With.Message.Contains("still running"));
+            Assert.That(runner.Commands.Select(static command => command.FileName), Does.Not.Contain("/bin/chown"));
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
     public void PrepareAsync_RefusesAnExistingAccountWithoutThisSessionsHome()
     {
         var root = CreateTempDirectory();
