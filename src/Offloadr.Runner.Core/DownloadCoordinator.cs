@@ -210,9 +210,22 @@ public sealed class DownloadCoordinator
 
         foreach (var registration in registrations)
         {
+            // A different model taking over a destination cancels the displaced download, so it
+            // cannot finish and publish a file the new registration would accept by its size.
+            // The new download waits for the cancelled transfer's removal before it starts.
+            if (_registry.TryGetValue(registration.DestinationPath, out var displaced) &&
+                !IsSameModel(displaced.Request, registration.Request))
+            {
+                displaced.CancelRegistration();
+            }
+
             _registry[registration.DestinationPath] = registration;
         }
     }
+
+    private static bool IsSameModel(ModelDownloadRequest current, ModelDownloadRequest replacement)
+        => string.Equals(current.ModelId, replacement.ModelId, StringComparison.Ordinal) &&
+           current.SizeBytes == replacement.SizeBytes;
 
     public Task EnsureDownloadsAsync(IEnumerable<ModelDownloadRequest> downloads, CancellationToken cancellationToken, bool highPriority)
     {

@@ -912,6 +912,82 @@ public class DownloadCoordinatorTests
     }
 
     [Test]
+    public async Task RegisterDownloads_DifferentModelAtSameDestinationCancelsDisplacedDownload()
+    {
+        var delay = new BlockingDelay();
+        var aria = new FakeAria2Client
+        {
+            StatusFactory = _ => new Aria2DownloadStatus("active", 25, 100, 0, null, null)
+        };
+        var sut = new DownloadCoordinator(aria, new FakeFileSystem(), delay: delay);
+        sut.SetActiveSession("session-1");
+        sut.RegisterDownloads("session-1", [new ModelDownloadRequest
+        {
+            ModelId = "old-model",
+            Filename = "model.safetensors",
+            DestinationPath = "/tmp/model.safetensors",
+            SizeBytes = 100,
+            SourceUrl = "https://example.com/old"
+        }]);
+
+        var downloadTask = sut.EnsureDownloadedAsync(
+            "/tmp/model.safetensors",
+            CancellationToken.None,
+            highPriority: false);
+        await delay.WaitUntilStartedAsync();
+
+        sut.RegisterDownloads("session-1", [new ModelDownloadRequest
+        {
+            ModelId = "new-model",
+            Filename = "model.safetensors",
+            DestinationPath = "/tmp/model.safetensors",
+            SizeBytes = 100,
+            SourceUrl = "https://example.com/new"
+        }]);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(async () => await downloadTask, Throws.InstanceOf<OperationCanceledException>());
+            Assert.That(aria.ForceRemovedGids, Is.EquivalentTo(["gid-1"]));
+        });
+    }
+
+    [Test]
+    public async Task RegisterDownloads_SameModelAtSameDestinationKeepsInFlightDownload()
+    {
+        var delay = new BlockingDelay();
+        var aria = new FakeAria2Client
+        {
+            StatusFactory = _ => new Aria2DownloadStatus("active", 25, 100, 0, null, null)
+        };
+        var sut = new DownloadCoordinator(aria, new FakeFileSystem(), delay: delay);
+        sut.SetActiveSession("session-1");
+        var request = new ModelDownloadRequest
+        {
+            ModelId = "model",
+            Filename = "model.safetensors",
+            DestinationPath = "/tmp/model.safetensors",
+            SizeBytes = 100,
+            SourceUrl = "https://example.com/model"
+        };
+        sut.RegisterDownloads("session-1", [request]);
+
+        var downloadTask = sut.EnsureDownloadedAsync(
+            "/tmp/model.safetensors",
+            CancellationToken.None,
+            highPriority: false);
+        await delay.WaitUntilStartedAsync();
+
+        sut.RegisterDownloads("session-1", [request.Clone()]);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(downloadTask.IsCompleted, Is.False);
+            Assert.That(aria.ForceRemovedGids, Is.Empty);
+        });
+    }
+
+    [Test]
     public async Task EnsureDownloadedAsync_ReportsZeroSpeeds_OnStartingCompleteAndFailedReports()
     {
         var completeFileSystem = new FakeFileSystem();
