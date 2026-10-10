@@ -160,11 +160,13 @@ internal sealed partial class SessionProcessManager : IDisposable
                 $"This runner runs editor runtime '{_runtimeKind}', not '{requestedRuntimeKind}'.", nameof(command));
         if (_sessions.TryGetValue(sessionId, out var existing))
         {
-            if (existing.StopInProgress || existing.Process.HasExited)
+            if (existing.Process.HasExited && !existing.StopInProgress && !existing.RuntimeIdentity.SameRuntime(runtimeIdentity))
             {
-                // A retired runtime of this session is still being cleaned up. Wait until it
-                // leaves tracking: failing here would run failed-start cleanup while the old
-                // runtime's own cleanup is still in progress.
+                // A runtime of this session exited on its own and its exit cleanup is still
+                // running. Wait until it leaves tracking: failing here would run failed-start
+                // cleanup in the middle of that exit cleanup. A runtime being stopped is not
+                // waited for: its stopper still runs session-wide cleanup after untracking it,
+                // and a start for the runtime being stopped must not relaunch it.
                 try
                 {
                     await existing.Untracked.WaitAsync(RetiredRuntimeCleanupWait, cancellationToken).ConfigureAwait(false);
@@ -177,7 +179,7 @@ internal sealed partial class SessionProcessManager : IDisposable
                 if (_sessions.ContainsKey(sessionId))
                     throw new InvalidOperationException("The tracked session is a different or retired runtime.");
             }
-            else if (existing.RuntimeIdentity != runtimeIdentity)
+            else if (existing.StopInProgress || existing.Process.HasExited || existing.RuntimeIdentity != runtimeIdentity)
             {
                 throw new InvalidOperationException("The tracked session is a different or retired runtime.");
             }

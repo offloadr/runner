@@ -298,6 +298,67 @@ public partial class SessionProcessManagerOwnershipTests
     }
 
     [Test]
+    public async Task StartForTheRuntimeThatJustExitedIsRefused()
+    {
+        await using var fixture = await PromptRuntimeFixture.CreateAsync();
+        var hookEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseHook = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        fixture.Manager.UnexpectedSessionExitCleanup = async (_, _, _, _) =>
+        {
+            hookEntered.TrySetResult();
+            await releaseHook.Task;
+        };
+        System.Diagnostics.Process.GetProcessById(fixture.Manager.TryGetTrackedProcessId(fixture.Start.SessionId)!.Value).Kill();
+        await hookEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        try
+        {
+            // A redelivered start for the runtime that just died must not bring it back.
+            Assert.That(
+                async () => await fixture.Manager.StartSessionAsync(fixture.Start.Clone(), CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(2)),
+                Throws.InvalidOperationException);
+        }
+        finally
+        {
+            releaseHook.TrySetResult();
+        }
+    }
+
+    [TestCase(false)]
+    [TestCase(true)]
+    public async Task StartDuringAStopIsRefusedRatherThanWaitingForIt(bool sameRuntime)
+    {
+        var cleanupEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseCleanup = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var fixture = await PromptRuntimeFixture.CreateAsync(cleanup: async () =>
+        {
+            cleanupEntered.TrySetResult();
+            await releaseCleanup.Task;
+        });
+        var stopping = fixture.Manager.StopSessionAsync(fixture.Start.SessionId, CancellationToken.None);
+        await cleanupEntered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        var start = fixture.Start.Clone();
+        if (!sameRuntime)
+        {
+            start.RuntimeEpoch++;
+            start.RuntimeInstanceId = Guid.NewGuid().ToString("n");
+        }
+
+        try
+        {
+            Assert.That(
+                async () => await fixture.Manager.StartSessionAsync(start, CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(2)),
+                Throws.InvalidOperationException);
+        }
+        finally
+        {
+            releaseCleanup.TrySetResult();
+            await stopping.WaitAsync(TimeSpan.FromSeconds(10));
+        }
+    }
+
+    [Test]
     public async Task DuplicateStartMustMatchTheExactTrackedChild()
     {
         await using var fixture = await PromptRuntimeFixture.CreateAsync();
