@@ -203,6 +203,7 @@ public class WorkspaceMirrorServiceTests
     }
 
     [TestCase("short.png", "abc", 5L, null)]
+    [TestCase("huge.png", "abc", 5L * 1024 * 1024 * 1024, null)]
     [TestCase("digest.png", "abcde", 5L, "0000000000000000000000000000000000000000000000000000000000000000")]
     public async Task TryEnsureWorkspaceFileAvailableAsync_DoesNotPublishAStreamThatFailsVerification(
         string relativePath,

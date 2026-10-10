@@ -144,6 +144,8 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
     {
         private const long MaxArchiveBytes = 512L * 1024 * 1024;
         private const long MaxExpandedBytes = 1024L * 1024 * 1024;
+        // Largest single workspace file, applied even when its metadata declares no size.
+        internal const long MaxWorkspaceFileBytes = 4L * 1024 * 1024 * 1024;
         private const int MaxArchiveEntries = 50_000;
 
         private readonly RunnerWorkspaceService.RunnerWorkspaceServiceClient _workspaceClient;
@@ -617,6 +619,12 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
 
                             if (response.Metadata.SizeBytes.HasValue)
                             {
+                                if (response.Metadata.SizeBytes.Value > MaxWorkspaceFileBytes)
+                                {
+                                    throw new InvalidOperationException(
+                                        $"Workspace file declares {response.Metadata.SizeBytes.Value} bytes, above the {MaxWorkspaceFileBytes} byte limit.");
+                                }
+
                                 state.SizeBytes = response.Metadata.SizeBytes.Value;
                             }
 
@@ -637,6 +645,12 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                             {
                                 throw new InvalidOperationException(
                                     $"Workspace file stream exceeded its declared size of {limit} bytes.");
+                            }
+
+                            if (written > MaxWorkspaceFileBytes)
+                            {
+                                throw new InvalidOperationException(
+                                    $"Workspace file stream exceeded the {MaxWorkspaceFileBytes} byte limit.");
                             }
 
                             hash.AppendData(response.Chunk.Span);
