@@ -422,9 +422,15 @@ internal static class ServiceClientManager
         }
     }
 
+    /// <summary>The shared result of one physical startup, acknowledged by every command that joined it.</summary>
+    internal readonly record struct StartupOutcome(bool Ready, string Message);
+
     internal sealed class TrackedCommandWork
     {
         public Task? Task { get; set; }
+
+        /// <summary>The startup's result, set only for startup work so other commands can join it.</summary>
+        public Task<StartupOutcome>? Outcome { get; set; }
         public required CancellationTokenSource CancellationSource { get; init; }
         public required string SessionId { get; init; }
         public RuntimeIdentity RuntimeIdentity { get; init; }
@@ -2230,17 +2236,21 @@ internal static class ServiceClientManager
                         cancellationToken).ConfigureAwait(false);
                     deps.RuntimeIdentities.Remove(preemptedSessionId);
                     await deps.StartRuntimeAndWaitForReady(command, cancellationToken).ConfigureAwait(false);
-                    ack.Ready = true;
-                    ack.Message = IsComfyRuntime(command.EditorRuntimeKind) ? "ComfyUI ready" : "GPU runtime ready";
+                    return new StartupOutcome(
+                        true,
+                        IsComfyRuntime(command.EditorRuntimeKind) ? "ComfyUI ready" : "GPU runtime ready");
                 }
                 catch (Exception ex)
                 {
                     RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed to start session {command.SessionId}: {ex.Message}");
-                    ack.Ready = false;
-                    ack.Message = ex.Message;
                     await CleanUpFailedStartupAsync(command.SessionId, runtimeIdentity, deps).ConfigureAwait(false);
+                    return new StartupOutcome(false, ex.Message);
                 }
-
+            },
+            outcome =>
+            {
+                ack.Ready = outcome.Ready;
+                ack.Message = outcome.Message;
                 return ack;
             },
             deps.Sink.AckStartSessionAsync,
@@ -2450,19 +2460,23 @@ internal static class ServiceClientManager
                 try
                 {
                     await deps.StartRuntimeAndWaitForReady(start, cancellationToken).ConfigureAwait(false);
-                    ack.Ready = true;
-                    ack.Message = IsComfyRuntime(command.EditorRuntimeKind) ? "ComfyUI ready" : "GPU runtime ready";
+                    return new StartupOutcome(
+                        true,
+                        IsComfyRuntime(command.EditorRuntimeKind) ? "ComfyUI ready" : "GPU runtime ready");
                 }
                 catch (Exception ex)
                 {
-                    ack.Ready = false;
-                    ack.Message = ex.Message;
                     RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed launching runtime for restart {command.RestartId}: {ex.Message}");
                     // Clean up only this launch's runtime, never a valid runtime of
                     // another identity that happens to share the session id.
                     await CleanUpFailedStartupAsync(command.SessionId, runtimeIdentity, deps).ConfigureAwait(false);
+                    return new StartupOutcome(false, ex.Message);
                 }
-
+            },
+            outcome =>
+            {
+                ack.Ready = outcome.Ready;
+                ack.Message = outcome.Message;
                 return ack;
             },
             deps.Sink.AckEditorRuntimeLaunchAsync,
@@ -2487,21 +2501,23 @@ internal static class ServiceClientManager
         RuntimeCommandDependencies deps,
         string sessionId,
         RuntimeIdentity runtimeIdentity,
-        Func<CancellationToken, Task<TAck>> startup,
+        Func<CancellationToken, Task<StartupOutcome>> startup,
+        Func<StartupOutcome, TAck> toAcknowledgement,
         Func<TAck, CancellationToken, Task> acknowledge,
         string acknowledgementKey)
     {
-        // A redelivery of the startup already in progress joins it: replacing it would cancel
-        // the work starting this very runtime, and that work's failure cleanup would stop it.
-        // The running startup acknowledges with the same command and identity.
-        if (deps.WorkState.GetActiveStartup() is { Task: { } inProgress } active &&
+        // Another command for the runtime already starting joins that startup: replacing it
+        // would cancel the work starting this very runtime, and that work's failure cleanup
+        // would stop it. The joined command still acknowledges under its own command id and
+        // attempt, with the shared startup's result.
+        if (deps.WorkState.GetActiveStartup() is { Outcome: { } inProgress } active &&
             string.Equals(active.SessionId, sessionId, StringComparison.Ordinal) &&
             active.RuntimeIdentity.SameRuntime(runtimeIdentity))
         {
             RunnerLog.Info(
                 nameof(ServiceClientManager),
                 $"Startup {acknowledgementKey} for session {sessionId} is already in progress; joining it.");
-            return inProgress.ContinueWith(static _ => { }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+            return AcknowledgeOutcomeAsync(inProgress);
         }
 
         TrackedCommandWork? previous = null;
@@ -2515,14 +2531,15 @@ internal static class ServiceClientManager
 
         // Publish a joinable task before it starts, so Stop and Quiesce can never
         // observe the slot without the work that owns it.
-        var starter = new Task<Task<TAck>>(RunPhysicalAsync);
+        var starter = new Task<Task<StartupOutcome>>(RunPhysicalAsync);
         var physical = starter.Unwrap();
         tracked.Task = physical;
+        tracked.Outcome = physical;
         previous = deps.WorkState.ReplaceActiveStartup(tracked);
         starter.Start(TaskScheduler.Default);
-        return AcknowledgeAsync();
+        return AcknowledgeOutcomeAsync(physical);
 
-        async Task<TAck> RunPhysicalAsync()
+        async Task<StartupOutcome> RunPhysicalAsync()
         {
             try
             {
@@ -2536,9 +2553,9 @@ internal static class ServiceClientManager
             }
         }
 
-        async Task AcknowledgeAsync()
+        async Task AcknowledgeOutcomeAsync(Task<StartupOutcome> outcome)
         {
-            var ack = await physical.ConfigureAwait(false);
+            var ack = toAcknowledgement(await outcome.ConfigureAwait(false));
             await AcknowledgeRuntimeCommandWithRetryAsync(
                 acknowledge,
                 ack,

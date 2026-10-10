@@ -184,18 +184,54 @@ public partial class ServiceClientManagerTests
             await release.Task.WaitAsync(token);
         };
 
-        var original = ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 4, InstanceB, revision: 2), harness.Deps);
+        var first = Launch(7, 4, InstanceB, revision: 2);
+        var original = ServiceClientManager.HandleLaunchRuntimeCommand(first, harness.Deps);
         await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
-        // The same command again, as after its id left the duplicate cache.
-        var duplicate = ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 4, InstanceB, revision: 2), harness.Deps);
+        // The same runtime again under a new command id and attempt, as after a control-plane retry.
+        var retry = Launch(7, 4, InstanceB, revision: 2);
+        retry.Attempt = 2;
+        var duplicate = ServiceClientManager.HandleLaunchRuntimeCommand(retry, harness.Deps);
         release.TrySetResult();
         await Task.WhenAll(original, duplicate).WaitAsync(TimeSpan.FromSeconds(5));
 
         Assert.Multiple(() =>
         {
             Assert.That(starts, Is.EqualTo(1));
+            Assert.That(harness.Sink.LaunchAcks, Has.Count.EqualTo(2));
             Assert.That(harness.Sink.LaunchAcks, Has.All.Property(nameof(AcknowledgeEditorRuntimeLaunchRequest.Ready)).True);
+            Assert.That(
+                harness.Sink.LaunchAcks.Select(ack => (ack.CommandId, ack.Attempt)),
+                Is.EquivalentTo(new[] { (first.CommandId, 1u), (retry.CommandId, 2u) }));
             Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(new RuntimeIdentity(7, 4, InstanceB)));
+        });
+    }
+
+    [Test]
+    public async Task LaunchJoiningAFailedStartup_AcknowledgesTheFailureUnderItsOwnCommand()
+    {
+        var harness = new RuntimeCommandHarness();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        harness.BeforeStart = async (_, token) =>
+        {
+            entered.TrySetResult();
+            await release.Task.WaitAsync(token);
+            throw new InvalidOperationException("editor failed to start");
+        };
+
+        var first = Launch(7, 4, InstanceB, revision: 2);
+        var original = ServiceClientManager.HandleLaunchRuntimeCommand(first, harness.Deps);
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var retry = Launch(7, 4, InstanceB, revision: 2);
+        var joined = ServiceClientManager.HandleLaunchRuntimeCommand(retry, harness.Deps);
+        release.TrySetResult();
+        await Task.WhenAll(original, joined).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(harness.Sink.LaunchAcks.Select(ack => ack.CommandId), Is.EquivalentTo(new[] { first.CommandId, retry.CommandId }));
+            Assert.That(harness.Sink.LaunchAcks, Has.All.Property(nameof(AcknowledgeEditorRuntimeLaunchRequest.Ready)).False);
+            Assert.That(harness.Sink.LaunchAcks, Has.All.Property(nameof(AcknowledgeEditorRuntimeLaunchRequest.Message)).EqualTo("editor failed to start"));
         });
     }
 
