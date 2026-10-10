@@ -771,7 +771,9 @@ internal static class ServiceClientManager
         // Sessions that ended on this runner, by the highest lifecycle generation they ran
         // at. A start is only fenced against its own session's generations: ordering across
         // different sessions needs an allocation order only the control plane has.
-        private const int MaxRetiredSessions = 256;
+        // Bounded memory; once the control plane sends assignment sequences those fence every
+        // start regardless of how many sessions ended here.
+        private const int MaxRetiredSessions = 16_384;
         private readonly object _retiredGate = new();
         private readonly Dictionary<string, ulong> _retiredGenerations = new(StringComparer.Ordinal);
         private readonly Queue<string> _retiredOrder = new();
