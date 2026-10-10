@@ -2314,6 +2314,16 @@ internal static class ServiceClientManager
             return false;
         }
 
+        // Only starts admitted as newer reach the startup slot, so a pending startup for a
+        // different runtime of this session means the quiesce is stale, even while that
+        // startup has not adopted its identity yet and no child is tracked.
+        if (deps.WorkState.GetActiveStartup() is { } pending &&
+            string.Equals(pending.SessionId, command.SessionId, StringComparison.Ordinal) &&
+            !pending.RuntimeIdentity.SameRuntime(target))
+        {
+            return false;
+        }
+
         if (deps.LogicalSessionState.TryGetRuntime(command.SessionId, out var current, out var currentRevision))
         {
             return current.SameRuntime(target) && command.RestartRevision >= currentRevision;

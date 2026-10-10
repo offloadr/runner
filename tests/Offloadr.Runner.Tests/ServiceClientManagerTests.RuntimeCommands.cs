@@ -443,6 +443,36 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
+    public async Task DelayedQuiesce_WhileANewerStartupIsPendingAndNothingIsTracked_IsRefused()
+    {
+        var harness = new RuntimeCommandHarness();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        harness.BeforeStart = async (_, token) =>
+        {
+            entered.TrySetResult();
+            await release.Task.WaitAsync(token);
+        };
+
+        var launch = ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 4, InstanceB, revision: 2), harness.Deps);
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        // The gap: the session identity is cleared and no child is tracked yet.
+        harness.Logical.ClearIfMatches(CommandSessionId);
+        await ServiceClientManager.HandleQuiesceRuntimeCommandAsync(Quiesce(7, 3, InstanceA, revision: 1), harness.Deps);
+        var quiesceAck = await harness.Sink.WaitForAsync(harness.Sink.QuiesceAcks, 1);
+        var callsDuringStartup = harness.Calls.Where(call => !call.StartsWith("start:", StringComparison.Ordinal)).ToArray();
+        release.TrySetResult();
+        await launch.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(quiesceAck.Quiesced, Is.False);
+            Assert.That(callsDuringStartup, Is.Empty, "Nothing was stopped or cleaned up for the newer startup's session.");
+            Assert.That(harness.Sink.LaunchAcks.Single().Ready, Is.True);
+        });
+    }
+
+    [Test]
     public async Task FailedLaunch_DoesNotStopAValidRuntimeOfAnotherIdentity()
     {
         // The runtime at epoch 4 is still tracked, so the launch at epoch 5 fails.
