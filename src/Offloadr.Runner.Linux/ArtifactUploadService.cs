@@ -1396,7 +1396,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     fullPath,
                     status.Length);
 
-                var request = new UploadRequest(type, fullPath, 0);
+                var request = new UploadRequest(type, fullPath, 0, CurrentRuntime());
                 if (!_queue.Writer.TryWrite(request))
                 {
                     _pending.TryRemove(fullPath, out _);
@@ -1409,6 +1409,9 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         }
 
         internal int PendingUploadCount => _pending.Count;
+
+        private RuntimeIdentity? CurrentRuntime()
+            => _runtimeIdentities?.TryGet(_sessionId, out var identity) == true ? identity : null;
 
         /// <summary>
         /// Rescans the artifact folders once the queue has drained to half its cap after
@@ -1530,7 +1533,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
         private async Task<UploadRequest?> UploadAsync(UploadRequest request)
         {
-            var (type, fullPath, attempt) = request;
+            var (type, fullPath, attempt, runtime) = request;
             if (!type.Equals("output", StringComparison.OrdinalIgnoreCase) &&
                 !type.Equals("temp", StringComparison.OrdinalIgnoreCase))
             {
@@ -1608,11 +1611,13 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     {
                         metadata.SessionId = _sessionId;
                     }
-                    if (_runtimeIdentities?.TryGet(_sessionId, out var runtimeIdentity) == true)
+                    // The runtime captured when the file was queued, never the session's
+                    // current one: that may since have exited or been replaced.
+                    if (runtime is { IsValid: true } queuedFor)
                     {
-                        metadata.LifecycleGeneration = runtimeIdentity.LifecycleGeneration;
-                        metadata.RuntimeEpoch = runtimeIdentity.RuntimeEpoch;
-                        metadata.RuntimeInstanceId = runtimeIdentity.RuntimeInstanceId;
+                        metadata.LifecycleGeneration = queuedFor.LifecycleGeneration;
+                        metadata.RuntimeEpoch = queuedFor.RuntimeEpoch;
+                        metadata.RuntimeInstanceId = queuedFor.RuntimeInstanceId;
                     }
 
                     _logger.LogInformation(

@@ -349,6 +349,50 @@ public partial class ArtifactUploadServiceTests
     }
 
     [Test]
+    public async Task Uploads_CarryTheRuntimeTheyWereQueuedUnder()
+    {
+        var root = CreateTempDirectory();
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
+        {
+            var paths = CreateSessionPaths(root);
+            File.WriteAllBytes(Path.Combine(paths.OutputDirectory, "first.png"), [1, 2, 3]);
+            File.WriteAllBytes(Path.Combine(paths.OutputDirectory, "second.png"), [4, 5, 6]);
+            var identities = new RuntimeIdentityRegistry();
+            identities.Set("session-1", 7, 3, "aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaa");
+            var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse())
+            {
+                UploadGate = gate.Task
+            };
+            await using var service = new ArtifactUploadService(
+                runnerSecret: "runner-secret-value",
+                artifactClient,
+                NullLogger<ArtifactUploadService>.Instance,
+                identities);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+
+            // Both files are queued; the session is replaced while the first upload stalls.
+            var first = await artifactClient.WaitForUploadAsync(TimeSpan.FromSeconds(10));
+            identities.Set("session-1", 7, 4, "bbbbbbbbbbbb4bbb8bbbbbbbbbbbbbbb");
+            gate.TrySetResult();
+            var second = await artifactClient.WaitForUploadAsync(TimeSpan.FromSeconds(10));
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(first.Metadata!.RuntimeEpoch, Is.EqualTo(3));
+                Assert.That(second.Metadata!.RuntimeEpoch, Is.EqualTo(3));
+                Assert.That(second.Metadata.RuntimeInstanceId, Is.EqualTo("aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaa"));
+            });
+        }
+        finally
+        {
+            gate.TrySetResult();
+            TryDelete(root);
+        }
+    }
+
+    [Test]
     public async Task Upload_IsRepeatedWhenTheFileChangesWhileItIsSent()
     {
         var root = CreateTempDirectory();
