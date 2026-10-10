@@ -291,9 +291,13 @@ internal sealed class LocalModelScanner
 
     private static IReadOnlyList<string> ComputeSelectionHashes(IReadOnlyList<ModelInfo> models)
     {
+        // A selection hash covers name, size and category only. When several local files
+        // share one, it cannot say which file a request means, so it is not offered: the
+        // control plane then downloads the catalog model instead of projecting a guess.
         return models
-            .Select(model => LocalModelSelectionHash.Compute(model.Filename, model.SizeBytes, model.Category))
-            .Distinct(StringComparer.Ordinal)
+            .GroupBy(model => LocalModelSelectionHash.Compute(model.Filename, model.SizeBytes, model.Category), StringComparer.Ordinal)
+            .Where(static group => group.Count() == 1)
+            .Select(static group => group.Key)
             .OrderBy(static value => value, StringComparer.Ordinal)
             .ToArray();
     }

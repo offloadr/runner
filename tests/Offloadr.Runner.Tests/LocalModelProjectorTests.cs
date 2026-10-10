@@ -157,29 +157,33 @@ public class LocalModelProjectorTests
         }
     }
 
-    [Test]
-    public void SetRequestedModels_ProjectsTheFileWhoseNameMatchesExactly()
+    [TestCase("checkpoints/Foo.safetensors", "checkpoints/foo.safetensors")]
+    [TestCase("checkpoints/a/model.safetensors", "checkpoints/b/model.safetensors")]
+    public void SetRequestedModels_RefusesAnAmbiguousSelectionHash(string first, string second)
     {
         var root = CreateTempDirectory();
         try
         {
             var sourceRoot = Path.Combine(root, "local");
             var destinationRoot = Path.Combine(root, "comfy", "models");
-            Directory.CreateDirectory(Path.Combine(sourceRoot, "checkpoints"));
-            var upper = Path.Combine(sourceRoot, "checkpoints", "Foo.safetensors");
-            var lower = Path.Combine(sourceRoot, "checkpoints", "foo.safetensors");
-            File.WriteAllText(upper, "aaaa");
-            File.WriteAllText(lower, "bbbb");
-            var projected = Path.Combine(destinationRoot, "checkpoints", "foo.safetensors");
+            var firstPath = Path.Combine(sourceRoot, first);
+            var secondPath = Path.Combine(sourceRoot, second);
+            Directory.CreateDirectory(Path.GetDirectoryName(firstPath)!);
+            Directory.CreateDirectory(Path.GetDirectoryName(secondPath)!);
+            // Same name (ignoring case), size and category, different contents.
+            File.WriteAllText(firstPath, "aaaa");
+            File.WriteAllText(secondPath, "bbbb");
+            var projected = Path.Combine(destinationRoot, "checkpoints", Path.GetFileName(secondPath));
 
             var projector = new LocalModelProjector(sourceRoot, destinationRoot);
-            // The upper-case file is indexed first; both share a case-insensitive selection hash.
             projector.UpdateSnapshot(CreateSnapshot(
-                CreateModel(upper, ModelCategory.Checkpoint),
-                CreateModel(lower, ModelCategory.Checkpoint)));
-            projector.SetRequestedModels([CreateLocalProjectionRequest(lower, ModelCategory.Checkpoint, projected)]);
+                CreateModel(firstPath, ModelCategory.Checkpoint),
+                CreateModel(secondPath, ModelCategory.Checkpoint)));
 
-            Assert.That(new FileInfo(projected).LinkTarget, Is.EqualTo(lower));
+            Assert.That(
+                () => projector.SetRequestedModels([CreateLocalProjectionRequest(secondPath, ModelCategory.Checkpoint, projected)]),
+                Throws.InvalidOperationException);
+            Assert.That(File.Exists(projected) || new FileInfo(projected).LinkTarget is not null, Is.False);
         }
         finally
         {

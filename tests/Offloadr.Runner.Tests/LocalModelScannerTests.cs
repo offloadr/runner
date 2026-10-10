@@ -56,6 +56,35 @@ public class LocalModelScannerTests
     }
 
     [Test]
+    public void Scan_DoesNotOfferASelectionHashSharedByTwoFiles()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(root, "checkpoints", "a"));
+            Directory.CreateDirectory(Path.Combine(root, "checkpoints", "b"));
+            File.WriteAllText(Path.Combine(root, "checkpoints", "a", "model.safetensors"), "aaaa");
+            File.WriteAllText(Path.Combine(root, "checkpoints", "b", "model.safetensors"), "bbbb");
+            File.WriteAllText(Path.Combine(root, "checkpoints", "unique.safetensors"), "cccc");
+
+            var snapshot = new LocalModelScanner("runner-1", root).Scan();
+            var sharedHash = LocalModelSelectionHash.Compute("model.safetensors", 4, ModelCategory.Checkpoint);
+            var uniqueHash = LocalModelSelectionHash.Compute("unique.safetensors", 4, ModelCategory.Checkpoint);
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(snapshot.Models, Has.Count.EqualTo(3));
+                Assert.That(snapshot.SelectionHashes, Does.Not.Contain(sharedHash));
+                Assert.That(snapshot.SelectionHashes, Does.Contain(uniqueHash));
+            });
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
     public void Scan_SkipsSymbolicLinksToFilesAndFolders()
     {
         LinuxTestPrerequisites.RequireLinux();
