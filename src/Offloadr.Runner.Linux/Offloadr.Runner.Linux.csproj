@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The in-container session runtime: Linux users, the model VFS shim and its IPC, demand-aware hydration. -->
+  <PropertyGroup>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Offloadr.Runner.Core\Offloadr.Runner.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Offloadr.Runner.Core" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="VfsShim/model_vfs.c" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="RunnerAgent" />
+    <InternalsVisibleTo Include="Offloadr.Runner.Tests" />
+  </ItemGroup>
+
+</Project>

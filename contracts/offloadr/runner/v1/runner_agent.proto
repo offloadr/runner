@@ -1,0 +1,651 @@
+syntax = "proto3";
+
+package offloadr.runner.v1;
+
+import "offloadr/common/v1/gpus.proto"; // GpuType
+import "offloadr/common/v1/models.proto"; // ModelCategory
+import "offloadr/common/v1/prompt.proto"; // Prompt relay helpers
+import "offloadr/common/v1/gpu_control.proto";
+import "offloadr/runner/v1/allocator.proto"; // RunnerRuntimeTelemetrySnapshot
+import "offloadr/editor_runtime/v1/editor_proxy.proto"; // Artifact messages
+import "google/protobuf/timestamp.proto"; // Timestamp for session stream events
+import "google/protobuf/wrappers.proto";
+
+// Basic hardware/resource snapshot sent during registration.
+message RunnerResources {
+	offloadr.common.v1.GpuType gpu_type = 1;       // Optional coarse classification for hosted matching/metrics.
+	uint64 gpu_count = 2;       // Number of GPUs visible/usable.
+	uint64 vram_bytes = 3;      // Total VRAM across all GPUs (or primary) in bytes.
+	uint64 system_ram_bytes = 4;// Total system RAM in bytes.
+    string gpu_model_name = 5;  // Free-form GPU model (e.g., "NVIDIA GeForce RTX 4090").
+}
+
+// Command from Offloadr API instructing a runner to start a session for a user.
+message StartSessionCommand {
+    reserved 12;
+
+    string session_id = 1;     // Session id (uuid, no dashes)
+    string user = 2;           // Username/owner for the session
+    string editor_sid = 3;
+    repeated ModelDownloadRequest initial_models = 4;
+    repeated offloadr.editor_runtime.v1.EditorArtifactMetadata initial_artifacts = 5;
+    repeated WorkspaceFileMetadata initial_workspace_files = 6;
+    string editor_template = 7;
+    string editor_runtime_kind = 8;
+    uint64 lifecycle_generation = 9;
+    uint64 runtime_epoch = 10;
+    string runtime_instance_id = 11;
+    // Optional. Increases each time the control plane assigns a session to this runner,
+    // across sessions. When set, the runner refuses a start older than the newest
+    // assignment it has seen, so a delayed start cannot replace a newer session.
+    uint64 assignment_sequence = 13;
+}
+
+// Command instructing runner to stop a session (graceful cleanup + release).
+message StopSessionCommand {
+	string session_id = 1;
+	string user = 2;
+	// Optional runtime identity of the Stop. When lifecycle_generation is set the
+	// runner ignores a Stop that is older than the session's current runtime;
+	// unset fields leave the Stop unfenced.
+	string command_id = 3;
+	uint64 lifecycle_generation = 4;
+	uint64 runtime_epoch = 5;
+	string runtime_instance_id = 6;
+}
+
+message QuiesceEditorRuntimeCommand {
+    string command_id = 1;
+    string restart_id = 2;
+    string runner_id = 3;
+    string session_id = 4;
+    string editor_sid = 5;
+    uint64 lifecycle_generation = 6;
+    uint64 runtime_epoch = 7;
+    string runtime_instance_id = 8;
+    uint32 restart_revision = 9;
+}
+
+message LaunchEditorRuntimeCommand {
+    reserved 17;
+
+    string command_id = 1;
+    string restart_id = 2;
+    string runner_id = 3;
+    string session_id = 4;
+    string user = 5;
+    string editor_sid = 6;
+    string editor_template = 7;
+    string editor_runtime_kind = 8;
+    uint64 lifecycle_generation = 9;
+    uint64 runtime_epoch = 10;
+    string runtime_instance_id = 11;
+    uint32 restart_revision = 12;
+    uint32 attempt = 13;
+    repeated ModelDownloadRequest initial_models = 14;
+    repeated offloadr.editor_runtime.v1.EditorArtifactMetadata initial_artifacts = 15;
+    repeated WorkspaceFileMetadata initial_workspace_files = 16;
+}
+
+message SubmitPromptCommand {
+    string session_id = 1;
+    string submission_id = 2;
+    string editor_sid = 3;
+    string prompt_json = 4;
+    string owner = 5;
+    repeated ModelDownloadRequest downloads = 6;
+    string editor_runtime_kind = 7;
+    string http_method = 8;
+    string http_path = 9;
+    string http_query = 10;
+    string content_type = 11;
+    repeated offloadr.common.v1.PromptHttpRequest preflight_requests = 12;
+    repeated offloadr.common.v1.PromptArtifactReference artifact_references = 13;
+    bytes websocket_client_message = 14;
+    offloadr.common.v1.PromptExecutionTarget target = 15;
+    string command_id = 16;
+    // A new recovery delivery still refers to this original immutable command.
+    // It cannot acquire another execution permission or invoke native mutations.
+    uint64 recovery_revision = 17;
+    bool recovery_only = 18;
+    offloadr.common.v1.PromptNativeIdentifiers native_identifiers = 19;
+}
+
+message RelayEditorRuntimeRequestCommand {
+    string request_id = 1;
+    string delivery_id = 2;
+    string runner_id = 3;
+    string session_id = 4;
+    string editor_sid = 5;
+    uint64 lifecycle_generation = 6;
+    offloadr.editor_runtime.v1.EditorRuntimeRequestKind kind = 7;
+    string method = 8;
+    string path = 9;
+    string query = 10;
+    bytes body = 11;
+    string content_type = 12;
+    string client_id = 13;
+    bytes client_message = 14;
+    google.protobuf.Timestamp expires_utc = 15;
+    uint32 attempt = 16;
+    bool urgent = 17;
+    uint64 runtime_epoch = 18;
+    string runtime_instance_id = 19;
+}
+
+message AcknowledgeEditorRuntimeRequestRequest {
+    string request_id = 1;
+    string delivery_id = 2;
+    string runner_id = 3;
+    string session_id = 4;
+    uint64 lifecycle_generation = 5;
+    bool transport_succeeded = 6;
+    int32 status_code = 7;
+    bytes body = 8;
+    string content_type = 9;
+    string error_message = 10;
+    offloadr.editor_runtime.v1.EditorRuntimeRequestKind kind = 11;
+    uint64 runtime_epoch = 12;
+    string runtime_instance_id = 13;
+}
+
+enum EditorRuntimeBridgeState {
+    EDITOR_RUNTIME_BRIDGE_STATE_UNSPECIFIED = 0;
+    EDITOR_RUNTIME_BRIDGE_STATE_ACTIVE = 1;
+    EDITOR_RUNTIME_BRIDGE_STATE_HEARTBEAT = 2;
+    EDITOR_RUNTIME_BRIDGE_STATE_INACTIVE = 3;
+}
+
+message ReportEditorRuntimeBridgeStateRequest {
+    reserved 11;
+
+    string runner_id = 1;
+    string session_id = 2;
+    string editor_sid = 3;
+    string client_id = 4;
+    uint64 lifecycle_generation = 5;
+    EditorRuntimeBridgeState state = 6;
+    google.protobuf.Timestamp observed_utc = 7;
+    google.protobuf.Timestamp expires_utc = 8;
+    uint64 runtime_epoch = 9;
+    string runtime_instance_id = 10;
+    string bridge_connection_id = 12;
+}
+
+message ReportEditorRuntimeBridgeStateResponse {}
+
+message ModelDownloadRequest {
+    string model_id = 1;
+    offloadr.common.v1.ModelCategory category = 2;
+    string filename = 3;
+    string destination_path = 4;
+    int64 size_bytes = 5;
+    string metalink_xml = 6;
+    string source_url = 7;
+    string local_selection_hash = 8; // Present when a registered model should be projected from runner-local inventory instead of downloaded.
+    string relative_model_path = 9; // Runtime model path relative to the runner session model root.
+}
+
+enum ModelDownloadState {
+    MODEL_DOWNLOAD_STATE_UNSPECIFIED = 0;
+    MODEL_DOWNLOAD_STATE_IN_PROGRESS = 1;
+    MODEL_DOWNLOAD_STATE_COMPLETE = 2;
+    MODEL_DOWNLOAD_STATE_FAILED = 3;
+    MODEL_DOWNLOAD_STATE_RETRYING = 4;
+}
+
+message ReportModelDownloadRequest {
+    string runner_id = 1;
+    string session_id = 2;
+    string model_id = 3;
+    string filename = 4;
+    string destination_path = 5;
+    int64 bytes_downloaded = 6;
+    int64 total_bytes = 7;
+    double percent = 8;
+    ModelDownloadState state = 9;
+    string message = 10;
+    int64 bytes_per_second = 11;
+    int64 average_bytes_per_second = 12;
+    uint64 runtime_epoch = 13;
+    string runtime_instance_id = 14;
+    uint64 lifecycle_generation = 15;
+}
+
+message ReportModelDownloadResponse {}
+
+message SyncLocalModelsRequest {
+    string runner_id = 1;
+    repeated string selection_hashes = 2;
+    string snapshot_digest = 3;
+    bool full_snapshot = 4;
+}
+
+message SyncLocalModelsResponse {
+    int32 accepted_count = 1;
+}
+
+enum WorkspaceRoot {
+    WORKSPACE_ROOT_UNSPECIFIED = 0;
+    WORKSPACE_ROOT_USER = 1;
+    WORKSPACE_ROOT_CUSTOM_NODES = 2;
+    WORKSPACE_ROOT_INPUT = 3;
+}
+
+message WorkspaceFileMetadata {
+    WorkspaceRoot root = 1;
+    string relative_path = 2;
+    int64 size_bytes = 3;
+    google.protobuf.Timestamp modified_utc = 4;
+}
+
+// Request sent by a runner agent when (re)registering with Offloadr API.
+message RegisterRunnerRequest {
+	string runner_id = 1;       // Stable unique ID (e.g., UUID) generated client side.
+	string version = 2;         // Runner agent semantic version.
+	RunnerResources resources = 3; // Current resource snapshot.
+    string instance_id = 4;    // Process instance id; changes on runner process restart.
+    string active_session_id = 5; // Authoritative active session currently alive on this runner (empty means none).
+    bool active_session_reported = 6; // True when active_session_id is intentionally reported by the runner.
+    repeated string supported_editor_templates = 7; // Canonical editor templates this runner can execute.
+}
+
+// Response acknowledging registration.
+message RegisterRunnerResponse {
+	bool accepted = 1;          // False if rejected (e.g., incompatible version).
+	string message = 2;         // Optional human-readable reason / guidance.
+	int32 refresh_seconds = 3;  // When to re-register / heartbeat; 0 = default.
+}
+
+// Unary ack request message for start-session.
+message AcknowledgeSessionStartRequest {
+    string session_id = 1;
+    string user = 2;
+    bool ready = 3;
+    string message = 4;
+    uint64 lifecycle_generation = 5;
+    uint64 runtime_epoch = 6;
+    string runtime_instance_id = 7;
+}
+
+message AcknowledgeEditorRuntimeQuiesceRequest {
+    string command_id = 1;
+    string restart_id = 2;
+    string runner_id = 3;
+    string session_id = 4;
+    uint64 lifecycle_generation = 5;
+    uint64 runtime_epoch = 6;
+    string runtime_instance_id = 7;
+    uint32 restart_revision = 8;
+    bool quiesced = 9;
+    string message = 10;
+}
+
+message AcknowledgeEditorRuntimeLaunchRequest {
+    reserved 11, 13;
+
+    string command_id = 1;
+    string restart_id = 2;
+    string runner_id = 3;
+    string session_id = 4;
+    uint64 lifecycle_generation = 5;
+    uint64 runtime_epoch = 6;
+    string runtime_instance_id = 7;
+    uint32 restart_revision = 8;
+    uint32 attempt = 9;
+    bool ready = 10;
+    string message = 12;
+}
+
+// Unary ack request message for stop-session.
+message AcknowledgeSessionStopRequest {
+    string session_id = 1;
+    string user = 2;
+    // Echo of the Stop command's identity fields, unset when the Stop carried none.
+    string command_id = 3;
+    uint64 lifecycle_generation = 4;
+    uint64 runtime_epoch = 5;
+    string runtime_instance_id = 6;
+}
+
+message AcknowledgePromptResultRequest {
+    string runner_id = 1;
+    string session_id = 2;
+    string submission_id = 3;
+    string command_id = 4;
+    offloadr.common.v1.PromptExecutionTarget target = 5;
+    offloadr.common.v1.PromptInvocationResult result = 6;
+}
+
+message GrantPromptExecutionRequest {
+    string runner_id = 1;
+    string session_id = 2;
+    string submission_id = 3;
+    string command_id = 4;
+    offloadr.common.v1.PromptExecutionTarget target = 5;
+}
+
+message GrantPromptExecutionResponse {
+    // True only for the first committed grant. Even an exact retry after a
+    // lost response is recovery-only and must not invoke the native runtime.
+    bool may_execute = 1;
+    offloadr.common.v1.PromptSubmissionSnapshot submission = 2;
+}
+
+message ReportPromptEvidenceRequest {
+    string runner_id = 1;
+    string session_id = 2;
+    string submission_id = 3;
+    string command_id = 4;
+    offloadr.common.v1.PromptExecutionTarget target = 5;
+    offloadr.common.v1.PromptExecutionEvidence evidence = 6;
+}
+
+message ReportPromptEvidenceResponse {}
+
+message SetGpuPowerLimitCommand {
+    string command_id = 1;
+    string session_id = 2;
+    double target_watts = 3;
+    offloadr.common.v1.GpuControlTarget target = 4;
+}
+
+message GrantGpuPowerExecutionRequest {
+    string command_id = 1;
+    string runner_id = 2;
+    string session_id = 3;
+    offloadr.common.v1.GpuControlTarget target = 4;
+}
+
+message GrantGpuPowerExecutionResponse {
+    // An exact retry cannot grant another execution after response loss.
+    bool may_execute = 1;
+}
+
+message AcknowledgeGpuPowerLimitRequest {
+    string command_id = 1;
+    string runner_id = 2;
+    string session_id = 3;
+    offloadr.common.v1.GpuPowerOutcome outcome = 4;
+    string message = 5;
+    double requested_watts = 6;
+    double applied_watts = 7;
+    offloadr.runner.v1.RunnerRuntimeTelemetrySnapshot telemetry = 8;
+    offloadr.common.v1.GpuControlTarget target = 9;
+}
+
+enum SessionStreamFrameType {
+    SESSION_STREAM_FRAME_TYPE_UNSPECIFIED = 0;
+    SESSION_STREAM_FRAME_TYPE_TEXT = 1;
+    SESSION_STREAM_FRAME_TYPE_BINARY = 2;
+}
+
+message SessionStreamEvent {
+    string runner_id = 1;
+    string session_id = 2;
+    string editor_sid = 3;
+    string client_id = 4;
+    string submission_id = 5;
+    string prompt_id = 6;
+    string event_type = 7;
+    SessionStreamFrameType frame_type = 8;
+    bytes payload = 9;
+    google.protobuf.Timestamp created_utc = 10;
+    uint64 lifecycle_generation = 11;
+    uint64 runtime_epoch = 12;
+    string runtime_instance_id = 13;
+}
+
+message ReportSessionEventsRequest {
+    repeated SessionStreamEvent events = 1;
+}
+
+message ReportSessionEventsResponse {}
+
+enum SessionProcessLogStream {
+    SESSION_PROCESS_LOG_STREAM_UNSPECIFIED = 0;
+    SESSION_PROCESS_LOG_STREAM_STDOUT = 1;
+    SESSION_PROCESS_LOG_STREAM_STDERR = 2;
+}
+
+message SessionProcessLogEntry {
+    string runner_id = 1;
+    string session_id = 2;
+    SessionProcessLogStream stream = 3;
+    string message = 4;
+    google.protobuf.Timestamp created_utc = 5;
+    uint64 sequence = 6;
+    uint64 lifecycle_generation = 7;
+    uint64 runtime_epoch = 8;
+    string runtime_instance_id = 9;
+}
+
+message ReportSessionLogsRequest {
+    repeated SessionProcessLogEntry entries = 1;
+}
+
+message ReportSessionLogsResponse {}
+
+message RunnerLogEntry {
+    string runner_id = 1;
+    string category = 2;
+    string message = 3;
+    google.protobuf.Timestamp created_utc = 4;
+    uint64 sequence = 5;
+}
+
+message ReportRunnerLogsRequest {
+    repeated RunnerLogEntry entries = 1;
+}
+
+message ReportRunnerLogsResponse {}
+
+message SessionRuntimeTelemetryEntry {
+    string runner_id = 1;
+    string session_id = 2;
+    offloadr.runner.v1.RunnerRuntimeTelemetrySnapshot telemetry = 3;
+    uint64 lifecycle_generation = 4;
+    uint64 runtime_epoch = 5;
+    string runtime_instance_id = 6;
+}
+
+message ReportRuntimeTelemetryRequest {
+    repeated SessionRuntimeTelemetryEntry entries = 1;
+}
+
+message ReportRuntimeTelemetryResponse {}
+
+message CommandStreamKeepAlive {}
+
+message CommandStreamRequest {
+    string runner_id = 1;
+    string version = 2;
+    string instance_id = 3;
+}
+
+message CommandStreamResponse {
+    oneof payload {
+        StartSessionCommand start_session = 1;
+        StopSessionCommand stop_session = 2;
+        SubmitPromptCommand submit_prompt = 3;
+        CommandStreamKeepAlive keepalive = 4;
+        SetGpuPowerLimitCommand set_gpu_power_limit = 5;
+        RelayEditorRuntimeRequestCommand relay_editor_runtime_request = 6;
+        QuiesceEditorRuntimeCommand quiesce_editor_runtime = 7;
+        LaunchEditorRuntimeCommand launch_editor_runtime = 8;
+    }
+}
+
+message AcknowledgeSessionStartResponse {}
+message AcknowledgeSessionStopResponse {}
+message AcknowledgePromptResultResponse {}
+message AcknowledgeGpuPowerLimitResponse {}
+message AcknowledgeEditorRuntimeRequestResponse {}
+message AcknowledgeEditorRuntimeQuiesceResponse {}
+message AcknowledgeEditorRuntimeLaunchResponse {}
+
+message RunnerArtifactServiceListArtifactsRequest {
+    string editor_sid = 1;
+    string type = 2;
+    string subfolder = 3;
+}
+
+message RunnerArtifactServiceListArtifactsResponse {
+    repeated offloadr.editor_runtime.v1.EditorArtifactMetadata artifacts = 1;
+}
+
+message RunnerArtifactServiceGetDownloadUrlRequest {
+    string editor_sid = 1;
+    string filename = 2;
+    string type = 3;
+    string subfolder = 4;
+}
+
+message RunnerArtifactServiceGetDownloadUrlResponse {
+    string url = 1;
+    google.protobuf.StringValue content_type = 2;
+    google.protobuf.Int64Value size_bytes = 3;
+    google.protobuf.StringValue sha256 = 4;
+    google.protobuf.Timestamp created_utc = 5;
+}
+
+message RunnerReadStreamMetadata {
+    google.protobuf.StringValue content_type = 1;
+    google.protobuf.Int64Value size_bytes = 2;
+    google.protobuf.StringValue sha256 = 3;
+    google.protobuf.Timestamp modified_utc = 4;
+}
+
+message RunnerArtifactServiceReadArtifactRequest {
+    string editor_sid = 1;
+    string filename = 2;
+    string type = 3;
+    string subfolder = 4;
+}
+
+message RunnerArtifactServiceReadArtifactResponse {
+    oneof payload {
+        RunnerReadStreamMetadata metadata = 1;
+        bytes chunk = 2;
+    }
+}
+
+message RunnerArtifactUploadMetadata {
+    string editor_sid = 1;
+    google.protobuf.StringValue prompt_id = 2;
+    string filename = 3;
+    string type = 4;
+    string subfolder = 5;
+    google.protobuf.StringValue content_type = 6;
+    google.protobuf.Int64Value size_bytes = 7;
+    google.protobuf.StringValue sha256 = 8;
+    google.protobuf.StringValue owner = 9;
+    google.protobuf.StringValue session_id = 10;
+    uint64 lifecycle_generation = 11;
+    uint64 runtime_epoch = 12;
+    string runtime_instance_id = 13;
+    string runner_id = 14;
+}
+
+message RunnerArtifactServiceUploadArtifactRequest {
+    oneof payload {
+        RunnerArtifactUploadMetadata metadata = 1;
+        bytes chunk = 2;
+    }
+}
+
+message RunnerArtifactServiceUploadArtifactResponse {
+    bool success = 1;
+    string message = 2;
+    offloadr.editor_runtime.v1.EditorArtifactMetadata artifact = 3;
+}
+
+message RunnerArtifactServiceRegisterMetadataRequest {
+    RunnerArtifactUploadMetadata metadata = 1;
+}
+
+message RunnerArtifactServiceRegisterMetadataResponse {
+    offloadr.editor_runtime.v1.EditorArtifactMetadata artifact = 1;
+}
+
+message RunnerWorkspaceServiceReadWorkspaceFileRequest {
+    string editor_sid = 1;
+    WorkspaceRoot root = 2;
+    string relative_path = 3;
+}
+
+message RunnerWorkspaceServiceReadWorkspaceFileResponse {
+    oneof payload {
+        RunnerReadStreamMetadata metadata = 1;
+        bytes chunk = 2;
+    }
+}
+
+message RunnerWorkspaceServiceGetDownloadUrlRequest {
+    string editor_sid = 1;
+    WorkspaceRoot root = 2;
+    string relative_path = 3;
+}
+
+message RunnerWorkspaceServiceGetDownloadUrlResponse {
+    string url = 1;
+    google.protobuf.Int64Value size_bytes = 2;
+    google.protobuf.Timestamp modified_utc = 3;
+}
+
+message RunnerWorkspaceServiceReadWorkspaceSeedArchiveRequest {
+    string editor_sid = 1;
+    WorkspaceRoot root = 2;
+}
+
+message RunnerWorkspaceServiceReadWorkspaceSeedArchiveResponse {
+    oneof payload {
+        RunnerReadStreamMetadata metadata = 1;
+        bytes chunk = 2;
+    }
+}
+
+message RunnerWorkspaceServiceGetSeedArchiveUrlRequest {
+    string editor_sid = 1;
+    WorkspaceRoot root = 2;
+}
+
+message RunnerWorkspaceServiceGetSeedArchiveUrlResponse {
+    string url = 1;
+}
+
+// Offloadr API service exposed to runner agents.
+service RunnerControlService {
+    rpc RegisterRunner(RegisterRunnerRequest) returns (RegisterRunnerResponse);
+    rpc CommandStream(CommandStreamRequest) returns (stream CommandStreamResponse);
+    rpc AcknowledgeSessionStart(AcknowledgeSessionStartRequest) returns (AcknowledgeSessionStartResponse);
+    rpc AcknowledgeSessionStop(AcknowledgeSessionStopRequest) returns (AcknowledgeSessionStopResponse);
+    rpc AcknowledgePromptResult(AcknowledgePromptResultRequest) returns (AcknowledgePromptResultResponse);
+    rpc GrantPromptExecution(GrantPromptExecutionRequest) returns (GrantPromptExecutionResponse);
+    rpc ReportPromptEvidence(ReportPromptEvidenceRequest) returns (ReportPromptEvidenceResponse);
+    rpc AcknowledgeGpuPowerLimit(AcknowledgeGpuPowerLimitRequest) returns (AcknowledgeGpuPowerLimitResponse);
+    rpc GrantGpuPowerExecution(GrantGpuPowerExecutionRequest) returns (GrantGpuPowerExecutionResponse);
+    rpc AcknowledgeEditorRuntimeRequest(AcknowledgeEditorRuntimeRequestRequest) returns (AcknowledgeEditorRuntimeRequestResponse);
+    rpc AcknowledgeEditorRuntimeQuiesce(AcknowledgeEditorRuntimeQuiesceRequest) returns (AcknowledgeEditorRuntimeQuiesceResponse);
+    rpc AcknowledgeEditorRuntimeLaunch(AcknowledgeEditorRuntimeLaunchRequest) returns (AcknowledgeEditorRuntimeLaunchResponse);
+    rpc ReportModelDownload(ReportModelDownloadRequest) returns (ReportModelDownloadResponse);
+    rpc SyncLocalModels(SyncLocalModelsRequest) returns (SyncLocalModelsResponse);
+    rpc ReportSessionEvents(ReportSessionEventsRequest) returns (ReportSessionEventsResponse);
+    rpc ReportSessionLogs(ReportSessionLogsRequest) returns (ReportSessionLogsResponse);
+    rpc ReportRunnerLogs(ReportRunnerLogsRequest) returns (ReportRunnerLogsResponse);
+    rpc ReportRuntimeTelemetry(ReportRuntimeTelemetryRequest) returns (ReportRuntimeTelemetryResponse);
+    rpc ReportEditorRuntimeBridgeState(ReportEditorRuntimeBridgeStateRequest) returns (ReportEditorRuntimeBridgeStateResponse);
+}
+
+// Runner-scoped artifact APIs authenticated via runner secret.
+service RunnerArtifactService {
+    rpc ListArtifacts(RunnerArtifactServiceListArtifactsRequest) returns (RunnerArtifactServiceListArtifactsResponse);
+    rpc ReadArtifact(RunnerArtifactServiceReadArtifactRequest) returns (stream RunnerArtifactServiceReadArtifactResponse);
+    rpc UploadArtifact(stream RunnerArtifactServiceUploadArtifactRequest) returns (RunnerArtifactServiceUploadArtifactResponse);
+    rpc RegisterMetadata(RunnerArtifactServiceRegisterMetadataRequest) returns (RunnerArtifactServiceRegisterMetadataResponse);
+}
+
+service RunnerWorkspaceService {
+    rpc ReadWorkspaceFile(RunnerWorkspaceServiceReadWorkspaceFileRequest) returns (stream RunnerWorkspaceServiceReadWorkspaceFileResponse);
+    rpc ReadWorkspaceSeedArchive(RunnerWorkspaceServiceReadWorkspaceSeedArchiveRequest) returns (stream RunnerWorkspaceServiceReadWorkspaceSeedArchiveResponse);
+}

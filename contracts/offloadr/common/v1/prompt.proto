@@ -1,0 +1,167 @@
+syntax = "proto3";
+
+package offloadr.common.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// Captured editor work submission originating from the editor.
+// Persisted via editor-runtime-proxy and consumed by Offloadr API before
+// dispatching work to a runner.
+message PromptSubmission {
+  string submission_id = 1;              // Required immutable operation UUID, created before sending.
+  string editor_sid = 2;                 // Editor session identifier (matches EditorProxyInfo.id).
+  string owner = 3;                      // Owning user principal.
+  string prompt_json = 4;                // Accepted normalized body, retained unchanged on duplicate intent.
+  google.protobuf.Timestamp captured_utc = 5; // Capture time in UTC.
+  string runtime_kind = 6;               // Editor runtime kind, e.g. comfyui or forge-neo.
+  string http_method = 7;                // Original HTTP method for generic editor actions.
+  string http_path = 8;                  // Original editor-relative request path.
+  string http_query = 9;                 // Original query string, without leading '?'.
+  string content_type = 10;              // Original request content type, when known.
+  repeated PromptHttpRequest preflight_requests = 11; // Lightweight editor state requests to replay before the submission.
+  repeated PromptArtifactReference artifact_references = 12; // Prompt-local placeholders backed by editor artifacts.
+  PromptExecutionTarget expected_target = 13;
+  PromptHttpRequest original_request = 14; // Immutable intent, before derived preflight/input normalization.
+  PromptNativeIdentifiers native_identifiers = 15;
+}
+
+// Captured before asynchronous preparation. All generations/epochs are positive.
+// The server compares these values with authenticated, durable ownership; they
+// are preconditions and never grant authorization.
+message PromptExecutionTarget {
+  string editor_lifecycle_id = 1;
+  uint64 editor_generation = 2;
+  uint64 cpu_runtime_generation = 3;
+  string cpu_runtime_instance_id = 4;
+  string gpu_lifecycle_id = 5;
+  uint64 gpu_generation = 6;
+  string allocation_id = 7;
+  uint64 runtime_epoch = 8;
+  string runtime_instance_id = 9;
+  string runner_id = 10;
+  string runner_session_id = 11;
+}
+
+message PromptNativeIdentifiers {
+  string prompt_id = 1;
+  string task_id = 2;
+  string event_id = 3;
+  string session_hash = 4;
+}
+
+message PromptNativeResponse {
+  int32 status_code = 1;
+  bytes body = 2;
+  string content_type = 3;
+}
+
+enum PromptInvocationOutcome {
+  PROMPT_INVOCATION_OUTCOME_UNSPECIFIED = 0;
+  PROMPT_INVOCATION_OUTCOME_NATIVE_RESPONSE = 1;
+  PROMPT_INVOCATION_OUTCOME_NOT_EXECUTED = 2;
+  PROMPT_INVOCATION_OUTCOME_UNKNOWN = 3;
+}
+
+// The original invocation result. Exact acknowledgement retries retain this
+// entire value; later read-only evidence does not manufacture a native response.
+message PromptInvocationResult {
+  PromptInvocationOutcome outcome = 1;
+  PromptNativeResponse native_response = 2;
+  string diagnostic_code = 3;
+  string message = 4;
+}
+
+enum PromptExecutionStatus {
+  PROMPT_EXECUTION_STATUS_UNSPECIFIED = 0;
+  PROMPT_EXECUTION_STATUS_NOT_STARTED = 1;
+  PROMPT_EXECUTION_STATUS_UNKNOWN = 2;
+  PROMPT_EXECUTION_STATUS_QUEUED = 3;
+  PROMPT_EXECUTION_STATUS_RUNNING = 4;
+  PROMPT_EXECUTION_STATUS_SUCCEEDED = 5;
+  PROMPT_EXECUTION_STATUS_FAILED = 6;
+  PROMPT_EXECUTION_STATUS_INTERRUPTED = 7;
+  PROMPT_EXECUTION_STATUS_FINISHED_UNKNOWN = 8;
+  PROMPT_EXECUTION_STATUS_NOT_EXECUTED = 9;
+  PROMPT_EXECUTION_STATUS_NOT_APPLICABLE = 10; // Native observation requests, not generation.
+}
+
+enum PromptEvidenceKind {
+  PROMPT_EVIDENCE_KIND_UNSPECIFIED = 0;
+  PROMPT_EVIDENCE_KIND_COMFY_QUEUE = 1;
+  PROMPT_EVIDENCE_KIND_COMFY_HISTORY = 2;
+  PROMPT_EVIDENCE_KIND_COMFY_EVENT = 3;
+  PROMPT_EVIDENCE_KIND_FORGE_PROGRESS = 4;
+  PROMPT_EVIDENCE_KIND_FORGE_TERMINAL_EVENT = 5;
+}
+
+message PromptExecutionEvidence {
+  PromptEvidenceKind kind = 1;
+  PromptNativeIdentifiers native_identifiers = 2;
+  bytes native_payload = 3;
+  google.protobuf.Timestamp observed_utc = 4;
+}
+
+enum PromptArtifactPublication {
+  PROMPT_ARTIFACT_PUBLICATION_UNSPECIFIED = 0;
+  PROMPT_ARTIFACT_PUBLICATION_UNKNOWN = 1;
+  PROMPT_ARTIFACT_PUBLICATION_PENDING = 2;
+  PROMPT_ARTIFACT_PUBLICATION_COMMITTED = 3;
+}
+
+// Offloadr acceptance, native invocation and generation/artifact evidence are
+// separate facts. This owner-authenticated receipt survives login replacement
+// and runtime teardown. It omits stored request bodies and credentials; an actual
+// native response or terminal evidence may contain the owner's input/output data.
+message PromptSubmissionSnapshot {
+  string submission_id = 1;
+  string editor_sid = 2;
+  PromptExecutionTarget target = 3;
+  uint64 version = 4;
+  google.protobuf.Timestamp accepted_utc = 5;
+  google.protobuf.Timestamp execution_permission_utc = 6;
+  PromptInvocationResult invocation_result = 7;
+  PromptNativeIdentifiers native_identifiers = 8;
+  PromptExecutionStatus execution_status = 9;
+  PromptArtifactPublication artifact_publication = 10;
+  // Only the newest terminal native fact; all evidence remains in durable storage.
+  PromptExecutionEvidence latest_terminal_evidence = 11;
+  google.protobuf.Timestamp last_observed_utc = 12;
+  bool recovery_unknown = 13;
+  string diagnostic_code = 14;
+  string message = 15;
+  // Newest terminal native progress, selected by kind: a completed progress
+  // payload stays readable even when latest_terminal_evidence is an SSE frame.
+  PromptExecutionEvidence latest_terminal_progress = 16;
+}
+
+// Bounded discovery record. Read GetPromptSubmission for the original native
+// response and newest terminal payload; listing never multiplies large bodies.
+message PromptSubmissionSummary {
+  string submission_id = 1;
+  string editor_sid = 2;
+  PromptExecutionTarget target = 3;
+  uint64 version = 4;
+  google.protobuf.Timestamp accepted_utc = 5;
+  google.protobuf.Timestamp execution_permission_utc = 6;
+  PromptNativeIdentifiers native_identifiers = 7;
+  PromptExecutionStatus execution_status = 8;
+  PromptArtifactPublication artifact_publication = 9;
+  google.protobuf.Timestamp last_observed_utc = 10;
+  bool recovery_unknown = 11;
+  string diagnostic_code = 12;
+}
+
+message PromptHttpRequest {
+  string method = 1;
+  string path = 2;
+  string query = 3;
+  string body = 4;
+  string content_type = 5;
+}
+
+message PromptArtifactReference {
+  string placeholder = 1;
+  string filename = 2;
+  string type = 3;
+  string subfolder = 4;
+}

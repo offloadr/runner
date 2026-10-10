@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package offloadr.common.v1;
+
+// Account ownership is authenticated independently; these fields fence the target.
+message GpuControlTarget {
+  string editor_lifecycle_id = 1;
+  uint64 editor_generation = 2;
+  string lifecycle_id = 3;
+  string allocation_id = 4;
+  uint64 generation = 5;
+}
+
+enum GpuPowerOutcome {
+  GPU_POWER_OUTCOME_UNSPECIFIED = 0;
+  GPU_POWER_OUTCOME_PENDING = 1;
+  GPU_POWER_OUTCOME_APPLIED = 2;
+  GPU_POWER_OUTCOME_REJECTED = 3;
+  GPU_POWER_OUTCOME_UNKNOWN = 4;
+}

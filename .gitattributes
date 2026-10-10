@@ -1,0 +1,5 @@
+# LF everywhere: tests embed shell scripts in C# raw strings, and the runner image is built from this tree.
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.png binary
+*.ico binary

@@ -1,0 +1,68 @@
+syntax = "proto3";
+
+package offloadr.common.v1;
+
+import "google/protobuf/timestamp.proto"; // for ModelInfo timestamps
+
+// Category / type of model artifact (aligned with common ComfyUI folder groupings).
+// Shared across services so DB/proto alignment stays consistent.
+enum ModelCategory {
+  MODEL_CATEGORY_UNSPECIFIED = 0;
+  MODEL_CATEGORY_DIFFUSION_MODEL = 1; // main diffusion / checkpoint / base model
+  MODEL_CATEGORY_VAE = 2;             // VAE model
+  MODEL_CATEGORY_CLIP = 3;            // CLIP text/image encoder
+  MODEL_CATEGORY_TEXT_ENCODER = 4;    // Other text encoder (e.g., T5)
+  MODEL_CATEGORY_LORA = 5;            // LoRA / adapter
+  MODEL_CATEGORY_CONTROLNET = 6;      // ControlNet / conditioning network
+  MODEL_CATEGORY_UPSCALER = 7;        // ESRGAN / REAL-ESRGAN / upscalers
+  MODEL_CATEGORY_EMBEDDING = 8;       // Textual inversion / embeddings
+  MODEL_CATEGORY_OTHER = 9;           // Anything else / unknown
+  MODEL_CATEGORY_CHECKPOINT = 10;     // Checkpoint file (legacy, contains multiple models)
+  MODEL_CATEGORY_LATENT_UPSCALER = 11; // Latent-space upscaler models
+  MODEL_CATEGORY_AUDIO_ENCODER = 12;   // Audio encoder models
+  MODEL_CATEGORY_CLIP_VISION = 13;     // CLIP vision encoder models
+  MODEL_CATEGORY_STYLE_MODEL = 14;     // Style model weights
+  MODEL_CATEGORY_VAE_APPROX = 15;      // Approximate VAE preview models
+  MODEL_CATEGORY_GLIGEN = 16;          // GLIGEN grounding models
+  MODEL_CATEGORY_HYPERNETWORK = 17;    // Legacy hypernetwork models
+  MODEL_CATEGORY_PHOTOMAKER = 18;      // PhotoMaker model weights
+  MODEL_CATEGORY_CLASSIFIER = 19;      // Classifier model files
+  MODEL_CATEGORY_MODEL_PATCH = 20;     // Model patch weights
+  MODEL_CATEGORY_CONFIG = 21;          // Model YAML configs
+  MODEL_CATEGORY_BACKGROUND_REMOVAL = 22; // Background removal models
+  MODEL_CATEGORY_FRAME_INTERPOLATION = 23; // Video frame interpolation models
+  MODEL_CATEGORY_GEOMETRY_ESTIMATION = 24; // Depth/normal/geometry estimation models
+  MODEL_CATEGORY_OPTICAL_FLOW = 25;    // Optical flow models
+  MODEL_CATEGORY_DETECTION = 26;       // Detection models
+}
+
+// Status of a model in the cache / catalog.
+enum ModelStatus {
+  MODEL_STATUS_UNSPECIFIED = 0;
+  MODEL_STATUS_FETCHING = 1;     // Still downloading / verifying.
+  MODEL_STATUS_AVAILABLE = 2;    // Ready for use.
+  MODEL_STATUS_ERROR = 3;        // Failed during last attempt; may be retried.
+}
+
+// Source/origin of a model entry.
+enum ModelOrigin {
+  MODEL_ORIGIN_UNSPECIFIED = 0;
+  MODEL_ORIGIN_CATALOG = 1;       // User/catalog-backed model from persisted metadata.
+  MODEL_ORIGIN_LOCAL_RUNNER = 2;  // Ephemeral model discovered from a local runner filesystem.
+}
+
+// Canonical model metadata shared across services / APIs.
+message ModelInfo {
+  string model_id = 1;                 // Canonical identifier (e.g., GUID / content hash UUID).
+  string filename = 2;                 // Original filename (derived from URL / upload name).
+  int64 size_bytes = 3;                // Total size in bytes. Catalog-backed models require a positive value.
+  ModelStatus status = 4;              // Current availability status.
+  google.protobuf.Timestamp added_utc = 5;     // When first added/seen.
+  google.protobuf.Timestamp last_used_utc = 6; // When last referenced (optional).
+  ModelCategory category = 7;          // Detected or user-supplied category.
+  string local_path = 8;               // Calculated depending on the editor in use
+  ModelOrigin origin = 9;              // Catalog vs local-runner provenance.
+  string origin_runner_id = 10;        // Runner UUID when origin=LOCAL_RUNNER.
+  bool available_on_selected_runner = 11; // True when the selected personal runner already has a matching local copy.
+  string source_url = 12;              // External/original source URL for the model when known.
+}

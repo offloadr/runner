@@ -1,0 +1,58 @@
+syntax = "proto3";
+
+package offloadr.common.v1;
+
+enum BillingUnit {
+  BILLING_UNIT_UNSPECIFIED = 0;
+  BILLING_UNIT_SECOND = 1;
+  BILLING_UNIT_MINUTE = 2;
+  BILLING_UNIT_HOUR = 3;
+}
+
+message BillingRate {
+  int64 unit_price_micros = 1;
+  BillingUnit billing_unit = 2;
+  string currency_code = 3;
+}
+
+// Shared GPU-related types used across services.
+enum GpuType {
+  GPU_TYPE_UNSPECIFIED = 0;
+  // Consumer / GeForce
+  GPU_TYPE_NVIDIA_RTX_5060_TI_16 = 1;
+  GPU_TYPE_NVIDIA_RTX_5070_TI_16 = 2;
+  GPU_TYPE_NVIDIA_RTX_3090 = 3;
+  GPU_TYPE_NVIDIA_RTX_3090_TI = 4;
+  GPU_TYPE_NVIDIA_RTX_4080 = 5;
+  GPU_TYPE_NVIDIA_RTX_4080_SUPER = 6;
+  GPU_TYPE_NVIDIA_RTX_4090 = 7;
+  GPU_TYPE_NVIDIA_RTX_5080 = 8;
+  GPU_TYPE_NVIDIA_RTX_5090 = 9;
+
+  // Workstation / pro visualization
+  GPU_TYPE_NVIDIA_RTX_A4000 = 29;
+  GPU_TYPE_NVIDIA_RTX_A5000 = 30;
+  GPU_TYPE_NVIDIA_RTX_A6000 = 31;
+  GPU_TYPE_NVIDIA_RTX_6000_ADA = 32;
+  GPU_TYPE_NVIDIA_RTX_PRO_6000_BLACKWELL_96 = 33;
+
+  // Datacenter / accelerator
+  GPU_TYPE_NVIDIA_A40 = 50;
+  GPU_TYPE_NVIDIA_L4 = 51;
+  GPU_TYPE_NVIDIA_L40 = 52;
+  GPU_TYPE_NVIDIA_L40S = 53;
+  GPU_TYPE_NVIDIA_A100_PCIE_40 = 54;
+  GPU_TYPE_NVIDIA_A100_PCIE_80 = 55;
+  GPU_TYPE_NVIDIA_A100_SXM_40 = 56;
+  GPU_TYPE_NVIDIA_A100_SXM_80 = 57;
+  GPU_TYPE_NVIDIA_H100_PCIE_80 = 58;
+  GPU_TYPE_NVIDIA_H100_SXM_80 = 59;
+  GPU_TYPE_NVIDIA_H100_NVL = 60;
+  GPU_TYPE_NVIDIA_H200 = 61;
+  GPU_TYPE_NVIDIA_B200 = 62;
+
+  // Fallbacks
+  GPU_TYPE_NVIDIA_OTHER = 100; // Fallback for any other NVIDIA GPU.
+  GPU_TYPE_AMD_OTHER = 101;    // Placeholder for future AMD support.
+  GPU_TYPE_UNKNOWN = 199;      // Unknown / not detectable.
+}

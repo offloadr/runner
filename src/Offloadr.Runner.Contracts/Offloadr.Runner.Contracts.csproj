@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- C# for the runner protocol is generated at build time from ../../contracts by Grpc.Tools. -->
+  <ItemGroup>
+    <Protobuf Include="../../contracts/offloadr/**/*.proto" ProtoRoot="../../contracts" GrpcServices="Both" Access="Public" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Google.Protobuf" />
+    <PackageReference Include="Grpc.Core.Api" />
+    <PackageReference Include="Grpc.Tools" PrivateAssets="all" />
+  </ItemGroup>
+
+</Project>

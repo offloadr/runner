@@ -1,0 +1,123 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Build and test (Linux)
+    runs-on: ubuntu-latest
+    # Root is required: session isolation tests create and remove Linux users.
+    container: mcr.microsoft.com/dotnet/sdk:10.0
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      RUNNER_NATIVE_TESTS_REQUIRED: "1"
+    steps:
+      - name: Install native prerequisites
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git gcc libc6-dev aria2
+          gcc --version
+          aria2c --version
+
+      - uses: actions/checkout@v7
+
+      - name: Build
+        run: dotnet build runner.slnx -warnaserror
+
+      - name: Check formatting
+        run: dotnet format runner.slnx --verify-no-changes --no-restore
+
+      - name: Unit and native tests
+        run: dotnet test runner.slnx --no-build --filter "TestCategory!=RealAria2"
+
+      # Real aria2 transfers run one at a time with a hang guard.
+      - name: Real aria2 deterministic transfer
+        run: >-
+          dotnet test tests/Offloadr.Runner.Tests --no-build
+          --filter "FullyQualifiedName=Offloadr.Runner.Tests.Aria2ModelTransferBackendLinuxTests.RealAria2_PausedDeterministicTransfer_WithMetalink_ReplacesUriAndCompletes"
+          --blame-hang --blame-hang-timeout 90s
+          -- RunConfiguration.TreatNoTestsAsError=true
+
+      - name: Real aria2 native shim
+        run: >-
+          dotnet test tests/Offloadr.Runner.Tests --no-build
+          --filter "FullyQualifiedName=Offloadr.Runner.Tests.Aria2ModelTransferBackendLinuxTests.RealAria2_NativeShim_PausedOpenGatesPiecesAndMmapWaitsForCompletion"
+          --blame-hang --blame-hang-timeout 90s
+          -- RunConfiguration.TreatNoTestsAsError=true
+
+      - name: Real aria2 restart reattachment
+        run: >-
+          dotnet test tests/Offloadr.Runner.Tests --no-build
+          --filter "FullyQualifiedName=Offloadr.Runner.Tests.Aria2ModelTransferBackendLinuxTests.RealAria2_PartialTransfer_ReattachesAcrossProcessRestartWithoutEpochChange"
+          --blame-hang --blame-hang-timeout 90s
+          -- RunConfiguration.TreatNoTestsAsError=true
+
+  build-windows:
+    name: Build (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+
+      - name: Build
+        run: dotnet build runner.slnx -warnaserror
+
+  contracts:
+    name: Lint contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: buf lint
+        run: npx --yes @bufbuild/buf@1.73.0 lint contracts
+
+  image:
+    name: Image ${{ matrix.target }}
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [comfyui-latest, comfyui-master, forge-neo-neo, forge-neo-latest]
+    env:
+      SOURCE_REVISION: ${{ github.sha }}
+    steps:
+      # The editor base images are around 12 GB; keep BuildKit state on the larger /mnt disk.
+      - name: Put BuildKit state on /mnt
+        run: |
+          sudo mkdir -p /mnt/buildkit-state
+          sudo docker volume create \
+            --driver local \
+            --opt type=none \
+            --opt device=/mnt/buildkit-state \
+            --opt o=bind \
+            buildx_buildkit_ci0_state
+
+      - uses: docker/setup-buildx-action@v4
+        with:
+          name: ci
+
+      - name: Build ${{ matrix.target }}
+        uses: docker/bake-action@v7
+        with:
+          targets: ${{ matrix.target }}
+          push: false

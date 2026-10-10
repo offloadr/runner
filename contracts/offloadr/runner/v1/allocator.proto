@@ -1,0 +1,117 @@
+syntax = "proto3";
+
+package offloadr.runner.v1;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/wrappers.proto";
+import "offloadr/common/v1/gpus.proto"; // GpuType
+
+// Job pushed by Offloadr API to request a GPU allocation for an editor.
+message AllocationJob {
+  string allocation_id = 1;                    // Unique job id
+  string editor_id = 2;                        // Editor session id
+  string owner = 3;                            // Username/owner
+  offloadr.common.v1.GpuType gpu_type = 4;// Requested hosted GPU type (optional if UNSPECIFIED)
+  google.protobuf.Timestamp created_utc = 5;   // Creation time
+  string runner_id = 6;                        // Requested personal runner id (UUID).
+  string offer_id = 7;                         // Offer id selected by the caller.
+  offloadr.common.v1.BillingRate billing_rate = 8;
+  string addon_lookup_key = 9;
+  string price_lookup_key = 10;
+  string runner_image = 11;                    // Matched runner image for hosted compute.
+  string editor_template = 12;                 // Matched editor template for this GPU session.
+  string editor_runtime_kind = 13;             // Runtime kind this GPU session can serve.
+}
+
+// Fine-grained provisioning steps with optional progress metrics.
+message ProvisioningStep {
+  enum Type {
+    TYPE_UNSPECIFIED = 0;
+      TYPE_ALLOCATOR_PICKED_UP = 1;         // Allocator worker popped the job
+      TYPE_INSTANCE_RESERVED = 2;           // Capacity/reservation acquired
+      TYPE_INSTANCE_PROVISIONED = 3;        // Base image pulled / ready
+      TYPE_INSTANCE_STARTED = 4;            // Runtime started / agent reachable
+      TYPE_MODEL_INSTALLATION_STARTED = 5;  // Model(s) download/install began
+      TYPE_MODELS_DONE = 6;                 // All models ready
+      TYPE_READY = 7;                       // Final ready signal
+  }
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    STATE_PENDING = 1;
+    STATE_IN_PROGRESS = 2;
+    STATE_DONE = 3;
+    STATE_ERROR = 4;
+  }
+  Type type = 1;
+  State state = 2;
+  string message = 3;                         // Optional human message
+  double percent = 4;                         // 0-100 if applicable
+  uint64 bytes_downloaded = 5;                // Optional live bytes
+  uint64 total_bytes = 6;                     // Optional total size
+  google.protobuf.Timestamp updated_utc = 7;  // Last update
+}
+
+enum ModelDownloadActivityState {
+  MODEL_DOWNLOAD_ACTIVITY_STATE_UNSPECIFIED = 0;
+  MODEL_DOWNLOAD_ACTIVITY_STATE_IN_PROGRESS = 1;
+  MODEL_DOWNLOAD_ACTIVITY_STATE_COMPLETE = 2;
+  MODEL_DOWNLOAD_ACTIVITY_STATE_FAILED = 3;
+  MODEL_DOWNLOAD_ACTIVITY_STATE_RETRYING = 4;
+}
+
+message ModelDownloadActivity {
+  string model_id = 1;
+  string filename = 2;
+  string destination_path = 3;
+  ModelDownloadActivityState state = 4;
+  string message = 5;
+  uint64 bytes_downloaded = 6;
+  uint64 total_bytes = 7;
+  double percent = 8;
+  google.protobuf.Timestamp updated_utc = 9;
+  uint64 bytes_per_second = 10;
+  uint64 average_bytes_per_second = 11;
+}
+
+message RunnerRuntimeTelemetrySnapshot {
+  google.protobuf.UInt32Value utilization_percent = 1;
+  google.protobuf.UInt64Value vram_used_bytes = 2;
+  google.protobuf.UInt64Value vram_total_bytes = 3;
+  google.protobuf.UInt32Value temperature_celsius = 4;
+  google.protobuf.Timestamp sampled_utc = 5;
+  google.protobuf.UInt32Value fan_percent = 6;
+  google.protobuf.DoubleValue power_usage_watts = 7;
+  google.protobuf.DoubleValue power_limit_watts = 8;
+  google.protobuf.DoubleValue power_min_limit_watts = 9;
+  google.protobuf.DoubleValue power_default_limit_watts = 10;
+  google.protobuf.DoubleValue power_max_limit_watts = 11;
+  google.protobuf.UInt64Value system_ram_used_bytes = 12;
+  google.protobuf.UInt64Value system_ram_total_bytes = 13;
+  google.protobuf.UInt64Value model_disk_available_bytes = 14;
+  google.protobuf.UInt64Value model_disk_total_bytes = 15;
+  string model_disk_path = 16;
+}
+
+// Status snapshot written back by allocator as the job progresses.
+message AllocationStatusRecord {
+  string allocation_id = 1;                       // Job id
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    STATUS_PENDING = 1;
+    STATUS_PROVISIONING = 2;
+    STATUS_RUNNING = 3;
+    STATUS_ERROR = 4;
+  }
+  Status status = 2;                               // Current status
+  string message = 3;                               // Optional human message
+  offloadr.common.v1.GpuType gpu_type = 4;     // Resolved type
+  uint64 vram_bytes = 5;                            // Resolved VRAM
+  offloadr.common.v1.BillingRate billing_rate = 6; // Billing rate
+  google.protobuf.Timestamp updated_utc = 7;        // Last update
+  repeated ProvisioningStep steps = 8;              // Detailed lifecycle
+  string offer_id = 9;                              // Offer id selected by the caller.
+  string addon_lookup_key = 10;
+  string price_lookup_key = 11;
+  repeated ModelDownloadActivity model_downloads = 12;
+  RunnerRuntimeTelemetrySnapshot runtime_telemetry = 13;
+}
