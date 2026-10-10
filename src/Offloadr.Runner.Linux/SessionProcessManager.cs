@@ -59,6 +59,12 @@ internal sealed partial class SessionProcessManager : IDisposable
 
     internal Func<string, RuntimeIdentity, int?, CancellationToken, Task>? UnexpectedSessionExitCleanup { get; set; }
 
+    internal int? TryGetTrackedProcessId(string sessionId)
+        => _sessions.TryGetValue(sessionId, out var context) ? context.Process.Id : null;
+
+    /// <summary>How long a start waits for a retired runtime of its session to finish cleanup.</summary>
+    internal static TimeSpan RetiredRuntimeCleanupWait { get; set; } = TimeSpan.FromSeconds(60);
+
     public SessionProcessManager()
         : this(
             SessionProcessOptions.FromEnvironment(),
@@ -154,10 +160,32 @@ internal sealed partial class SessionProcessManager : IDisposable
                 $"This runner runs editor runtime '{_runtimeKind}', not '{requestedRuntimeKind}'.", nameof(command));
         if (_sessions.TryGetValue(sessionId, out var existing))
         {
-            if (existing.RuntimeIdentity != runtimeIdentity || existing.StopInProgress || existing.Process.HasExited)
+            if (existing.StopInProgress || existing.Process.HasExited)
+            {
+                // A retired runtime of this session is still being cleaned up. Wait until it
+                // leaves tracking: failing here would run failed-start cleanup while the old
+                // runtime's own cleanup is still in progress.
+                try
+                {
+                    await existing.Untracked.WaitAsync(RetiredRuntimeCleanupWait, cancellationToken).ConfigureAwait(false);
+                }
+                catch (TimeoutException)
+                {
+                    throw new InvalidOperationException("The session's previous runtime is still being cleaned up.");
+                }
+
+                if (_sessions.ContainsKey(sessionId))
+                    throw new InvalidOperationException("The tracked session is a different or retired runtime.");
+            }
+            else if (existing.RuntimeIdentity != runtimeIdentity)
+            {
                 throw new InvalidOperationException("The tracked session is a different or retired runtime.");
-            LogSessionInfo(sessionId, "Already running at the exact identity; ignoring duplicate start.");
-            return;
+            }
+            else
+            {
+                LogSessionInfo(sessionId, "Already running at the exact identity; ignoring duplicate start.");
+                return;
+            }
         }
 
         // Offloadr API currently schedules a single active session per runner.
@@ -1257,6 +1285,7 @@ internal sealed partial class SessionProcessManager : IDisposable
             finally
             {
                 ((ICollection<KeyValuePair<string, SessionContext>>)_sessions).Remove(new(context.SessionId, context));
+                context.MarkUntracked();
             }
         }
     }
@@ -2931,6 +2960,13 @@ internal sealed partial class SessionProcessManager : IDisposable
         public Process Process { get; }
         public Task<int> ExitTask { get; }
         public bool StopInProgress => Volatile.Read(ref _stopState) != 0;
+
+        /// <summary>Completes once this context has been removed from tracking.</summary>
+        public Task Untracked => _untracked.Task;
+
+        private readonly TaskCompletionSource _untracked = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public void MarkUntracked() => _untracked.TrySetResult();
 
         public bool TryBeginCleanup() => Interlocked.CompareExchange(ref _cleanupState, 1, 0) == 0;
 

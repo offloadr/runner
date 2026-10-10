@@ -266,6 +266,38 @@ public partial class SessionProcessManagerOwnershipTests
     }
 
     [Test]
+    public async Task ReplacementStartWaitsForTheExitedRuntimesCleanup()
+    {
+        await using var fixture = await PromptRuntimeFixture.CreateAsync();
+        var hookEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseHook = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        fixture.Manager.UnexpectedSessionExitCleanup = async (_, _, _, _) =>
+        {
+            hookEntered.TrySetResult();
+            await releaseHook.Task;
+        };
+
+        var pid = fixture.Manager.TryGetTrackedProcessId(fixture.Start.SessionId);
+        Assert.That(pid, Is.Not.Null);
+        System.Diagnostics.Process.GetProcessById(pid!.Value).Kill();
+        await hookEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // The old runtime's exit cleanup is still running when the replacement arrives.
+        var replacement = fixture.Start.Clone();
+        replacement.RuntimeEpoch++;
+        replacement.RuntimeInstanceId = Guid.NewGuid().ToString("n");
+        var start = fixture.Manager.StartSessionAsync(replacement, CancellationToken.None);
+        await Task.Delay(TimeSpan.FromMilliseconds(200));
+        Assert.That(start.IsCompleted, Is.False, "The replacement waits for the exited runtime's cleanup.");
+
+        releaseHook.TrySetResult();
+        await start.WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.That(fixture.Manager.TryGetRuntimeIdentity(replacement.SessionId, out var tracked), Is.True);
+        Assert.That(tracked, Is.EqualTo(new RuntimeIdentity(replacement.LifecycleGeneration, replacement.RuntimeEpoch, replacement.RuntimeInstanceId)));
+    }
+
+    [Test]
     public async Task DuplicateStartMustMatchTheExactTrackedChild()
     {
         await using var fixture = await PromptRuntimeFixture.CreateAsync();
