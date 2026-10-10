@@ -145,7 +145,7 @@ Runtime telemetry notes:
   retargets a command. Lost acknowledgements retry the original result only.
   Ambiguous execution remains unknown. Replacement session activation waits for
   an in-flight physical command (and its native process) to finish, independently
-  of acknowledgement retries. See [GPU control workflows](gpu-control-workflows.md).
+  of acknowledgement retries.
 - Current telemetry includes first-visible-GPU metrics, system RAM, and the filesystem backing `ARIA2_DOWNLOAD_DIR` (default `/models`).
 - The runner now keeps multiple persistent native gRPC channels:
   - one status lane for explicit `RegisterRunner` heartbeats
