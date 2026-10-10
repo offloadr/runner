@@ -1272,6 +1272,12 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                                 sawMetadata = true;
                                 var metadata = response.Metadata;
                                 expectedSizeBytes = metadata.SizeBytes;
+                                if (expectedSizeBytes > MaxUploadBytes)
+                                {
+                                    throw new InvalidOperationException(
+                                        $"Artifact declares {expectedSizeBytes} bytes, above the {MaxUploadBytes} byte limit.");
+                                }
+
                                 expectedSha256 = string.IsNullOrWhiteSpace(metadata.Sha256) ? null : metadata.Sha256;
                                 state.UpdateMetadata(
                                     expectedSizeBytes,
@@ -1282,6 +1288,15 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                                 if (!sawMetadata)
                                 {
                                     throw new InvalidOperationException("Artifact stream missing metadata frame.");
+                                }
+
+                                // Bound the write as it happens, so a stream larger than declared
+                                // (or unbounded, when no size is declared) cannot fill the disk.
+                                var limit = expectedSizeBytes ?? MaxUploadBytes;
+                                if (bytesWritten + response.Chunk.Length > limit)
+                                {
+                                    throw new InvalidOperationException(
+                                        $"Artifact stream exceeds its {(expectedSizeBytes.HasValue ? "declared size" : "size limit")} of {limit} bytes.");
                                 }
 
                                 await destination.WriteAsync(response.Chunk.Memory, cancellationToken).ConfigureAwait(false);

@@ -1027,6 +1027,67 @@ public partial class ArtifactUploadServiceTests
     }
 
     [Test]
+    public async Task TryEnsureArtifactAvailableAsync_StopsAStreamLongerThanDeclared()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var inputDirectory = Path.Combine(root, "input");
+            var outputDirectory = Path.Combine(root, "output");
+            var tempDirectory = Path.Combine(root, "temp");
+            Directory.CreateDirectory(inputDirectory);
+            Directory.CreateDirectory(outputDirectory);
+            Directory.CreateDirectory(tempDirectory);
+
+            const string filename = "too-long.png";
+            var inputPath = Path.Combine(inputDirectory, filename);
+            var listResponse = new RunnerArtifactServiceListArtifactsResponse();
+            listResponse.Artifacts.Add(new EditorArtifactMetadata
+            {
+                EditorSid = "editor-current",
+                Filename = filename,
+                Type = "input",
+                Subfolder = string.Empty,
+                SizeBytes = 8,
+                CreatedUtc = Timestamp.FromDateTime(DateTime.UtcNow.AddMinutes(-1))
+            });
+            var artifactClient = new FakeRunnerArtifactClient(listResponse)
+            {
+                ReadArtifactContent = new byte[64],
+                ReadArtifactMetadataSizeBytes = 8
+            };
+            await using var service = new ArtifactUploadService(
+                runnerSecret: "runner-secret-value",
+                artifactClient,
+                NullLogger<ArtifactUploadService>.Instance);
+
+            var paths = new SessionProcessManager.SessionPaths
+            {
+                HomeDirectory = root,
+                UserDirectory = root,
+                OutputDirectory = outputDirectory,
+                InputDirectory = inputDirectory,
+                TempDirectory = tempDirectory,
+                CacheDirectory = root,
+                LogsDirectory = root
+            };
+
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-current", "owner-1", CancellationToken.None);
+
+            var ex = Assert.ThrowsAsync<InvalidOperationException>(async () =>
+                await service.TryEnsureArtifactAvailableAsync(inputPath, highPriority: true, CancellationToken.None));
+
+            Assert.That(ex!.Message, Does.Contain("exceeds its declared size"));
+            Assert.That(new FileInfo(inputPath).Length, Is.EqualTo(0));
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
     public async Task TryEnsureArtifactAvailableAsync_RejectsArtifactStreamShaMismatch()
     {
         var root = CreateTempDirectory();
