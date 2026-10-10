@@ -123,6 +123,33 @@ public class RunnerStartupValidatorTests
     }
 
     [Test]
+    public void ValidateOrThrow_DoesNotEchoAMalformedApiUrl()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            Assert.Ignore("Runner startup validation is Linux-specific.");
+        }
+
+        var tempRoot = Path.Combine(Path.GetTempPath(), $"runner-validator-{Guid.NewGuid():N}");
+        try
+        {
+            var options = BuildOptions(tempRoot, "/bin/sh", offloadrApiUrl: "api.example.test/?token=very-secret-value");
+            var validator = new RunnerStartupValidator(new NoopIsolationStrategy());
+
+            var ex = Assert.Throws<InvalidOperationException>(() => validator.ValidateOrThrow(options));
+            Assert.Multiple(() =>
+            {
+                Assert.That(ex!.Message, Does.Contain("offloadr-api URL"));
+                Assert.That(ex.Message, Does.Not.Contain("very-secret-value"));
+            });
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+        }
+    }
+
+    [Test]
     public void ValidateOrThrow_ThrowsWhenConfiguredRunnerIdIsNotUuid()
     {
         if (!OperatingSystem.IsLinux())

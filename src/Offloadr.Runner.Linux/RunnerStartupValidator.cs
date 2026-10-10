@@ -89,7 +89,8 @@ public sealed class RunnerStartupValidator
 
         if (!Uri.TryCreate(rawValue, UriKind.Absolute, out var uri))
         {
-            errors.Add($"Invalid {label} URL '{rawValue}'.");
+            // The raw value is not echoed: a malformed address can still contain credentials.
+            errors.Add($"Invalid {label} URL: it is not an absolute URL.");
             return;
         }
 
