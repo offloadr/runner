@@ -66,34 +66,34 @@ public sealed class ResourceDiscoveryService
         }
 
         ulong totalVramBytes = 0;
+        ulong gpuCount = 0;
         var detectedType = GpuType.Unknown;
         var detectedName = string.Empty;
 
-        for (var index = 0; index < lines.Length; index++)
+        // Only rows in the queried shape count as GPUs: diagnostics or other text in the
+        // output must never make the runner advertise hardware it does not have.
+        foreach (var line in lines)
         {
-            var parts = lines[index].Split(',', StringSplitOptions.TrimEntries);
-            if (parts.Length < 2)
+            var parts = line.Split(',', StringSplitOptions.TrimEntries);
+            if (parts.Length != 2 || parts[0].Length == 0 || !ulong.TryParse(parts[1], out var memMiB))
             {
                 continue;
             }
 
-            var detectedGpuVramGb = TryNormalizeDetectedGpuVramGb(parts[1]);
-            if (index == 0)
+            if (gpuCount == 0)
             {
-                detectedName = parts[0].Trim();
-                detectedType = MapGpuNameToType(parts[0], detectedGpuVramGb);
+                detectedName = parts[0];
+                detectedType = MapGpuNameToType(parts[0], TryNormalizeDetectedGpuVramGb(parts[1]));
             }
 
-            if (ulong.TryParse(parts[1], out var memMiB))
+            checked
             {
-                checked
-                {
-                    totalVramBytes += memMiB * 1024UL * 1024UL;
-                }
+                totalVramBytes += memMiB * 1024UL * 1024UL;
+                gpuCount++;
             }
         }
 
-        return (detectedType, detectedName, (ulong)lines.Length, totalVramBytes);
+        return (detectedType, detectedName, gpuCount, totalVramBytes);
     }
 
     public static GpuType MapGpuNameToType(string nameRaw, int? detectedVramGb = null)
@@ -195,13 +195,9 @@ public sealed class LinuxResourceProbe : IResourceProbe
                 return string.Empty;
             }
 
-            var stdout = process.StandardOutput.ReadToEnd();
-            if (string.IsNullOrWhiteSpace(stdout))
-            {
-                stdout = process.StandardError.ReadToEnd();
-            }
-
-            return stdout;
+            // A failed query (for example an NVML driver mismatch) reports no hardware; its
+            // diagnostics are never parsed as query output.
+            return process.ExitCode == 0 ? process.StandardOutput.ReadToEnd() : string.Empty;
         }
         catch
         {

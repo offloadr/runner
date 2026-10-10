@@ -56,8 +56,40 @@ public class ResourceDiscoveryServiceTests
 
         Assert.That(result.GpuType, Is.EqualTo(GpuType.Unknown));
         Assert.That(result.GpuModelName, Is.EqualTo(string.Empty));
-        Assert.That(result.GpuCount, Is.EqualTo(1UL));
+        Assert.That(result.GpuCount, Is.EqualTo(0UL));
         Assert.That(result.VramBytes, Is.EqualTo(0UL));
+    }
+
+    [Test]
+    public void ParseGpuQueryOutput_DoesNotCountDiagnosticLinesAsGpus()
+    {
+        const string output =
+            "Failed to initialize NVML: Driver/library version mismatch\n" +
+            "NVML library version: 550.54\n" +
+            "NVIDIA GeForce RTX 4090,24564\n";
+
+        var result = ResourceDiscoveryService.ParseGpuQueryOutput(output);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(result.GpuCount, Is.EqualTo(1UL));
+            Assert.That(result.GpuModelName, Is.EqualTo("NVIDIA GeForce RTX 4090"));
+            Assert.That(result.GpuType, Is.EqualTo(GpuType.NvidiaRtx4090));
+            Assert.That(result.VramBytes, Is.EqualTo(24564UL * 1024UL * 1024UL));
+        });
+    }
+
+    [Test]
+    public void ParseGpuQueryOutput_ReportsNoGpus_ForAnNvmlFailure()
+    {
+        var result = ResourceDiscoveryService.ParseGpuQueryOutput(
+            "Failed to initialize NVML: Driver/library version mismatch\nNVML library version: 550.54\n");
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(result.GpuCount, Is.EqualTo(0UL));
+            Assert.That(result.GpuType, Is.EqualTo(GpuType.Unknown));
+        });
     }
 
     [Test]
