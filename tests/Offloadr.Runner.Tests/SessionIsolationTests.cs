@@ -127,6 +127,40 @@ public class SessionIsolationTests
     }
 
     [Test]
+    public void CleanupAsync_FailsWhenUserdelFails()
+    {
+        var runner = new RecordingCommandRunner(userExists: true, userdelExitCode: 12);
+        var strategy = new LinuxUserIsolationStrategy(
+            runner,
+            static (_, _) => Task.FromResult(true),
+            residueRoots: [],
+            passwdPath: "/nonexistent/passwd");
+
+        Assert.That(
+            async () => await strategy.CleanupAsync(
+                new PreparedSessionIdentity("sess_6f1c2d3e4b5a", "/sessions/x", CleanupIdentity: true, 4242),
+                CancellationToken.None),
+            Throws.InvalidOperationException.With.Message.Contains("userdel"));
+    }
+
+    [Test]
+    public void CleanupAsync_TreatsAnAlreadyRemovedUserAsCleanedUp()
+    {
+        var runner = new RecordingCommandRunner(userExists: true, userdelExitCode: 6);
+        var strategy = new LinuxUserIsolationStrategy(
+            runner,
+            static (_, _) => Task.FromResult(true),
+            residueRoots: [],
+            passwdPath: "/nonexistent/passwd");
+
+        Assert.That(
+            async () => await strategy.CleanupAsync(
+                new PreparedSessionIdentity("sess_6f1c2d3e4b5a", "/sessions/x", CleanupIdentity: true, 4242),
+                CancellationToken.None),
+            Throws.Nothing);
+    }
+
+    [Test]
     public void PrepareAsync_FailsWhenAProcessOfTheUidSurvivesSigkill()
     {
         // passwd fields are colon-separated, so the home must be a Linux path.
@@ -247,7 +281,7 @@ public class SessionIsolationTests
         }
     }
 
-    private sealed class RecordingCommandRunner(bool userExists) : ILinuxCommandRunner
+    private sealed class RecordingCommandRunner(bool userExists, int userdelExitCode = 0) : ILinuxCommandRunner
     {
         private readonly ConcurrentQueue<LinuxCommand> _commands = new();
 
@@ -256,6 +290,11 @@ public class SessionIsolationTests
         public Task<LinuxCommandResult> RunAsync(LinuxCommand command, CancellationToken cancellationToken)
         {
             _commands.Enqueue(command);
+            if (command.FileName == "/usr/sbin/userdel" && userdelExitCode != 0)
+            {
+                return Task.FromResult(new LinuxCommandResult(userdelExitCode, string.Empty, "userdel: failure"));
+            }
+
             var exitCode = command.FileName == "/usr/bin/id" && !userExists ? 1 : 0;
             var stdout = command.FileName == "/usr/bin/id" && userExists ? "4242" : string.Empty;
             return Task.FromResult(new LinuxCommandResult(exitCode, stdout, string.Empty));

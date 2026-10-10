@@ -201,10 +201,14 @@ public sealed class LinuxUserIsolationStrategy : ISessionIsolationStrategy
             RemoveSharedResidue(identity.UserName, uid);
         }
 
+        // Any other failure fails the teardown, so the Stop that asked for it stays pending and a
+        // later Stop retries. A retry after userdel removed the account but not its home finds
+        // the user gone and lets the caller delete the home.
         var result = await _commandRunner.RunAsync(LinuxCommandFactory.RemoveUser(identity.UserName), cancellationToken).ConfigureAwait(false);
-        if (result.ExitCode != 0 && result.ExitCode != UserdelUnknownUser && !string.IsNullOrWhiteSpace(result.Stderr))
+        if (result.ExitCode != 0 && result.ExitCode != UserdelUnknownUser)
         {
-            RunnerLog.Error<LinuxUserIsolationStrategy>($"userdel for '{identity.UserName}' returned {result.ExitCode}: {result.Stderr.Trim()}");
+            throw new InvalidOperationException(
+                $"userdel for session user '{identity.UserName}' returned {result.ExitCode}: {result.Stderr.Trim()}");
         }
     }
 
