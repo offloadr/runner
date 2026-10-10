@@ -1419,15 +1419,6 @@ internal static class ServiceClientManager
                             runnerId,
                             transientDeliveries,
                             transientCancellation,
-                            () =>
-                            {
-                                if (runtimeRequest.Kind == EditorRuntimeRequestKind.Control &&
-                                    ComfyRuntimeRoutes.IsGlobalInterrupt(runtimeRequest.Path, runtimeRequest.Body.Span))
-                                {
-                                    commandWorkState.Prompts.Cancel(prompt =>
-                                        TargetsPromptRuntime(runtimeRequest, prompt) && !ShouldStreamHttpResponse(prompt));
-                                }
-                            },
                             (request, token) => ExecuteTransientEditorRuntimeRequestAsync(
                                 request,
                                 runnerId,
@@ -1435,6 +1426,15 @@ internal static class ServiceClientManager
                                 sessionEventRelay,
                                 ordinaryControlGate,
                                 readGate,
+                                () =>
+                                {
+                                    if (request.Kind == EditorRuntimeRequestKind.Control &&
+                                        ComfyRuntimeRoutes.IsGlobalInterrupt(request.Path, request.Body.Span))
+                                    {
+                                        commandWorkState.Prompts.Cancel(prompt =>
+                                            TargetsPromptRuntime(request, prompt) && !ShouldStreamHttpResponse(prompt));
+                                    }
+                                },
                                 token),
                             sessionSink.AckEditorRuntimeRequestAsync,
                             shutdown);
@@ -2641,7 +2641,6 @@ internal static class ServiceClientManager
         string runnerId,
         TransientRequestDeliveries deliveries,
         TransientCancellationRegistry cancellation,
-        Action beforeExecute,
         Func<RelayEditorRuntimeRequestCommand, CancellationToken, Task<AcknowledgeEditorRuntimeRequestRequest>> execute,
         Func<AcknowledgeEditorRuntimeRequestRequest, CancellationToken, Task> acknowledge,
         CancellationToken acknowledgementCancellationToken)
@@ -2688,7 +2687,6 @@ internal static class ServiceClientManager
         AcknowledgeEditorRuntimeRequestRequest response;
         try
         {
-            beforeExecute();
             using var lease = cancellation.Acquire(
                 request.SessionId,
                 request.LifecycleGeneration,
@@ -2738,13 +2736,14 @@ internal static class ServiceClientManager
             ErrorMessage = message,
         };
 
-    private static async Task<AcknowledgeEditorRuntimeRequestRequest> ExecuteTransientEditorRuntimeRequestAsync(
+    internal static async Task<AcknowledgeEditorRuntimeRequestRequest> ExecuteTransientEditorRuntimeRequestAsync(
         RelayEditorRuntimeRequestCommand command,
         string runnerId,
         SessionProcessManager sessionManager,
         ComfySessionEventRelay sessionEventRelay,
         SemaphoreSlim ordinaryControlGate,
         SemaphoreSlim readGate,
+        Action beforeSend,
         CancellationToken cancellationToken)
     {
         var response = new AcknowledgeEditorRuntimeRequestRequest
@@ -2782,6 +2781,10 @@ internal static class ServiceClientManager
                 response.ErrorMessage = "The request expired before it could run.";
                 return response;
             }
+
+            // Side effects such as cancelling prompts for an interrupt happen only once the
+            // request has its turn and is still within its deadline.
+            beforeSend();
 
             if (command.Kind == EditorRuntimeRequestKind.ClientMessage)
             {

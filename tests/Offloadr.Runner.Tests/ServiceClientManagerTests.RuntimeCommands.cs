@@ -778,10 +778,51 @@ public partial class ServiceClientManagerTests
         Assert.Multiple(() =>
         {
             Assert.That(harness.Executions, Is.Zero);
-            Assert.That(harness.BeforeExecuteCalls, Is.Zero);
             Assert.That(ack.TransportSucceeded, Is.False);
             Assert.That(ack.StatusCode, Is.EqualTo(504));
             Assert.That(harness.Deliveries.InFlightCount, Is.Zero);
+        });
+    }
+
+    [Test]
+    public async Task InterruptThatExpiresWhileQueued_DoesNotCancelPrompts()
+    {
+        using var ordinaryControlGate = new SemaphoreSlim(0, 1);
+        using var readGate = new SemaphoreSlim(1, 1);
+        var interruptsApplied = 0;
+        var request = new RelayEditorRuntimeRequestCommand
+        {
+            RequestId = "interrupt-1",
+            DeliveryId = "delivery-1",
+            RunnerId = CommandRunnerId,
+            SessionId = CommandSessionId,
+            LifecycleGeneration = 7,
+            RuntimeEpoch = 3,
+            RuntimeInstanceId = InstanceA,
+            Kind = Offloadr.EditorRuntime.V1.EditorRuntimeRequestKind.Control,
+            Method = "POST",
+            Path = "interrupt",
+            ExpiresUtc = Google.Protobuf.WellKnownTypes.Timestamp.FromDateTime(DateTime.UtcNow.AddMilliseconds(200)),
+        };
+
+        // Another control request holds the queue until after this one's deadline.
+        var execution = ServiceClientManager.ExecuteTransientEditorRuntimeRequestAsync(
+            request,
+            CommandRunnerId,
+            sessionManager: null!,
+            sessionEventRelay: null!,
+            ordinaryControlGate,
+            readGate,
+            () => Interlocked.Increment(ref interruptsApplied),
+            CancellationToken.None);
+        await Task.Delay(TimeSpan.FromMilliseconds(400));
+        ordinaryControlGate.Release();
+        var response = await execution.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(response.StatusCode, Is.EqualTo(504));
+            Assert.That(interruptsApplied, Is.Zero);
         });
     }
 
@@ -797,7 +838,6 @@ public partial class ServiceClientManagerTests
         Assert.Multiple(() =>
         {
             Assert.That(harness.Executions, Is.Zero);
-            Assert.That(harness.BeforeExecuteCalls, Is.Zero);
             Assert.That(harness.Acknowledgements.Single().StatusCode, Is.EqualTo(403));
             Assert.That(harness.Deliveries.InFlightCount, Is.Zero);
         });
@@ -815,7 +855,6 @@ public partial class ServiceClientManagerTests
         Assert.Multiple(() =>
         {
             Assert.That(harness.Executions, Is.Zero);
-            Assert.That(harness.BeforeExecuteCalls, Is.Zero);
             Assert.That(harness.Acknowledgements.Single().StatusCode, Is.EqualTo(504));
         });
     }
@@ -855,10 +894,8 @@ public partial class ServiceClientManagerTests
     {
         private int _executions;
 
-        private int _beforeExecuteCalls;
 
         public ServiceClientManager.TransientRequestDeliveries Deliveries { get; } = new(new ServiceClientManager.TransientAcknowledgementCache(retainedResults));
-        public int BeforeExecuteCalls => Volatile.Read(ref _beforeExecuteCalls);
         public ServiceClientManager.TransientCancellationRegistry Cancellation { get; } = new(CancellationToken.None);
         public ConcurrentQueue<AcknowledgeEditorRuntimeRequestRequest> AcknowledgementQueue { get; } = new();
         public List<AcknowledgeEditorRuntimeRequestRequest> Acknowledgements => [.. AcknowledgementQueue];
@@ -884,7 +921,6 @@ public partial class ServiceClientManagerTests
                 CommandRunnerId,
                 Deliveries,
                 Cancellation,
-                () => Interlocked.Increment(ref _beforeExecuteCalls),
                 async (command, token) =>
                 {
                     var execution = Interlocked.Increment(ref _executions);
