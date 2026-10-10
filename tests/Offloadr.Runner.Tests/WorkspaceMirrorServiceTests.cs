@@ -301,6 +301,32 @@ public class WorkspaceMirrorServiceTests
         }
     }
 
+    [Test]
+    public void CopyEntryBounded_StopsWhenCancelled()
+    {
+        using var source = new MemoryStream(new byte[256 * 1024]);
+        using var destination = new MemoryStream();
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        Assert.That(
+            () => WorkspaceMirrorService.CopyEntryBounded(source, destination, source.Length, "big.bin", cancellation.Token),
+            Throws.InstanceOf<OperationCanceledException>());
+        Assert.That(destination.Length, Is.Zero);
+    }
+
+    [Test]
+    public void CopyEntryBounded_RefusesAnEntryLargerThanDeclared()
+    {
+        using var source = new MemoryStream(new byte[200 * 1024]);
+        using var destination = new MemoryStream();
+
+        Assert.That(
+            () => WorkspaceMirrorService.CopyEntryBounded(source, destination, 100 * 1024, "bomb.bin", CancellationToken.None),
+            Throws.InvalidOperationException);
+        Assert.That(destination.Length, Is.LessThanOrEqualTo(100 * 1024));
+    }
+
     [TestCase(4096L, null)]
     [TestCase(null, "0000000000000000000000000000000000000000000000000000000000000000")]
     public void PrepareSessionAsync_RefusesASeedArchiveThatFailsVerification(long? declaredSize, string? declaredSha256)

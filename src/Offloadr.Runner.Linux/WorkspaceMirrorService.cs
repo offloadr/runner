@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.IO.Compression;
 using System.Security.Cryptography;
@@ -107,6 +108,36 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
             { "x-runner-secret", runnerSecret.Trim() }
         };
         return headers;
+    }
+
+    /// <summary>
+    /// Copies one archive entry, observing cancellation between chunks so Stop does not wait
+    /// for a large seed to finish, and refusing to write more than the entry declares, which
+    /// the archive's expanded-size limit was checked against.
+    /// </summary>
+    internal static void CopyEntryBounded(Stream source, Stream destination, long declaredLength, string entryName, CancellationToken cancellationToken)
+    {
+        var buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
+        try
+        {
+            long written = 0;
+            int read;
+            while ((read = source.Read(buffer, 0, buffer.Length)) > 0)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                written += read;
+                if (written > declaredLength)
+                {
+                    throw new InvalidOperationException($"ZIP entry '{entryName}' expands beyond its declared size.");
+                }
+
+                destination.Write(buffer, 0, read);
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
     }
 
     private sealed class SessionMirror : IAsyncDisposable
@@ -366,7 +397,7 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
             var tempPath = await DownloadArchiveAsync(call.ResponseStream, cancellationToken).ConfigureAwait(false);
             try
             {
-                ExtractArchiveSafely(tempPath, destinationRoot);
+                ExtractArchiveSafely(tempPath, destinationRoot, cancellationToken);
             }
             finally
             {
@@ -452,7 +483,7 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
             }
         }
 
-        private void ExtractArchiveSafely(string archivePath, string destinationRoot)
+        private void ExtractArchiveSafely(string archivePath, string destinationRoot, CancellationToken cancellationToken)
         {
             Directory.CreateDirectory(destinationRoot);
 
@@ -496,7 +527,7 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                 Directory.CreateDirectory(Path.GetDirectoryName(destinationPath)!);
                 using var entryStream = entry.Open();
                 using var output = new FileStream(destinationPath, FileMode.Create, FileAccess.Write, FileShare.None, 64 * 1024, FileOptions.SequentialScan);
-                entryStream.CopyTo(output);
+                CopyEntryBounded(entryStream, output, entry.Length, entry.FullName, cancellationToken);
                 output.Flush(true);
 
                 if (entry.LastWriteTime != default)
