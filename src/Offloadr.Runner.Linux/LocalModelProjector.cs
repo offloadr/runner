@@ -248,27 +248,47 @@ internal sealed class LocalModelProjector
     {
         DiscoverEarlierProjections();
         var desiredTargets = new HashSet<string>(_desiredProjections.Keys, StringComparer.Ordinal);
+        InvalidOperationException? failure = null;
 
         foreach (var projection in _desiredProjections.Values)
         {
+            string? problem = null;
+            string? sourcePath = null;
             if (!_modelsBySelectionHash.TryGetValue(projection.SelectionHash, out var model))
             {
-                throw new InvalidOperationException($"Registered local model '{projection.Filename}' is no longer present in the runner local inventory.");
+                problem = $"Registered local model '{projection.Filename}' is no longer present in the runner local inventory.";
+            }
+            else
+            {
+                // BuildSourcePath also requires the file's real location inside the local root,
+                // so a source swapped for a link to elsewhere fails here.
+                sourcePath = BuildSourcePath(model);
+                if (string.IsNullOrWhiteSpace(sourcePath) || !File.Exists(sourcePath))
+                {
+                    problem = $"Registered local model '{projection.Filename}' is no longer readable at '{sourcePath}'.";
+                }
             }
 
-            var sourcePath = BuildSourcePath(model);
-            if (string.IsNullOrWhiteSpace(sourcePath) || !File.Exists(sourcePath))
+            if (problem is not null)
             {
-                throw new InvalidOperationException($"Registered local model '{projection.Filename}' is no longer readable at '{sourcePath}'.");
+                // A projection whose source is gone or no longer safe must not stay linked:
+                // remove it now, and report the failure after the stale links are cleaned up.
+                if (_managedTargets.Contains(projection.TargetPath))
+                {
+                    RemoveManagedLink(projection.TargetPath);
+                }
+
+                failure ??= new InvalidOperationException(problem);
+                continue;
             }
 
             var targetPath = projection.TargetPath;
-            if (PathsEqual(sourcePath, targetPath))
+            if (PathsEqual(sourcePath!, targetPath))
             {
                 continue;
             }
 
-            EnsureProjectedLink(sourcePath, targetPath);
+            EnsureProjectedLink(sourcePath!, targetPath);
         }
 
         foreach (var stale in _managedTargets.ToArray())
@@ -279,6 +299,11 @@ internal sealed class LocalModelProjector
             }
 
             RemoveManagedLink(stale);
+        }
+
+        if (failure is not null)
+        {
+            throw failure;
         }
     }
 

@@ -192,6 +192,41 @@ public class LocalModelProjectorTests
     }
 
     [Test]
+    public void UpdateSnapshot_RemovesAProjectionWhoseSourceWasSwappedForALink()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var sourceRoot = Path.Combine(root, "local");
+            var destinationRoot = Path.Combine(root, "comfy", "models");
+            var outside = Directory.CreateDirectory(Path.Combine(root, "host")).FullName;
+            Directory.CreateDirectory(Path.Combine(sourceRoot, "checkpoints"));
+            var source = Path.Combine(sourceRoot, "checkpoints", "demo.safetensors");
+            File.WriteAllText(source, "checkpoint");
+            var projected = Path.Combine(destinationRoot, "checkpoints", "demo.safetensors");
+            var model = CreateModel(source, ModelCategory.Checkpoint);
+
+            var projector = new LocalModelProjector(sourceRoot, destinationRoot);
+            projector.UpdateSnapshot(CreateSnapshot(model));
+            projector.SetRequestedModels([CreateLocalProjectionRequest(source, ModelCategory.Checkpoint, projected)]);
+            Assert.That(new FileInfo(projected).LinkTarget, Is.Not.Null);
+
+            // The source is replaced by a link to a file outside the local model root.
+            var hostFile = Path.Combine(outside, "secret.safetensors");
+            File.WriteAllText(hostFile, "secret0000");
+            File.Delete(source);
+            File.CreateSymbolicLink(source, hostFile);
+
+            Assert.That(() => projector.UpdateSnapshot(CreateSnapshot(model)), Throws.InvalidOperationException);
+            Assert.That(File.Exists(projected) || new FileInfo(projected).LinkTarget is not null, Is.False);
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
     public void SetRequestedModels_RefusesAModelWhoseRealFileIsOutsideTheLocalRoot()
     {
         var root = CreateTempDirectory();
