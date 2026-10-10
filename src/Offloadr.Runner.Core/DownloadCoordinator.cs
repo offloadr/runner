@@ -99,6 +99,12 @@ public sealed class DownloadCoordinator
 
     public Func<ModelDownloadProgress, Task>? ProgressReporter { get; set; }
 
+    /// <summary>Resolves a session's current runtime when a download is registered for it.</summary>
+    public Func<string, RuntimeIdentity?>? RuntimeResolver { get; set; }
+
+    private RuntimeIdentity? ResolveRuntime(string? sessionId)
+        => string.IsNullOrWhiteSpace(sessionId) ? null : RuntimeResolver?.Invoke(sessionId);
+
     public void SetActiveSession(string? sessionId)
     {
         var normalizedSessionId = string.IsNullOrWhiteSpace(sessionId) ? null : sessionId.Trim();
@@ -181,7 +187,7 @@ public sealed class DownloadCoordinator
                 continue;
             }
 
-            registrations.Add(new TrackedDownload(normalizedSessionId, download, normalized));
+            registrations.Add(new TrackedDownload(normalizedSessionId, download, normalized) { Runtime = ResolveRuntime(normalizedSessionId) });
         }
 
         if (replaceExisting)
@@ -240,7 +246,7 @@ public sealed class DownloadCoordinator
                     throw new InvalidOperationException("Download destination path is required.");
                 }
 
-                tracked = new TrackedDownload(session, download, destination);
+                tracked = new TrackedDownload(session, download, destination) { Runtime = ResolveRuntime(session) };
                 if (normalized != null)
                 {
                     _registry[normalized] = tracked;
@@ -270,7 +276,8 @@ public sealed class DownloadCoordinator
                 DestinationPath = normalized
             };
 
-            tracked = new TrackedDownload(GetActiveSessionId(), fallback, normalized);
+            var fallbackSessionId = GetActiveSessionId();
+            tracked = new TrackedDownload(fallbackSessionId, fallback, normalized) { Runtime = ResolveRuntime(fallbackSessionId) };
             _registry[normalized] = tracked;
         }
 
@@ -793,7 +800,8 @@ public sealed class DownloadCoordinator
             bytesPerSecond,
             averageBytesPerSecond,
             state,
-            message);
+            message,
+            tracked.Runtime);
 
         try
         {
@@ -1035,6 +1043,7 @@ public sealed class DownloadCoordinator
         public string? SessionId { get; } = sessionId;
         public ModelDownloadRequest Request { get; } = request;
         public string DestinationPath { get; } = destinationPath;
+        public RuntimeIdentity? Runtime { get; init; }
         public CancellationToken RegistrationCancellation => _registrationCancellation.Token;
 
         public void CancelRegistration()
@@ -1058,7 +1067,10 @@ public readonly record struct ModelDownloadProgress(
     long BytesPerSecond,
     long AverageBytesPerSecond,
     ModelDownloadState State,
-    string? Message);
+    string? Message,
+    // The runtime the download was registered for, captured at registration: by the time
+    // progress is reported the session may have moved on to a replacement runtime.
+    RuntimeIdentity? Runtime = null);
 
 public sealed class SystemFileSystem : IFileSystem
 {

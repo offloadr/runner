@@ -101,6 +101,12 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
 
     public Func<ModelDownloadProgress, Task>? ProgressReporter { get; set; }
 
+    /// <summary>Resolves a session's current runtime when a transfer is registered for it.</summary>
+    public Func<string, RuntimeIdentity?>? RuntimeResolver { get; set; }
+
+    private RuntimeIdentity? ResolveRuntime(string? sessionId)
+        => string.IsNullOrWhiteSpace(sessionId) ? null : RuntimeResolver?.Invoke(sessionId);
+
     public async Task InitializeAsync(CancellationToken cancellationToken)
     {
         if (!_capabilities.SupportsPersistentRangeHydration)
@@ -320,13 +326,15 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
                         Inode = placeholder.Inode,
                         Handle = placeholder.PreviousHandle,
                         TransferEpoch = placeholder.TransferEpoch,
-                        RestartRequired = placeholder.RestartRequired
+                        RestartRequired = placeholder.RestartRequired,
+                        Runtime = ResolveRuntime(registration.SessionId)
                     };
                     _states.Add(registration.Identity.DestinationPath, existing);
                 }
                 else
                 {
                     existing.SessionId = registration.SessionId;
+                    existing.Runtime = ResolveRuntime(registration.SessionId);
                     existing.PendingOrphanCleanup = false;
                     existing.OrphanCleanupQueued = false;
                     existing.PendingConflictQuarantine = false;
@@ -2779,7 +2787,8 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
                     snapshot.DownloadSpeed,
                     0,
                     snapshot.IsComplete ? ModelDownloadState.Complete : ModelDownloadState.InProgress,
-                    snapshot.IsComplete ? "complete" : null))
+                    snapshot.IsComplete ? "complete" : null,
+                    state.Runtime))
                 .ConfigureAwait(false);
         }
         catch (Exception ex)
@@ -3126,6 +3135,7 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
         bool placeholderOwned)
     {
         public string SessionId { get; set; } = sessionId;
+        public RuntimeIdentity? Runtime { get; set; }
         public ModelDownloadRequest Request { get; set; } = request;
         public ModelTransferIdentity Identity { get; } = identity;
         public bool PlaceholderOwned { get; set; } = placeholderOwned;

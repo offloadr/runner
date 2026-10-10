@@ -54,6 +54,23 @@ internal sealed class ModelDownloadService : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Resolves a session's current runtime when downloads are registered, so progress
+    /// stays labelled with the runtime it was started for.
+    /// </summary>
+    public Func<string, RuntimeIdentity?>? RuntimeResolver
+    {
+        get => _fullDownloadCoordinator.RuntimeResolver;
+        set
+        {
+            _fullDownloadCoordinator.RuntimeResolver = value;
+            if (_hydrationCoordinator is not null)
+            {
+                _hydrationCoordinator.RuntimeResolver = value;
+            }
+        }
+    }
+
     public async Task InitializeAsync(CancellationToken cancellationToken)
     {
         await DiscardStagedDownloadsAsync(cancellationToken).ConfigureAwait(false);

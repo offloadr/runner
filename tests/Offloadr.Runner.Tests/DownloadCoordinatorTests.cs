@@ -5,6 +5,38 @@ namespace Offloadr.Runner.Tests;
 public class DownloadCoordinatorTests
 {
     [Test]
+    public async Task Progress_CarriesTheRuntimeTheDownloadWasRegisteredFor()
+    {
+        var registered = new RuntimeIdentity(7, 3, "original");
+        var current = registered;
+        var sut = new DownloadCoordinator(new FakeAria2Client(), new FakeFileSystem(exists: ["/tmp/model.safetensors"]))
+        {
+            RuntimeResolver = _ => current,
+        };
+        ModelDownloadProgress? observed = null;
+        sut.ProgressReporter = progress =>
+        {
+            observed = progress;
+            return Task.CompletedTask;
+        };
+
+        sut.SetActiveSession("session-1");
+        sut.RegisterDownloads("session-1", [new ModelDownloadRequest
+        {
+            ModelId = "model-1",
+            Filename = "model.safetensors",
+            DestinationPath = "/tmp/model.safetensors",
+            SourceUrl = "https://example.com/a"
+        }]);
+        // The session is replaced before the download reports progress.
+        current = new RuntimeIdentity(7, 4, "replacement");
+
+        await sut.EnsureDownloadedAsync("/tmp/model.safetensors", CancellationToken.None, highPriority: false);
+
+        Assert.That(observed?.Runtime, Is.EqualTo(registered));
+    }
+
+    [Test]
     public async Task SetActiveSession_ClearsRegistry_WhenSessionChanges()
     {
         var aria = new FakeAria2Client();

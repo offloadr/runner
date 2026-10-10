@@ -901,6 +901,7 @@ internal static class ServiceClientManager
 
         var initialLocalModelSnapshot = PrepareInitialLocalModelSnapshot(localModelSnapshotProvider, localModelSnapshotObserver);
 
+        downloadService.RuntimeResolver = sessionId => runtimeIdentities.TryGet(sessionId, out var identity) ? identity : null;
         downloadService.ProgressReporter = async progress =>
         {
             RuntimeIdentity? reportedRuntime = null;
@@ -921,12 +922,22 @@ internal static class ServiceClientManager
                     State = progress.State,
                     Message = progress.Message ?? string.Empty
                 };
-                if (runtimeIdentities.TryGet(progress.SessionId, out var runtimeIdentity))
+                // Report under the runtime the download was registered for. Only that identity
+                // may be treated as revoked: the session may since have a replacement runtime.
+                if (progress.Runtime is { IsValid: true } registeredRuntime)
                 {
-                    request.LifecycleGeneration = runtimeIdentity.LifecycleGeneration;
-                    request.RuntimeEpoch = runtimeIdentity.RuntimeEpoch;
-                    request.RuntimeInstanceId = runtimeIdentity.RuntimeInstanceId;
-                    reportedRuntime = runtimeIdentity;
+                    request.LifecycleGeneration = registeredRuntime.LifecycleGeneration;
+                    request.RuntimeEpoch = registeredRuntime.RuntimeEpoch;
+                    request.RuntimeInstanceId = registeredRuntime.RuntimeInstanceId;
+                    reportedRuntime = registeredRuntime;
+                }
+                else if (runtimeIdentities.TryGet(progress.SessionId, out var currentRuntime))
+                {
+                    // Registered before the session had a runtime: label it with the current
+                    // one so it is accepted, but never revoke a runtime on its rejection.
+                    request.LifecycleGeneration = currentRuntime.LifecycleGeneration;
+                    request.RuntimeEpoch = currentRuntime.RuntimeEpoch;
+                    request.RuntimeInstanceId = currentRuntime.RuntimeInstanceId;
                 }
                 await sessionSink.ReportModelDownloadAsync(request, CancellationToken.None).ConfigureAwait(false);
             }
