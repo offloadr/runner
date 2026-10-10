@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Transport, authentication, logging relays and model transfer shared by every runner host. -->
+  <PropertyGroup>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Offloadr.Runner.Contracts\Offloadr.Runner.Contracts.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Aria2.NET" />
+    <PackageReference Include="Grpc.Net.Client" />
+    <PackageReference Include="Microsoft.Extensions.Logging" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Offloadr.Runner.Linux" />
+    <InternalsVisibleTo Include="RunnerAgent" />
+    <InternalsVisibleTo Include="Offloadr.Runner.Tests" />
+  </ItemGroup>
+
+</Project>
