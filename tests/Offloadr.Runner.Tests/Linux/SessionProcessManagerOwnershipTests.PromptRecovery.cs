@@ -298,6 +298,27 @@ public partial class SessionProcessManagerOwnershipTests
     }
 
     [Test]
+    public async Task StopStaysFailedUntilSurvivingProcessesAreReaped()
+    {
+        var teardowns = 0;
+        await using var fixture = await PromptRuntimeFixture.CreateAsync(cleanup: () =>
+        {
+            // The first teardown finds processes that survived SIGKILL.
+            return Interlocked.Increment(ref teardowns) == 1
+                ? throw new InvalidOperationException("Processes of the session user were still running after SIGKILL.")
+                : Task.CompletedTask;
+        });
+
+        Assert.That(
+            async () => await fixture.Manager.StopSessionAsync(fixture.Start.SessionId, CancellationToken.None),
+            Throws.InvalidOperationException);
+
+        // A retried Stop reaps them and completes.
+        await fixture.Manager.StopSessionAsync(fixture.Start.SessionId, CancellationToken.None);
+        Assert.That(teardowns, Is.EqualTo(2));
+    }
+
+    [Test]
     public async Task StartForTheRuntimeThatJustExitedIsRefused()
     {
         await using var fixture = await PromptRuntimeFixture.CreateAsync();

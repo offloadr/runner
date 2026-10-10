@@ -109,6 +109,24 @@ public class SessionIsolationTests
     }
 
     [Test]
+    public void CleanupAsync_KeepsTheAccountWhenAProcessSurvivesSigkill()
+    {
+        var runner = new RecordingCommandRunner(userExists: true);
+        var strategy = new LinuxUserIsolationStrategy(
+            runner,
+            static (_, _) => Task.FromResult(false),
+            residueRoots: [],
+            passwdPath: "/nonexistent/passwd");
+
+        Assert.That(
+            async () => await strategy.CleanupAsync(
+                new PreparedSessionIdentity("sess_6f1c2d3e4b5a", "/sessions/x", CleanupIdentity: true, 4242),
+                CancellationToken.None),
+            Throws.InvalidOperationException.With.Message.Contains("still running"));
+        Assert.That(runner.Commands.Select(static command => command.FileName), Does.Not.Contain("/usr/sbin/userdel"));
+    }
+
+    [Test]
     public void PrepareAsync_FailsWhenAProcessOfTheUidSurvivesSigkill()
     {
         // passwd fields are colon-separated, so the home must be a Linux path.

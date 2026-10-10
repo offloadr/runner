@@ -38,6 +38,9 @@ internal sealed partial class SessionProcessManager : IDisposable
     // Prepared identities, from user creation until isolation cleanup. Unlike _sessions this
     // covers the window before launch, so the editor can use the IPC socket as soon as it runs.
     private readonly ConcurrentDictionary<string, PreparedSessionIdentity> _preparedIdentities = new(StringComparer.Ordinal);
+    // Sessions whose account could not be torn down because processes survived; Stop for them
+    // retries the teardown and stays pending until it succeeds.
+    private readonly ConcurrentDictionary<string, PreparedSessionIdentity> _pendingTeardowns = new(StringComparer.Ordinal);
     private readonly string _sessionRoot;
     private readonly string _entryPointPath;
     private readonly string _workingDirectory;
@@ -260,7 +263,7 @@ internal sealed partial class SessionProcessManager : IDisposable
             }
             else if (prepared)
             {
-                await CleanupPreparedStartupAsync(identity).ConfigureAwait(false);
+                await CleanupPreparedStartupAsync(identity, sessionId).ConfigureAwait(false);
             }
             throw;
         }
@@ -341,6 +344,8 @@ internal sealed partial class SessionProcessManager : IDisposable
                 await beforeCleanup(sessionId, cancellationToken).ConfigureAwait(false);
             }
 
+            // A retried Stop for a session whose processes survived its first teardown.
+            await EnsureTeardownCompleteAsync(sessionId).ConfigureAwait(false);
             LogSessionInfo(sessionId, "Stop requested for unknown session.");
             return true;
         }
@@ -372,6 +377,7 @@ internal sealed partial class SessionProcessManager : IDisposable
             }
 
             await CleanupTrackedContextAsync(context, cancellationToken).ConfigureAwait(false);
+            ThrowIfTeardownPending(sessionId);
             stopCompletion.TrySetResult();
             return true;
         }
@@ -1316,10 +1322,10 @@ internal sealed partial class SessionProcessManager : IDisposable
         context.Cancellation.Cancel();
         try { context.Process.Dispose(); } catch { }
 
-        await CleanupPreparedStartupAsync(context.Identity).ConfigureAwait(false);
+        await CleanupPreparedStartupAsync(context.Identity, context.SessionId).ConfigureAwait(false);
     }
 
-    private async Task CleanupPreparedStartupAsync(PreparedSessionIdentity identity)
+    private async Task CleanupPreparedStartupAsync(PreparedSessionIdentity identity, string sessionId)
     {
         // Stop authorizing the uid before its processes are killed and the user is removed.
         foreach (var prepared in _preparedIdentities.Where(pair => pair.Value == identity).ToArray())
@@ -1333,10 +1339,38 @@ internal sealed partial class SessionProcessManager : IDisposable
         }
         catch (Exception ex)
         {
+            // Processes of the session may still run (and hold the GPU). The account is kept
+            // so its uid is not handed out again, and Stop stays pending until a retry reaps them.
             RunnerLog.Error<SessionProcessManager>(ex, $"Failed to cleanup isolation for user '{identity.UserName}': {ex.Message}");
+            _pendingTeardowns[sessionId] = identity;
+            return;
         }
 
+        _pendingTeardowns.TryRemove(new KeyValuePair<string, PreparedSessionIdentity>(sessionId, identity));
         DeleteSessionHomeDirectory(identity.HomeDirectory);
+    }
+
+    /// <summary>
+    /// Retries a session teardown that failed earlier. Throws while it still fails, so a Stop
+    /// for the session is not acknowledged while its processes survive.
+    /// </summary>
+    private async Task EnsureTeardownCompleteAsync(string sessionId)
+    {
+        if (_pendingTeardowns.TryGetValue(sessionId, out var identity))
+        {
+            await CleanupPreparedStartupAsync(identity, sessionId).ConfigureAwait(false);
+        }
+
+        ThrowIfTeardownPending(sessionId);
+    }
+
+    private void ThrowIfTeardownPending(string sessionId)
+    {
+        if (_pendingTeardowns.ContainsKey(sessionId))
+        {
+            throw new InvalidOperationException(
+                $"Processes of session '{sessionId}' are still running after its teardown; the stop is not complete.");
+        }
     }
 
     /// <summary>
@@ -1701,7 +1735,7 @@ internal sealed partial class SessionProcessManager : IDisposable
 
         try
         {
-            await CleanupPreparedStartupAsync(context.Identity).ConfigureAwait(false);
+            await CleanupPreparedStartupAsync(context.Identity, context.SessionId).ConfigureAwait(false);
         }
         catch (Exception ex)
         {

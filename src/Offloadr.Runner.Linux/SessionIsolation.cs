@@ -195,7 +195,9 @@ public sealed class LinuxUserIsolationStrategy : ISessionIsolationStrategy
 
         if (userId is { } uid and not 0)
         {
-            await KillUserProcessesAsync(identity.UserName, uid, cancellationToken).ConfigureAwait(false);
+            // Survivors keep the account (and its uid) in place and fail the teardown, so the
+            // stop that asked for it is not reported as complete while they run.
+            await KillUserProcessesAsync(identity.UserName, uid, cancellationToken, requireNoSurvivors: true).ConfigureAwait(false);
             RemoveSharedResidue(identity.UserName, uid);
         }
 
@@ -217,10 +219,18 @@ public sealed class LinuxUserIsolationStrategy : ISessionIsolationStrategy
             }
 
             RunnerLog.Warning<LinuxUserIsolationStrategy>($"Removing session user '{userName}' left by an earlier run.");
-            await CleanupAsync(
-                    new PreparedSessionIdentity(userName, string.Empty, CleanupIdentity: true, userId),
-                    cancellationToken)
-                .ConfigureAwait(false);
+            try
+            {
+                await CleanupAsync(
+                        new PreparedSessionIdentity(userName, string.Empty, CleanupIdentity: true, userId),
+                        cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (InvalidOperationException ex)
+            {
+                // The account is kept while its processes survive, so its uid is not reused.
+                RunnerLog.Error<LinuxUserIsolationStrategy>(ex, $"Could not remove session user '{userName}': {ex.Message}");
+            }
         }
 
         if (string.IsNullOrWhiteSpace(sessionRoot))
