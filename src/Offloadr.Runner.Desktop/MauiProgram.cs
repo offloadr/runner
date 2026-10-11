@@ -30,7 +30,8 @@ public static class MauiProgram
         builder.Services.AddScoped<IHostActions, DesktopHostActions>();
 
         // Hosted services start in registration order: take the single-instance lock before the supervisor runs.
-        builder.Services.AddHostedService(_ => new SingleInstanceLock(paths));
+        builder.Services.AddSingleton(new SingleInstanceLock(paths));
+        builder.Services.AddHostedService(provider => provider.GetRequiredService<SingleInstanceLock>());
         builder.Services.AddRunnerSupervisor(paths).AddRunnerUI();
 
         builder.Logging.AddProvider(new FileLoggerProvider(paths.Logs));

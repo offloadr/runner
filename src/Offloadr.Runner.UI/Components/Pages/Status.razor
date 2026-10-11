@@ -11,7 +11,7 @@
             <MudStack Row="true" AlignItems="AlignItems.Center" Spacing="3">
                 <MudIcon Icon="@StateIcon" Color="@StateColor" Size="Size.Large" />
                 <div>
-                    <MudText Typo="Typo.h5" HtmlTag="h1">@StateTitle</MudText>
+                    <MudText Typo="Typo.h5" HtmlTag="h1">@View.StateTitle</MudText>
                     <MudText Typo="Typo.body2" Class="mud-text-secondary">@View.Message</MudText>
                 </div>
             </MudStack>
@@ -107,21 +107,6 @@
         LaunchPlanSource.BuiltIn => "Your choice in Settings",
         LaunchPlanSource.Unreachable => "Your choice in Settings, while Offloadr cannot be reached",
         _ => "–",
-    };
-
-    private string StateTitle => View.State switch
-    {
-        SupervisorState.Stopped => "Stopped",
-        SupervisorState.Checking => "Checking…",
-        SupervisorState.ResolvingPlan => "Finding the image…",
-        SupervisorState.Pulling => "Downloading the image…",
-        SupervisorState.Starting => "Starting…",
-        SupervisorState.Running => "Running",
-        SupervisorState.RestartPending => "Running, restart pending",
-        SupervisorState.WaitingToRestart => "Restarting soon",
-        SupervisorState.Stopping => "Stopping…",
-        SupervisorState.Faulted => "Needs attention",
-        _ => View.State.ToString(),
     };
 
     private string StateIcon => View.State switch

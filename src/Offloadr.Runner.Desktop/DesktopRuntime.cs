@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using Microsoft.Extensions.FileProviders;
 using Microsoft.Extensions.Hosting;
 
@@ -58,12 +59,18 @@ internal sealed class DesktopHostEnvironment : IHostEnvironment
 }
 
 /// <summary>
-/// Two copies of the app would fight over the same runner container, so the second one refuses to start.
+/// Two copies of the app would fight over the same runner container, so the second one does not
+/// start: it asks the first one to show its window (often hidden in the notification area) instead.
 /// A held file handle, not a PID file, owns the lock, so a crash never leaves it stale.
 /// </summary>
-internal sealed class SingleInstanceLock(SupervisorPaths paths) : IHostedService, IDisposable
+public sealed class SingleInstanceLock(SupervisorPaths paths) : IHostedService, IDisposable
 {
     private FileStream? _lock;
+    private EventWaitHandle? _openSignal;
+    private RegisteredWaitHandle? _openWait;
+
+    /// <summary>Raised on a background thread when another launch of the app asks this one to show its window.</summary>
+    public event Action? OpenRequested;
 
     public Task StartAsync(CancellationToken cancellationToken)
     {
@@ -74,9 +81,11 @@ internal sealed class SingleInstanceLock(SupervisorPaths paths) : IHostedService
         }
         catch (IOException ex)
         {
-            throw new InvalidOperationException("Offloadr Runner is already open. Use the window that is already running.", ex);
+            throw new AlreadyOpenException(SignalTheOpenCopy(), ex);
         }
 
+        _openSignal = new EventWaitHandle(false, EventResetMode.AutoReset, SignalName());
+        _openWait = ThreadPool.RegisterWaitForSingleObject(_openSignal, (_, _) => OpenRequested?.Invoke(), null, Timeout.Infinite, executeOnlyOnce: false);
         return Task.CompletedTask;
     }
 
@@ -88,9 +97,50 @@ internal sealed class SingleInstanceLock(SupervisorPaths paths) : IHostedService
 
     public void Dispose()
     {
+        _openWait?.Unregister(null);
+        _openWait = null;
+        _openSignal?.Dispose();
+        _openSignal = null;
         _lock?.Dispose();
         _lock = null;
     }
+
+    private bool SignalTheOpenCopy()
+    {
+        try
+        {
+            using var signal = EventWaitHandle.OpenExisting(SignalName());
+
+            // The open copy runs in the background, so Windows would not let it take the foreground;
+            // this launch, just started by the person, may pass that right on.
+            AllowSetForegroundWindow(AsfwAny);
+            return signal.Set();
+        }
+        catch (Exception ex) when (ex is WaitHandleCannotBeOpenedException or UnauthorizedAccessException or IOException)
+        {
+            return false;
+        }
+    }
+
+    private const int AsfwAny = -1;
+
+    [DllImport("user32.dll")]
+    private static extern bool AllowSetForegroundWindow(int processId);
+
+    /// <summary>One per data folder and Windows session, like the lock itself.</summary>
+    private string SignalName()
+        => "Local\\OffloadrRunner-open-" + Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(paths.Data.ToUpperInvariant())))[..16];
+}
+
+/// <summary>Another copy of the app already runs the runner.</summary>
+public sealed class AlreadyOpenException(bool broughtUp, Exception inner) : Exception(
+    broughtUp
+        ? "Offloadr Runner is already open; its window has been brought up."
+        : "Offloadr Runner is already open. Open it from its icon in the notification area.",
+    inner)
+{
+    /// <summary>True when the open copy was asked to show its window, so this one can simply quit.</summary>
+    public bool BroughtUp { get; } = broughtUp;
 }
 
 /// <summary>Writes warnings and runner activity to a daily file under the app's data folder.</summary>

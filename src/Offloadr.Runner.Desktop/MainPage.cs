@@ -3,12 +3,12 @@ using Microsoft.AspNetCore.Components.WebView.Maui;
 
 namespace Offloadr.Runner.Desktop;
 
-public sealed class App(MainPage page) : Application
+public sealed class App(MainPage page, RunnerSupervisor supervisor, SingleInstanceLock instanceLock) : Application
 {
     protected override Window CreateWindow(IActivationState? activationState)
     {
         var window = new Window(page) { Title = "Offloadr Runner", Width = 1100, Height = 860, MinimumWidth = 480, MinimumHeight = 560 };
-        window.HandlerChanged += (_, _) => PlatformWindow.Attach(window, page);
+        window.HandlerChanged += (_, _) => PlatformWindow.Attach(window, page, supervisor, instanceLock);
         return window;
     }
 }
@@ -18,6 +18,7 @@ public sealed class MainPage : ContentPage
     private readonly DesktopRuntime _runtime;
     private readonly RunnerSupervisor _supervisor;
     private readonly BlazorWebView _webView;
+    private readonly TaskCompletionSource<bool> _started = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private bool _loaded;
     private bool _closing;
 
@@ -42,6 +43,9 @@ public sealed class MainPage : ContentPage
 
     public bool CanClose { get; private set; }
 
+    /// <summary>True once the runner supervisor runs; false when the app could not start (another copy is open, say).</summary>
+    public Task<bool> Started => _started.Task;
+
     protected override async void OnAppearing()
     {
         base.OnAppearing();
@@ -55,10 +59,20 @@ public sealed class MainPage : ContentPage
         {
             await _runtime.StartAsync();
             Content = _webView;
+            _started.TrySetResult(true);
+        }
+        catch (AlreadyOpenException ex) when (ex.BroughtUp)
+        {
+            // The copy that is already open shows its window; this one has nothing to do. Quitting
+            // waits for the dispatcher: this runs while the window is still being created.
+            CanClose = true;
+            _started.TrySetResult(false);
+            Dispatcher.Dispatch(() => Application.Current?.Quit());
         }
         catch (Exception ex)
         {
             CanClose = true;
+            _started.TrySetResult(false);
             Content = new VerticalStackLayout
             {
                 Padding = 32,
@@ -93,7 +107,7 @@ public sealed class MainPage : ContentPage
             {
                 var message = view.HasActiveSession
                     ? "An editor session is using this runner. Quitting stops the runner and interrupts that session."
-                    : "Quitting stops the runner. Offloadr can no longer use this GPU until you open the app again.";
+                    : "Quitting stops the runner. Offloadr can no longer use this GPU until you open the app again. Close the window instead to keep it running in the notification area.";
                 if (!await DisplayAlertAsync("Quit Offloadr Runner?", message, "Quit", "Keep running"))
                 {
                     return false;

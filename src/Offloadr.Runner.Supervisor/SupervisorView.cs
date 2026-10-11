@@ -44,6 +44,22 @@ public sealed record SupervisorView(
     public bool IsActive => State is SupervisorState.Checking or SupervisorState.ResolvingPlan or SupervisorState.Pulling
         or SupervisorState.Starting or SupervisorState.Running or SupervisorState.RestartPending or SupervisorState.WaitingToRestart;
 
+    /// <summary>Short name of the state for headings, tooltips and menus.</summary>
+    public string StateTitle => State switch
+    {
+        SupervisorState.Stopped => "Stopped",
+        SupervisorState.Checking => "Checking…",
+        SupervisorState.ResolvingPlan => "Finding the image…",
+        SupervisorState.Pulling => "Downloading the image…",
+        SupervisorState.Starting => "Starting…",
+        SupervisorState.Running => "Running",
+        SupervisorState.RestartPending => "Running, restart pending",
+        SupervisorState.WaitingToRestart => "Restarting soon",
+        SupervisorState.Stopping => "Stopping…",
+        SupervisorState.Faulted => "Needs attention",
+        _ => State.ToString(),
+    };
+
     /// <summary>True when the runner reports an editor session; stopping now would interrupt someone's work.</summary>
     public bool HasActiveSession => !string.IsNullOrEmpty(RunnerStatus?.ActiveSessionId);
 }

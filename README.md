@@ -10,7 +10,7 @@ You need an NVIDIA GPU, Docker with GPU support, and a personal runner key from 
 
 ### Desktop app (Windows)
 
-Download `OffloadrRunner-<version>-windows-x64.zip` from the [releases](https://github.com/offloadr/runner/releases), extract it and run `OffloadrRunner.exe`. It needs Docker Desktop with the WSL 2 backend and the [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/), which Windows 11 includes; on Windows 10, install it if the app's window stays blank. Paste your runner key under Settings and press Start runner. The app picks the runner image for your editor, downloads it, keeps it running, and stops it when you quit.
+Download `OffloadrRunner-<version>-windows-x64.zip` from the [releases](https://github.com/offloadr/runner/releases), extract it and run `OffloadrRunner.exe`. It needs Docker Desktop with the WSL 2 backend and the [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/), which Windows 11 includes; on Windows 10, install it if the app's window stays blank. Paste your runner key under Settings and press Start runner. The app picks the runner image for your editor, downloads it and keeps it running. Closing the window leaves it in the notification area; quit from its tray icon to stop the runner.
 
 ### Docker
 
