@@ -2702,13 +2702,12 @@ public class VfsShimLinuxTests
             #include <pthread.h>
             #include <stdio.h>
             #include <string.h>
-            #include <sys/syscall.h>
             #include <unistd.h>
 
             static int read_alias(const char *alias, const char *expected) {
                 int fd = open(alias, O_RDONLY);
                 if (fd < 0) {
-                    perror("alias open");
+                    perror(alias);
                     return 1;
                 }
                 char bytes[4] = {0};
@@ -2741,8 +2740,30 @@ public class VfsShimLinuxTests
 
             static void *read_thread_aliases(void *opaque) {
                 struct thread_arguments *arguments = opaque;
-                long process_id = (long)getpid();
-                long thread_id = (long)syscall(SYS_gettid);
+                // The mounted procfs can expose a different PID namespace from getpid/gettid.
+                // Derive numeric aliases from this mount's identity of the accessing thread.
+                char thread_path[96];
+                ssize_t length = readlink("/proc/thread-self", thread_path, sizeof(thread_path) - 1);
+                if (length < 0) {
+                    perror("readlink /proc/thread-self");
+                    arguments->result = 5;
+                    return NULL;
+                }
+                if (length == 0 || length >= (ssize_t)sizeof(thread_path) - 1) {
+                    fprintf(stderr, "unexpected proc thread link length: %zd\n", length);
+                    arguments->result = 5;
+                    return NULL;
+                }
+                thread_path[length] = '\0';
+                long process_id;
+                long thread_id;
+                char trailing;
+                if (sscanf(thread_path, "%ld/task/%ld%c", &process_id, &thread_id, &trailing) != 2 ||
+                    process_id <= 0 || thread_id <= 0) {
+                    fprintf(stderr, "unexpected proc thread identity: %s\n", thread_path);
+                    arguments->result = 6;
+                    return NULL;
+                }
                 char thread_self_alias[64];
                 char thread_id_alias[64];
                 char task_alias[96];
