@@ -6,7 +6,15 @@ The runner images Offloadr uses on its own hosted GPUs are built from this repos
 
 ## Run it
 
-You need Docker with NVIDIA GPU support and a personal runner key from Settings in the Offloadr web app.
+You need an NVIDIA GPU, Docker with GPU support, and a personal runner key from Settings in the Offloadr web app.
+
+### Desktop app (Windows)
+
+Download `OffloadrRunner-<version>-windows-x64.zip` from the [releases](https://github.com/offloadr/runner/releases), extract it and run `OffloadrRunner.exe`. It needs Docker Desktop with the WSL 2 backend and the [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/), which Windows 11 includes; on Windows 10, install it if the app's window stays blank. Paste your runner key under Settings and press Start runner. The app picks the runner image for your editor, downloads it, keeps it running, and stops it when you quit.
+
+### Docker
+
+On Linux, or if you prefer the command line:
 
 ```bash
 docker run --rm -it --pull always --gpus all -e RUNNER_SECRET=<your-runner-key> ghcr.io/offloadr/runner-comfyui:latest
@@ -31,13 +39,19 @@ dotnet build runner.slnx
 docker buildx bake comfyui-latest --load
 ```
 
+The desktop app needs Windows and the `maui-windows` workload:
+
+```bash
+dotnet build runner.desktop.slnx
+```
+
 The full test suite needs Linux, root, `gcc` and `aria2c`. From any machine with Docker:
 
 ```bash
 ./build/test-linux.sh
 ```
 
-[docs/architecture.md](docs/architecture.md) explains how the runner works and how the code is organised.
+[docs/architecture.md](docs/architecture.md) explains how the runner works and how the code is organised. [CONTRIBUTING.md](CONTRIBUTING.md) lists the checks to run before a pull request.
 
 ## License
 

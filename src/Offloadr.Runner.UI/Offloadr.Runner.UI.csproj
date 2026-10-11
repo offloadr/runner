@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk.Razor">
+
+  <!-- The runner's user interface, shared by desktop hosts. Logic lives in Offloadr.Runner.Supervisor. -->
+  <PropertyGroup>
+    <RootNamespace>Offloadr.Runner.UI</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Offloadr.Runner.Supervisor\Offloadr.Runner.Supervisor.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.Components.Web" />
+    <PackageReference Include="MudBlazor" />
+  </ItemGroup>
+
+</Project>

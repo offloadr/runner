@@ -1,0 +1,135 @@
+@page "/settings"
+@inherits SupervisorComponent
+@inject RunnerSettingsEditor SettingsEditor
+@inject IHostActions Host
+@inject ISnackbar Snackbar
+
+<PageTitle>Settings - Offloadr Runner</PageTitle>
+
+<MudText Typo="Typo.h5" HtmlTag="h1" Class="mb-4">Settings</MudText>
+
+<MudPaper Outlined="true" Class="pa-5">
+    <MudStack Spacing="4">
+        <MudStack Spacing="1">
+            <MudTextField T="string" @bind-Value="_runnerKey" Label="Runner key" Variant="Variant.Outlined"
+                          InputType="@(_showKey ? InputType.Text : InputType.Password)"
+                          Adornment="Adornment.End" AdornmentIcon="@(_showKey ? Icons.Material.Filled.VisibilityOff : Icons.Material.Filled.Visibility)"
+                          AdornmentAriaLabel="Show or hide the key" OnAdornmentClick="@(() => _showKey = !_showKey)"
+                          HelperText="Create a personal runner key under Settings in the Offloadr web app. It is stored encrypted on this computer." />
+            <div>
+                <MudButton Size="Size.Small" Variant="Variant.Text" EndIcon="@Icons.Material.Filled.OpenInNew"
+                           OnClick="OpenOffloadrAsync">Open Offloadr</MudButton>
+            </div>
+        </MudStack>
+
+        <MudSelect T="string" @bind-Value="_editorTemplate" Label="Editor" Variant="Variant.Outlined"
+                   HelperText="@EditorHelp">
+            @foreach (var template in Templates)
+            {
+                <MudSelectItem Value="@template.EditorTemplate">@template.Label</MudSelectItem>
+            }
+        </MudSelect>
+
+        <MudStack Row="true" AlignItems="AlignItems.Start" Spacing="2">
+            <MudTextField T="string" @bind-Value="_modelsDirectory" Label="Models folder (optional)" Variant="Variant.Outlined" Clearable="true"
+                          HelperText="Model files here are shared read-only with the runner, so matching models are not downloaded again." />
+            @if (Host.CanPickFolder)
+            {
+                <MudButton Variant="Variant.Outlined" Class="mt-2" OnClick="PickModelsFolderAsync">Browse</MudButton>
+            }
+        </MudStack>
+
+        <MudSwitch T="bool" @bind-Value="_autoStart" Color="Color.Primary" Label="Start the runner when this app opens" />
+
+        <MudExpansionPanels Outlined="true" Elevation="0">
+            <MudExpansionPanel Text="Advanced">
+                <MudStack Spacing="4">
+                    <MudTextField T="string" @bind-Value="_origin" Label="Offloadr address" Variant="Variant.Outlined"
+                                  HelperText="Change this only to use another Offloadr environment." />
+                    <MudTextField T="string" @bind-Value="_engineExecutable" Label="Docker or podman executable" Variant="Variant.Outlined" Clearable="true"
+                                  HelperText="Leave empty to find Docker automatically." />
+                </MudStack>
+            </MudExpansionPanel>
+        </MudExpansionPanels>
+
+        @if (_problems.Count > 0)
+        {
+            <MudAlert Severity="Severity.Warning" Dense="true">
+                @foreach (var problem in _problems)
+                {
+                    <div>@problem</div>
+                }
+            </MudAlert>
+        }
+
+        <MudStack Row="true" Justify="Justify.FlexEnd">
+            <MudButton Variant="Variant.Filled" Color="Color.Primary" Disabled="_saving" OnClick="SaveAsync">Save</MudButton>
+        </MudStack>
+    </MudStack>
+</MudPaper>
+
+@code {
+    private string? _runnerKey;
+    private string? _editorTemplate;
+    private string? _modelsDirectory;
+    private string? _origin;
+    private string? _engineExecutable;
+    private bool _autoStart;
+    private bool _showKey;
+    private bool _saving;
+    private IReadOnlyList<string> _problems = [];
+
+    private IReadOnlyList<LaunchTemplate> Templates
+        => View.Plan?.Source == LaunchPlanSource.ControlPlane ? View.Plan.Templates : BuiltInLaunchPlanCatalog.Templates;
+
+    private string EditorHelp => View.Plan?.Source == LaunchPlanSource.ControlPlane
+        ? "Offloadr picks the editor you have selected there; this choice is only a fallback."
+        : "The runner image to run. Match the editor you use in Offloadr.";
+
+    protected override void OnInitialized()
+    {
+        base.OnInitialized();
+        var form = SettingsEditor.Load();
+        _runnerKey = form.RunnerKey;
+        _editorTemplate = form.SelectedEditorTemplate;
+        _modelsDirectory = form.LocalModelsDirectory;
+        _origin = form.OffloadrApiOrigin;
+        _engineExecutable = form.ContainerEngineExecutable;
+        _autoStart = form.AutoStart;
+    }
+
+    private async Task SaveAsync()
+    {
+        _saving = true;
+        try
+        {
+            var result = await SettingsEditor.SaveAsync(new SettingsForm(_runnerKey, _editorTemplate, _modelsDirectory, _origin, _engineExecutable, _autoStart));
+            _problems = result.Problems;
+            if (!result.Saved)
+            {
+                Snackbar.Add(result.Error ?? "Could not save the settings.", Severity.Error);
+                return;
+            }
+
+            Snackbar.Add(
+                View.IsActive ? "Saved. The runner restarts with these settings when no session is using it." : "Saved.",
+                _problems.Count == 0 ? Severity.Success : Severity.Warning);
+        }
+        finally
+        {
+            _saving = false;
+        }
+    }
+
+    private async Task PickModelsFolderAsync()
+    {
+        var folder = await Host.PickFolderAsync();
+        if (!string.IsNullOrEmpty(folder))
+        {
+            _modelsDirectory = folder;
+        }
+    }
+
+    private Task OpenOffloadrAsync()
+        => Host.OpenExternalAsync(string.IsNullOrWhiteSpace(_origin) ? RunnerSettings.DefaultOffloadrApiOrigin : _origin);
+}

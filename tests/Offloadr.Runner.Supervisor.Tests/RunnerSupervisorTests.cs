@@ -2551,6 +2551,31 @@ public class RunnerSupervisorTests
         });
     }
 
+    [Test]
+    public async Task CheckGpuAccess_BeforeTheFirstStart_UsesTheConfiguredImage()
+    {
+        _engine.AddImage("ghcr.io/offloadr/runner-comfyui:latest");
+        var supervisor = await StartSupervisorAsync();
+
+        var check = await supervisor.CheckGpuAccessAsync();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(check.Succeeded, Is.True);
+            Assert.That(supervisor.View.GpuAccess, Is.EqualTo(check));
+        });
+    }
+
+    [Test]
+    public async Task CheckGpuAccess_WithoutTheImage_AsksForAFirstStart()
+    {
+        var supervisor = await StartSupervisorAsync();
+
+        var check = await supervisor.CheckGpuAccessAsync();
+
+        Assert.That(check.Output, Does.Contain("Start the runner once"));
+    }
+
     /// <summary>Test cleanup; a scanner may briefly hold a file the test just wrote.</summary>
     private static void DeleteQuietly(string path)
     {

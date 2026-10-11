@@ -272,7 +272,7 @@ public sealed class RunnerSupervisor : BackgroundService
     /// <summary>Runs <c>nvidia-smi</c> in a throwaway container to prove Docker can reach the GPU.</summary>
     public async Task<GpuAccessCheck> CheckGpuAccessAsync(CancellationToken cancellationToken = default)
     {
-        var image = View.ActiveTemplate?.Image ?? View.Plan?.Choose(_settings.Current)?.Image;
+        var image = View.ActiveTemplate?.Image ?? (View.Plan ?? BuiltInLaunchPlanCatalog.Plan()).Choose(_settings.Current)?.Image;
         GpuAccessCheck result;
         try
         {

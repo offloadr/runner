@@ -14,6 +14,15 @@ variable "SOURCE_REVISION" {
   default = ""
 }
 
+# Each image gets its channel tag, plus <channel>-<commit> when SOURCE_REVISION is set.
+function "tags_for" {
+  params = [repository, channel]
+  result = SOURCE_REVISION == "" ? ["${REGISTRY}/${repository}:${channel}"] : [
+    "${REGISTRY}/${repository}:${channel}",
+    "${REGISTRY}/${repository}:${channel}-${substr(SOURCE_REVISION, 0, 12)}",
+  ]
+}
+
 group "default" {
   targets = ["comfyui-latest", "comfyui-master", "forge-neo-neo", "forge-neo-latest"]
 }
@@ -60,7 +69,7 @@ target "comfyui-latest" {
     FINAL_BASE_IMAGE                  = "${BASE_REGISTRY}/comfyui-extensions:latest"
     RUNNER_SUPPORTED_EDITOR_TEMPLATES = "comfyui-latest"
   }
-  tags     = ["${REGISTRY}/runner-comfyui:latest"]
+  tags     = tags_for("runner-comfyui", "latest")
 }
 
 target "comfyui-master" {
@@ -69,7 +78,7 @@ target "comfyui-master" {
     FINAL_BASE_IMAGE                  = "${BASE_REGISTRY}/comfyui-extensions:master"
     RUNNER_SUPPORTED_EDITOR_TEMPLATES = "comfyui-master"
   }
-  tags     = ["${REGISTRY}/runner-comfyui:master"]
+  tags     = tags_for("runner-comfyui", "master")
 }
 
 target "forge-neo-neo" {
@@ -78,7 +87,7 @@ target "forge-neo-neo" {
     FINAL_BASE_IMAGE                  = "${BASE_REGISTRY}/sd-webui-forge-neo:neo"
     RUNNER_SUPPORTED_EDITOR_TEMPLATES = "forge-neo:neo"
   }
-  tags     = ["${REGISTRY}/runner-forge-neo:neo"]
+  tags     = tags_for("runner-forge-neo", "neo")
 }
 
 target "forge-neo-latest" {
@@ -87,5 +96,5 @@ target "forge-neo-latest" {
     FINAL_BASE_IMAGE                  = "${BASE_REGISTRY}/sd-webui-forge-neo:latest"
     RUNNER_SUPPORTED_EDITOR_TEMPLATES = "forge-neo:latest"
   }
-  tags     = ["${REGISTRY}/runner-forge-neo:latest"]
+  tags     = tags_for("runner-forge-neo", "latest")
 }

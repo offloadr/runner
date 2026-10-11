@@ -26,6 +26,8 @@ The agent is the container's entry point and runs as root. It:
 | Offloadr.Runner.Linux | command loop, session process manager, Linux user isolation, VFS shim and IPC, hydration coordinator, workspace and artifact mirroring, local model projection, GPU power and telemetry | Linux |
 | Offloadr.Runner.Agent | entry point and `Dockerfile` | Linux container |
 | Offloadr.Runner.Supervisor | runs the runner container on a desktop: settings, Docker CLI, launch plans, supervision | Windows, macOS, Linux |
+| Offloadr.Runner.UI | Razor pages for status, settings and logs | any Blazor host |
+| Offloadr.Runner.Desktop | MAUI Blazor Hybrid window, encrypted key storage, close flow | Windows |
 
 Core must not reference Linux. A future host that runs on Windows or macOS, such as a desktop supervisor or a mode that attaches to a locally running ComfyUI, references Core only.
 
@@ -51,6 +53,10 @@ The split follows today's dependency graph. These services sit in Linux only bec
 4. The image comes from `GetRunnerLaunchPlan` on `RunnerControlService`, authenticated with the runner key. It returns the templates, their images and the owner's selected editor template. Until a control plane implements it, the call fails with `UNIMPLEMENTED` and the supervisor uses the built-in list of published images with the template chosen in Settings. The server must treat this call as a catalog query, never as a heartbeat.
 5. When the wanted image or settings change, it first downloads the new image in the background while the current runner keeps serving, then restarts once the status file shows no active session (read twice, a moment apart, right before the stop), and otherwise waits until the session ends. Without a status file it leaves the restart to the person. A session assigned in the instant between that last read and the stop can still be interrupted; closing that gap needs the control plane to hold back new assignments while the supervisor switches, which is not designed yet.
 6. Containers carry labels with the editor template, a fingerprint of their configuration, the launch that created them and an ID kept in the app's data folder. On launch the supervisor adopts a matching container left running by an earlier session of the same app, and it never touches a container with the same name that it did not create, including a runner that another copy of the app (another data folder, or another computer using the same engine) started.
+
+## Desktop app
+
+The desktop app is a MAUI Blazor Hybrid window around `Offloadr.Runner.UI`, following the structure of a shared Razor UI with thin hosts. MAUI does not run hosted services, so `DesktopRuntime` starts them in order: a single-instance lock first, then the supervisor. The runner key is encrypted with ASP.NET Core Data Protection, whose key ring is protected with DPAPI. Settings, keys and logs live in `%LOCALAPPDATA%\OffloadrRunner`, or in `OFFLOADR_RUNNER_DATA_DIRECTORY` when set. Quitting stops the runner container; the app asks first when the runner is active, and warns when a session would be interrupted.
 
 ## Origin
 

@@ -21,6 +21,7 @@ public static class SupervisorServiceCollectionExtensions
         services.TryAddSingleton(TimeProvider.System);
         services.TryAddSingleton<IProcessRunner, SystemProcessRunner>();
         services.AddSingleton<IRunnerSettingsStore, FileRunnerSettingsStore>();
+        services.AddSingleton<RunnerSettingsEditor>();
         services.AddSingleton(new ContainerEngineSelection(statePath: paths.EngineState));
         services.AddSingleton(new SupervisorInstanceLock(paths.SupervisorLock));
         services.AddSingleton(_ => SupervisorOwner.LoadOrCreate(paths.Owner));

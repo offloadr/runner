@@ -1,0 +1,24 @@
+@implements IDisposable
+@inject NavigationManager Navigation
+
+<MudButton Href="@Href" Variant="Variant.Text" Color="Color.Inherit" Class="@($"runner-nav{(IsCurrent ? " active" : string.Empty)}")"
+           aria-current="@(IsCurrent ? "page" : null)">@Text</MudButton>
+
+@code {
+    [Parameter, EditorRequired]
+    public string Href { get; set; } = string.Empty;
+
+    [Parameter, EditorRequired]
+    public string Text { get; set; } = string.Empty;
+
+    private bool IsCurrent => string.Equals(
+        Navigation.ToBaseRelativePath(Navigation.Uri).Split('?', '#')[0].TrimEnd('/'),
+        Href.TrimEnd('/'),
+        StringComparison.OrdinalIgnoreCase);
+
+    protected override void OnInitialized() => Navigation.LocationChanged += OnLocationChanged;
+
+    public void Dispose() => Navigation.LocationChanged -= OnLocationChanged;
+
+    private void OnLocationChanged(object? sender, Microsoft.AspNetCore.Components.Routing.LocationChangedEventArgs e) => InvokeAsync(StateHasChanged);
+}

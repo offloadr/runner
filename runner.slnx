@@ -5,6 +5,7 @@
     <Project Path="src/Offloadr.Runner.Linux/Offloadr.Runner.Linux.csproj" />
     <Project Path="src/Offloadr.Runner.Agent/Offloadr.Runner.Agent.csproj" />
     <Project Path="src/Offloadr.Runner.Supervisor/Offloadr.Runner.Supervisor.csproj" />
+    <Project Path="src/Offloadr.Runner.UI/Offloadr.Runner.UI.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/Offloadr.Runner.Supervisor.Tests/Offloadr.Runner.Supervisor.Tests.csproj" />

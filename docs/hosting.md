@@ -201,4 +201,4 @@ All published variants are defined in `docker-bake.hcl` at the repository root:
 docker buildx bake comfyui-latest --load
 ```
 
-The targets are `comfyui-latest`, `comfyui-master`, `forge-neo-neo` and `forge-neo-latest`. Each layers the agent, aria2 and the model VFS shim on a public editor image; see `THIRD-PARTY-NOTICES.md` for where those come from.
+The targets are `comfyui-latest`, `comfyui-master`, `forge-neo-neo` and `forge-neo-latest`. Setting `SOURCE_REVISION` to a commit adds a `<channel>-<commit>` tag next to the channel tag. The `Publish runner images` workflow builds all four and pushes them to `ghcr.io/offloadr`. Each layers the agent, aria2 and the model VFS shim on a public editor image; see `THIRD-PARTY-NOTICES.md` for where those come from.

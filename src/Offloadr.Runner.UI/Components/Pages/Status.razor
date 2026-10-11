@@ -1,0 +1,179 @@
+@page "/"
+@inherits SupervisorComponent
+@inject IRunnerSettingsStore SettingsStore
+@inject NavigationManager Navigation
+
+<PageTitle>Offloadr Runner</PageTitle>
+
+<MudStack Spacing="4">
+    <MudPaper Outlined="true" Class="pa-5">
+        <MudStack Row="true" AlignItems="AlignItems.Center" Justify="Justify.SpaceBetween" Wrap="Wrap.Wrap" Spacing="3">
+            <MudStack Row="true" AlignItems="AlignItems.Center" Spacing="3">
+                <MudIcon Icon="@StateIcon" Color="@StateColor" Size="Size.Large" />
+                <div>
+                    <MudText Typo="Typo.h5" HtmlTag="h1">@StateTitle</MudText>
+                    <MudText Typo="Typo.body2" Class="mud-text-secondary">@View.Message</MudText>
+                </div>
+            </MudStack>
+            @if (View.IsActive || View.State == SupervisorState.Stopping)
+            {
+                <MudButton Variant="Variant.Outlined" Color="Color.Error" StartIcon="@Icons.Material.Filled.Stop"
+                           Disabled="@(View.State == SupervisorState.Stopping)" OnClick="Supervisor.RequestStop">Stop runner</MudButton>
+            }
+            else
+            {
+                <MudButton Variant="Variant.Filled" Color="Color.Primary" StartIcon="@Icons.Material.Filled.PlayArrow"
+                           OnClick="Supervisor.RequestStart">Start runner</MudButton>
+            }
+        </MudStack>
+        @if (View.State is SupervisorState.Pulling or SupervisorState.Checking or SupervisorState.ResolvingPlan or SupervisorState.Starting or SupervisorState.Stopping)
+        {
+            <MudProgressLinear Indeterminate="true" Color="Color.Primary" Class="mt-4" />
+        }
+        @if (View.HasActiveSession)
+        {
+            <MudAlert Severity="Severity.Info" Dense="true" Class="mt-4">An editor session is using this runner. Stopping now interrupts it.</MudAlert>
+        }
+        @if (View.Plan?.Notice is { } notice && View.IsActive)
+        {
+            <MudAlert Severity="Severity.Normal" Dense="true" Class="mt-4">@notice</MudAlert>
+        }
+    </MudPaper>
+
+    <MudGrid Spacing="4">
+        <MudItem xs="12" md="6">
+            <MudPaper Outlined="true" Class="pa-5" Style="height: 100%">
+                <MudStack Row="true" AlignItems="AlignItems.Center" Justify="Justify.SpaceBetween">
+                    <MudText Typo="Typo.h6" HtmlTag="h2">This computer</MudText>
+                    <MudButton Size="Size.Small" Variant="Variant.Text" StartIcon="@Icons.Material.Filled.Refresh"
+                               Disabled="@View.IsActive" OnClick="Supervisor.RequestRefresh">Check again</MudButton>
+                </MudStack>
+                <MudStack Spacing="3" Class="mt-3">
+                    <Check Ok="@View.Engine?.Available" Title="Docker" Detail="@EngineDetail" />
+                    <Check Ok="@HostGpuOk" Title="NVIDIA GPU" Detail="@HostGpuDetail" />
+                    <MudStack Row="true" AlignItems="AlignItems.Start" Justify="Justify.SpaceBetween">
+                        <Check Ok="@View.GpuAccess?.Succeeded" Title="GPU inside containers" Detail="@GpuAccessDetail" />
+                        <MudButton Size="Size.Small" Variant="Variant.Text" Disabled="@(_checkingGpu || View.Engine?.Available != true)"
+                                   OnClick="CheckGpuAsync">@(_checkingGpu ? "Checking…" : "Check")</MudButton>
+                    </MudStack>
+                    <MudStack Row="true" AlignItems="AlignItems.Start" Justify="Justify.SpaceBetween">
+                        <Check Ok="@SettingsStore.Current.HasRunnerKey" Title="Runner key"
+                               Detail="@(SettingsStore.Current.HasRunnerKey ? "Saved on this computer, encrypted." : "Not set yet.")" />
+                        @if (!SettingsStore.Current.HasRunnerKey)
+                        {
+                            <MudButton Size="Size.Small" Variant="Variant.Text" OnClick="@(() => Navigation.NavigateTo("settings"))">Add key</MudButton>
+                        }
+                    </MudStack>
+                </MudStack>
+            </MudPaper>
+        </MudItem>
+        <MudItem xs="12" md="6">
+            <MudPaper Outlined="true" Class="pa-5" Style="height: 100%">
+                <MudText Typo="Typo.h6" HtmlTag="h2">Runner</MudText>
+                <MudSimpleTable Dense="true" Elevation="0" Class="mt-2">
+                    <tbody>
+                        <tr><th scope="row">Editor</th><td>@(Template?.Label ?? "Not chosen yet")</td></tr>
+                        <tr><th scope="row">Image</th><td class="runner-check-detail">@(Template?.Image ?? "–")</td></tr>
+                        <tr><th scope="row">Digest</th><td class="runner-check-detail">@(Digest ?? "–")</td></tr>
+                        <tr><th scope="row">Chosen by</th><td>@PlanSource</td></tr>
+                        <tr><th scope="row">Agent version</th><td>@(View.RunnerStatus?.Version ?? "–")</td></tr>
+                        <tr><th scope="row">Session</th><td>@(View.RunnerStatus is null ? "–" : View.HasActiveSession ? "In use" : "Idle")</td></tr>
+                        <tr><th scope="row">Restarts</th><td>@View.Restarts</td></tr>
+                    </tbody>
+                </MudSimpleTable>
+            </MudPaper>
+        </MudItem>
+    </MudGrid>
+
+    <MudPaper Outlined="true" Class="pa-5">
+        <MudStack Row="true" AlignItems="AlignItems.Center" Justify="Justify.SpaceBetween">
+            <MudText Typo="Typo.h6" HtmlTag="h2">Recent log</MudText>
+            <MudLink Href="logs">All logs</MudLink>
+        </MudStack>
+        <pre class="runner-log runner-log-tail mt-3">@string.Join('\n', Supervisor.LogLines.TakeLast(14))</pre>
+    </MudPaper>
+</MudStack>
+
+@code {
+    private bool _checkingGpu;
+
+    private LaunchTemplate? Template => View.ActiveTemplate ?? (View.Plan ?? BuiltInLaunchPlanCatalog.Plan()).Choose(SettingsStore.Current);
+
+    private string? Digest => View.Image?.RepoDigest is { } digest && digest.Contains('@') ? digest[(digest.IndexOf('@') + 1)..] : null;
+
+    private string PlanSource => View.Plan?.Source switch
+    {
+        LaunchPlanSource.ControlPlane => "Offloadr, from your editor selection",
+        LaunchPlanSource.BuiltIn => "Your choice in Settings",
+        LaunchPlanSource.Unreachable => "Your choice in Settings, while Offloadr cannot be reached",
+        _ => "–",
+    };
+
+    private string StateTitle => View.State switch
+    {
+        SupervisorState.Stopped => "Stopped",
+        SupervisorState.Checking => "Checking…",
+        SupervisorState.ResolvingPlan => "Finding the image…",
+        SupervisorState.Pulling => "Downloading the image…",
+        SupervisorState.Starting => "Starting…",
+        SupervisorState.Running => "Running",
+        SupervisorState.RestartPending => "Running, restart pending",
+        SupervisorState.WaitingToRestart => "Restarting soon",
+        SupervisorState.Stopping => "Stopping…",
+        SupervisorState.Faulted => "Needs attention",
+        _ => View.State.ToString(),
+    };
+
+    private string StateIcon => View.State switch
+    {
+        SupervisorState.Running or SupervisorState.RestartPending => Icons.Material.Filled.CheckCircle,
+        SupervisorState.Faulted => Icons.Material.Filled.Error,
+        SupervisorState.Stopped => Icons.Material.Filled.PauseCircle,
+        _ => Icons.Material.Filled.Autorenew,
+    };
+
+    private Color StateColor => View.State switch
+    {
+        SupervisorState.Running or SupervisorState.RestartPending => Color.Success,
+        SupervisorState.Faulted => Color.Error,
+        SupervisorState.WaitingToRestart => Color.Warning,
+        SupervisorState.Stopped => Color.Default,
+        _ => Color.Primary,
+    };
+
+    private string EngineDetail => View.Engine switch
+    {
+        null => "Not checked yet.",
+        { Available: false } engine => engine.Error ?? "Not available.",
+        var engine => $"{engine.OperatingSystem ?? engine.Kind.ToString()}, engine {engine.ServerVersion}.",
+    };
+
+    private bool? HostGpuOk => View.HostGpus is null ? null : View.HostGpus.Gpus.Count > 0;
+
+    private string HostGpuDetail => View.HostGpus switch
+    {
+        null => "Not checked yet.",
+        { Gpus.Count: 0 } report => report.Error ?? "No NVIDIA GPU found.",
+        var report => string.Join(", ", report.Gpus.Select(gpu => $"{gpu.Name} ({gpu.MemoryMiB / 1024.0:0.#} GB)")),
+    };
+
+    private string GpuAccessDetail => View.GpuAccess switch
+    {
+        null => "Runs nvidia-smi in a throwaway container from the runner image.",
+        { Succeeded: true } check => check.Output.Split('\n').Length == 1 ? check.Output : $"{check.Output.Split('\n').Length} GPUs visible.",
+        var check => check.Output,
+    };
+
+    private async Task CheckGpuAsync()
+    {
+        _checkingGpu = true;
+        try
+        {
+            await Supervisor.CheckGpuAccessAsync();
+        }
+        finally
+        {
+            _checkingGpu = false;
+        }
+    }
+}

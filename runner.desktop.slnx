@@ -1,0 +1,12 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Offloadr.Runner.Contracts/Offloadr.Runner.Contracts.csproj" />
+    <Project Path="src/Offloadr.Runner.Core/Offloadr.Runner.Core.csproj" />
+    <Project Path="src/Offloadr.Runner.Supervisor/Offloadr.Runner.Supervisor.csproj" />
+    <Project Path="src/Offloadr.Runner.UI/Offloadr.Runner.UI.csproj" />
+    <Project Path="src/Offloadr.Runner.Desktop/Offloadr.Runner.Desktop.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Offloadr.Runner.Supervisor.Tests/Offloadr.Runner.Supervisor.Tests.csproj" />
+  </Folder>
+</Solution>

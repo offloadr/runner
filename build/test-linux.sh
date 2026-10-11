@@ -20,5 +20,5 @@ mkdir /work
 tar -C /repo --exclude=./.git --exclude="*/bin" --exclude="*/obj" -cf - . | tar -xf - -C /work
 cd /work
 dotnet build runner.slnx -warnaserror -nologo -v q
-dotnet test tests/Offloadr.Runner.Tests --no-build "$@"
+dotnet test runner.slnx --no-build "$@"
 ' bash "${filter_args[@]}"

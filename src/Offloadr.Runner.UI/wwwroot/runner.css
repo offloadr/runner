@@ -1,0 +1,33 @@
+.runner-nav {
+    color: inherit;
+    opacity: 0.8;
+    margin-left: 4px;
+}
+
+.runner-nav.active {
+    opacity: 1;
+    background-color: rgba(255, 255, 255, 0.16);
+}
+
+.runner-log {
+    font-family: ui-monospace, "Cascadia Mono", Consolas, "Liberation Mono", monospace;
+    font-size: 0.8rem;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    word-break: break-all;
+    margin: 0;
+    overflow-y: auto;
+}
+
+.runner-log-tail {
+    max-height: 16rem;
+}
+
+.runner-log-full {
+    height: calc(100vh - 13rem);
+}
+
+.runner-check-detail {
+    color: var(--mud-palette-text-secondary);
+    font-size: 0.85rem;
+}

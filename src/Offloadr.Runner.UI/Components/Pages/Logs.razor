@@ -1,0 +1,37 @@
+@page "/logs"
+@inherits SupervisorComponent
+@inject IJSRuntime JS
+@inject ISnackbar Snackbar
+
+<PageTitle>Logs - Offloadr Runner</PageTitle>
+
+<MudStack Row="true" AlignItems="AlignItems.Center" Justify="Justify.SpaceBetween" Class="mb-4">
+    <MudText Typo="Typo.h5" HtmlTag="h1">Logs</MudText>
+    <MudButton Variant="Variant.Outlined" StartIcon="@Icons.Material.Filled.ContentCopy" OnClick="CopyAsync">Copy</MudButton>
+</MudStack>
+
+<MudPaper Outlined="true" Class="pa-4">
+    @if (Supervisor.LogLines.Count == 0)
+    {
+        <MudText Class="mud-text-secondary">Image downloads and runner output appear here once the runner starts.</MudText>
+    }
+    else
+    {
+        <pre class="runner-log runner-log-full">@string.Join('\n', Supervisor.LogLines)</pre>
+    }
+</MudPaper>
+
+@code {
+    private async Task CopyAsync()
+    {
+        try
+        {
+            await JS.InvokeVoidAsync("navigator.clipboard.writeText", string.Join('\n', Supervisor.LogLines));
+            Snackbar.Add("Copied the log. The runner key is never included.", Severity.Success);
+        }
+        catch (JSException ex)
+        {
+            Snackbar.Add($"Could not copy: {ex.Message}", Severity.Error);
+        }
+    }
+}

@@ -1,0 +1,71 @@
+name: Release desktop app
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release, for example 1.2.3
+        required: true
+        type: string
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check version and tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$GITHUB_REF" != refs/heads/main ]; then
+            echo "::error::Releases are made from main, not $GITHUB_REF."; exit 1
+          fi
+          # Windows package versions allow three numeric parts of at most 65535.
+          if ! [[ "$VERSION" =~ ^(0|[1-9][0-9]{0,4})\.(0|[1-9][0-9]{0,4})\.(0|[1-9][0-9]{0,4})$ ]] ||
+             (( BASH_REMATCH[1] > 65535 || BASH_REMATCH[2] > 65535 || BASH_REMATCH[3] > 65535 )); then
+            echo "::error::Version must be three numbers such as 1.2.3, got '$VERSION'."; exit 1
+          fi
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v$VERSION" --silent 2>/dev/null; then
+            echo "::error::Tag v$VERSION already exists."; exit 1
+          fi
+
+  build:
+    needs: validate
+    uses: ./.github/workflows/ci.yml
+    with:
+      version: ${{ inputs.version }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: offloadr-runner-windows-x64
+          path: dist/offloadr-runner-windows-x64
+
+      - name: Collect packages
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          mkdir release
+          (cd dist/offloadr-runner-windows-x64 && zip -qr "../../release/OffloadrRunner-$VERSION-windows-x64.zip" .)
+          ls -l release
+
+      - name: Tag and publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          gh release create "v$VERSION" release/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Offloadr Runner $VERSION" --generate-notes \
+            --notes "**Windows:** extract \`OffloadrRunner-$VERSION-windows-x64.zip\` and run \`OffloadrRunner.exe\`. You also need Docker Desktop with the WSL 2 backend and an NVIDIA driver. The build is unsigned, so Windows may ask you to confirm the first launch."

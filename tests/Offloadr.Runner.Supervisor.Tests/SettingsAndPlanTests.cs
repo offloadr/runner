@@ -430,3 +430,59 @@ public class ModelsFolderValidationTests
         Assert.That(settings.Validate(_ => true).Any(error => error.Contains("cannot contain ':'", StringComparison.Ordinal)), Is.EqualTo(rejected));
     }
 }
+
+public class RunnerSettingsEditorTests
+{
+    [Test]
+    public void Load_StartsTheFormWithTheFirstEditorWhenNoneIsChosen()
+    {
+        var editor = new RunnerSettingsEditor(new FakeSettingsStore(new RunnerSettings()));
+
+        Assert.That(editor.Load().SelectedEditorTemplate, Is.EqualTo(BuiltInLaunchPlanCatalog.Templates[0].EditorTemplate));
+    }
+
+    [Test]
+    public async Task Save_UsesTheDefaultAddressForABlankOne_AndReportsWhatIsStillWrong()
+    {
+        var store = new FakeSettingsStore(new RunnerSettings());
+        var editor = new RunnerSettingsEditor(store);
+
+        var result = await editor.SaveAsync(new SettingsForm(null, "comfyui-latest", null, "  ", null, AutoStart: true));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(result.Saved, Is.True);
+            Assert.That(store.Current.OffloadrApiOrigin, Is.EqualTo(RunnerSettings.DefaultOffloadrApiOrigin));
+            Assert.That(store.Current.AutoStart, Is.True);
+            Assert.That(result.Problems, Is.Not.Empty);
+        });
+    }
+
+    [Test]
+    public async Task Save_ThatCannotBeWritten_SaysWhy()
+    {
+        var editor = new RunnerSettingsEditor(new UnwritableSettingsStore());
+
+        var result = await editor.SaveAsync(new SettingsForm(null, "comfyui-latest", null, null, null, AutoStart: false));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(result.Saved, Is.False);
+            Assert.That(result.Error, Does.Contain("Access to the settings file is denied"));
+        });
+    }
+
+    private sealed class UnwritableSettingsStore : IRunnerSettingsStore
+    {
+        public RunnerSettings Current { get; } = new();
+
+        public event Action<RunnerSettings>? Changed
+        {
+            add { }
+            remove { }
+        }
+
+        public Task SaveAsync(RunnerSettings settings, CancellationToken cancellationToken = default)
+            => Task.FromException(new UnauthorizedAccessException("Access to the settings file is denied."));
+    }
+}

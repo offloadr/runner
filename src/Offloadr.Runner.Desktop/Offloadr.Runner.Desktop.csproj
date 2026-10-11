@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk.Razor">
+
+  <!-- Windows desktop app: a MAUI Blazor Hybrid window around Offloadr.Runner.UI. Needs the maui-windows workload. -->
+  <PropertyGroup>
+    <TargetFrameworks>net10.0-windows10.0.19041.0</TargetFrameworks>
+    <TargetFramework></TargetFramework>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>OffloadrRunner</AssemblyName>
+    <RootNamespace>Offloadr.Runner.Desktop</RootNamespace>
+    <UseMaui>true</UseMaui>
+    <SingleProject>true</SingleProject>
+    <EnableDefaultCssItems>false</EnableDefaultCssItems>
+    <ApplicationTitle>Offloadr Runner</ApplicationTitle>
+    <ApplicationId>app.offloadr.runner</ApplicationId>
+    <ApplicationDisplayVersion>$(VersionPrefix)</ApplicationDisplayVersion>
+    <ApplicationVersion>1</ApplicationVersion>
+    <WindowsPackageType Condition="'$(WindowsPackageType)' == ''">None</WindowsPackageType>
+    <SupportedOSPlatformVersion>10.0.17763.0</SupportedOSPlatformVersion>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(RuntimeIdentifierOverride)' != ''">
+    <RuntimeIdentifier>$(RuntimeIdentifierOverride)</RuntimeIdentifier>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Offloadr.Runner.UI\Offloadr.Runner.UI.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Maui.Controls" />
+    <PackageReference Include="Microsoft.AspNetCore.Components.WebView.Maui" />
+    <PackageReference Include="Microsoft.AspNetCore.DataProtection" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <MauiIcon Include="..\Offloadr.Runner.UI\wwwroot\icon.svg" Link="Resources\AppIcon\appicon.svg" Color="#4f46e5" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,36 @@
+@* One line of the environment checklist. Ok is null while the check has not run. *@
+<MudStack Row="true" AlignItems="AlignItems.Start" Spacing="2">
+    <MudIcon Icon="@Icon" Color="@IconColor" Size="Size.Small" Class="mt-1" />
+    <div>
+        <MudText Typo="Typo.body1">@Title</MudText>
+        @if (!string.IsNullOrEmpty(Detail))
+        {
+            <div class="runner-check-detail">@Detail</div>
+        }
+    </div>
+</MudStack>
+
+@code {
+    [Parameter, EditorRequired]
+    public string Title { get; set; } = string.Empty;
+
+    [Parameter]
+    public bool? Ok { get; set; }
+
+    [Parameter]
+    public string? Detail { get; set; }
+
+    private string Icon => Ok switch
+    {
+        true => Icons.Material.Filled.CheckCircle,
+        false => Icons.Material.Filled.Cancel,
+        null => Icons.Material.Outlined.Circle,
+    };
+
+    private Color IconColor => Ok switch
+    {
+        true => Color.Success,
+        false => Color.Error,
+        null => Color.Default,
+    };
+}

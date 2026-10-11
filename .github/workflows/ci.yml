@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      version:
+        description: Desktop app version, for example 1.2.3
+        required: false
+        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -13,6 +19,10 @@ concurrency:
 
 permissions:
   contents: read
+
+env:
+  # Empty outside releases; the publish script then uses its development version.
+  OFFLOADR_RUNNER_VERSION: ${{ inputs.version }}
 
 jobs:
   test:
@@ -80,6 +90,28 @@ jobs:
       # The agent suite assumes Linux; the supervisor runs on desktops and is tested here too.
       - name: Supervisor tests
         run: dotnet test tests/Offloadr.Runner.Supervisor.Tests --no-build
+
+  desktop:
+    name: Desktop app (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+
+      - run: dotnet workload install maui-windows --skip-manifest-update
+
+      - name: Publish self-contained folder
+        shell: pwsh
+        run: ./build/publish-windows.ps1 -Unpackaged
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: offloadr-runner-windows-x64
+          path: artifacts/packages/windows-win-x64/
+          if-no-files-found: error
 
   contracts:
     name: Lint contracts
