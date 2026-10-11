@@ -614,6 +614,24 @@ message RunnerWorkspaceServiceGetSeedArchiveUrlResponse {
     string url = 1;
 }
 
+message GetRunnerLaunchPlanRequest {
+    string supervisor_version = 1; // Version of the supervisor asking, for diagnostics.
+}
+
+// One editor template and the runner image that serves it.
+message RunnerLaunchTemplate {
+    string editor_template = 1;     // Canonical template id, as advertised in RegisterRunnerRequest.supported_editor_templates.
+    string editor_runtime_kind = 2; // comfyui | forge-neo
+    string runner_image = 3;        // Image reference to run; digest-pinned when the server can resolve it.
+    string label = 4;               // Human-readable name, e.g. "ComfyUI - current release".
+}
+
+message GetRunnerLaunchPlanResponse {
+    repeated RunnerLaunchTemplate templates = 1;
+    string selected_editor_template = 2; // The owner's current editor template; empty when unknown.
+    int32 refresh_seconds = 3;           // When to ask again; 0 = supervisor default.
+}
+
 // Offloadr API service exposed to runner agents.
 service RunnerControlService {
     rpc RegisterRunner(RegisterRunnerRequest) returns (RegisterRunnerResponse);
@@ -635,6 +653,10 @@ service RunnerControlService {
     rpc ReportRunnerLogs(ReportRunnerLogsRequest) returns (ReportRunnerLogsResponse);
     rpc ReportRuntimeTelemetry(ReportRuntimeTelemetryRequest) returns (ReportRuntimeTelemetryResponse);
     rpc ReportEditorRuntimeBridgeState(ReportEditorRuntimeBridgeStateRequest) returns (ReportEditorRuntimeBridgeStateResponse);
+    // Which runner image a local supervisor (for example the desktop app) should run for the key's
+    // owner. A catalog query only: it must not count as a heartbeat or change runner liveness,
+    // instance identity or registration state.
+    rpc GetRunnerLaunchPlan(GetRunnerLaunchPlanRequest) returns (GetRunnerLaunchPlanResponse);
 }
 
 // Runner-scoped artifact APIs authenticated via runner secret.

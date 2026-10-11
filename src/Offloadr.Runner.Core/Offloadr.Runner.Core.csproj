@@ -19,6 +19,8 @@
     <InternalsVisibleTo Include="Offloadr.Runner.Linux" />
     <InternalsVisibleTo Include="RunnerAgent" />
     <InternalsVisibleTo Include="Offloadr.Runner.Tests" />
+    <InternalsVisibleTo Include="Offloadr.Runner.Supervisor" />
+    <InternalsVisibleTo Include="Offloadr.Runner.Supervisor.Tests" />
   </ItemGroup>
 
 </Project>

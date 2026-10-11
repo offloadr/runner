@@ -25,6 +25,7 @@ The agent is the container's entry point and runs as root. It:
 | Offloadr.Runner.Core | gRPC channels, runner-key auth, registration backoff, options, log and telemetry relays, aria2 backend and transfer index, status file | any |
 | Offloadr.Runner.Linux | command loop, session process manager, Linux user isolation, VFS shim and IPC, hydration coordinator, workspace and artifact mirroring, local model projection, GPU power and telemetry | Linux |
 | Offloadr.Runner.Agent | entry point and `Dockerfile` | Linux container |
+| Offloadr.Runner.Supervisor | runs the runner container on a desktop: settings, Docker CLI, launch plans, supervision | Windows, macOS, Linux |
 
 Core must not reference Linux. A future host that runs on Windows or macOS, such as a desktop supervisor or a mode that attaches to a locally running ComfyUI, references Core only.
 
@@ -39,6 +40,17 @@ The split follows today's dependency graph. These services sit in Linux only bec
 | `WorkspaceMirrorService` | `SessionProcessManager.SessionPaths`, `LinuxSecureDirectoryRoot`, `LinuxPathCanonicalizer` |
 | `ModelDownloadService` | `DemandAwareModelHydrationCoordinator`, `LinuxFileIdentityReader`, `LocalModelProjector` |
 | `ComfySessionEventRelay` | calls `ServiceClientManager` for acknowledgement retries |
+
+## Supervisor
+
+`RunnerSupervisor` keeps one runner container alive on a person's machine, for the desktop app. It never registers as a runner itself; the container does that with the same key.
+
+1. It validates the settings, checks that Docker answers with Linux containers, and asks an `ILaunchPlanProvider` which image matches the person's editor template.
+2. It pulls that image, falling back to a local copy when the registry is unreachable, and runs it detached as `offloadr-runner` with `--gpus all`. The runner key reaches Docker through the process environment, never the command line.
+3. While running, it watches the container, follows its log, and reads the agent's status file. An unexpected exit restarts the container after a jittered backoff.
+4. The image comes from `GetRunnerLaunchPlan` on `RunnerControlService`, authenticated with the runner key. It returns the templates, their images and the owner's selected editor template. Until a control plane implements it, the call fails with `UNIMPLEMENTED` and the supervisor uses the built-in list of published images with the template chosen in Settings. The server must treat this call as a catalog query, never as a heartbeat.
+5. When the wanted image or settings change, it first downloads the new image in the background while the current runner keeps serving, then restarts once the status file shows no active session (read twice, a moment apart, right before the stop), and otherwise waits until the session ends. Without a status file it leaves the restart to the person. A session assigned in the instant between that last read and the stop can still be interrupted; closing that gap needs the control plane to hold back new assignments while the supervisor switches, which is not designed yet.
+6. Containers carry labels with the editor template, a fingerprint of their configuration, the launch that created them and an ID kept in the app's data folder. On launch the supervisor adopts a matching container left running by an earlier session of the same app, and it never touches a container with the same name that it did not create, including a runner that another copy of the app (another data folder, or another computer using the same engine) started.
 
 ## Origin
 

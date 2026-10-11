@@ -11,8 +11,10 @@ The Offloadr runner: the agent that executes GPU work for the Offloadr control p
 - `src/Offloadr.Runner.Core`: transport, authentication, registration backoff, logging relays, model transfer (aria2), status file. Must not depend on Linux-only code.
 - `src/Offloadr.Runner.Linux`: the in-container session runtime: command loop, per-session Linux users, editor child process, model VFS shim and its IPC, demand-aware hydration, workspace/artifact mirroring.
 - `src/Offloadr.Runner.Agent`: the container entry point (assembly `RunnerAgent`) and `Dockerfile`.
+- `src/Offloadr.Runner.Supervisor`: runs the runner container on a desktop (settings, Docker CLI, launch plans, supervision). Never shipped in the image.
 - `docker-bake.hcl`: the four published image variants.
 - `tests/Offloadr.Runner.Tests`: NUnit suite. Linux-native tests live in `Linux/` and need root, `gcc` and `aria2c`.
+- `tests/Offloadr.Runner.Supervisor.Tests`: supervisor tests with fakes; they run on any OS. `RUNNER_REAL_DOCKER_IMAGE=<image>` enables one test against the real Docker engine.
 - `docs/`: architecture, hosting guide, contracts sync.
 
 ## Coding standards

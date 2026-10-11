@@ -9,7 +9,7 @@ namespace Offloadr.Runner.Core;
 /// Local status a supervisor reads to decide when restarting the runner is safe.
 /// It is published inside the container only and never sent to the control plane.
 /// </summary>
-internal sealed record RunnerStatusSnapshot(
+public sealed record RunnerStatusSnapshot(
     [property: JsonPropertyName("runner_id")] string RunnerId,
     [property: JsonPropertyName("instance_id")] string InstanceId,
     [property: JsonPropertyName("version")] string Version,

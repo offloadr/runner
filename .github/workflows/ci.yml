@@ -77,6 +77,10 @@ jobs:
       - name: Build
         run: dotnet build runner.slnx -warnaserror
 
+      # The agent suite assumes Linux; the supervisor runs on desktops and is tested here too.
+      - name: Supervisor tests
+        run: dotnet test tests/Offloadr.Runner.Supervisor.Tests --no-build
+
   contracts:
     name: Lint contracts
     runs-on: ubuntu-latest
