@@ -25,4 +25,21 @@ public class ServiceRegistrationTests
             Assert.That(provider.GetRequiredService<ILoggerFactory>(), Is.Not.Null);
         });
     }
+
+    [Test]
+    public void AddRunnerUpdateChecks_RegistersTheCheckerAsAHostedService()
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddRunnerUpdateChecks(new Version(1, 2, 3));
+
+        using var provider = services.BuildServiceProvider(new ServiceProviderOptions { ValidateOnBuild = true });
+        var checker = provider.GetRequiredService<Offloadr.Runner.Supervisor.Hosting.UpdateChecker>();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(provider.GetServices<IHostedService>().Single(), Is.SameAs(checker));
+            Assert.That(checker.CurrentVersion, Is.EqualTo(new Version(1, 2, 3)));
+        });
+    }
 }

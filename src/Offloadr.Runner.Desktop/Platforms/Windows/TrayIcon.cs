@@ -40,14 +40,12 @@ internal sealed class TrayIcon : IDisposable
     private const uint TpmRightButton = 0x0002;
     private const uint TpmNoNotify = 0x0080;
     private const uint TpmReturnCmd = 0x0100;
-    private const uint ImageIcon = 1;
-    private const uint LrLoadFromFile = 0x10;
     private const int SmCxSmIcon = 49;
     private const int SmCySmIcon = 50;
     private static readonly UIntPtr SubclassId = 0x0FF1;
 
     private readonly IntPtr _window;
-    private readonly IntPtr _icon;
+    private IntPtr _icon;
     private readonly uint _taskbarCreated;
     private readonly Action _open;
     private readonly Func<IReadOnlyList<TrayMenuItem>> _menu;
@@ -56,13 +54,14 @@ internal sealed class TrayIcon : IDisposable
     private bool _disposed;
     private bool _subclassed;
 
-    public TrayIcon(IntPtr window, string iconPath, string tooltip, Action open, Func<IReadOnlyList<TrayMenuItem>> menu)
+    /// <param name="icon">Icon handle owned by the caller; it must outlive this tray icon.</param>
+    public TrayIcon(IntPtr window, IntPtr icon, string tooltip, Action open, Func<IReadOnlyList<TrayMenuItem>> menu)
     {
         _window = window;
+        _icon = icon;
         _tooltip = tooltip;
         _open = open;
         _menu = menu;
-        _icon = LoadImageW(IntPtr.Zero, iconPath, ImageIcon, GetSystemMetrics(SmCxSmIcon), GetSystemMetrics(SmCySmIcon), LrLoadFromFile);
         _taskbarCreated = RegisterWindowMessageW("TaskbarCreated");
         _subclass = WindowProc;
 
@@ -80,6 +79,22 @@ internal sealed class TrayIcon : IDisposable
     /// say); it is added again when the taskbar comes back. Nothing should hide into it meanwhile.
     /// </summary>
     public bool IsVisible { get; private set; }
+
+    /// <summary>Size, in pixels, of notification-area icons at the system DPI.</summary>
+    public static int SmallIconSize => Math.Max(GetSystemMetrics(SmCxSmIcon), GetSystemMetrics(SmCySmIcon));
+
+    /// <summary>Swaps the icon; the handle stays owned by the caller.</summary>
+    public void SetIcon(IntPtr icon)
+    {
+        if (_disposed || icon == IntPtr.Zero || icon == _icon)
+        {
+            return;
+        }
+
+        _icon = icon;
+        var data = Data(NifIcon);
+        Shell_NotifyIconW(NimModify, ref data);
+    }
 
     public void SetTooltip(string tooltip)
     {
@@ -120,10 +135,6 @@ internal sealed class TrayIcon : IDisposable
         if (_subclassed)
         {
             RemoveWindowSubclass(_window, _subclass, SubclassId);
-        }
-        if (_icon != IntPtr.Zero)
-        {
-            DestroyIcon(_icon);
         }
     }
 
@@ -262,12 +273,6 @@ internal sealed class TrayIcon : IDisposable
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern uint RegisterWindowMessageW(string name);
-
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    private static extern IntPtr LoadImageW(IntPtr instance, string name, uint type, int width, int height, uint load);
-
-    [DllImport("user32.dll")]
-    private static extern bool DestroyIcon(IntPtr icon);
 
     [DllImport("user32.dll")]
     private static extern int GetSystemMetrics(int index);

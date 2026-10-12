@@ -41,6 +41,14 @@
 
         <MudSwitch T="bool" @bind-Value="_autoStart" Color="Color.Primary" Label="Start the runner when this app opens" />
 
+        @if (Host.CanStartAtSignIn)
+        {
+            <MudStack Spacing="0">
+                <MudSwitch T="bool" @bind-Value="_startAtSignIn" Color="Color.Primary" Label="Open this app in the notification area when I sign in to Windows" />
+                <MudText Typo="Typo.caption" Class="mud-text-secondary ml-14">Together with the switch above, your GPU is available to Offloadr after every sign-in.</MudText>
+            </MudStack>
+        }
+
         <MudExpansionPanels Outlined="true" Elevation="0">
             <MudExpansionPanel Text="Advanced">
                 <MudStack Spacing="4">
@@ -75,6 +83,7 @@
     private string? _origin;
     private string? _engineExecutable;
     private bool _autoStart;
+    private bool _startAtSignIn;
     private bool _showKey;
     private bool _saving;
     private IReadOnlyList<string> _problems = [];
@@ -96,6 +105,7 @@
         _origin = form.OffloadrApiOrigin;
         _engineExecutable = form.ContainerEngineExecutable;
         _autoStart = form.AutoStart;
+        _startAtSignIn = Host.CanStartAtSignIn && Host.StartsAtSignIn;
     }
 
     private async Task SaveAsync()
@@ -111,9 +121,18 @@
                 return;
             }
 
+            if (Host.CanStartAtSignIn && _startAtSignIn != Host.StartsAtSignIn)
+            {
+                Host.SetStartAtSignIn(_startAtSignIn);
+            }
+
             Snackbar.Add(
                 View.IsActive ? "Saved. The runner restarts with these settings when no session is using it." : "Saved.",
                 _problems.Count == 0 ? Severity.Success : Severity.Warning);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException)
+        {
+            Snackbar.Add($"Saved, but could not change whether the app starts at sign-in: {ex.Message}", Severity.Error);
         }
         finally
         {

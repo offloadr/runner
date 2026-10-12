@@ -1,5 +1,7 @@
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Logging;
+using Offloadr.Runner.Supervisor.Hosting;
 using Offloadr.Runner.Supervisor.Containers;
 using Offloadr.Runner.Supervisor.Hardware;
 using Offloadr.Runner.Supervisor.LaunchPlans;
@@ -33,6 +35,14 @@ public static class SupervisorServiceCollectionExtensions
         services.TryAddSingleton<ILaunchPlanProvider, ControlPlaneLaunchPlanProvider>();
         services.AddSingleton<RunnerSupervisor>();
         services.AddHostedService(provider => provider.GetRequiredService<RunnerSupervisor>());
+        return services;
+    }
+
+    /// <summary>Checks GitHub for a newer release of the app shortly after start and then daily.</summary>
+    public static IServiceCollection AddRunnerUpdateChecks(this IServiceCollection services, Version currentVersion)
+    {
+        services.AddSingleton(provider => new UpdateChecker(currentVersion, provider.GetRequiredService<ILogger<UpdateChecker>>()));
+        services.AddHostedService(provider => provider.GetRequiredService<UpdateChecker>());
         return services;
     }
 }

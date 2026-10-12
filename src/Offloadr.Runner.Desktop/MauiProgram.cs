@@ -9,6 +9,12 @@ public static class MauiProgram
     /// <summary>Overrides where settings, keys and logs live; handy for trying the app without touching your own settings.</summary>
     public const string DataDirectoryVariable = "OFFLOADR_RUNNER_DATA_DIRECTORY";
 
+    /// <summary>
+    /// True when <see cref="DataDirectoryVariable"/> points the app at another data folder (a
+    /// development build, say). Such a copy leaves the person's sign-in entry alone.
+    /// </summary>
+    public static bool UsesOtherDataDirectory => !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(DataDirectoryVariable));
+
     public static SupervisorPaths Paths()
     {
         var data = Environment.GetEnvironmentVariable(DataDirectoryVariable);
@@ -33,6 +39,7 @@ public static class MauiProgram
         builder.Services.AddSingleton(new SingleInstanceLock(paths));
         builder.Services.AddHostedService(provider => provider.GetRequiredService<SingleInstanceLock>());
         builder.Services.AddRunnerSupervisor(paths).AddRunnerUI();
+        builder.Services.AddRunnerUpdateChecks(Offloadr.Runner.Supervisor.Hosting.UpdateChecker.VersionOf(typeof(MauiProgram).Assembly));
 
         builder.Logging.AddProvider(new FileLoggerProvider(paths.Logs));
         builder.Services.AddSingleton<DesktopRuntime>();

@@ -16,6 +16,14 @@ public interface IHostActions
 
     /// <summary>Opens an http(s) link in the person's browser.</summary>
     Task OpenExternalAsync(string url);
+
+    /// <summary>Whether the host can start itself when the person signs in.</summary>
+    bool CanStartAtSignIn => false;
+
+    bool StartsAtSignIn => false;
+
+    /// <summary>Turns starting at sign-in on or off; throws when the host cannot change it.</summary>
+    void SetStartAtSignIn(bool enabled) => throw new NotSupportedException("This host cannot start at sign-in.");
 }
 
 /// <summary>Fallback for hosts that render in a browser: no folder picker, links open in a new tab.</summary>

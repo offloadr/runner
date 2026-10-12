@@ -24,6 +24,30 @@ public sealed class DesktopRuntime(IEnumerable<IHostedService> services, ILogger
             await StopAsync();
             throw;
         }
+
+        RefreshStartupRegistration();
+    }
+
+    /// <summary>
+    /// Keeps "start at sign-in" pointing at this copy of the app, for example after an update moved
+    /// it. Only the copy that now holds the single-instance lock does it, and never one pointed at
+    /// another data folder, which Windows would then start against the person's real one.
+    /// </summary>
+    private void RefreshStartupRegistration()
+    {
+        if (MauiProgram.UsesOtherDataDirectory)
+        {
+            return;
+        }
+
+        try
+        {
+            new Offloadr.Runner.Supervisor.Hosting.WindowsStartupRegistration(Environment.ProcessPath!).RefreshIfMoved();
+        }
+        catch (Exception ex) when (ex is UnauthorizedAccessException or System.Security.SecurityException or IOException)
+        {
+            logger.LogWarning(ex, "Could not refresh the sign-in startup registration.");
+        }
     }
 
     /// <summary>Stops everything, including the runner container. The supervisor waits for the runner to shut down cleanly.</summary>

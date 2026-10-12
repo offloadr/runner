@@ -1,0 +1,40 @@
+@using Offloadr.Runner.Supervisor.Hosting
+@implements IDisposable
+@inject IServiceProvider Services
+@inject IHostActions Host
+
+@* Shown only when the host checks for updates and a newer release exists. *@
+@if (_checker?.Available is { } update && update.Version != _dismissed)
+{
+    <MudAlert Severity="Severity.Info" Variant="Variant.Outlined" Class="mb-4" ShowCloseIcon="true" CloseIconClicked="@(() => _dismissed = update.Version)">
+        <MudStack Row="true" AlignItems="AlignItems.Center" Spacing="3" Wrap="Wrap.Wrap">
+            <span>Offloadr Runner @update.Version.ToString(3) is available. You have @_checker.CurrentVersion.ToString(3).</span>
+            <MudButton Size="Size.Small" Variant="Variant.Text" EndIcon="@Icons.Material.Filled.OpenInNew"
+                       OnClick="@(() => Host.OpenExternalAsync(update.Url))">Download</MudButton>
+        </MudStack>
+    </MudAlert>
+}
+
+@code {
+    private UpdateChecker? _checker;
+    private Version? _dismissed;
+
+    protected override void OnInitialized()
+    {
+        _checker = Services.GetService(typeof(UpdateChecker)) as UpdateChecker;
+        if (_checker is not null)
+        {
+            _checker.Changed += OnChanged;
+        }
+    }
+
+    public void Dispose()
+    {
+        if (_checker is not null)
+        {
+            _checker.Changed -= OnChanged;
+        }
+    }
+
+    private void OnChanged() => InvokeAsync(StateHasChanged);
+}

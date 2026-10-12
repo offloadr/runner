@@ -31,3 +31,9 @@
     color: var(--mud-palette-text-secondary);
     font-size: 0.85rem;
 }
+
+/* Blazor moves focus to the page heading after navigation. Keyboard users keep the ring that shows
+   where they are; it is hidden only when the browser judges it not needed, as after a mouse click. */
+h1:focus:not(:focus-visible) {
+    outline: none;
+}

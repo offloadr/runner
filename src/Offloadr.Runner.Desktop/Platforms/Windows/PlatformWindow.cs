@@ -24,6 +24,7 @@ internal static class PlatformWindow
         var balloonShown = false;
         var activated = false;
         TrayIcon? tray = null;
+        TrayStateIcons? icons = null;
         native.Activated += (_, _) => activated = true;
 
         void Open()
@@ -97,6 +98,7 @@ internal static class PlatformWindow
             if (page.CanClose)
             {
                 tray?.Dispose();
+                icons?.Dispose();
                 return;
             }
 
@@ -122,19 +124,27 @@ internal static class PlatformWindow
                 return;
             }
 
-            tray = new TrayIcon(handle, Path.Combine(AppContext.BaseDirectory, "appicon.ico"), Tooltip(supervisor.View), Open, Menu);
+            var stateIcons = new TrayStateIcons(Path.Combine(AppContext.BaseDirectory, "appicon.ico"), TrayIcon.SmallIconSize);
+            icons = stateIcons;
+            tray = new TrayIcon(handle, stateIcons[TrayStateIcons.BadgeFor(supervisor.View.State)], Tooltip(supervisor.View), Open, Menu);
             instanceLock.OpenRequested += () => native.DispatcherQueue.TryEnqueue(Open);
 
             // Changed is raised on several threads, so the posted update reads the view itself, on the UI
             // thread: whichever post runs last shows the current state. The check here only skips
-            // posts for changes (log lines, say) that leave the tooltip as it was.
+            // posts for changes (log lines, say) that leave the tooltip, which names the state and so
+            // changes whenever the badge would, as it was.
             var postedTooltip = Tooltip(supervisor.View);
             supervisor.Changed += () =>
             {
                 var tooltip = Tooltip(supervisor.View);
                 if (Interlocked.Exchange(ref postedTooltip, tooltip) != tooltip)
                 {
-                    MainThread.BeginInvokeOnMainThread(() => tray.SetTooltip(Tooltip(supervisor.View)));
+                    MainThread.BeginInvokeOnMainThread(() =>
+                    {
+                        var view = supervisor.View;
+                        tray.SetTooltip(Tooltip(view));
+                        tray.SetIcon(stateIcons[TrayStateIcons.BadgeFor(view.State)]);
+                    });
                 }
             };
 
