@@ -219,11 +219,18 @@ message ListArtifactsResponse {
   repeated EditorArtifactMetadata artifacts = 1;
 }
 
+message ArtifactReadVersion {
+  string artifact_id = 1;
+  int32 artifact_generation = 2;
+  int64 mutation_revision = 3;
+}
+
 message ArtifactReadMetadata {
   google.protobuf.StringValue content_type = 1;
   google.protobuf.Int64Value size_bytes = 2;
   google.protobuf.StringValue sha256 = 3;
   google.protobuf.Timestamp modified_utc = 4;
+  ArtifactReadVersion version = 5;
 }
 
 message ReadArtifactRequest {
@@ -231,6 +238,9 @@ message ReadArtifactRequest {
   string filename = 2;
   string type = 3;
   string subfolder = 4;
+  // App catalog reads require this exact identity. Native editor reads omit it
+  // to select the current committed path; failed exact reads never fall back.
+  ArtifactReadVersion exact_version = 5;
 }
 
 message ReadArtifactResponse {

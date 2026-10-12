@@ -735,10 +735,12 @@ public class DemandAwareModelHydrationCoordinatorTests
                 [first, second],
                 replaceExisting: true);
 
+            // This verifies ordinal order, not scheduler latency. Leave room for
+            // loaded CI workers while keeping a bounded completion requirement.
             await coordinator.EnsurePromptDownloadsAsync(
                 "session-1",
                 [first, second],
-                CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(2));
+                CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(10));
 
             var expectedOrder = new[]
             {
@@ -2708,59 +2710,99 @@ public class DemandAwareModelHydrationCoordinatorTests
                 RemoveAttemptRelease = releaseRemoval.Task
             };
             await using var coordinator = CreateCoordinator(backend, root);
-            await coordinator.InitializeAsync(CancellationToken.None);
-            var request = CreateRequest(root, "reserved-inode-reset.bin");
-            coordinator.RegisterDownloads("session-1", [request], replaceExisting: true);
-            var firstOpen = await coordinator.OpenAsync(
-                request.DestinationPath,
-                "session-1",
-                CancellationToken.None);
-            await coordinator.ReleaseAsync(firstOpen.LeaseId);
-            backend.StatusAttemptStarted = statusStarted;
-            backend.StatusAttemptRelease = releaseStatus.Task;
-
-            var prompt = coordinator.EnsurePromptDownloadsAsync(
-                "session-1",
-                [request],
-                promptCancellation.Token);
-            await statusStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
-
-            var replacementPath = $"{request.DestinationPath}.replacement";
-            await File.WriteAllBytesAsync(
-                replacementPath,
-                new byte[checked((int)request.SizeBytes)]);
-            File.Move(replacementPath, request.DestinationPath, overwrite: true);
-
-            var opening = coordinator.OpenAsync(
-                request.DestinationPath,
-                "session-1",
-                CancellationToken.None);
-            await removalStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
-            releaseStatus.TrySetResult();
-            await Task.Delay(TimeSpan.FromMilliseconds(250));
-
-            Assert.That(backend.RemoveAttempts, Is.EqualTo(1));
-
-            releaseRemoval.TrySetResult();
-            var reopened = await opening.WaitAsync(TimeSpan.FromSeconds(2));
-            Assert.Multiple(() =>
+            Task? prompt = null;
+            Task<ModelHydrationOpenResult>? opening = null;
+            try
             {
-                Assert.That(reopened.TransferEpoch, Is.GreaterThan(firstOpen.TransferEpoch));
-                Assert.That(backend.CreateCallCount, Is.EqualTo(2));
-                Assert.That(backend.RemoveAttempts, Is.EqualTo(1));
-            });
-            await coordinator.ReleaseAsync(reopened.LeaseId);
+                await coordinator.InitializeAsync(CancellationToken.None);
+                var request = CreateRequest(root, "reserved-inode-reset.bin");
+                coordinator.RegisterDownloads("session-1", [request], replaceExisting: true);
+                var firstOpen = await coordinator.OpenAsync(
+                    request.DestinationPath,
+                    "session-1",
+                    CancellationToken.None);
+                await coordinator.ReleaseAsync(firstOpen.LeaseId);
+                backend.StatusAttemptStarted = statusStarted;
+                backend.StatusAttemptRelease = releaseStatus.Task;
 
-            promptCancellation.Cancel();
-            var promptException = Assert.CatchAsync(async () => await prompt);
-            Assert.That(
-                promptException,
-                Is.InstanceOf<OperationCanceledException>()
-                    .Or.InstanceOf<ModelHydrationIOException>());
+                prompt = coordinator.EnsurePromptDownloadsAsync(
+                    "session-1",
+                    [request],
+                    promptCancellation.Token);
+                await statusStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+                var replacementPath = $"{request.DestinationPath}.replacement";
+                await File.WriteAllBytesAsync(
+                    replacementPath,
+                    new byte[checked((int)request.SizeBytes)]);
+                File.Move(replacementPath, request.DestinationPath, overwrite: true);
+
+                var statusCallsBeforeRelease = backend.StatusCallsByHandle
+                    .GetValueOrDefault(backend.CreatedHandle!.Value);
+                opening = coordinator.OpenAsync(
+                    request.DestinationPath,
+                    "session-1",
+                    promptCancellation.Token);
+                await removalStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+                releaseStatus.TrySetResult();
+                // Observe two completed polls: the first held response has been
+                // processed and another scheduler turn ran while Open owns removal.
+                await WaitUntilAsync(
+                    () => backend.StatusCallsByHandle.GetValueOrDefault(backend.CreatedHandle!.Value)
+                        >= statusCallsBeforeRelease + 2,
+                    TimeSpan.FromSeconds(2));
+
+                Assert.That(backend.RemoveAttempts, Is.EqualTo(1));
+
+                releaseRemoval.TrySetResult();
+                var reopened = await opening.WaitAsync(TimeSpan.FromSeconds(2));
+                Assert.Multiple(() =>
+                {
+                    Assert.That(reopened.TransferEpoch, Is.GreaterThan(firstOpen.TransferEpoch));
+                    Assert.That(backend.CreateCallCount, Is.EqualTo(2));
+                    Assert.That(backend.RemoveAttempts, Is.EqualTo(1));
+                });
+                await coordinator.ReleaseAsync(reopened.LeaseId);
+
+                promptCancellation.Cancel();
+                var promptException = Assert.CatchAsync(async () => await prompt);
+                Assert.That(
+                    promptException,
+                    Is.InstanceOf<OperationCanceledException>()
+                        .Or.InstanceOf<ModelHydrationIOException>());
+            }
+            finally
+            {
+                // Settle captured operations before await using disposes the
+                // coordinator, including when a phase assertion fails.
+                promptCancellation.Cancel();
+                releaseStatus.TrySetResult();
+                releaseRemoval.TrySetResult();
+                foreach (var pending in new Task?[] { prompt, opening })
+                {
+                    if (pending is null)
+                    {
+                        continue;
+                    }
+
+                    try
+                    {
+                        await pending;
+                    }
+                    catch (Exception ex) when (ex is OperationCanceledException or ModelHydrationIOException)
+                    {
+                        // The original test body observes/asserts these outcomes.
+                    }
+                }
+
+                if (opening?.IsCompletedSuccessfully == true)
+                {
+                    await coordinator.ReleaseAsync((await opening).LeaseId);
+                }
+            }
         }
         finally
         {
-            promptCancellation.Cancel();
             releaseStatus.TrySetResult();
             releaseRemoval.TrySetResult();
             TryDelete(root);
@@ -3001,43 +3043,26 @@ public class DemandAwareModelHydrationCoordinatorTests
     public async Task RegistrationSnapshot_ReclaimedPartialIdentity_CancelsQueuedOrphanCleanup()
     {
         var root = CreateTempDirectory();
+        var releaseScheduler = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         try
         {
             var stateDirectory = Path.Combine(root, "state");
             var request = CreateRequest(root, "reclaimed-partial.bin");
-            var identity = ModelTransferIdentity.Create(
-                request.ModelId,
-                request.DestinationPath,
-                request.SizeBytes);
-            var requestHandle = new ModelTransferHandle(identity.DeterministicIdentifier);
-
-            // Park the scheduler in a restored-pause retry for an unrelated transfer, so the
-            // queued orphan cleanup cannot run between the release and the reclaim below.
-            var parkingHandle = new ModelTransferHandle("0123456789abcdef");
-            var parked = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-            var releaseParked = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var orphan = CreateRequest(root, "unclaimed-sentinel.bin");
+            var pauseStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var restoredHandle = new ModelTransferHandle("restored-scheduler-gate");
             var backend = new DemandBackend
             {
                 ListedSnapshots =
                 [
-                    TestModelTransferBackend.Snapshot(
-                        parkingHandle,
-                        "active",
-                        completedLength: 0,
-                        totalLength: 8,
-                        files:
-                        [
-                            new ModelTransferFileSnapshot(
-                                Path.Combine(root, "parking.bin"),
-                                8,
-                                0,
-                                ["https://models.example.test/parking.bin"])
-                        ])
+                    TestModelTransferBackend.Snapshot(restoredHandle, "active", completedLength: 0,
+                        totalLength: request.SizeBytes, bitfield: "00", pieceLength: 4, numPieces: 2,
+                        files: [new ModelTransferFileSnapshot(Path.Combine(root, "restored-gate.bin"), request.SizeBytes, 0, [request.SourceUrl])])
                 ],
-                PauseAttemptStarted = parked,
-                PauseAttemptRelease = releaseParked.Task
+                PauseAttemptStarted = pauseStarted,
+                PauseAttemptRelease = releaseScheduler.Task
             };
-            backend.PauseFailuresRemaining[parkingHandle] = 1;
+            backend.PauseFailuresRemaining[restoredHandle] = 1;
             await using var coordinator = new DemandAwareModelHydrationCoordinator(
                 backend,
                 new ModelHydrationRuntimeCapabilities(
@@ -3046,27 +3071,22 @@ public class DemandAwareModelHydrationCoordinatorTests
                     PersistentModelRoots: [root]),
                 stateDirectory);
             await coordinator.InitializeAsync(CancellationToken.None);
-            await parked.Task.WaitAsync(TimeSpan.FromSeconds(2));
 
-            try
-            {
-                coordinator.RegisterDownloads("session-1", [request], replaceExisting: true);
-                coordinator.RegisterDownloads("session-1", [], replaceExisting: true);
-                coordinator.RegisterDownloads("session-2", [request], replaceExisting: true);
-            }
-            finally
-            {
-                releaseParked.TrySetResult();
-            }
+            // Hold the scheduler in its restored-pause retry, before registration
+            // cleanup, so reclaim wins while the orphan work is still queued.
+            await pauseStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            coordinator.RegisterDownloads("session-1", [request, orphan], replaceExisting: true);
+            coordinator.RegisterDownloads("session-1", [], replaceExisting: true);
+            coordinator.RegisterDownloads("session-2", [request], replaceExisting: true);
+            releaseScheduler.TrySetResult();
+            // Initialize, the restored pause, legacy cleanup and orphan cleanup
+            // each save; the fourth save proves the orphan pass completed.
+            await WaitUntilAsync(() => backend.SaveSessionAttempts >= 4, TimeSpan.FromSeconds(2));
 
-            // The registration snapshot also retires the unrelated transfer, so its removal shows
-            // the scheduler resumed. The orphan stage runs right after it in the same pass; the
-            // short delay only gives a regression time to show and cannot fail a correct run.
-            await WaitUntilAsync(
-                () => backend.RemovedHandles.Contains(parkingHandle),
-                TimeSpan.FromSeconds(5));
-            await Task.Delay(250);
-
+            var identity = ModelTransferIdentity.Create(
+                request.ModelId,
+                request.DestinationPath,
+                request.SizeBytes);
             var reloaded = new ModelTransferIndex(stateDirectory);
             var opened = await coordinator.OpenAsync(
                 request.DestinationPath,
@@ -3074,7 +3094,8 @@ public class DemandAwareModelHydrationCoordinatorTests
                 CancellationToken.None);
             Assert.Multiple(() =>
             {
-                Assert.That(backend.RemovedHandles, Does.Not.Contain(requestHandle));
+                Assert.That(backend.RemovedHandles, Does.Not.Contain(new ModelTransferHandle(identity.DeterministicIdentifier)));
+                Assert.That(File.Exists(orphan.DestinationPath), Is.False);
                 Assert.That(File.Exists(request.DestinationPath), Is.True);
                 Assert.That(reloaded.TryGet(identity.Digest, out _), Is.True);
                 Assert.That(opened.Disposition, Is.EqualTo(ModelHydrationOpenDisposition.RangeManaged));
@@ -3083,6 +3104,7 @@ public class DemandAwareModelHydrationCoordinatorTests
         }
         finally
         {
+            releaseScheduler.TrySetResult();
             TryDelete(root);
         }
     }

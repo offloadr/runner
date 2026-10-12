@@ -52,11 +52,9 @@ public partial class ServiceClientManagerTests
     {
         var harness = RunningHarness(7, 3, InstanceA);
         harness.BeforeStop = (_, _) => throw new IOException("signal failed");
+        var stop = Stop(7, 3, InstanceA);
 
-        await ServiceClientManager.HandleStopSessionCommandAsync(
-            new StopSessionCommand { SessionId = CommandSessionId, User = "alice" },
-            harness.Deps);
-        await Task.Delay(TimeSpan.FromMilliseconds(100));
+        await ServiceClientManager.HandleStopSessionCommandAsync(stop, harness.Deps);
 
         Assert.Multiple(() =>
         {
@@ -64,6 +62,16 @@ public partial class ServiceClientManagerTests
             Assert.That(harness.Logical.GetActiveSessionId(), Is.EqualTo(CommandSessionId));
             Assert.That(harness.Identities.TryGet(CommandSessionId, out _), Is.True);
             Assert.That(harness.Tracked(CommandSessionId), Is.Not.Null);
+        });
+
+        harness.BeforeStop = (_, _) => Task.CompletedTask;
+        await ServiceClientManager.HandleStopSessionCommandAsync(stop, harness.Deps);
+        var ack = await harness.Sink.WaitForAsync(harness.Sink.StopAcks, 1);
+        Assert.Multiple(() =>
+        {
+            Assert.That(ack.CommandId, Is.EqualTo(stop.CommandId));
+            Assert.That(harness.Calls.Count(call => call.StartsWith("stop:", StringComparison.Ordinal)), Is.EqualTo(2));
+            Assert.That(harness.Tracked(CommandSessionId), Is.Null);
         });
     }
 
@@ -341,7 +349,7 @@ public partial class ServiceClientManagerTests
         var launch = ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 3, InstanceA, revision: 1), harness.Deps);
         await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
         await ServiceClientManager.HandleStopSessionCommandAsync(
-            new StopSessionCommand { SessionId = CommandSessionId, User = "alice" },
+            new StopSessionCommand { SessionId = CommandSessionId, User = "alice", CommandId = Guid.NewGuid().ToString("n") },
             harness.Deps).WaitAsync(TimeSpan.FromSeconds(5));
         await launch.WaitAsync(TimeSpan.FromSeconds(5));
         await harness.Sink.WaitForAsync(harness.Sink.StopAcks, 1);
@@ -367,7 +375,7 @@ public partial class ServiceClientManagerTests
         await WaitUntilAsync(() => harness.Sink.Attempts.OfType<AcknowledgeEditorRuntimeLaunchRequest>().Any());
 
         await ServiceClientManager.HandleStopSessionCommandAsync(
-            new StopSessionCommand { SessionId = CommandSessionId, User = "alice" },
+            new StopSessionCommand { SessionId = CommandSessionId, User = "alice", CommandId = Guid.NewGuid().ToString("n") },
             harness.Deps).WaitAsync(TimeSpan.FromSeconds(2));
 
         Assert.Multiple(() =>
@@ -594,19 +602,21 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
-    public async Task UnfencedStopFromAnOlderControlPlane_KeepsTodaysBehaviour()
+    public async Task StopWithoutRuntimeFence_StillRequiresAndAcknowledgesCommandIdentity()
     {
         var harness = RunningHarness(7, 3, InstanceA);
+        var commandId = Guid.NewGuid().ToString("n");
 
         await ServiceClientManager.HandleStopSessionCommandAsync(
-            new StopSessionCommand { SessionId = CommandSessionId, User = "alice" },
+            new StopSessionCommand { SessionId = CommandSessionId, User = "alice", CommandId = commandId },
             harness.Deps);
 
         var ack = await harness.Sink.WaitForAsync(harness.Sink.StopAcks, 1);
         Assert.Multiple(() =>
         {
             Assert.That(ack.SessionId, Is.EqualTo(CommandSessionId));
-            Assert.That(ack.CommandId, Is.Empty);
+            Assert.That(ack.CommandId, Is.EqualTo(commandId));
+            Assert.That(ack.InstanceId, Is.EqualTo("process-1"));
             Assert.That(ack.LifecycleGeneration, Is.Zero);
             Assert.That(harness.Tracked(CommandSessionId), Is.Null);
             Assert.That(harness.Logical.GetActiveSessionId(), Is.Empty);
@@ -654,7 +664,246 @@ public partial class ServiceClientManagerTests
             Assert.That(attempts, Has.Count.EqualTo(3));
             Assert.That(attempts.Distinct(), Has.Exactly(1).Items);
             Assert.That(attempts[0].CommandId, Is.EqualTo(stop.CommandId));
+            Assert.That(attempts[0].InstanceId, Is.EqualTo(harness.InstanceId));
             Assert.That(harness.Calls.Count(call => call.StartsWith("stop:", StringComparison.Ordinal)), Is.EqualTo(1));
+        });
+    }
+
+    [TestCase(false)]
+    [TestCase(true)]
+    public async Task CompletedStop_RedeliveryReplaysWithoutTouchingReplacementRuntime(bool normalizeRetryId)
+    {
+        var harness = RunningHarness(7, 3, InstanceA);
+        var stop = Stop(0, 0, "");
+        stop.CommandId = Guid.NewGuid().ToString("D").ToUpperInvariant();
+        await ServiceClientManager.HandleStopSessionCommandAsync(stop, harness.Deps);
+        var originalAck = await harness.Sink.WaitForAsync(harness.Sink.StopAcks, 1);
+        var cleanupCalls = harness.Calls.ToArray();
+
+        harness.Track(CommandSessionId, new RuntimeIdentity(8, 1, InstanceB));
+        harness.Logical.SetActiveRuntime(CommandSessionId, 8, 1, InstanceB);
+        harness.Identities.Set(CommandSessionId, 8, 1, InstanceB);
+        var prompt = harness.StartPrompt(8, 1, InstanceB);
+        if (normalizeRetryId)
+        {
+            stop.CommandId = Guid.Parse(stop.CommandId).ToString("n");
+        }
+
+        await ServiceClientManager.HandleStopSessionCommandAsync(stop, harness.Deps);
+        var replay = await harness.Sink.WaitForAsync(harness.Sink.StopAcks, 2);
+        Assert.Multiple(() =>
+        {
+            Assert.That(replay, Is.EqualTo(originalAck));
+            Assert.That(harness.Calls, Is.EqualTo(cleanupCalls));
+            Assert.That(prompt.IsCompleted, Is.False);
+            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(new RuntimeIdentity(8, 1, InstanceB)));
+            Assert.That(harness.Logical.GetActiveSessionId(), Is.EqualTo(CommandSessionId));
+            Assert.That(harness.Identities.TryGet(CommandSessionId, out var identity), Is.True);
+            Assert.That(identity, Is.EqualTo(new RuntimeIdentity(8, 1, InstanceB)));
+        });
+        await harness.Shutdown.CancelAsync();
+    }
+
+    [Test]
+    public async Task ConcurrentDuplicateStops_ShareCleanupAndWaitUntilItCompletes()
+    {
+        var harness = RunningHarness(7, 3, InstanceA);
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        harness.BeforeStop = async (_, token) =>
+        {
+            entered.TrySetResult();
+            await release.Task.WaitAsync(token);
+        };
+        var stop = Stop(7, 3, InstanceA);
+        var first = ServiceClientManager.HandleStopSessionCommandAsync(stop, harness.Deps);
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var duplicate = ServiceClientManager.HandleStopSessionCommandAsync(stop.Clone(), harness.Deps);
+        try
+        {
+            Assert.Multiple(() =>
+            {
+                Assert.That(duplicate.IsCompleted, Is.False);
+                Assert.That(harness.Sink.StopAcks, Is.Empty);
+                Assert.That(harness.Calls.Count(call => call.StartsWith("stop:", StringComparison.Ordinal)), Is.EqualTo(1));
+            });
+        }
+        finally
+        {
+            release.TrySetResult();
+            await Task.WhenAll(first, duplicate).WaitAsync(TimeSpan.FromSeconds(5));
+        }
+
+        Assert.That(harness.Calls.Count(call => call.StartsWith("stop:", StringComparison.Ordinal)), Is.EqualTo(1));
+        Assert.That(harness.Sink.StopAcks, Is.Not.Empty);
+    }
+
+    [Test]
+    public async Task StopRedelivery_DoesNotStartAnotherAcknowledgementRetryLoop()
+    {
+        var harness = RunningHarness(7, 3, InstanceA);
+        harness.Sink.FailWhen = _ => true;
+        var stop = Stop(0, 0, "");
+        await ServiceClientManager.HandleStopSessionCommandAsync(stop, harness.Deps);
+        var work = harness.WorkState.Stops[Guid.Parse(stop.CommandId)];
+        var retryLoop = work.AcknowledgementTask;
+
+        await ServiceClientManager.HandleStopSessionCommandAsync(stop, harness.Deps);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(work.AcknowledgementTask, Is.SameAs(retryLoop));
+            Assert.That(harness.Calls.Count(call => call.StartsWith("stop:", StringComparison.Ordinal)), Is.EqualTo(1));
+        });
+        await harness.Shutdown.CancelAsync();
+        await retryLoop!.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [TestCase("session")]
+    [TestCase("process")]
+    [TestCase("runtime")]
+    public async Task StopNonceReuse_WithDifferentIdentityDoesNotCleanUpOrAcknowledge(string changedIdentity)
+    {
+        var harness = RunningHarness(7, 3, InstanceA);
+        var stop = Stop(7, 3, InstanceA);
+        harness.BeforeStop = (_, _) => throw new IOException("signal failed");
+        await ServiceClientManager.HandleStopSessionCommandAsync(stop, harness.Deps);
+        var cleanupCalls = harness.Calls.ToArray();
+        harness.BeforeStop = (_, _) => Task.CompletedTask;
+        switch (changedIdentity)
+        {
+            case "session": stop.SessionId = "another-session"; break;
+            case "process": harness.InstanceId = "another-process"; break;
+            case "runtime": stop.RuntimeInstanceId = InstanceB; break;
+        }
+
+        await ServiceClientManager.HandleStopSessionCommandAsync(stop, harness.Deps);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(harness.Calls, Is.EqualTo(cleanupCalls));
+            Assert.That(harness.Sink.StopAcks, Is.Empty);
+            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(new RuntimeIdentity(7, 3, InstanceA)));
+        });
+    }
+
+    [TestCase("")]
+    [TestCase("invalid")]
+    [TestCase("00000000-0000-0000-0000-000000000000")]
+    public async Task StopWithInvalidCommandIdentity_DoesNotCancelOrCleanUp(string commandId)
+    {
+        var harness = RunningHarness(7, 3, InstanceA);
+        var prompt = harness.StartPrompt(7, 3, InstanceA);
+        var stop = Stop(7, 3, InstanceA);
+        stop.CommandId = commandId;
+
+        await ServiceClientManager.HandleStopSessionCommandAsync(stop, harness.Deps);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(harness.Calls, Is.Empty);
+            Assert.That(harness.Sink.StopAcks, Is.Empty);
+            Assert.That(prompt.IsCompleted, Is.False);
+            Assert.That(harness.Logical.GetActiveSessionId(), Is.EqualTo(CommandSessionId));
+        });
+        await harness.Shutdown.CancelAsync();
+    }
+
+    [TestCase("", "process-1")]
+    [TestCase(" ", "process-1")]
+    [TestCase(CommandSessionId, "")]
+    [TestCase(CommandSessionId, " ")]
+    public async Task StopWithoutSessionOrProcessIdentity_DoesNotCleanUpOrAcknowledge(string sessionId, string instanceId)
+    {
+        var harness = RunningHarness(7, 3, InstanceA);
+        harness.InstanceId = instanceId;
+        var stop = Stop(7, 3, InstanceA);
+        stop.SessionId = sessionId;
+
+        await ServiceClientManager.HandleStopSessionCommandAsync(stop, harness.Deps);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(harness.Calls, Is.Empty);
+            Assert.That(harness.Sink.StopAcks, Is.Empty);
+            Assert.That(harness.Logical.GetActiveSessionId(), Is.EqualTo(CommandSessionId));
+        });
+    }
+
+    [TestCase("N")]
+    [TestCase("D")]
+    public async Task StopCapturesIdentityBeforeCleanup_AndAcknowledgesOnlyAfterward(string format)
+    {
+        var harness = RunningHarness(7, 3, InstanceA);
+        harness.InstanceId = " process-1 ";
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        harness.BeforeStop = async (_, token) =>
+        {
+            entered.TrySetResult();
+            await release.Task.WaitAsync(token);
+        };
+        var stop = Stop(7, 3, InstanceA);
+        var commandId = Guid.NewGuid();
+        var deliveredCommandId = commandId.ToString(format).ToUpperInvariant();
+        stop.CommandId = deliveredCommandId;
+        var operation = ServiceClientManager.HandleStopSessionCommandAsync(stop, harness.Deps);
+        try
+        {
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.That(harness.Sink.StopAcks, Is.Empty);
+            stop.SessionId = Guid.NewGuid().ToString("n");
+            stop.CommandId = Guid.NewGuid().ToString("n");
+            stop.User = "replacement";
+            stop.LifecycleGeneration = 99;
+            stop.RuntimeEpoch = 99;
+            stop.RuntimeInstanceId = InstanceB;
+            harness.InstanceId = "replacement-process";
+        }
+        finally
+        {
+            release.TrySetResult();
+            await operation.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+
+        var ack = await harness.Sink.WaitForAsync(harness.Sink.StopAcks, 1);
+        Assert.Multiple(() =>
+        {
+            Assert.That(ack.SessionId, Is.EqualTo(CommandSessionId));
+            Assert.That(ack.CommandId, Is.EqualTo(deliveredCommandId));
+            Assert.That(ack.InstanceId, Is.EqualTo("process-1"));
+            Assert.That(ack.User, Is.EqualTo("alice"));
+            Assert.That(ack.LifecycleGeneration, Is.EqualTo(7));
+            Assert.That(ack.RuntimeEpoch, Is.EqualTo(3));
+            Assert.That(ack.RuntimeInstanceId, Is.EqualTo(InstanceA));
+            Assert.That(harness.Logical.GetActiveSessionId(), Is.Empty);
+            Assert.That(harness.Identities.TryGet(CommandSessionId, out _), Is.False);
+        });
+    }
+
+    [Test]
+    public async Task StopCancelledDuringCleanup_DoesNotAcknowledgeSuccess()
+    {
+        var harness = RunningHarness(7, 3, InstanceA);
+        harness.BeforeStop = async (_, _) => await harness.Shutdown.CancelAsync();
+
+        await ServiceClientManager.HandleStopSessionCommandAsync(Stop(7, 3, InstanceA), harness.Deps);
+
+        Assert.That(harness.Sink.StopAcks, Is.Empty);
+    }
+
+    [Test]
+    public void StopAfterHostShutdown_DoesNotEnterCleanup()
+    {
+        var harness = RunningHarness(7, 3, InstanceA);
+        harness.Shutdown.Cancel();
+
+        Assert.ThrowsAsync<OperationCanceledException>(() =>
+            ServiceClientManager.HandleStopSessionCommandAsync(Stop(7, 3, InstanceA), harness.Deps));
+        Assert.Multiple(() =>
+        {
+            Assert.That(harness.Calls, Is.Empty);
+            Assert.That(harness.Sink.StopAcks, Is.Empty);
         });
     }
 
@@ -1140,6 +1389,7 @@ public partial class ServiceClientManagerTests
         public RuntimeIdentityRegistry Identities { get; } = new();
         public ServiceClientManager.TransientCancellationRegistry TransientCancellation { get; }
         public ConcurrentQueue<string> Calls { get; } = new();
+        public string InstanceId { get; set; } = "process-1";
 
         /// <summary>Runs before a start registers its runtime; may block or throw.</summary>
         public Func<StartSessionCommand, CancellationToken, Task> BeforeStart { get; set; } = (_, _) => Task.CompletedTask;
@@ -1186,6 +1436,7 @@ public partial class ServiceClientManagerTests
         public ServiceClientManager.RuntimeCommandDependencies Deps => new()
         {
             RunnerId = CommandRunnerId,
+            InstanceId = InstanceId,
             Sink = Sink,
             WorkState = WorkState,
             LogicalSessionState = Logical,

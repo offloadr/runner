@@ -74,6 +74,13 @@ jobs:
           --blame-hang --blame-hang-timeout 90s
           -- RunConfiguration.TreatNoTestsAsError=true
 
+      - name: Real aria2 preemption
+        run: >-
+          dotnet test tests/Offloadr.Runner.Tests --no-build
+          --filter "FullyQualifiedName=Offloadr.Runner.Tests.Aria2ModelTransferBackendLinuxTests.RealAria2_BlockedRangePreemptsStickyTransferAndOnlyOneIsActive"
+          --blame-hang --blame-hang-timeout 90s
+          -- RunConfiguration.TreatNoTestsAsError=true
+
   build-windows:
     name: Build (Windows)
     runs-on: windows-latest

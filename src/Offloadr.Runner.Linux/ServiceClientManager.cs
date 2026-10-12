@@ -455,6 +455,7 @@ internal static class ServiceClientManager
     internal sealed class RuntimeCommandDependencies
     {
         public required string RunnerId { get; init; }
+        public required string InstanceId { get; init; }
         public required IRunnerSessionSink Sink { get; init; }
         public required RunnerCommandWorkState WorkState { get; init; }
         public required LogicalSessionState LogicalSessionState { get; init; }
@@ -479,6 +480,9 @@ internal static class ServiceClientManager
     {
         private readonly object _gate = new();
         public PromptCommandWorkSet Prompts { get; } = new(shutdown);
+        // Retain successful Stops for the process lifetime, including reconnects.
+        // Evicting a nonce would allow a delayed retry to stop a replacement runtime.
+        public ConcurrentDictionary<Guid, StopCommandWork> Stops { get; } = new();
         private TrackedCommandWork? _activeStartup;
 
         public TrackedCommandWork? GetActiveStartup()
@@ -512,6 +516,23 @@ internal static class ServiceClientManager
                     _activeStartup = null;
                 }
             }
+        }
+    }
+
+    internal sealed class StopCommandWork(AcknowledgeSessionStopRequest acknowledgement)
+    {
+        public SemaphoreSlim Gate { get; } = new(1, 1);
+        public AcknowledgeSessionStopRequest Acknowledgement { get; } = acknowledgement;
+        public bool Completed { get; set; }
+        public Task? AcknowledgementTask { get; set; }
+
+        public bool Matches(AcknowledgeSessionStopRequest delivery)
+        {
+            // The dictionary key already compares parsed command IDs. Preserve
+            // the original spelling in every replay of the acknowledgement.
+            delivery = delivery.Clone();
+            delivery.CommandId = Acknowledgement.CommandId;
+            return Acknowledgement.Equals(delivery);
         }
     }
 
@@ -1315,6 +1336,7 @@ internal static class ServiceClientManager
         var runtimeCommands = new RuntimeCommandDependencies
         {
             RunnerId = runnerId,
+            InstanceId = instanceId,
             Sink = sessionSink,
             WorkState = commandWorkState,
             LogicalSessionState = logicalSessionState,
@@ -2057,17 +2079,60 @@ internal static class ServiceClientManager
     /// </summary>
     internal static async Task HandleStopSessionCommandAsync(StopSessionCommand command, RuntimeCommandDependencies deps)
     {
+        deps.Shutdown.ThrowIfCancellationRequested();
+        if (string.IsNullOrWhiteSpace(command.SessionId) || string.IsNullOrWhiteSpace(deps.InstanceId) ||
+            !Guid.TryParse(command.CommandId, out var commandId) || commandId == Guid.Empty)
+        {
+            RunnerLog.Warning(nameof(ServiceClientManager), "Ignoring StopSession with missing session or invalid command/process identity");
+            return;
+        }
+
+        // Cleanup and acknowledgement retain the delivered identity even if the
+        // caller changes its message while asynchronous cleanup is in progress.
+        command = command.Clone();
         var ack = new AcknowledgeSessionStopRequest
         {
             SessionId = command.SessionId,
             User = command.User,
             CommandId = command.CommandId,
+            InstanceId = deps.InstanceId.Trim(),
             LifecycleGeneration = command.LifecycleGeneration,
             RuntimeEpoch = command.RuntimeEpoch,
             RuntimeInstanceId = command.RuntimeInstanceId,
         };
-        var acknowledgementKey = string.IsNullOrWhiteSpace(command.CommandId) ? command.SessionId : command.CommandId;
+        var acknowledgementKey = commandId.ToString("n");
+        var work = deps.WorkState.Stops.GetOrAdd(commandId, _ => new StopCommandWork(ack));
+        if (!work.Matches(ack))
+        {
+            RunnerLog.Warning(nameof(ServiceClientManager), "Ignoring StopSession that reuses a command identity with different session or process identity");
+            return;
+        }
 
+        await work.Gate.WaitAsync(deps.Shutdown).ConfigureAwait(false);
+        try
+        {
+            if (!work.Completed)
+            {
+                work.Completed = await ExecuteStopSessionCommandAsync(command, deps).ConfigureAwait(false);
+            }
+
+            if (work.Completed && (work.AcknowledgementTask is null || work.AcknowledgementTask.IsCompleted))
+            {
+                // One retry loop per command; redelivery after a finished loop
+                // replays the same result without touching runtime state.
+                work.AcknowledgementTask = AcknowledgeRuntimeCommandWithRetryAsync(
+                    deps.Sink.AckStopSessionAsync, work.Acknowledgement, acknowledgementKey, deps.Shutdown);
+            }
+        }
+        finally
+        {
+            work.Gate.Release();
+        }
+    }
+
+    private static async Task<bool> ExecuteStopSessionCommandAsync(StopSessionCommand command, RuntimeCommandDependencies deps)
+    {
+        deps.Shutdown.ThrowIfCancellationRequested();
         if (IsStopSuperseded(command, deps))
         {
             // A delayed or redelivered Stop for an older runtime must not stop the
@@ -2075,8 +2140,7 @@ internal static class ServiceClientManager
             RunnerLog.Warning(
                 nameof(ServiceClientManager),
                 $"Ignoring stale stop for session {command.SessionId}; a newer runtime is current.");
-            _ = AcknowledgeRuntimeCommandWithRetryAsync(deps.Sink.AckStopSessionAsync, ack, acknowledgementKey, deps.Shutdown);
-            return;
+            return true;
         }
 
         await deps.WorkState.Prompts.CancelAndWaitAsync(
@@ -2094,24 +2158,25 @@ internal static class ServiceClientManager
         try
         {
             await StopSessionAndCleanupAsync(command.SessionId, deps, deps.Shutdown).ConfigureAwait(false);
+            deps.Shutdown.ThrowIfCancellationRequested();
         }
         catch (Exception ex)
         {
             // Keep the heartbeat and identity of a child that may still be alive,
             // and do not acknowledge: the control plane retains the Stop.
             RunnerLog.Error(nameof(ServiceClientManager), ex, $"Stop of session {command.SessionId} did not complete; retaining its state.");
-            return;
+            return false;
         }
 
         deps.LogicalSessionState.ClearAndRetire(command.SessionId, command.LifecycleGeneration);
         deps.RuntimeIdentities.Remove(command.SessionId);
-        _ = AcknowledgeRuntimeCommandWithRetryAsync(deps.Sink.AckStopSessionAsync, ack, acknowledgementKey, deps.Shutdown);
+        return true;
     }
 
     /// <summary>
     /// A Stop that carries a lifecycle generation is fenced: it is superseded when
     /// the session's current runtime, tracked child or active startup is newer.
-    /// A Stop without one (an older control plane) is never fenced.
+    /// A Stop without one is not runtime-fenced; its command identity still deduplicates retries.
     /// </summary>
     private static bool IsStopSuperseded(StopSessionCommand command, RuntimeCommandDependencies deps)
     {
