@@ -38,4 +38,6 @@ The desktop app needs Windows and the `maui-windows` workload:
 dotnet build runner.desktop.slnx -warnaserror
 ```
 
+For each release of the runner's own code, someone with an NVIDIA GPU works through [docs/release-checklist.md](docs/release-checklist.md), because CI has no GPUs.
+
 If you change `contracts/`, run `buf lint contracts` and read `docs/contracts-sync.md`, because the control plane has to accept the same change.

@@ -18,7 +18,7 @@ The Offloadr runner: the agent that executes GPU work for the Offloadr control p
 - `docker-bake.hcl`: the four published image variants.
 - `tests/Offloadr.Runner.Tests`: NUnit suite. Linux-native tests live in `Linux/` and need root, `gcc` and `aria2c`.
 - `tests/Offloadr.Runner.Supervisor.Tests`: supervisor tests with fakes; they run on any OS. `RUNNER_REAL_DOCKER_IMAGE=<image>` enables one test against the real Docker engine, and `RUNNER_REAL_API_ORIGIN` with `RUNNER_REAL_KEY` one against a real control plane.
-- `docs/`: architecture, hosting guide, contracts sync.
+- `docs/`: architecture, hosting guide, contracts sync, and the manual GPU release checklist (`release-checklist.md`), since CI has no GPUs.
 
 ## Coding standards
 
