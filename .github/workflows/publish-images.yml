@@ -7,6 +7,9 @@ name: Publish runner images
 # stop the control plane's CI from dispatching it, otherwise the mirror overwrites these tags.
 # The editor image repositories can trigger a rebuild after publishing a new editor release with
 # a repository_dispatch of type editor-image-updated.
+#
+# A run counts as a release only when the verify step passes: a green build step is not proof
+# that the registry holds the image this commit produced.
 
 on:
   workflow_dispatch:
@@ -32,6 +35,8 @@ jobs:
     env:
       SOURCE_REVISION: ${{ github.sha }}
     steps:
+      - uses: actions/checkout@v7
+
       # The editor base images are around 12 GB; keep BuildKit state on the larger /mnt disk.
       - name: Put BuildKit state on /mnt
         run: |
@@ -54,7 +59,41 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push ${{ matrix.target }}
+        id: bake
         uses: docker/bake-action@v7
         with:
+          # The checkout, which is exactly github.sha: by default Bake builds from the event's Git
+          # ref, which may have moved on while this run waited, yet the tags and the verify step
+          # would still name github.sha.
+          source: .
           targets: ${{ matrix.target }}
           push: true
+
+      - name: Verify the registry holds this build
+        env:
+          METADATA: ${{ steps.bake.outputs.metadata }}
+          TARGET: ${{ matrix.target }}
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq skopeo jq
+          echo "$REGISTRY_TOKEN" | skopeo login ghcr.io --username "$REGISTRY_USER" --password-stdin
+
+          digest="$(jq -r --arg target "$TARGET" '.[$target]["containerimage.digest"] // empty' <<< "$METADATA")"
+          names="$(jq -r --arg target "$TARGET" '.[$target]["image.name"] // empty' <<< "$METADATA")"
+          if [ -z "$names" ]; then
+            echo "::error::The build reported no pushed tags for $TARGET."
+            exit 1
+          fi
+          IFS=',' read -r -a refs <<< "$names"
+
+          ./build/verify-published-image.sh "$digest" "$SOURCE_REVISION" "${refs[@]}"
+
+          {
+            echo "### $TARGET"
+            echo
+            echo "Revision \`$SOURCE_REVISION\`, digest \`$digest\`:"
+            for ref in "${refs[@]}"; do echo "- \`$ref\`"; done
+          } >> "$GITHUB_STEP_SUMMARY"

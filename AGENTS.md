@@ -14,7 +14,7 @@ The Offloadr runner: the agent that executes GPU work for the Offloadr control p
 - `src/Offloadr.Runner.Supervisor`: runs the runner container on a desktop (settings, Docker CLI, launch plans, supervision). Never shipped in the image.
 - `src/Offloadr.Runner.UI`: Razor class library with the app's pages (MudBlazor). No logic beyond presentation; it reads `RunnerSupervisor`.
 - `src/Offloadr.Runner.Desktop`: Windows MAUI Blazor Hybrid host (assembly `OffloadrRunner`). Built from `runner.desktop.slnx`, which needs the `maui-windows` workload; `runner.slnx` builds everything else on any OS.
-- `build/`: `test-linux.sh` (full suite in a container) and `publish-windows.ps1` (desktop app).
+- `build/`: `test-linux.sh` (full suite in a container), `publish-windows.ps1` (desktop app) and `verify-published-image.sh` (post-push registry proof for image releases).
 - `docker-bake.hcl`: the four published image variants.
 - `tests/Offloadr.Runner.Tests`: NUnit suite. Linux-native tests live in `Linux/` and need root, `gcc` and `aria2c`.
 - `tests/Offloadr.Runner.Supervisor.Tests`: supervisor tests with fakes; they run on any OS. `RUNNER_REAL_DOCKER_IMAGE=<image>` enables one test against the real Docker engine, and `RUNNER_REAL_API_ORIGIN` with `RUNNER_REAL_KEY` one against a real control plane.
