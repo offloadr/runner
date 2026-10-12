@@ -25,6 +25,15 @@ env:
   OFFLOADR_RUNNER_VERSION: ${{ inputs.version }}
 
 jobs:
+  registry-scripts:
+    name: Registry recovery scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: bash -n build/record-image-channels.sh build/restore-image-channels.sh
+      - run: python3 build/test-record-image-channels.py
+      - run: python3 build/test-restore-image-channels.py
+
   test:
     name: Build and test (Linux)
     runs-on: ubuntu-latest

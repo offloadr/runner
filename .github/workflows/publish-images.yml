@@ -3,8 +3,7 @@ name: Publish runner images
 # Builds the runner images from this repository and pushes them to ghcr.io/offloadr. These are
 # the images personal and hosted runners run.
 #
-# Manual for now. Before the first run, retire the mirror: delete republish-runner.yml here and
-# stop the control plane's CI from dispatching it, otherwise the mirror overwrites these tags.
+# Manual publication builds directly from this repository.
 # The editor image repositories can trigger a rebuild after publishing a new editor release with
 # a repository_dispatch of type editor-image-updated.
 #
@@ -23,10 +22,38 @@ permissions:
 concurrency:
   group: publish-runner-images
   cancel-in-progress: false
+  queue: max
 
 jobs:
+  record-channels:
+    name: Record previous channel digests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install registry tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq skopeo jq
+      - name: Record all channels before publication
+        env:
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "$REGISTRY_TOKEN" | skopeo login ghcr.io --username "$REGISTRY_USER" --password-stdin
+          ./build/record-image-channels.sh previous-runner-channels.json >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: previous-runner-channels
+          path: previous-runner-channels.json
+          if-no-files-found: error
+
   publish:
     name: Publish ${{ matrix.target }}
+    needs: record-channels
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false

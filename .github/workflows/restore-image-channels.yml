@@ -1,0 +1,54 @@
+name: Restore runner image channels
+
+on:
+  workflow_dispatch:
+    inputs:
+      comfyui_latest:
+        description: Recorded digest for runner-comfyui:latest (sha256:...)
+        required: true
+        type: string
+      comfyui_master:
+        description: Recorded digest for runner-comfyui:master (sha256:...)
+        required: true
+        type: string
+      forge_neo_latest:
+        description: Recorded digest for runner-forge-neo:latest (sha256:...)
+        required: true
+        type: string
+      forge_neo_neo:
+        description: Recorded digest for runner-forge-neo:neo (sha256:...)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+# Restoration and publication must never write the channel tags concurrently.
+concurrency:
+  group: publish-runner-images
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  restore:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install registry tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq skopeo
+      - name: Restore recorded channel digests
+        env:
+          COMFYUI_LATEST: ${{ inputs.comfyui_latest }}
+          COMFYUI_MASTER: ${{ inputs.comfyui_master }}
+          FORGE_NEO_LATEST: ${{ inputs.forge_neo_latest }}
+          FORGE_NEO_NEO: ${{ inputs.forge_neo_neo }}
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "$REGISTRY_TOKEN" | skopeo login ghcr.io --username "$REGISTRY_USER" --password-stdin
+          ./build/restore-image-channels.sh "$COMFYUI_LATEST" "$COMFYUI_MASTER" "$FORGE_NEO_LATEST" "$FORGE_NEO_NEO"
