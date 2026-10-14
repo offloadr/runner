@@ -243,11 +243,22 @@ public sealed class RuntimeTelemetryService
 
 public sealed class NvidiaRuntimeTelemetryProbe : IRuntimeTelemetryProbe
 {
+    private readonly string _executablePath;
+    private readonly NvidiaGpuSelection _gpuSelection;
+
+    public NvidiaRuntimeTelemetryProbe() : this("nvidia-smi", NvidiaGpuSelection.CaptureEnvironment()) { }
+
+    internal NvidiaRuntimeTelemetryProbe(string executablePath, NvidiaGpuSelection gpuSelection)
+    {
+        _executablePath = executablePath;
+        _gpuSelection = gpuSelection;
+    }
+
     public string CaptureRuntimeTelemetryQuery()
     {
         return RunProcessCapture(
-            "nvidia-smi",
-            "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,fan.speed,power.draw,power.limit,power.min_limit,power.default_limit,power.max_limit --format=csv,noheader,nounits",
+            _executablePath,
+            _gpuSelection.QueryArguments("utilization.gpu,memory.used,memory.total,temperature.gpu,fan.speed,power.draw,power.limit,power.min_limit,power.default_limit,power.max_limit"),
             timeoutMs: 4000);
     }
 
@@ -350,7 +361,7 @@ public sealed class NvidiaRuntimeTelemetryProbe : IRuntimeTelemetryProbe
             path.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.Ordinal);
     }
 
-    private static string RunProcessCapture(string fileName, string arguments, int timeoutMs)
+    private static string RunProcessCapture(string fileName, IEnumerable<string> arguments, int timeoutMs)
     {
         try
         {
@@ -359,13 +370,13 @@ public sealed class NvidiaRuntimeTelemetryProbe : IRuntimeTelemetryProbe
                 StartInfo = new ProcessStartInfo
                 {
                     FileName = fileName,
-                    Arguments = arguments,
                     RedirectStandardOutput = true,
                     RedirectStandardError = true,
                     UseShellExecute = false,
                     CreateNoWindow = true
                 }
             };
+            foreach (var argument in arguments) process.StartInfo.ArgumentList.Add(argument);
 
             if (!process.Start())
             {
@@ -386,13 +397,9 @@ public sealed class NvidiaRuntimeTelemetryProbe : IRuntimeTelemetryProbe
                 return string.Empty;
             }
 
-            var stdout = process.StandardOutput.ReadToEnd();
-            if (string.IsNullOrWhiteSpace(stdout))
-            {
-                stdout = process.StandardError.ReadToEnd();
-            }
-
-            return stdout;
+            // Failed or missing-device queries never supply physical limits
+            // that could authorize a power command.
+            return process.ExitCode == 0 ? process.StandardOutput.ReadToEnd() : string.Empty;
         }
         catch
         {

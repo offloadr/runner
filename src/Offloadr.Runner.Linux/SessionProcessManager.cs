@@ -1660,7 +1660,7 @@ internal sealed partial class SessionProcessManager : IDisposable
 
         AddRuntimeArguments(psi, paths);
 
-        SessionEnvironmentFilter.RemoveNonInheritable(psi.Environment);
+        SessionEnvironmentFilter.PrepareForChildProcess(psi.Environment);
         foreach (var kvp in BuildSessionEnvironment(sessionId, identity, paths))
         {
             psi.Environment[kvp.Key] = kvp.Value;
@@ -1704,7 +1704,7 @@ internal sealed partial class SessionProcessManager : IDisposable
         psi.ArgumentList.Add("--user-directory");
         psi.ArgumentList.Add(paths.UserDirectory);
 
-        SessionEnvironmentFilter.RemoveNonInheritable(psi.Environment);
+        SessionEnvironmentFilter.PrepareForChildProcess(psi.Environment);
         foreach (var kvp in BuildSessionEnvironment(sessionId, identity, paths))
         {
             psi.Environment[kvp.Key] = kvp.Value;
