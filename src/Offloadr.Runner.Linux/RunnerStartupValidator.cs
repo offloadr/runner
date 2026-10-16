@@ -7,11 +7,16 @@ public sealed class RunnerStartupValidator
 {
     private readonly ISessionIsolationStrategy _sessionIsolationStrategy;
     private readonly string _passwdPath;
+    private readonly SealedStorageProbe _sealedStorageProbe;
 
-    public RunnerStartupValidator(ISessionIsolationStrategy sessionIsolationStrategy, string passwdPath = "/etc/passwd")
+    public RunnerStartupValidator(
+        ISessionIsolationStrategy sessionIsolationStrategy,
+        string passwdPath = "/etc/passwd",
+        SealedStorageProbe? sealedStorageProbe = null)
     {
         _sessionIsolationStrategy = sessionIsolationStrategy ?? throw new ArgumentNullException(nameof(sessionIsolationStrategy));
         _passwdPath = passwdPath;
+        _sealedStorageProbe = sealedStorageProbe ?? new SealedStorageProbe();
     }
 
     public void ValidateOrThrow(RunnerAgentOptions options)
@@ -71,11 +76,32 @@ public sealed class RunnerStartupValidator
         }
 
         ValidateBinary(options.Session.UvBinaryPath, "RUNNER_UV_BINARY", errors);
+        ValidateSealedStorage(options.Session.Sealing, errors);
         _sessionIsolationStrategy.ValidatePrerequisites(errors);
 
         if (errors.Count > 0)
         {
             throw new InvalidOperationException($"Runner startup validation failed:{Environment.NewLine} - {string.Join($"{Environment.NewLine} - ", errors)}");
+        }
+    }
+
+    private void ValidateSealedStorage(SealedStorageOptions sealing, ICollection<string> errors)
+    {
+        if (sealing.InvalidMode is not null)
+        {
+            errors.Add($"RUNNER_SEALED_STORAGE must be off, auto or required, not '{sealing.InvalidMode}'.");
+            return;
+        }
+
+        if (sealing.Mode != SealedStorageMode.Required)
+        {
+            return;
+        }
+
+        var status = _sealedStorageProbe.Probe(sealing);
+        if (!status.Available)
+        {
+            errors.Add($"RUNNER_SEALED_STORAGE=required but the sealed root '{sealing.Root}' is unusable: {status.Reason}.");
         }
     }
 

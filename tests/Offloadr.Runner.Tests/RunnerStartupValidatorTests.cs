@@ -49,6 +49,58 @@ public class RunnerStartupValidatorTests
     }
 
     [Test]
+    public void ValidateOrThrow_RejectsAnUnknownSealedStorageMode()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            Assert.Ignore("Runner startup validation is Linux-specific.");
+        }
+
+        var tempRoot = Path.Combine(Path.GetTempPath(), $"runner-validator-{Guid.NewGuid():N}");
+        try
+        {
+            var sealing = SealedStorageOptions.FromEnvironment(name => name == "RUNNER_SEALED_STORAGE" ? "on" : null);
+            var options = BuildOptions(tempRoot, "/bin/sh", sealing: sealing);
+
+            var ex = Assert.Throws<InvalidOperationException>(
+                () => new RunnerStartupValidator(new NoopIsolationStrategy()).ValidateOrThrow(options));
+            Assert.That(ex!.Message, Does.Contain("RUNNER_SEALED_STORAGE must be off, auto or required"));
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+        }
+    }
+
+    [Test]
+    public void ValidateOrThrow_RequiredSealedStorageNeedsAMemoryBackedRoot()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            Assert.Ignore("Runner startup validation is Linux-specific.");
+        }
+
+        var tempRoot = Path.Combine(Path.GetTempPath(), $"runner-validator-{Guid.NewGuid():N}");
+        try
+        {
+            Directory.CreateDirectory(tempRoot);
+            var diskRoot = LinuxPathCanonicalizer.ResolveExistingPath(tempRoot) + "/sealed";
+            var required = new SealedStorageOptions { Mode = SealedStorageMode.Required, Root = diskRoot };
+            var auto = new SealedStorageOptions { Mode = SealedStorageMode.Auto, Root = diskRoot };
+
+            var ex = Assert.Throws<InvalidOperationException>(
+                () => new RunnerStartupValidator(new NoopIsolationStrategy()).ValidateOrThrow(BuildOptions(tempRoot, "/bin/sh", sealing: required)));
+            Assert.That(ex!.Message, Does.Contain("RUNNER_SEALED_STORAGE=required"));
+            Assert.DoesNotThrow(
+                () => new RunnerStartupValidator(new NoopIsolationStrategy()).ValidateOrThrow(BuildOptions(tempRoot, "/bin/sh", sealing: auto)));
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+        }
+    }
+
+    [Test]
     public void ValidateOrThrow_RequiresTheAria2AccountWhenConfigured()
     {
         if (!OperatingSystem.IsLinux())
@@ -441,7 +493,8 @@ public class RunnerStartupValidatorTests
         string? runnerId = null,
         string? seedVirtualEnvPath = null,
         string? uvBinaryPath = null,
-        bool requireAria2User = false)
+        bool requireAria2User = false,
+        SealedStorageOptions? sealing = null)
     {
         var sessionRoot = Path.Combine(tempRoot, "sessions");
         var workingDirectory = Path.Combine(tempRoot, "comfy");
@@ -486,7 +539,8 @@ public class RunnerStartupValidatorTests
                 ComfyPort = 8188,
                 ShutdownGracePeriod = TimeSpan.FromSeconds(20),
                 ReadyTimeout = TimeSpan.FromSeconds(120),
-                ReadyHost = "127.0.0.1"
+                ReadyHost = "127.0.0.1",
+                Sealing = sealing ?? new SealedStorageOptions()
             },
             Aria2 = Aria2Settings.FromEnvironment(name => name switch
             {

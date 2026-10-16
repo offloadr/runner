@@ -82,6 +82,52 @@ public class RunnerStatusFileWriterTests
     }
 
     [Test]
+    public void Write_IncludesSealedStorageStatusAndReadsBack()
+    {
+        var path = Path.Combine(_root, "status.json");
+        var sealedStorage = new SealedStorageStatus(
+            "required",
+            true,
+            null,
+            "/dev/shm/offloadr",
+            10L << 30,
+            9L << 30,
+            48L << 30,
+            9L << 30,
+            new SealedStorageSwapStatus(62499836L * 1024, "0", false));
+        var writer = new RunnerStatusFileWriter(
+            path,
+            "runner-1",
+            "instance-1",
+            "1.2.3",
+            ["comfyui-latest"],
+            () => string.Empty,
+            sealedStorage: () => sealedStorage);
+
+        writer.Write(string.Empty, DateTimeOffset.UnixEpoch);
+
+        var json = File.ReadAllText(path);
+        using var document = JsonDocument.Parse(json);
+        var sealedJson = document.RootElement.GetProperty("sealed_storage");
+        Assert.Multiple(() =>
+        {
+            Assert.That(sealedJson.GetProperty("available").GetBoolean(), Is.True);
+            Assert.That(sealedJson.GetProperty("budget_bytes").GetInt64(), Is.EqualTo(9L << 30));
+            Assert.That(sealedJson.GetProperty("swap").GetProperty("cgroup_limit").GetString(), Is.EqualTo("0"));
+            Assert.That(JsonSerializer.Deserialize<RunnerStatusSnapshot>(json)!.SealedStorage, Is.EqualTo(sealedStorage));
+        });
+    }
+
+    [Test]
+    public void Snapshot_WithoutSealedStorageStillParses()
+    {
+        var snapshot = JsonSerializer.Deserialize<RunnerStatusSnapshot>(
+            """{"runner_id":"r","instance_id":"i","version":"1","supported_editor_templates":[],"active_session_id":"","updated_utc":"2026-10-16T00:00:00Z"}""");
+
+        Assert.That(snapshot!.SealedStorage, Is.Null);
+    }
+
+    [Test]
     public async Task RunAsync_RewritesWhenTheActiveSessionChanges()
     {
         var path = Path.Combine(_root, "status.json");

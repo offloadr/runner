@@ -1,6 +1,7 @@
 using Offloadr.Runner.V1;
 using Grpc.Net.Client;
 using Microsoft.Extensions.Logging;
+using System.Globalization;
 using System.Reflection;
 using System.Runtime.InteropServices;
 
@@ -21,7 +22,8 @@ using var loggerFactory = LoggerFactory.Create(builder =>
 
 RunnerLog.Configure(loggerFactory);
 var sessionIsolationStrategy = new LinuxUserIsolationStrategy(new LinuxCommandRunner());
-var startupValidator = new RunnerStartupValidator(sessionIsolationStrategy);
+var sealedStorageProbe = new SealedStorageProbe();
+var startupValidator = new RunnerStartupValidator(sessionIsolationStrategy, sealedStorageProbe: sealedStorageProbe);
 
 try
 {
@@ -43,6 +45,13 @@ RunnerLog.Info(
     $"Runner starting id={options.RunnerId} version={version} offloadr-api={GrpcChannelManager.RedactForLog(options.OffloadrApiUrl)} " +
     $"instance={instanceId} mode=grpc grpc-trace={(options.TraceGrpcHttp ? "on" : "off")}");
 RunnerLog.Info("Offloadr runner is free software under AGPL-3.0-only; source: https://github.com/offloadr/runner");
+var sealedStorageStatus = sealedStorageProbe.Probe(options.Session.Sealing);
+RunnerLog.Info(
+    $"Sealed storage mode={sealedStorageStatus.Mode} root='{sealedStorageStatus.Root}' available={sealedStorageStatus.Available} " +
+    $"budget={sealedStorageStatus.BudgetBytes?.ToString(CultureInfo.InvariantCulture) ?? "unknown"} " +
+    $"swap-devices={sealedStorageStatus.Swap.DevicesBytes} swap-cgroup={sealedStorageStatus.Swap.CgroupLimit ?? "unknown"} " +
+    $"tmpfs-noswap={sealedStorageStatus.Swap.TmpfsNoswap}" +
+    (sealedStorageStatus.Reason is null ? string.Empty : $" reason='{sealedStorageStatus.Reason}'"));
 
 using var shutdown = new CancellationTokenSource();
 var runtimeIdentities = new RuntimeIdentityRegistry();
@@ -239,7 +248,8 @@ var statusFileTask = statusFilePath is null
         instanceId,
         version,
         options.SupportedEditorTemplates,
-        logicalSessionState.GetActiveSessionId).RunAsync(shutdown.Token);
+        logicalSessionState.GetActiveSessionId,
+        sealedStorage: () => sealedStorageProbe.Probe(options.Session.Sealing)).RunAsync(shutdown.Token);
 
 try
 {
