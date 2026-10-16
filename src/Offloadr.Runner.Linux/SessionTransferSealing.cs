@@ -140,6 +140,13 @@ internal sealed class SealedReadSink : IDisposable
     public long? SealedCiphertextSize
         => _reader is null ? null : SealedEnvelopeFormat.CiphertextSize(_reader.Header.PlaintextSize);
 
+    /// <summary>
+    /// Most bytes a transfer of at most <paramref name="plaintextLimit"/> may put on the wire: a
+    /// sealed one carries a 16-byte tag per 64 KiB chunk.
+    /// </summary>
+    public static long WireLimit(ProtoSealedEnvelope? envelope, long plaintextLimit)
+        => envelope is null ? plaintextLimit : SealedEnvelopeFormat.CiphertextSize(plaintextLimit);
+
     public static SealedReadSink Open(
         Stream destination,
         ProtoSealedEnvelope? envelope,

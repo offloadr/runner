@@ -156,6 +156,59 @@ public partial class ArtifactUploadServiceTests
         }
     }
 
+    [Test]
+    public async Task EvictUploadedArtifacts_LeavesAnArtifactTheVfsJustServed()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = CreateEvictionPaths(root, sealedSession: true);
+            var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse());
+            await using var service = new ArtifactUploadService("runner-secret-value", artifactClient, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            var outputPath = Path.Combine(paths.OutputDirectory, "reused.png");
+            await File.WriteAllBytesAsync(outputPath, [1, 2, 3]);
+            await artifactClient.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            var idle = TimeSpan.FromMilliseconds(400);
+            await Task.Delay(idle * 2);
+
+            // The next workflow loads the output: the shim is told it is ready and opens it itself.
+            Assert.That(await service.TryEnsureArtifactAvailableAsync(outputPath, highPriority: true, CancellationToken.None), Is.True);
+
+            Assert.That(service.EvictUploadedArtifacts("session-1", long.MaxValue, idle), Is.Zero);
+            Assert.That(new FileInfo(outputPath).Length, Is.EqualTo(3));
+            await Task.Delay(idle * 2);
+            Assert.That(service.EvictUploadedArtifacts("session-1", long.MaxValue, idle), Is.EqualTo(3));
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
+    public async Task StopSessionAsync_CountsAnEmptyArtifactThatNeverUploaded()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = CreateEvictionPaths(root, sealedSession: true);
+            var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse()) { RejectUploads = true };
+            await using var service = new ArtifactUploadService("runner-secret-value", artifactClient, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            await File.WriteAllBytesAsync(Path.Combine(paths.OutputDirectory, "empty.txt"), []);
+            await artifactClient.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+
+            Assert.That(await service.StopSessionAsync("session-1"), Is.EqualTo(1));
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
     private static async Task WaitUntilAsync(Func<bool> condition)
     {
         var deadline = DateTime.UtcNow.AddSeconds(5);

@@ -103,6 +103,13 @@ public sealed class RunnerStartupValidator
         {
             errors.Add($"RUNNER_SEALED_STORAGE=required but the sealed root '{sealing.Root}' is unusable: {status.Reason}.");
         }
+
+        // Session processes are made non-dumpable by the VFS shim.
+        var vfsLibrary = Environment.GetEnvironmentVariable("RUNNER_VFS_LIB") ?? new RunnerVfsEnvironmentBuilder().DefaultVfsLibraryPath;
+        if (!File.Exists(vfsLibrary))
+        {
+            errors.Add($"RUNNER_SEALED_STORAGE=required needs the VFS shim at '{vfsLibrary}' (RUNNER_VFS_LIB).");
+        }
     }
 
     private static void ValidateHttpsUrl(string rawValue, string label, ICollection<string> errors)

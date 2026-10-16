@@ -435,9 +435,15 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 }
             }
 
-            if (state.Downloaded && File.Exists(state.LocalPath))
+            // The shim opens the file itself once this returns: eviction must not replace it in
+            // between, so serving marks it as in use under the eviction gate.
+            lock (_evictionGate)
             {
-                return true;
+                if (state.Downloaded && File.Exists(state.LocalPath))
+                {
+                    state.MarkServed(DateTimeOffset.UtcNow);
+                    return true;
+                }
             }
 
             // The fetch is shared by every caller for this artifact and runs for the uploader's
@@ -1281,7 +1287,11 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     cancellationToken: token);
 
                 var published = await FetchToFileAsync(state, call.ResponseStream, token).ConfigureAwait(false);
-                state.MarkDownloaded(published);
+                lock (_evictionGate)
+                {
+                    state.MarkDownloaded(published);
+                    state.MarkServed(DateTimeOffset.UtcNow);
+                }
             }
             catch (RpcException ex) when (!token.IsCancellationRequested)
             {
@@ -1319,7 +1329,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                                 sawMetadata = true;
                                 var metadata = response.Metadata;
                                 expectedSizeBytes = metadata.SizeBytes;
-                                if (expectedSizeBytes > MaxUploadBytes)
+                                if (expectedSizeBytes > SealedReadSink.WireLimit(metadata.Envelope, MaxUploadBytes))
                                 {
                                     throw new InvalidOperationException(
                                         $"Artifact declares {expectedSizeBytes} bytes, above the {MaxUploadBytes} byte limit.");
@@ -1517,13 +1527,15 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         }
 
                         var status = secureRoot.GetStatus(relativePath);
-                        // Empty files are catalog placeholders or evicted artifacts, held remotely.
-                        if (!status.IsRegularFile || status.Length == 0)
+                        if (!status.IsRegularFile)
                         {
                             continue;
                         }
 
-                        if (!_catalog.TryGetValue(NormalizePath(file), out var state) || !state.MatchesLocalFile(status))
+                        var catalogued = _catalog.TryGetValue(NormalizePath(file), out var state);
+                        // An empty catalogued file is a placeholder or an evicted artifact, held
+                        // remotely; an empty file the catalog does not know was never received.
+                        if (status.Length == 0 ? !catalogued : !catalogued || !state!.MatchesLocalFile(status))
                         {
                             unsaved++;
                         }
@@ -1540,12 +1552,27 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
         public bool IsSealed => _paths.IsSealed;
 
+        private readonly object _evictionGate = new();
+
+        private readonly struct EvictionGateScope : IDisposable
+        {
+            private readonly object _gate;
+
+            public EvictionGateScope(object gate)
+            {
+                _gate = gate;
+                Monitor.Enter(gate);
+            }
+
+            public void Dispose() => Monitor.Exit(_gate);
+        }
+
         internal long EvictUploadedArtifacts(long bytesToFree, TimeSpan minimumIdle, DateTimeOffset now)
         {
             long released = 0;
             var candidates = _catalog.Values
                 .Where(state => state.LocalVersion is { Length: > 0 } &&
-                                now - state.CreatedUtc >= minimumIdle &&
+                                state.IdleSince(now) >= minimumIdle &&
                                 RunnerVfsEnvironmentBuilder.IsArtifactReadbackPath(state.LocalPath))
                 .OrderBy(static state => state.CreatedUtc)
                 .ToArray();
@@ -1564,6 +1591,13 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
                 try
                 {
+                    // Excludes the VFS serving this file while it is checked and replaced.
+                    using var gate = new EvictionGateScope(_evictionGate);
+                    if (state.IdleSince(DateTimeOffset.UtcNow) < minimumIdle)
+                    {
+                        continue;
+                    }
+
                     using var secureRoot = new LinuxSecureDirectoryRoot(root);
                     // A rewrite of the same length is a different version: only the one the control
                     // plane holds may be replaced, since opening the placeholder downloads that one.
@@ -2027,6 +2061,15 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 Downloaded = false;
                 LocalVersion = null;
             }
+
+            /// <summary>When the VFS last told a reader the local file is ready.</summary>
+            public DateTimeOffset LastServedUtc { get; private set; }
+
+            public void MarkServed(DateTimeOffset when) => LastServedUtc = when;
+
+            /// <summary>How long since the artifact was last uploaded, downloaded or served.</summary>
+            public TimeSpan IdleSince(DateTimeOffset now)
+                => now - (LastServedUtc > CreatedUtc ? LastServedUtc : CreatedUtc);
 
             /// <summary>True when <paramref name="status"/> is the version the control plane holds.</summary>
             public bool MatchesLocalFile(SecureFileStatus status)

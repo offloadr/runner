@@ -155,6 +155,37 @@ public class SessionTransferSealingTests
     }
 
     [Test]
+    public void WireLimit_LeavesRoomForTheTagOfEveryChunk()
+    {
+        const long fourGiB = 4L * 1024 * 1024 * 1024;
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(SealedReadSink.WireLimit(null, fourGiB), Is.EqualTo(fourGiB));
+            Assert.That(SealedReadSink.WireLimit(new ProtoSealedEnvelope(), fourGiB), Is.EqualTo(fourGiB + (65536 * 16)));
+            Assert.That(SealedReadSink.WireLimit(new ProtoSealedEnvelope(), 512L * 1024 * 1024), Is.EqualTo((512L * 1024 * 1024) + (8192 * 16)));
+        });
+    }
+
+    [Test]
+    public void CoreDumpHardening_LoadsTheShimWithNothingManaged()
+    {
+        var builder = new RunnerVfsEnvironmentBuilder();
+        var env = new Dictionary<string, string?> { ["RUNNER_VFS_LIB"] = "/opt/shim.so", ["LD_PRELOAD"] = "/other.so" };
+
+        var hardening = builder.BuildCoreDumpHardening(name => env.GetValueOrDefault(name), path => path == "/opt/shim.so");
+        var missing = builder.BuildCoreDumpHardening(name => env.GetValueOrDefault(name), _ => false);
+
+        Assert.That(hardening, Is.EquivalentTo(new Dictionary<string, string>
+        {
+            ["LD_PRELOAD"] = "/opt/shim.so:/other.so",
+            ["VFS_ROOTS"] = string.Empty,
+            ["VFS_NO_DUMP"] = "1",
+        }));
+        Assert.That(missing, Is.Empty);
+    }
+
+    [Test]
     public async Task LengthLimitedReadStream_StopsAtItsLength()
     {
         await using var limited = new LengthLimitedReadStream(new MemoryStream([1, 2, 3, 4, 5]), 3);

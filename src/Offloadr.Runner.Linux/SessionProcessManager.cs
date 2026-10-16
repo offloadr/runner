@@ -1996,6 +1996,11 @@ internal sealed partial class SessionProcessManager : IDisposable
         {
             // Dependency builds may compile and run helpers, which the noexec sealed TMPDIR forbids.
             psi.Environment["TMPDIR"] = paths.BuildScratchDirectory;
+            // It reads the memory-backed user workspace, so it must not dump core either.
+            foreach (var kvp in _vfsEnvironmentBuilder.BuildCoreDumpHardening())
+            {
+                psi.Environment[kvp.Key] = kvp.Value;
+            }
         }
 
         return psi;

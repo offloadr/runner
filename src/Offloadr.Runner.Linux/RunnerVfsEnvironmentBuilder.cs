@@ -61,6 +61,31 @@ public sealed class RunnerVfsEnvironmentBuilder
     public string DefaultExtensions { get; init; } = ".safetensors,.pt,.pth,.bin,.ckpt,.onnx,.emb,.gguf";
     public string DefaultLogValue { get; init; } = "0";
 
+    /// <summary>
+    /// Loads the shim into a process that reads no models or artifacts, only so it becomes
+    /// non-dumpable: no roots are managed. Empty when the library is missing.
+    /// </summary>
+    public IReadOnlyDictionary<string, string> BuildCoreDumpHardening(
+        Func<string, string?>? getEnv = null,
+        Func<string, bool>? fileExists = null)
+    {
+        getEnv ??= Environment.GetEnvironmentVariable;
+        fileExists ??= File.Exists;
+        var vfsLib = getEnv("RUNNER_VFS_LIB") ?? DefaultVfsLibraryPath;
+        if (!fileExists(vfsLib))
+        {
+            return new Dictionary<string, string>(StringComparer.Ordinal);
+        }
+
+        var inheritedPreload = getEnv("LD_PRELOAD");
+        return new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["LD_PRELOAD"] = string.IsNullOrWhiteSpace(inheritedPreload) ? vfsLib : string.Concat(vfsLib, ":", inheritedPreload),
+            ["VFS_ROOTS"] = string.Empty,
+            ["VFS_NO_DUMP"] = "1",
+        };
+    }
+
     public IReadOnlyDictionary<string, string> Build(
         RunnerVfsSessionPaths sessionPaths,
         Func<string, string?>? getEnv = null,

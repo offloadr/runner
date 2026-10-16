@@ -423,6 +423,7 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
             string? expectedSha256 = null;
             using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
             using var sinkSlot = new SealedReadSinkSlot();
+            var archiveWireLimit = MaxArchiveBytes;
 
             try
             {
@@ -434,7 +435,8 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                     {
                         case RunnerWorkspaceServiceReadWorkspaceSeedArchiveResponse.PayloadOneofCase.Metadata:
                             sawMetadata = true;
-                            if (response.Metadata.SizeBytes.HasValue && response.Metadata.SizeBytes.Value > MaxArchiveBytes)
+                            archiveWireLimit = SealedReadSink.WireLimit(response.Metadata.Envelope, MaxArchiveBytes);
+                            if (response.Metadata.SizeBytes.HasValue && response.Metadata.SizeBytes.Value > archiveWireLimit)
                             {
                                 throw new InvalidOperationException($"Workspace seed archive exceeds max allowed size ({MaxArchiveBytes} bytes).");
                             }
@@ -445,11 +447,16 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                                 expectedSha256 = response.Metadata.Sha256.Trim();
                             }
 
-                            sinkSlot.Replace(SealedReadSink.Open(
+                            var archiveSink = sinkSlot.Replace(SealedReadSink.Open(
                                 destination,
                                 response.Metadata.Envelope,
                                 _paths.TransferSealing,
                                 () => new SealedSeedArchiveIdentity(_sessionId, SealedRootName(root))));
+                            if (archiveSink.SealedPlaintextSize > MaxArchiveBytes)
+                            {
+                                throw new InvalidOperationException($"Workspace seed archive exceeds max allowed size ({MaxArchiveBytes} bytes).");
+                            }
+
                             break;
                         case RunnerWorkspaceServiceReadWorkspaceSeedArchiveResponse.PayloadOneofCase.Chunk:
                             if (!sawMetadata)
@@ -458,7 +465,7 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                             }
 
                             totalBytes += response.Chunk.Length;
-                            if (totalBytes > MaxArchiveBytes || totalBytes > expectedSize)
+                            if (totalBytes > archiveWireLimit || totalBytes > expectedSize)
                             {
                                 throw new InvalidOperationException(
                                     $"Workspace seed archive exceeds its declared or maximum size ({expectedSize ?? MaxArchiveBytes} bytes).");
@@ -628,6 +635,7 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
             // Without a declared size, an unsealed stream is held to the catalog's size.
             var catalogSize = state.SizeBytes;
             long? declaredWireSize = null;
+            var fileWireLimit = MaxWorkspaceFileBytes;
             long written = 0;
             using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
             using var sinkSlot = new SealedReadSinkSlot();
@@ -646,9 +654,10 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                                 state.ModifiedUtc = modifiedUtc;
                             }
 
+                            fileWireLimit = SealedReadSink.WireLimit(response.Metadata.Envelope, MaxWorkspaceFileBytes);
                             if (response.Metadata.SizeBytes.HasValue)
                             {
-                                if (response.Metadata.SizeBytes.Value > MaxWorkspaceFileBytes)
+                                if (response.Metadata.SizeBytes.Value > fileWireLimit)
                                 {
                                     throw new InvalidOperationException(
                                         $"Workspace file declares {response.Metadata.SizeBytes.Value} bytes, above the {MaxWorkspaceFileBytes} byte limit.");
@@ -688,7 +697,7 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                                     $"Workspace file stream exceeded its declared size of {limit} bytes.");
                             }
 
-                            if (written > MaxWorkspaceFileBytes)
+                            if (written > fileWireLimit)
                             {
                                 throw new InvalidOperationException(
                                     $"Workspace file stream exceeded the {MaxWorkspaceFileBytes} byte limit.");
