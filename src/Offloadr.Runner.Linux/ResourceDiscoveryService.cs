@@ -123,9 +123,20 @@ public sealed class ResourceDiscoveryService
 
 public sealed class LinuxResourceProbe : IResourceProbe
 {
+    private readonly string _executablePath;
+    private readonly NvidiaGpuSelection _gpuSelection;
+
+    public LinuxResourceProbe() : this("nvidia-smi", NvidiaGpuSelection.CaptureEnvironment()) { }
+
+    internal LinuxResourceProbe(string executablePath, NvidiaGpuSelection gpuSelection)
+    {
+        _executablePath = executablePath;
+        _gpuSelection = gpuSelection;
+    }
+
     public string CaptureGpuQuery()
     {
-        return RunProcessCapture("nvidia-smi", "--query-gpu=name,memory.total --format=csv,noheader,nounits", timeoutMs: 4000);
+        return RunProcessCapture(_executablePath, _gpuSelection.QueryArguments("name,memory.total"), timeoutMs: 4000);
     }
 
     public bool TryReadLinuxMemTotalKb(out ulong memTotalKb)
@@ -159,7 +170,7 @@ public sealed class LinuxResourceProbe : IResourceProbe
         }
     }
 
-    private static string RunProcessCapture(string fileName, string arguments, int timeoutMs)
+    private static string RunProcessCapture(string fileName, IEnumerable<string> arguments, int timeoutMs)
     {
         try
         {
@@ -168,13 +179,13 @@ public sealed class LinuxResourceProbe : IResourceProbe
                 StartInfo = new ProcessStartInfo
                 {
                     FileName = fileName,
-                    Arguments = arguments,
                     RedirectStandardOutput = true,
                     RedirectStandardError = true,
                     UseShellExecute = false,
                     CreateNoWindow = true
                 }
             };
+            foreach (var argument in arguments) process.StartInfo.ArgumentList.Add(argument);
 
             if (!process.Start())
             {

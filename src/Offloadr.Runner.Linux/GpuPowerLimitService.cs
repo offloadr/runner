@@ -140,9 +140,14 @@ public sealed class NvidiaSmiGpuPowerLimitCommandRunner : IGpuPowerLimitCommandR
 {
     private static readonly TimeSpan Timeout = TimeSpan.FromSeconds(10);
     private readonly string _executablePath;
+    private readonly NvidiaGpuSelection _gpuSelection;
 
     public NvidiaSmiGpuPowerLimitCommandRunner() : this("nvidia-smi") { }
-    internal NvidiaSmiGpuPowerLimitCommandRunner(string executablePath) => _executablePath = executablePath;
+    internal NvidiaSmiGpuPowerLimitCommandRunner(string executablePath, NvidiaGpuSelection? gpuSelection = null)
+    {
+        _executablePath = executablePath;
+        _gpuSelection = gpuSelection ?? NvidiaGpuSelection.CaptureEnvironment();
+    }
 
     public async Task<GpuPowerLimitCommandResult> SetPowerLimitAsync(double targetWatts, CancellationToken cancellationToken)
     {
@@ -152,13 +157,13 @@ public sealed class NvidiaSmiGpuPowerLimitCommandRunner : IGpuPowerLimitCommandR
             StartInfo = new ProcessStartInfo
             {
                 FileName = _executablePath,
-                Arguments = $"-i 0 -pl {formattedWatts}",
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 UseShellExecute = false,
                 CreateNoWindow = true
             }
         };
+        foreach (var argument in _gpuSelection.PowerArguments(formattedWatts)) process.StartInfo.ArgumentList.Add(argument);
 
         var started = false;
         try

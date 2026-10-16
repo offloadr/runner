@@ -74,12 +74,16 @@ internal static class SessionEnvironmentFilter
     public static bool IsInheritable(string name)
         => InheritableNames.Contains(name) || name.StartsWith("LC_", StringComparison.Ordinal);
 
-    /// <summary>Removes every variable that a session process must not inherit.</summary>
-    public static void RemoveNonInheritable(IDictionary<string, string?> environment)
+    /// <summary>Sanitizes inherited variables and binds an explicit physical GPU selection.</summary>
+    public static void PrepareForChildProcess(IDictionary<string, string?> environment)
     {
+        environment.TryGetValue(NvidiaGpuSelection.EnvironmentVariable, out var selectedGpu);
+        environment.TryGetValue("CUDA_VISIBLE_DEVICES", out var cudaVisibleDevices);
+        var selection = NvidiaGpuSelection.FromValues(selectedGpu, cudaVisibleDevices);
         foreach (var name in environment.Keys.Where(name => !IsInheritable(name)).ToList())
         {
             environment.Remove(name);
         }
+        selection.BindChildEnvironment(environment);
     }
 }

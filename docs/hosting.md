@@ -49,12 +49,39 @@ docker run --rm -it `
 
 For non-prod environments, add `-e OFFLOADR_API_GRPC=<environment-origin>`.
 
+## Selecting one physical GPU
+
+Set `OFFLOADR_GPU_UUID` to a complete UUID reported by
+`nvidia-smi --query-gpu=uuid,name --format=csv,noheader`. For example, add
+`-e OFFLOADR_GPU_UUID=GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` to the Docker
+command, replacing the placeholder with the selected device's UUID.
+
+The runner queries resources and telemetry for that UUID, applies power commands
+to that device, and sets the child editor's `CUDA_VISIBLE_DEVICES` to the same
+UUID. If you also supply `CUDA_VISIBLE_DEVICES`, it must contain that exact UUID;
+conflicting or ordinal masks are rejected rather than silently overridden.
+Changing the selection requires restarting the runner container. The selector
+and agent credentials are not inherited by the editor child.
+
+This matters on hosts where Docker or CUDA visibility does not also restrict
+NVML enumeration, including Windows/WSL configurations. CUDA visibility alone
+does not bind `nvidia-smi` discovery, telemetry or power commands. An explicit
+selection prevents the runner from advertising other GPUs or applying its power
+command to device zero. A missing selected device reports unavailable GPU data;
+it never falls back to another device.
+
+GPU selection is not a security isolation boundary. The host runtime determines
+which devices the container can access, and untrusted child code can change its
+own CUDA environment. Continue to use appropriate host/container isolation.
+
 ## Key Environment Variables
 
 - Required for startup
   - `RUNNER_SECRET` (required; pre-provisioned secret tied to owner)
 - Offloadr API
   - `OFFLOADR_API_GRPC` (optional; defaults to `https://offloadr.studio`; use a public HTTPS gRPC endpoint)
+- Optional physical GPU selection
+  - `OFFLOADR_GPU_UUID` (complete `GPU-...` UUID; binds resources, telemetry, power and child CUDA visibility)
 - Optional identity/retry tuning
   - `RUNNER_ID` (optional UUID override; primarily for Offloadr-managed hosted runners)
   - `REG_MIN_BACKOFF_SEC`
