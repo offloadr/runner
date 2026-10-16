@@ -11,7 +11,7 @@ MSYS_NO_PATHCONV=1 docker run --rm \
   -v "${repo}:/repo:ro" \
   -e RUNNER_NATIVE_TESTS_REQUIRED=1 \
   -e DOTNET_CLI_TELEMETRY_OPTOUT=1 \
-  mcr.microsoft.com/dotnet/sdk:10.0 \
+  mcr.microsoft.com/dotnet/sdk:10.0.402 \
   bash -c '
 set -euo pipefail
 apt-get update -qq >/dev/null
