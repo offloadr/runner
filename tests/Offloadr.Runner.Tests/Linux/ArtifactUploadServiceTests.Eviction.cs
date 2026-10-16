@@ -109,6 +109,14 @@ public partial class ArtifactUploadServiceTests
 
             Assert.That(unsaved, Is.EqualTo(1));
             Assert.That(await service.StopSessionAsync("session-1"), Is.Zero, "a repeated stop has nothing left");
+
+            // A restart's new runtime stops with nothing pending: the session still lost one.
+            var relaunched = CreateEvictionPaths(Path.Combine(root, "relaunched"), sealedSession: true);
+            await service.StartSessionAsync("session-1", relaunched, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            Assert.That(await service.StopSessionAsync("session-1"), Is.Zero);
+            Assert.That(service.TakeUnsavedUploadCount("session-1"), Is.EqualTo(1));
+            Assert.That(service.TakeUnsavedUploadCount("session-1"), Is.Zero, "taken once, for the session's stop");
         }
         finally
         {

@@ -476,8 +476,8 @@ internal static class ServiceClientManager
         public required CancellationToken Shutdown { get; init; }
         /// <summary>What a started session's runtime got, for its start acknowledgement.</summary>
         public Func<string, SessionSealingStatus?>? GetSessionSealing { get; init; }
-        /// <summary>Artifacts lost when the session's data was removed, for its stop acknowledgement.</summary>
-        public Func<string, int>? GetUnsavedArtifactCount { get; init; }
+        /// <summary>Takes the artifacts the session lost when its runtimes' data was removed, for its stop acknowledgement.</summary>
+        public Func<string, int>? TakeUnsavedArtifactCount { get; init; }
     }
 
     internal sealed class RunnerCommandWorkState(CancellationToken shutdown)
@@ -1373,7 +1373,7 @@ internal static class ServiceClientManager
             ActivateSession = gpuPowerLimitService.ActivateSessionAsync,
             Shutdown = shutdown,
             GetSessionSealing = sessionManager.GetSessionSealingStatus,
-            GetUnsavedArtifactCount = artifactUploadService.GetUnsavedUploadCount,
+            TakeUnsavedArtifactCount = artifactUploadService.TakeUnsavedUploadCount,
         };
 
         while (!shutdown.IsCancellationRequested)
@@ -2129,7 +2129,7 @@ internal static class ServiceClientManager
                 if (work.Completed)
                 {
                     work.Acknowledgement.UnsavedArtifactCount =
-                        (uint)Math.Max(0, deps.GetUnsavedArtifactCount?.Invoke(command.SessionId) ?? 0);
+                        (uint)Math.Max(0, deps.TakeUnsavedArtifactCount?.Invoke(command.SessionId) ?? 0);
                 }
             }
 

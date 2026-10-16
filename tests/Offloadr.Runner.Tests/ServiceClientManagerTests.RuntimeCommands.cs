@@ -1473,7 +1473,7 @@ public partial class ServiceClientManagerTests
             },
             Shutdown = Shutdown.Token,
             GetSessionSealing = _ => SealingStatus,
-            GetUnsavedArtifactCount = _ => UnsavedArtifacts,
+            TakeUnsavedArtifactCount = _ => UnsavedArtifacts,
         };
 
         private Task Record(string call)

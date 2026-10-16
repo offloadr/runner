@@ -12,8 +12,9 @@ public static class SealedHostLockdown
 
     /// <summary>
     /// Directories near the top of <paramref name="root"/>'s filesystem that anyone may write,
-    /// such as <c>/tmp</c>, <c>/var/tmp</c>, <c>/run/lock</c> or Ubuntu's <c>/var/crash</c>. Other
-    /// filesystems (<c>/dev/shm</c>, <c>/proc</c>, mounts) and symlinks are not entered.
+    /// such as <c>/tmp</c>, <c>/var/tmp</c>, <c>/run/lock</c> or Ubuntu's <c>/var/crash</c>, and
+    /// world-writable mount points there, such as a volume mounted into the container. Other
+    /// filesystems are reported but never entered, and symlinks are not followed.
     /// </summary>
     public static IReadOnlyList<string> FindSharedWritableDirectories(string root = "/", int maxDepth = 3)
     {
@@ -42,8 +43,7 @@ public static class SealedHostLockdown
             foreach (var child in children)
             {
                 if (SealedStorageProbe.ReadEntryStatus(child) is not { IsDirectory: true, IsSymbolicLink: false } entry ||
-                    !LinuxFileIdentityReader.TryRead(child, out var identity) ||
-                    identity.DeviceId != rootIdentity.DeviceId)
+                    !LinuxFileIdentityReader.TryRead(child, out var identity))
                 {
                     continue;
                 }
@@ -54,7 +54,7 @@ public static class SealedHostLockdown
                     continue;
                 }
 
-                if (depth + 1 < maxDepth)
+                if (identity.DeviceId == rootIdentity.DeviceId && depth + 1 < maxDepth)
                 {
                     Walk(child, depth + 1);
                 }
@@ -98,8 +98,16 @@ public static class SealedHostLockdown
                 continue;
             }
 
-            setMode(directory, entry.Mode & ~(UnixFileMode.GroupWrite | UnixFileMode.OtherWrite));
-            changed.Add(directory);
+            try
+            {
+                setMode(directory, entry.Mode & ~(UnixFileMode.GroupWrite | UnixFileMode.OtherWrite));
+                changed.Add(directory);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // A read-only mount cannot be changed, and nobody can write to it either.
+                RunnerLog.Warning($"Sealed storage: could not close '{directory}' to session users: {ex.Message}");
+            }
         }
 
         return changed;

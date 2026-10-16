@@ -37,7 +37,9 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
     private readonly RuntimeIdentityRegistry? _runtimeIdentities;
     private readonly string _runnerId;
     private readonly ConcurrentDictionary<string, SessionUploader> _sessions = new(StringComparer.Ordinal);
-    private (string SessionId, int Count)? _lastStopped;
+    // Unsaved artifacts per logical session, summed over its runtimes: a restart removes the old
+    // runtime's data too, and the session's Stop must still report what was lost then.
+    private readonly ConcurrentDictionary<string, int> _unsavedBySession = new(StringComparer.Ordinal);
 
     public ArtifactUploadService(string? runnerSecret, RunnerArtifactService.RunnerArtifactServiceClient artifactClient, ILogger<ArtifactUploadService> logger, RuntimeIdentityRegistry? runtimeIdentities = null, string? runnerId = null)
     {
@@ -96,11 +98,12 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         }
     }
 
-    /// <summary>Unsaved artifacts of the session whose uploads stopped most recently, for its stop acknowledgement.</summary>
-    public int GetUnsavedUploadCount(string sessionId)
-        => _lastStopped is { } stopped && string.Equals(stopped.SessionId, sessionId, StringComparison.Ordinal)
-            ? stopped.Count
-            : 0;
+    /// <summary>
+    /// Takes the artifacts the session lost across all its runtimes, for its stop acknowledgement,
+    /// and forgets them.
+    /// </summary>
+    public int TakeUnsavedUploadCount(string sessionId)
+        => _unsavedBySession.TryRemove(sessionId, out var count) ? count : 0;
 
     internal int GetPendingUploadCount(string sessionId)
         => _sessions.TryGetValue(sessionId, out var uploader) ? uploader.PendingUploadCount : 0;
@@ -195,7 +198,11 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         }
 
         await uploader.StopAsync().ConfigureAwait(false);
-        _lastStopped = (sessionId, uploader.UnsavedUploadCount);
+        if (uploader.UnsavedUploadCount > 0)
+        {
+            _unsavedBySession.AddOrUpdate(sessionId, uploader.UnsavedUploadCount, (_, earlier) => earlier + uploader.UnsavedUploadCount);
+        }
+
         if (uploader.UnsavedUploadCount > 0)
         {
             _logger.LogWarning(

@@ -29,9 +29,12 @@ public class SealedHostLockdownLinuxTests
             Directory.CreateSymbolicLink(Path.Combine(root, "link"), shallow);
 
             var found = SealedHostLockdown.FindSharedWritableDirectories(root);
+            var mounts = SealedHostLockdown.FindSharedWritableDirectories("/");
 
             // A world-writable directory is reported once; what it contains is its own concern.
             Assert.That(found, Is.EquivalentTo(new[] { shallow, nested }));
+            // /dev/shm lies on another filesystem below /dev, which is never entered.
+            Assert.That(mounts, Has.None.EqualTo("/dev/shm"));
         }
         finally
         {
