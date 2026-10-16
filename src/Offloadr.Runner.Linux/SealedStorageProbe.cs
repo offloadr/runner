@@ -99,6 +99,11 @@ public sealed class SealedStorageProbe
             return Unavailable("sealed root is not on a tmpfs or ramfs", swap);
         }
 
+        if (stats.ReadOnly)
+        {
+            return Unavailable("sealed root is on a read-only mount", swap);
+        }
+
         // ramfs reports no size; only the memory limit bounds it.
         long? capacity = stats.Type == RamfsMagic ? null : SafeMultiply(stats.Blocks, stats.BlockSize);
         long? free = stats.Type == RamfsMagic ? null : SafeMultiply(stats.AvailableBlocks, stats.BlockSize);

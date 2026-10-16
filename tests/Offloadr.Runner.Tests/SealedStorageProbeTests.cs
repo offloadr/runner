@@ -152,6 +152,18 @@ public class SealedStorageProbeTests
         Assert.That(status.Reason, Does.Contain("tmpfs"));
     }
 
+    [Test]
+    public void Probe_RefusesAReadOnlyMount()
+    {
+        var host = new FakeHost();
+        host.FileSystem = host.FileSystem with { ReadOnly = true };
+
+        var status = host.Probe().Probe(Required());
+
+        Assert.That(status.Available, Is.False);
+        Assert.That(status.Reason, Does.Contain("read-only"));
+    }
+
     [TestCase(false, true, 0u, "755")]
     [TestCase(true, false, 0u, "755")]
     [TestCase(false, false, 1000u, "755")]
