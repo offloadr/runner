@@ -218,6 +218,39 @@ public partial class ArtifactUploadServiceTests
         }
     }
 
+    [Test]
+    public async Task StopSessionAsync_ThatOverlapsADrainingStopWaitsForItsCount()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = CreateEvictionPaths(root, sealedSession: true);
+            var neverAccepted = new TaskCompletionSource();
+            var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse())
+            {
+                UploadGate = neverAccepted.Task,
+            };
+            await using var service = new ArtifactUploadService("runner-secret-value", artifactClient, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            await File.WriteAllBytesAsync(Path.Combine(paths.OutputDirectory, "late.png"), [1, 2, 3]);
+            await artifactClient.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+
+            // The exit cleanup starts draining; the Stop arrives while it does.
+            var exitCleanup = service.StopSessionAsync("session-1");
+            var stop = service.StopSessionAsync("session-1");
+            Assert.That(stop.IsCompleted, Is.False, "the overlapping stop waits for the drain");
+
+            Assert.That(await stop, Is.EqualTo(1));
+            Assert.That(await exitCleanup, Is.EqualTo(1));
+            Assert.That(service.TakeUnsavedUploadCount("session-1"), Is.EqualTo(1), "recorded once, before the Stop takes it");
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
     private static async Task<long> EvictWhenRecordedAsync(ArtifactUploadService service, string sessionId)
     {
         // The upload is recorded once the control plane's response arrives.

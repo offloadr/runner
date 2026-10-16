@@ -40,6 +40,8 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
     // Unsaved artifacts per logical session, summed over its runtimes: a restart removes the old
     // runtime's data too, and the session's Stop must still report what was lost then.
     private readonly ConcurrentDictionary<string, int> _unsavedBySession = new(StringComparer.Ordinal);
+    private readonly object _stopGate = new();
+    private readonly Dictionary<string, Task<int>> _stopping = new(StringComparer.Ordinal);
 
     public ArtifactUploadService(string? runnerSecret, RunnerArtifactService.RunnerArtifactServiceClient artifactClient, ILogger<ArtifactUploadService> logger, RuntimeIdentityRegistry? runtimeIdentities = null, string? runnerId = null)
     {
@@ -190,13 +192,36 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
     /// Stops the session's uploads after a short drain. Returns how many artifacts were not
     /// uploaded: they failed or were still pending, and are lost once the session's data is removed.
     /// </summary>
-    public async Task<int> StopSessionAsync(string sessionId)
+    public Task<int> StopSessionAsync(string sessionId)
     {
-        if (!_sessions.TryRemove(sessionId, out var uploader))
+        // A stop that overlaps another one for the session (an exit cleanup still draining when
+        // the Stop arrives) waits for it, so the lost artifacts are recorded before anyone takes them.
+        lock (_stopGate)
         {
-            return 0;
-        }
+            if (!_sessions.TryRemove(sessionId, out var uploader))
+            {
+                return _stopping.TryGetValue(sessionId, out var inFlight) ? inFlight : Task.FromResult(0);
+            }
 
+            var stopping = StopAndRecordAsync(sessionId, uploader);
+            _stopping[sessionId] = stopping;
+            _ = stopping.ContinueWith(
+                completed =>
+                {
+                    lock (_stopGate)
+                    {
+                        ((ICollection<KeyValuePair<string, Task<int>>>)_stopping).Remove(new(sessionId, completed));
+                    }
+                },
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+            return stopping;
+        }
+    }
+
+    private async Task<int> StopAndRecordAsync(string sessionId, SessionUploader uploader)
+    {
         await uploader.StopAsync().ConfigureAwait(false);
         if (uploader.UnsavedUploadCount > 0)
         {
