@@ -137,6 +137,9 @@ message LaunchEditorRuntimeCommand {
     repeated ModelDownloadRequest initial_models = 14;
     repeated offloadr.editor_runtime.v1.EditorArtifactMetadata initial_artifacts = 15;
     repeated WorkspaceFileMetadata initial_workspace_files = 16;
+    // The session's sealing, as on its StartSessionCommand. The runner also keeps the start's,
+    // but a runner that restarted since has only this.
+    SessionSealing sealing = 18;
 }
 
 message SubmitPromptCommand {
@@ -349,6 +352,7 @@ message AcknowledgeEditorRuntimeLaunchRequest {
     uint32 attempt = 9;
     bool ready = 10;
     string message = 12;
+    SessionSealingStatus sealing = 14; // What the launched runtime got; unset when it did not launch.
 }
 
 // Unary ack request message for stop-session.

@@ -2125,8 +2125,11 @@ internal static class ServiceClientManager
         {
             if (!work.Completed)
             {
-                work.Completed = await ExecuteStopSessionCommandAsync(command, deps).ConfigureAwait(false);
-                if (work.Completed)
+                var outcome = await ExecuteStopSessionCommandAsync(command, deps).ConfigureAwait(false);
+                work.Completed = outcome != StopOutcome.NotCompleted;
+                // Only the Stop that tore the session down reports what it lost; a superseded
+                // Stop leaves the count for the current runtime's Stop.
+                if (outcome == StopOutcome.Stopped)
                 {
                     work.Acknowledgement.UnsavedArtifactCount =
                         (uint)Math.Max(0, deps.TakeUnsavedArtifactCount?.Invoke(command.SessionId) ?? 0);
@@ -2147,7 +2150,14 @@ internal static class ServiceClientManager
         }
     }
 
-    private static async Task<bool> ExecuteStopSessionCommandAsync(StopSessionCommand command, RuntimeCommandDependencies deps)
+    private enum StopOutcome
+    {
+        NotCompleted,
+        Superseded,
+        Stopped,
+    }
+
+    private static async Task<StopOutcome> ExecuteStopSessionCommandAsync(StopSessionCommand command, RuntimeCommandDependencies deps)
     {
         deps.Shutdown.ThrowIfCancellationRequested();
         if (IsStopSuperseded(command, deps))
@@ -2157,7 +2167,7 @@ internal static class ServiceClientManager
             RunnerLog.Warning(
                 nameof(ServiceClientManager),
                 $"Ignoring stale stop for session {command.SessionId}; a newer runtime is current.");
-            return true;
+            return StopOutcome.Superseded;
         }
 
         await deps.WorkState.Prompts.CancelAndWaitAsync(
@@ -2182,13 +2192,13 @@ internal static class ServiceClientManager
             // Keep the heartbeat and identity of a child that may still be alive,
             // and do not acknowledge: the control plane retains the Stop.
             RunnerLog.Error(nameof(ServiceClientManager), ex, $"Stop of session {command.SessionId} did not complete; retaining its state.");
-            return false;
+            return StopOutcome.NotCompleted;
         }
 
         deps.LogicalSessionState.ClearAndRetire(command.SessionId, command.LifecycleGeneration);
         deps.RuntimeIdentities.Remove(command.SessionId);
         deps.WorkState.SessionSealing.TryRemove(command.SessionId, out _);
-        return true;
+        return StopOutcome.Stopped;
     }
 
     /// <summary>
@@ -2540,7 +2550,9 @@ internal static class ServiceClientManager
             LifecycleGeneration = command.LifecycleGeneration,
             RuntimeEpoch = command.RuntimeEpoch,
             RuntimeInstanceId = command.RuntimeInstanceId,
-            Sealing = deps.WorkState.SessionSealing.TryGetValue(command.SessionId, out var sealing) ? sealing.Clone() : null,
+            // The launch's own sealing wins; the start's covers a control plane that omits it.
+            Sealing = command.Sealing?.Clone() ??
+                (deps.WorkState.SessionSealing.TryGetValue(command.SessionId, out var sealing) ? sealing.Clone() : null),
         };
         start.InitialModels.AddRange(command.InitialModels);
         start.InitialArtifacts.AddRange(command.InitialArtifacts);
@@ -2572,6 +2584,7 @@ internal static class ServiceClientManager
             {
                 ack.Ready = outcome.Ready;
                 ack.Message = outcome.Message;
+                ack.Sealing = outcome.Ready ? deps.GetSessionSealing?.Invoke(command.SessionId) : null;
                 return ack;
             },
             deps.Sink.AckEditorRuntimeLaunchAsync,

@@ -1392,7 +1392,15 @@ public partial class ServiceClientManagerTests
         public ConcurrentQueue<StartSessionCommand> Starts { get; } = new();
         public string InstanceId { get; set; } = "process-1";
         public SessionSealingStatus? SealingStatus { get; set; }
-        public int UnsavedArtifacts { get; set; }
+
+        /// <summary>Lost artifacts the next completed Stop takes, as the uploader keeps them.</summary>
+        public int UnsavedArtifacts
+        {
+            get => Volatile.Read(ref _unsavedArtifacts);
+            set => Volatile.Write(ref _unsavedArtifacts, value);
+        }
+
+        private int _unsavedArtifacts;
 
         /// <summary>Runs before a start registers its runtime; may block or throw.</summary>
         public Func<StartSessionCommand, CancellationToken, Task> BeforeStart { get; set; } = (_, _) => Task.CompletedTask;
@@ -1473,7 +1481,7 @@ public partial class ServiceClientManagerTests
             },
             Shutdown = Shutdown.Token,
             GetSessionSealing = _ => SealingStatus,
-            TakeUnsavedArtifactCount = _ => UnsavedArtifacts,
+            TakeUnsavedArtifactCount = _ => Interlocked.Exchange(ref _unsavedArtifacts, 0),
         };
 
         private Task Record(string call)

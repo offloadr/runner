@@ -92,7 +92,6 @@ public partial class ServiceClientManagerTests
 
         await ServiceClientManager.HandleStopSessionCommandAsync(stop, harness.Deps);
         var first = await harness.Sink.WaitForAsync(harness.Sink.StopAcks, 1);
-        harness.UnsavedArtifacts = 0;
         await ServiceClientManager.HandleStopSessionCommandAsync(stop.Clone(), harness.Deps);
         var replayed = await harness.Sink.WaitForAsync(harness.Sink.StopAcks, 2);
 
@@ -102,6 +101,42 @@ public partial class ServiceClientManagerTests
             Assert.That(replayed.UnsavedArtifactCount, Is.EqualTo(2), "a redelivery replays the completed stop's result");
             Assert.That(harness.Calls.Count(call => call.StartsWith("stop:", StringComparison.Ordinal)), Is.EqualTo(1));
         });
+    }
+
+    [Test]
+    public async Task SupersededStop_LeavesTheLostArtifactsForTheCurrentRuntimesStop()
+    {
+        var harness = RunningHarness(7, 4, InstanceB);
+        harness.UnsavedArtifacts = 2;
+
+        await ServiceClientManager.HandleStopSessionCommandAsync(Stop(7, 3, InstanceA), harness.Deps);
+        var stale = await harness.Sink.WaitForAsync(harness.Sink.StopAcks, 1);
+        await ServiceClientManager.HandleStopSessionCommandAsync(Stop(7, 4, InstanceB), harness.Deps);
+        var current = await harness.Sink.WaitForAsync(harness.Sink.StopAcks, 2);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(stale.UnsavedArtifactCount, Is.Zero);
+            Assert.That(current.UnsavedArtifactCount, Is.EqualTo(2));
+        });
+    }
+
+    [Test]
+    public async Task LaunchRuntime_UsesItsOwnSealingAndAcknowledgesWhatItGot()
+    {
+        var harness = new RuntimeCommandHarness
+        {
+            SealingStatus = new SessionSealingStatus { MemoryWorkspace = true, EncryptedUploads = true, EncryptedReadsRequired = true },
+        };
+        var launch = Launch(7, 3, InstanceA, revision: 1);
+        launch.Sealing = SealedStart(7, 3, InstanceA).Sealing;
+
+        // A runner that never saw the start, as after an agent restart.
+        await ServiceClientManager.HandleLaunchRuntimeCommand(launch, harness.Deps);
+        var ack = await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 1);
+
+        Assert.That(harness.Starts.Single().Sealing, Is.EqualTo(launch.Sealing));
+        Assert.That(ack.Sealing, Is.EqualTo(harness.SealingStatus));
     }
 
     [Test]
