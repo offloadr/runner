@@ -54,6 +54,7 @@ RunnerLog.Info(
     (sealedStorageStatus.Reason is null ? string.Empty : $" reason='{sealedStorageStatus.Reason}'"));
 if (options.Session.Sealing.Mode == SealedStorageMode.Required)
 {
+    LinuxProcessHardening.DisableCoreDumps();
     foreach (var directory in SealedHostLockdown.RemoveSharedWriteAccess(SealedHostLockdown.SharedTemporaryDirectories))
     {
         RunnerLog.Info($"Sealed storage: '{directory}' is no longer writable by session users.");

@@ -666,6 +666,54 @@ public class WorkspaceMirrorServiceTests
         }
     }
 
+    [Test]
+    public async Task PrepareSessionAsync_SealedSessionStagesTheSeedArchiveOnTheSealedRoot()
+    {
+        const string sessionId = "session-sealed-seed";
+        var tempRoot = CreateTempDirectory();
+
+        try
+        {
+            var sealedDirectory = Path.Combine(tempRoot, "sealed");
+            var paths = CreateSessionPaths(tempRoot) with
+            {
+                SealedDirectory = sealedDirectory,
+                UserDirectory = Path.Combine(sealedDirectory, "user"),
+            };
+            Directory.CreateDirectory(paths.UserDirectory);
+            Directory.CreateDirectory(paths.SealedAgentDirectory!);
+            string[]? stagedInAgentDirectory = null;
+            string[]? stagedInTemp = null;
+            var workspaceClient = new FakeRunnerWorkspaceClient
+            {
+                SeedArchiveBytes = CreateZipBytes(("workflows/a.json", "{}")),
+                AfterSeedArchiveStream = () =>
+                {
+                    stagedInAgentDirectory ??= Directory.GetFiles(paths.SealedAgentDirectory!);
+                    stagedInTemp ??= Directory.GetFiles(Path.GetTempPath(), $"workspace-seed-{sessionId}-*");
+                },
+            };
+            await using var service = new WorkspaceMirrorService(
+                workspaceClient,
+                "runner-secret-value",
+                NullLogger<WorkspaceMirrorService>.Instance);
+
+            await service.PrepareSessionAsync(sessionId, paths, "editor-1", "comfyui", [], CancellationToken.None);
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(stagedInAgentDirectory, Has.Length.EqualTo(1));
+                Assert.That(stagedInTemp, Is.Empty);
+                Assert.That(Directory.GetFiles(paths.SealedAgentDirectory!), Is.Empty);
+                Assert.That(File.ReadAllText(Path.Combine(paths.UserDirectory, "workflows", "a.json")), Is.EqualTo("{}"));
+            });
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+        }
+    }
+
     private static SessionProcessManager.SessionPaths CreateSessionPaths(string root)
     {
         var paths = new SessionProcessManager.SessionPaths
@@ -716,6 +764,21 @@ public class WorkspaceMirrorServiceTests
         }
     }
 
+    private static byte[] CreateZipBytes(params (string Name, string Content)[] entries)
+    {
+        using var stream = new MemoryStream();
+        using (var archive = new ZipArchive(stream, ZipArchiveMode.Create, leaveOpen: true))
+        {
+            foreach (var (name, content) in entries)
+            {
+                using var writer = new StreamWriter(archive.CreateEntry(name).Open());
+                writer.Write(content);
+            }
+        }
+
+        return stream.ToArray();
+    }
+
     private static byte[] CreateEmptyZipBytes()
     {
         using var stream = new MemoryStream();
@@ -737,6 +800,8 @@ public class WorkspaceMirrorServiceTests
         public IReadOnlyDictionary<string, long> DeclaredSizeByRelativePath { get; init; } = new Dictionary<string, long>(StringComparer.Ordinal);
         public IReadOnlyDictionary<string, string> DeclaredSha256ByRelativePath { get; init; } = new Dictionary<string, string>(StringComparer.Ordinal);
         public bool ThrowArchiveRead { get; init; }
+        /// <summary>Runs once the seed archive stream has been read to its end, while the archive is still staged.</summary>
+        public Action? AfterSeedArchiveStream { get; init; }
         public BlockingResponseStreamReader? BlockingInputReader { get; init; }
         public List<WorkspaceRoot> SeedArchiveRequests { get; } = [];
         public List<RunnerWorkspaceServiceReadWorkspaceFileRequest> DownloadRequests { get; } = [];
@@ -762,6 +827,11 @@ public class WorkspaceMirrorServiceTests
                             Chunk = Google.Protobuf.ByteString.CopyFrom(SeedArchiveBytes)
                         }
                     ]);
+            if (AfterSeedArchiveStream is not null)
+            {
+                responseStream = new EndCallbackStreamReader<RunnerWorkspaceServiceReadWorkspaceSeedArchiveResponse>(responseStream, AfterSeedArchiveStream);
+            }
+
             return new AsyncServerStreamingCall<RunnerWorkspaceServiceReadWorkspaceSeedArchiveResponse>(
                 responseStream,
                 Task.FromResult(new Metadata()),
@@ -819,6 +889,22 @@ public class WorkspaceMirrorServiceTests
                 () => Status.DefaultSuccess,
                 () => new Metadata(),
                 () => { });
+        }
+    }
+
+    private sealed class EndCallbackStreamReader<T>(IAsyncStreamReader<T> inner, Action atEnd) : IAsyncStreamReader<T>
+    {
+        public T Current => inner.Current;
+
+        public async Task<bool> MoveNext(CancellationToken cancellationToken)
+        {
+            var moved = await inner.MoveNext(cancellationToken).ConfigureAwait(false);
+            if (!moved)
+            {
+                atEnd();
+            }
+
+            return moved;
         }
     }
 

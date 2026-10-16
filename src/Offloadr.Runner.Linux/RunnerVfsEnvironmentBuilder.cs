@@ -59,7 +59,8 @@ public sealed class RunnerVfsEnvironmentBuilder
         Func<string, string?>? getEnv = null,
         Func<string, bool>? fileExists = null,
         string? existingLdPreload = null,
-        string? sessionId = null)
+        string? sessionId = null,
+        bool disableCoreDumps = false)
     {
         getEnv ??= Environment.GetEnvironmentVariable;
         fileExists ??= File.Exists;
@@ -73,6 +74,11 @@ public sealed class RunnerVfsEnvironmentBuilder
             ["VFS_LOG"] = getEnv("RUNNER_VFS_LOG") ?? DefaultLogValue,
             ["VFS_SESSION_ID"] = sessionId?.Trim() ?? string.Empty
         };
+        if (disableCoreDumps)
+        {
+            // The shim marks every process that loads it non-dumpable again after each exec.
+            updates["VFS_NO_DUMP"] = "1";
+        }
 
         var vfsLib = getEnv("RUNNER_VFS_LIB") ?? DefaultVfsLibraryPath;
         if (fileExists(vfsLib))

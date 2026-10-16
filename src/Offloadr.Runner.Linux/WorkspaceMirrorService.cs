@@ -409,7 +409,8 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
 
         private async Task<string> DownloadArchiveAsync(IAsyncStreamReader<RunnerWorkspaceServiceReadWorkspaceSeedArchiveResponse> responseStream, CancellationToken cancellationToken)
         {
-            var tempPath = Path.Combine(Path.GetTempPath(), $"workspace-seed-{_sessionId}-{Guid.NewGuid():N}.zip");
+            // A sealed session stages its seed on the memory-backed root, never on disk.
+            var tempPath = Path.Combine(_paths.SealedAgentDirectory ?? Path.GetTempPath(), $"workspace-seed-{_sessionId}-{Guid.NewGuid():N}.zip");
             long totalBytes = 0;
             bool sawMetadata = false;
             long? expectedSize = null;

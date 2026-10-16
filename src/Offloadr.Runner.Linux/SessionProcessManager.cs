@@ -1093,6 +1093,8 @@ internal sealed partial class SessionProcessManager : IDisposable
             throw new PlatformNotSupportedException("Sealed storage needs Linux.");
         }
 
+        // The agent holds sealed data in its buffers too.
+        LinuxProcessHardening.DisableCoreDumps();
         var root = _sealing.Root;
         if (!Directory.Exists(root))
         {
@@ -1254,6 +1256,10 @@ internal sealed partial class SessionProcessManager : IDisposable
         try
         {
             var sessionCategory = SessionLogCategory(sessionId);
+            // Editor output carries prompts, filenames and node values. A sealed session keeps it
+            // off the console (which the container engine writes to the host's disk) and only
+            // relays it to the control plane.
+            var logToConsole = !paths.IsSealed;
             var psi = BuildEditorStartInfo(sessionId, identity, paths);
 
             process = new Process { StartInfo = psi, EnableRaisingEvents = true };
@@ -1272,7 +1278,11 @@ internal sealed partial class SessionProcessManager : IDisposable
             {
                 if (!string.IsNullOrWhiteSpace(line))
                 {
-                    RunnerLog.Info(sessionCategory, line);
+                    if (logToConsole)
+                    {
+                        RunnerLog.Info(sessionCategory, line);
+                    }
+
                     _processLogRelay?.Enqueue(sessionId, SessionProcessLogStream.Stdout, line, runtimeIdentity);
                 }
             });
@@ -1280,7 +1290,11 @@ internal sealed partial class SessionProcessManager : IDisposable
             {
                 if (!string.IsNullOrWhiteSpace(line))
                 {
-                    RunnerLog.Info(sessionCategory, line);
+                    if (logToConsole)
+                    {
+                        RunnerLog.Info(sessionCategory, line);
+                    }
+
                     _processLogRelay?.Enqueue(sessionId, SessionProcessLogStream.Stderr, line, runtimeIdentity);
                 }
             });
@@ -1752,7 +1766,11 @@ internal sealed partial class SessionProcessManager : IDisposable
         {
             if (!string.IsNullOrWhiteSpace(line))
             {
-                RunnerLog.Info(SessionLogCategory(sessionId), line);
+                if (!paths.IsSealed)
+                {
+                    RunnerLog.Info(SessionLogCategory(sessionId), line);
+                }
+
                 CaptureProcessOutput(output, outputLock, line);
             }
         }
@@ -1849,7 +1867,8 @@ internal sealed partial class SessionProcessManager : IDisposable
                 paths.OutputDirectory,
                 paths.InputDirectory,
                 paths.TempDirectory),
-            sessionId: sessionId);
+            sessionId: sessionId,
+            disableCoreDumps: paths.IsSealed);
         foreach (var kvp in vfsEnvironment)
         {
             psi.Environment[kvp.Key] = kvp.Value;
