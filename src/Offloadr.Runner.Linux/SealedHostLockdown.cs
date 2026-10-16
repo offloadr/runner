@@ -83,8 +83,15 @@ public static class SealedHostLockdown
         }
     }
 
-    /// <summary>Removes group and other write access from each disk-backed directory or regular file; returns the ones changed.</summary>
-    public static IReadOnlyList<string> RemoveSharedWriteAccess(IEnumerable<string> directories)
+    /// <summary>What the lockdown closed, and what it could not close although others can still write it.</summary>
+    public sealed record Result(IReadOnlyList<string> Closed, IReadOnlyList<string> StillWritable);
+
+    /// <summary>
+    /// Removes group and other write access from each disk-backed directory or regular file, then
+    /// checks that it is gone. A read-only mount needs no change; anything else that keeps its write
+    /// bits (a FUSE, network or bind mount refusing chmod) is reported as still writable.
+    /// </summary>
+    public static Result RemoveSharedWriteAccess(IEnumerable<string> directories)
         => RemoveSharedWriteAccess(
             directories,
             SealedStorageProbe.ReadEntryStatus,
@@ -97,7 +104,7 @@ public static class SealedHostLockdown
                 }
             });
 
-    internal static IReadOnlyList<string> RemoveSharedWriteAccess(
+    internal static Result RemoveSharedWriteAccess(
         IEnumerable<string> directories,
         Func<string, LinuxEntryStatus?> statEntry,
         Func<string, LinuxFileSystemStats?> statFileSystem,
@@ -105,6 +112,7 @@ public static class SealedHostLockdown
     {
         ArgumentNullException.ThrowIfNull(directories);
         var changed = new List<string>();
+        var stillWritable = new List<string>();
         foreach (var directory in directories)
         {
             if (statEntry(directory) is not { IsSymbolicLink: false } entry ||
@@ -114,8 +122,10 @@ public static class SealedHostLockdown
                 continue;
             }
 
-            // Memory-backed scratch space is not where residue is a concern.
-            if (statFileSystem(directory) is { Type: SealedStorageProbe.TmpfsMagic or SealedStorageProbe.RamfsMagic })
+            // Memory-backed scratch space is not where residue is a concern, and nobody writes to a
+            // read-only mount.
+            var fileSystem = statFileSystem(directory);
+            if (fileSystem is { Type: SealedStorageProbe.TmpfsMagic or SealedStorageProbe.RamfsMagic } or { ReadOnly: true })
             {
                 continue;
             }
@@ -123,15 +133,23 @@ public static class SealedHostLockdown
             try
             {
                 setMode(directory, entry.Mode & ~(UnixFileMode.GroupWrite | UnixFileMode.OtherWrite));
-                changed.Add(directory);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
-                // A read-only mount cannot be changed, and nobody can write to it either.
                 RunnerLog.Warning($"Sealed storage: could not close '{directory}' to session users: {ex.Message}");
+            }
+
+            // Some filesystems accept chmod and ignore it; only the mode read back counts.
+            if (statEntry(directory) is { } after && (after.Mode & (UnixFileMode.GroupWrite | UnixFileMode.OtherWrite)) == 0)
+            {
+                changed.Add(directory);
+            }
+            else
+            {
+                stillWritable.Add(directory);
             }
         }
 
-        return changed;
+        return new Result(changed, stillWritable);
     }
 }

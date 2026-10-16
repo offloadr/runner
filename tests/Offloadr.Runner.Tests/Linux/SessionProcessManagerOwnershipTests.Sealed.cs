@@ -326,13 +326,14 @@ public partial class SessionProcessManagerOwnershipTests
             ["/tmp/agent.sock"] = new(false, false, 0, Mode0755 | UnixFileMode.OtherWrite),
         };
 
-        var changed = SealedHostLockdown.RemoveSharedWriteAccess(
+        var result = SealedHostLockdown.RemoveSharedWriteAccess(
             entries.Keys,
-            path => entries.TryGetValue(path, out var entry) ? entry : null,
+            path => entries.TryGetValue(path, out var entry) ? entry with { Mode = modes.GetValueOrDefault(path, entry.Mode) } : null,
             path => new LinuxFileSystemStats(path == "/run/shm" ? 0x01021994 : 0xEF53, 4096, 1, 1),
             (path, mode) => modes[path] = mode);
 
-        Assert.That(changed, Is.EqualTo(new[] { "/tmp", "/var/tmp", "/tmp/shared.log" }));
+        Assert.That(result.Closed, Is.EqualTo(new[] { "/tmp", "/var/tmp", "/tmp/shared.log" }));
+        Assert.That(result.StillWritable, Is.Empty);
         Assert.That(modes["/tmp"], Is.EqualTo(UnixFileMode.StickyBit | Mode0755));
     }
 
@@ -665,6 +666,34 @@ public partial class SessionProcessManagerOwnershipTests
         }
 
         return new RunnerVfsEnvironmentBuilder { DefaultVfsLibraryPath = shim };
+    }
+
+    [Test]
+    public void SealedHostLockdown_ReportsWhatStaysWritableButNotReadOnlyMounts()
+    {
+        var shared = UnixFileMode.StickyBit | Mode0755 | UnixFileMode.OtherWrite;
+        var entries = new Dictionary<string, LinuxEntryStatus>(StringComparer.Ordinal)
+        {
+            ["/fuse"] = new(true, false, 0, shared),
+            ["/refuses"] = new(true, false, 0, shared),
+            ["/readonly"] = new(true, false, 0, shared),
+        };
+
+        var result = SealedHostLockdown.RemoveSharedWriteAccess(
+            entries.Keys,
+            path => entries[path],
+            path => new LinuxFileSystemStats(0xEF53, 4096, 1, 1, ReadOnly: path == "/readonly"),
+            (path, _) =>
+            {
+                // A FUSE mount accepts chmod and ignores it; another refuses it outright.
+                if (path == "/refuses")
+                {
+                    throw new UnauthorizedAccessException("Operation not permitted");
+                }
+            });
+
+        Assert.That(result.Closed, Is.Empty);
+        Assert.That(result.StillWritable, Is.EqualTo(new[] { "/fuse", "/refuses" }));
     }
 
     private static StartSessionCommand SealedStart(string sessionId, string runtimeKind = "comfyui")

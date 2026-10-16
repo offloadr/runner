@@ -104,6 +104,11 @@ public sealed class RunnerStartupValidator
             errors.Add($"RUNNER_SEALED_STORAGE=required but the sealed root '{sealing.Root}' is unusable: {status.Reason}.");
         }
 
+        if (string.Equals(Environment.GetEnvironmentVariable("RUNNER_VFS_LOG"), "1", StringComparison.Ordinal))
+        {
+            errors.Add("RUNNER_VFS_LOG=1 logs session file paths to the console, which sealed storage keeps off the host's disk.");
+        }
+
         // Session processes are made non-dumpable by the VFS shim.
         var vfsLibrary = Environment.GetEnvironmentVariable("RUNNER_VFS_LIB") ?? new RunnerVfsEnvironmentBuilder().DefaultVfsLibraryPath;
         if (!File.Exists(vfsLibrary))

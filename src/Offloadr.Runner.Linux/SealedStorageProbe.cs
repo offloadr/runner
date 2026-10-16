@@ -5,7 +5,7 @@ using System.Text;
 namespace Offloadr.Runner.Linux;
 
 /// <summary>Filesystem numbers from <c>statfs</c>.</summary>
-public readonly record struct LinuxFileSystemStats(long Type, long BlockSize, long Blocks, long AvailableBlocks);
+public readonly record struct LinuxFileSystemStats(long Type, long BlockSize, long Blocks, long AvailableBlocks, bool ReadOnly = false);
 
 /// <summary>Type, owner and permission bits of an entry itself (links are not followed).</summary>
 public readonly record struct LinuxEntryStatus(bool IsDirectory, bool IsSymbolicLink, uint OwnerId, UnixFileMode Mode, bool IsRegularFile = false);
@@ -327,11 +327,13 @@ public sealed class SealedStorageProbe
             var type = Marshal.ReadInt64(buffer, 0) & 0xFFFFFFFF;
             var blockSize = Marshal.ReadInt64(buffer, 8);
             var fragmentSize = Marshal.ReadInt64(buffer, 72);
+            // f_flags (offset 80) carries ST_RDONLY (1) for a read-only mount.
             return new LinuxFileSystemStats(
                 type,
                 fragmentSize > 0 ? fragmentSize : blockSize,
                 Marshal.ReadInt64(buffer, 16),
-                Marshal.ReadInt64(buffer, 32));
+                Marshal.ReadInt64(buffer, 32),
+                (Marshal.ReadInt64(buffer, 80) & 1) != 0);
         }
         finally
         {

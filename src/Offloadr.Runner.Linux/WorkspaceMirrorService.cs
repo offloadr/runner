@@ -47,7 +47,8 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
     {
         await StopSessionAsync(sessionId).ConfigureAwait(false);
 
-        var mirror = new SessionMirror(_workspaceClient, _authHeaders, sessionId, paths, _logger, _maxDynamicInputEntries);
+        ILogger logger = paths.IsSealed ? new SealedSessionLogger(_logger) : _logger;
+        var mirror = new SessionMirror(_workspaceClient, _authHeaders, sessionId, paths, logger, _maxDynamicInputEntries);
         if (!_sessions.TryAdd(sessionId, mirror))
         {
             await mirror.DisposeAsync().ConfigureAwait(false);

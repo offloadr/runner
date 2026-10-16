@@ -59,9 +59,19 @@ if (options.Session.Sealing.Mode == SealedStorageMode.Required)
     var sharedWritable = SealedHostLockdown.SharedTemporaryDirectories
         .Concat(SealedHostLockdown.FindSharedWritableDirectories())
         .Distinct(StringComparer.Ordinal);
-    foreach (var directory in SealedHostLockdown.RemoveSharedWriteAccess(sharedWritable))
+    var lockdown = SealedHostLockdown.RemoveSharedWriteAccess(sharedWritable);
+    foreach (var directory in lockdown.Closed)
     {
         RunnerLog.Info($"Sealed storage: '{directory}' is no longer writable by session users.");
+    }
+
+    if (lockdown.StillWritable.Count > 0)
+    {
+        // Sessions could write their data to these disk-backed places: required mode cannot hold.
+        RunnerLog.Error(
+            "RUNNER_SEALED_STORAGE=required but these disk-backed paths stay writable by session users: " +
+            string.Join(", ", lockdown.StillWritable));
+        return 1;
     }
 }
 

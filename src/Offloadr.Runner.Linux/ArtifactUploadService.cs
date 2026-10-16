@@ -76,7 +76,9 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             return;
         }
 
-        var uploader = new SessionUploader(_runnerSecret, _artifactClient, _authHeaders, sessionId, paths, _logger, _runtimeIdentities, _runnerId);
+        // A sealed session's artifact names stay out of the console, which reaches the host's disk.
+        ILogger logger = paths.IsSealed ? new SealedSessionLogger(_logger) : _logger;
+        var uploader = new SessionUploader(_runnerSecret, _artifactClient, _authHeaders, sessionId, paths, logger, _runtimeIdentities, _runnerId);
         if (!_sessions.TryAdd(sessionId, uploader))
         {
             await uploader.DisposeAsync().ConfigureAwait(false);
