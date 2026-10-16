@@ -1184,7 +1184,7 @@ internal sealed partial class SessionProcessManager : IDisposable
         }
 
         // The agent holds sealed data in its buffers too.
-        LinuxProcessHardening.DisableCoreDumps();
+        LinuxProcessHardening.RequireCoreDumpsDisabled();
         var root = _sealing.Root;
         if (!Directory.Exists(root))
         {

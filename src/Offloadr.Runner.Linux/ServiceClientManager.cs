@@ -423,7 +423,11 @@ internal static class ServiceClientManager
     }
 
     /// <summary>The shared result of one physical startup, acknowledged by every command that joined it.</summary>
-    internal readonly record struct StartupOutcome(bool Ready, string Message);
+    /// <summary>
+    /// How a startup ended. <paramref name="Sealing"/> is captured inside the startup, which a Stop
+    /// or replacement waits for, so it always describes the runtime this command started.
+    /// </summary>
+    internal readonly record struct StartupOutcome(bool Ready, string Message, SessionSealingStatus? Sealing = null);
 
     internal sealed class TrackedCommandWork
     {
@@ -2341,7 +2345,8 @@ internal static class ServiceClientManager
                     await deps.StartRuntimeAndWaitForReady(command, cancellationToken).ConfigureAwait(false);
                     return new StartupOutcome(
                         true,
-                        IsComfyRuntime(command.EditorRuntimeKind) ? "ComfyUI ready" : "GPU runtime ready");
+                        IsComfyRuntime(command.EditorRuntimeKind) ? "ComfyUI ready" : "GPU runtime ready",
+                        deps.GetSessionSealing?.Invoke(command.SessionId));
                 }
                 catch (Exception ex)
                 {
@@ -2354,7 +2359,7 @@ internal static class ServiceClientManager
             {
                 ack.Ready = outcome.Ready;
                 ack.Message = outcome.Message;
-                ack.Sealing = outcome.Ready ? deps.GetSessionSealing?.Invoke(command.SessionId) : null;
+                ack.Sealing = outcome.Ready ? outcome.Sealing : null;
                 return ack;
             },
             deps.Sink.AckStartSessionAsync,
@@ -2569,7 +2574,8 @@ internal static class ServiceClientManager
                     await deps.StartRuntimeAndWaitForReady(start, cancellationToken).ConfigureAwait(false);
                     return new StartupOutcome(
                         true,
-                        IsComfyRuntime(command.EditorRuntimeKind) ? "ComfyUI ready" : "GPU runtime ready");
+                        IsComfyRuntime(command.EditorRuntimeKind) ? "ComfyUI ready" : "GPU runtime ready",
+                        deps.GetSessionSealing?.Invoke(command.SessionId));
                 }
                 catch (Exception ex)
                 {
@@ -2584,7 +2590,7 @@ internal static class ServiceClientManager
             {
                 ack.Ready = outcome.Ready;
                 ack.Message = outcome.Message;
-                ack.Sealing = outcome.Ready ? deps.GetSessionSealing?.Invoke(command.SessionId) : null;
+                ack.Sealing = outcome.Ready ? outcome.Sealing : null;
                 return ack;
             },
             deps.Sink.AckEditorRuntimeLaunchAsync,

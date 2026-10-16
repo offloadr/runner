@@ -55,7 +55,15 @@ RunnerLog.Info(
     (sealedStorageStatus.Reason is null ? string.Empty : $" reason='{sealedStorageStatus.Reason}'"));
 if (options.Session.Sealing.Mode == SealedStorageMode.Required)
 {
-    LinuxProcessHardening.DisableCoreDumps();
+    try
+    {
+        LinuxProcessHardening.RequireCoreDumpsDisabled();
+    }
+    catch (InvalidOperationException ex)
+    {
+        RunnerLog.Error($"RUNNER_SEALED_STORAGE=required: {ex.Message}");
+        return 1;
+    }
     var sharedWritable = SealedHostLockdown.SharedTemporaryDirectories
         .Concat(SealedHostLockdown.FindSharedWritableDirectories())
         .Distinct(StringComparer.Ordinal);

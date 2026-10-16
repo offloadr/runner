@@ -15,6 +15,18 @@ public static class LinuxProcessHardening
     public static bool DisableCoreDumps()
         => OperatingSystem.IsLinux() && prctl(PrSetDumpable, 0, 0, 0, 0) == 0;
 
+    /// <summary>
+    /// Makes this process non-dumpable, and throws on Linux when the host forbids it (a seccomp
+    /// profile can): sealed data must not be held by a process that can dump core.
+    /// </summary>
+    public static void RequireCoreDumpsDisabled()
+    {
+        if (OperatingSystem.IsLinux() && !DisableCoreDumps())
+        {
+            throw new InvalidOperationException("Sealed storage is unavailable: this host does not allow the runner to disable its core dumps.");
+        }
+    }
+
     /// <summary>The current dumpable flag, or null where it cannot be read.</summary>
     public static int? ReadDumpable()
     {
