@@ -8,7 +8,7 @@ namespace Offloadr.Runner.Linux;
 public readonly record struct LinuxFileSystemStats(long Type, long BlockSize, long Blocks, long AvailableBlocks);
 
 /// <summary>Type, owner and permission bits of an entry itself (links are not followed).</summary>
-public readonly record struct LinuxEntryStatus(bool IsDirectory, bool IsSymbolicLink, uint OwnerId, UnixFileMode Mode);
+public readonly record struct LinuxEntryStatus(bool IsDirectory, bool IsSymbolicLink, uint OwnerId, UnixFileMode Mode, bool IsRegularFile = false);
 
 /// <summary>
 /// Checks whether the sealed root can hold session data in memory: it must be on a tmpfs or
@@ -305,6 +305,7 @@ public sealed class SealedStorageProbe
     private const int FileTypeMask = 0xF000;
     private const int DirectoryType = 0x4000;
     private const int SymbolicLinkType = 0xA000;
+    private const int RegularFileType = 0x8000;
 
     internal static LinuxFileSystemStats? ReadFileSystemStats(string path)
     {
@@ -360,7 +361,8 @@ public sealed class SealedStorageProbe
                 (mode & FileTypeMask) == DirectoryType,
                 (mode & FileTypeMask) == SymbolicLinkType,
                 ownerId,
-                (UnixFileMode)(mode & 0xFFF));
+                (UnixFileMode)(mode & 0xFFF),
+                (mode & FileTypeMask) == RegularFileType);
         }
         finally
         {

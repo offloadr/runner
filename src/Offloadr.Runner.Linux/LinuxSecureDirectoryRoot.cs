@@ -36,6 +36,9 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
     private const uint StatxNlink = 0x0004;
     private const uint StatxMtime = 0x0040;
     private const uint StatxSize = 0x0200;
+    private const uint StatxIno = 0x0100;
+    private const int StatxInoOffset = 32;
+    private const uint RenameExchange = 2;
     private const int StatxBufferSize = 256;
     private const int StatxNlinkOffset = 16;
     private const int StatxModeOffset = 28;
@@ -188,6 +191,55 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
 
             using var entry = new SafeFileHandle((nint)descriptor, ownsHandle: true);
             return ReadStatus(entry, relativePath);
+        }
+    }
+
+    /// <summary>
+    /// The status and inode of <paramref name="relativePath"/>, so a later replacement can check
+    /// that it displaces exactly this file. Null when it is not a single-link regular file.
+    /// </summary>
+    public SecureFileVersion? GetVersion(string relativePath)
+    {
+        var (_, parent, leafName) = TryOpenExistingParent(relativePath);
+        if (parent is null)
+        {
+            return null;
+        }
+
+        using (parent)
+        {
+            return ReadVersion(parent, leafName, relativePath);
+        }
+    }
+
+    private static SecureFileVersion? ReadVersion(SafeFileHandle parent, string leafName, string relativePath)
+    {
+        var descriptor = openat(GetDescriptor(parent), leafName, OPath | ONoFollow | OCloseOnExec);
+        if (descriptor < 0)
+        {
+            return null;
+        }
+
+        using var entry = new SafeFileHandle((nint)descriptor, ownsHandle: true);
+        var status = ReadStatus(entry, relativePath);
+        if (!status.IsRegularFile)
+        {
+            return null;
+        }
+
+        var buffer = Marshal.AllocHGlobal(StatxBufferSize);
+        try
+        {
+            if (statx(GetDescriptor(entry), string.Empty, AtEmptyPath | AtSymlinkNoFollow, StatxIno, buffer) != 0)
+            {
+                return null;
+            }
+
+            return new SecureFileVersion(status, unchecked((ulong)Marshal.ReadInt64(buffer, StatxInoOffset)));
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
         }
     }
 
@@ -769,6 +821,42 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
             _committed = true;
         }
 
+        /// <summary>
+        /// Swaps the publication with the existing destination in one step and keeps the swap only
+        /// when the file it displaced is <paramref name="expected"/>, same inode, length and
+        /// modification time; otherwise swaps back. A rewrite that lands between a caller's check
+        /// and this call is therefore never discarded. Returns whether the publication replaced it.
+        /// </summary>
+        public bool CommitReplacing(SecureFileVersion expected)
+        {
+            if (fchmod(GetDescriptor(_file), Convert.ToUInt32("644", 8)) != 0)
+            {
+                throw CreateException($"setting published workspace file mode for '{_relativePath}'");
+            }
+
+            if (renameat2(GetDescriptor(_parent), _temporaryName, GetDescriptor(_parent), _destinationName, RenameExchange) != 0)
+            {
+                // The destination went away or cannot be exchanged: nothing was replaced.
+                return false;
+            }
+
+            // The temporary name now holds the displaced file.
+            if (ReadVersion(_parent, _temporaryName, _relativePath) == expected)
+            {
+                _ = unlinkat(GetDescriptor(_parent), _temporaryName, 0);
+                _committed = true;
+                return true;
+            }
+
+            if (renameat2(GetDescriptor(_parent), _temporaryName, GetDescriptor(_parent), _destinationName, RenameExchange) != 0 &&
+                renameat(GetDescriptor(_parent), _temporaryName, GetDescriptor(_parent), _destinationName) != 0)
+            {
+                throw CreateException($"restoring '{_relativePath}' after a replacement it did not expect");
+            }
+
+            return false;
+        }
+
         public void Dispose()
         {
             _file.Dispose();
@@ -812,6 +900,14 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
         string oldPath,
         int newDirectoryFileDescriptor,
         string newPath);
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int renameat2(
+        int oldDirectoryFileDescriptor,
+        string oldPath,
+        int newDirectoryFileDescriptor,
+        string newPath,
+        uint flags);
 
     [DllImport("libc", SetLastError = true)]
     private static extern int unlinkat(int directoryFileDescriptor, string path, int flags);
@@ -862,3 +958,6 @@ internal readonly record struct SecureFileStatus(SecureEntryKind Kind, long Leng
 {
     public bool IsRegularFile => Kind == SecureEntryKind.RegularFile;
 }
+
+/// <summary>One regular file: its status and its inode, which a rewrite through a rename changes.</summary>
+internal readonly record struct SecureFileVersion(SecureFileStatus Status, ulong Inode);

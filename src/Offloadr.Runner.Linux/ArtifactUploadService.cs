@@ -1601,23 +1601,23 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     using var secureRoot = new LinuxSecureDirectoryRoot(root);
                     // A rewrite of the same length is a different version: only the one the control
                     // plane holds may be replaced, since opening the placeholder downloads that one.
-                    var status = secureRoot.GetStatus(relativePath);
-                    if (!state.MatchesLocalFile(status))
+                    if (secureRoot.GetVersion(relativePath) is not { } version || !state.MatchesLocalFile(version.Status))
                     {
                         continue;
                     }
+
+                    var status = version.Status;
 
                     // Replace rather than truncate: a reader or mapping that still has the file
                     // open keeps the uploaded bytes until it closes, and memory is released then.
                     using var placeholder = secureRoot.CreatePublication(relativePath);
                     placeholder.SetModifiedUtc(status.LastWriteTimeUtc);
-                    var current = secureRoot.GetStatus(relativePath);
-                    if (!current.IsRegularFile || current.Length != status.Length || current.LastWriteTimeUtc != status.LastWriteTimeUtc)
+                    // Swapped in atomically and kept only if it displaced exactly that version.
+                    if (!placeholder.CommitReplacing(version))
                     {
                         continue;
                     }
 
-                    placeholder.Commit();
                     state.MarkEvicted();
                     released += status.Length;
                 }

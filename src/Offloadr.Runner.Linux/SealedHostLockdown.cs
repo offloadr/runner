@@ -13,8 +13,10 @@ public static class SealedHostLockdown
     /// <summary>
     /// Directories near the top of <paramref name="root"/>'s filesystem that anyone may write,
     /// such as <c>/tmp</c>, <c>/var/tmp</c>, <c>/run/lock</c> or Ubuntu's <c>/var/crash</c>, and
-    /// world-writable mount points there, such as a volume mounted into the container. Other
-    /// filesystems are reported but never entered, and symlinks are not followed.
+    /// world-writable mount points there, such as a volume mounted into the container. Inside a
+    /// world-writable directory every world-writable directory and regular file is reported, at
+    /// any depth, since closing only the top would leave them usable. Other filesystems are
+    /// reported but never entered, symlinks are not followed and sockets are left alone.
     /// </summary>
     public static IReadOnlyList<string> FindSharedWritableDirectories(string root = "/", int maxDepth = 3)
     {
@@ -25,15 +27,15 @@ public static class SealedHostLockdown
             return found;
         }
 
-        Walk(root, 0);
+        Walk(root, 0, insideShared: false);
         return found;
 
-        void Walk(string directory, int depth)
+        void Walk(string directory, int depth, bool insideShared)
         {
             string[] children;
             try
             {
-                children = Directory.GetDirectories(directory);
+                children = insideShared ? Directory.GetFileSystemEntries(directory) : Directory.GetDirectories(directory);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
@@ -42,27 +44,46 @@ public static class SealedHostLockdown
 
             foreach (var child in children)
             {
-                if (SealedStorageProbe.ReadEntryStatus(child) is not { IsDirectory: true, IsSymbolicLink: false } entry ||
+                if (SealedStorageProbe.ReadEntryStatus(child) is not { IsSymbolicLink: false } entry ||
                     !LinuxFileIdentityReader.TryRead(child, out var identity))
                 {
                     continue;
                 }
 
-                if ((entry.Mode & UnixFileMode.OtherWrite) != 0)
+                var worldWritable = (entry.Mode & UnixFileMode.OtherWrite) != 0;
+                if (!entry.IsDirectory)
                 {
-                    found.Add(child);
+                    if (insideShared && entry.IsRegularFile && worldWritable)
+                    {
+                        found.Add(child);
+                    }
+
                     continue;
                 }
 
-                if (identity.DeviceId == rootIdentity.DeviceId && depth + 1 < maxDepth)
+                if (worldWritable)
                 {
-                    Walk(child, depth + 1);
+                    found.Add(child);
+                }
+
+                if (identity.DeviceId != rootIdentity.DeviceId)
+                {
+                    continue;
+                }
+
+                if (worldWritable || insideShared)
+                {
+                    Walk(child, depth + 1, insideShared: true);
+                }
+                else if (depth + 1 < maxDepth)
+                {
+                    Walk(child, depth + 1, insideShared: false);
                 }
             }
         }
     }
 
-    /// <summary>Removes group and other write access from each disk-backed directory; returns the ones changed.</summary>
+    /// <summary>Removes group and other write access from each disk-backed directory or regular file; returns the ones changed.</summary>
     public static IReadOnlyList<string> RemoveSharedWriteAccess(IEnumerable<string> directories)
         => RemoveSharedWriteAccess(
             directories,
@@ -86,7 +107,8 @@ public static class SealedHostLockdown
         var changed = new List<string>();
         foreach (var directory in directories)
         {
-            if (statEntry(directory) is not { IsDirectory: true, IsSymbolicLink: false } entry ||
+            if (statEntry(directory) is not { IsSymbolicLink: false } entry ||
+                !(entry.IsDirectory || entry.IsRegularFile) ||
                 (entry.Mode & (UnixFileMode.GroupWrite | UnixFileMode.OtherWrite)) == 0)
             {
                 continue;

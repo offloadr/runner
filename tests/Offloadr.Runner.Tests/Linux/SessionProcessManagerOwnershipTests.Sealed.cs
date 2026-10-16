@@ -321,6 +321,9 @@ public partial class SessionProcessManagerOwnershipTests
             ["/run/shm"] = new(true, false, 0, sticky),
             ["/already"] = new(true, false, 0, Mode0755),
             ["/link"] = new(false, true, 0, sticky),
+            ["/tmp/shared.log"] = new(false, false, 0, Mode0755 | UnixFileMode.OtherWrite, IsRegularFile: true),
+            // The agent's VFS socket must stay reachable for session processes.
+            ["/tmp/agent.sock"] = new(false, false, 0, Mode0755 | UnixFileMode.OtherWrite),
         };
 
         var changed = SealedHostLockdown.RemoveSharedWriteAccess(
@@ -329,7 +332,7 @@ public partial class SessionProcessManagerOwnershipTests
             path => new LinuxFileSystemStats(path == "/run/shm" ? 0x01021994 : 0xEF53, 4096, 1, 1),
             (path, mode) => modes[path] = mode);
 
-        Assert.That(changed, Is.EqualTo(new[] { "/tmp", "/var/tmp" }));
+        Assert.That(changed, Is.EqualTo(new[] { "/tmp", "/var/tmp", "/tmp/shared.log" }));
         Assert.That(modes["/tmp"], Is.EqualTo(UnixFileMode.StickyBit | Mode0755));
     }
 

@@ -20,19 +20,25 @@ public class SealedHostLockdownLinuxTests
             var nested = Path.Combine(root, "var", "crash");
             var deep = Path.Combine(root, "a", "b", "c", "d");
             var inside = Path.Combine(shallow, "inside");
-            foreach (var directory in new[] { shallow, nested, deep, inside })
+            var deepInside = Path.Combine(shallow, "x", "y", "z");
+            foreach (var directory in new[] { shallow, nested, deep, inside, deepInside })
             {
                 Directory.CreateDirectory(directory);
                 File.SetUnixFileMode(directory, Mode0755 | UnixFileMode.OtherWrite);
             }
 
+            var writableFile = Path.Combine(shallow, "x", "shared.log");
+            File.WriteAllText(writableFile, string.Empty);
+            File.SetUnixFileMode(writableFile, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.OtherRead | UnixFileMode.OtherWrite);
+            File.WriteAllText(Path.Combine(shallow, "private.log"), string.Empty);
             Directory.CreateSymbolicLink(Path.Combine(root, "link"), shallow);
 
             var found = SealedHostLockdown.FindSharedWritableDirectories(root);
             var mounts = SealedHostLockdown.FindSharedWritableDirectories("/");
 
-            // A world-writable directory is reported once; what it contains is its own concern.
-            Assert.That(found, Is.EquivalentTo(new[] { shallow, nested }));
+            // Below a world-writable directory, every world-writable entry is closed too, at any depth;
+            // elsewhere the scan stays near the top.
+            Assert.That(found, Is.EquivalentTo(new[] { shallow, nested, inside, deepInside, writableFile }));
             // /dev/shm lies on another filesystem below /dev, which is never entered.
             Assert.That(mounts, Has.None.EqualTo("/dev/shm"));
         }
