@@ -52,6 +52,13 @@ RunnerLog.Info(
     $"swap-devices={sealedStorageStatus.Swap.DevicesBytes} swap-cgroup={sealedStorageStatus.Swap.CgroupLimit ?? "unknown"} " +
     $"tmpfs-noswap={sealedStorageStatus.Swap.TmpfsNoswap}" +
     (sealedStorageStatus.Reason is null ? string.Empty : $" reason='{sealedStorageStatus.Reason}'"));
+if (options.Session.Sealing.Mode == SealedStorageMode.Required)
+{
+    foreach (var directory in SealedHostLockdown.RemoveSharedWriteAccess(SealedHostLockdown.SharedTemporaryDirectories))
+    {
+        RunnerLog.Info($"Sealed storage: '{directory}' is no longer writable by session users.");
+    }
+}
 
 using var shutdown = new CancellationTokenSource();
 var runtimeIdentities = new RuntimeIdentityRegistry();

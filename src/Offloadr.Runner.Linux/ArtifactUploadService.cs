@@ -309,7 +309,8 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             _activated = true;
             RegisterArtifactWatcher(_paths.OutputDirectory, "output");
             RegisterArtifactWatcher(_paths.TempDirectory, "temp");
-            RegisterHomeWatcher(_paths.HomeDirectory);
+            // Watches the directory holding the output and temp roots, which a sealed session keeps outside its home.
+            RegisterHomeWatcher(Path.GetDirectoryName(_paths.OutputDirectory));
             EnqueueExistingFiles(_paths.OutputDirectory, "output");
             EnqueueExistingFiles(_paths.TempDirectory, "temp");
             _logger.LogInformation(

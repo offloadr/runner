@@ -1,0 +1,411 @@
+using Offloadr.Runner.V1;
+
+namespace Offloadr.Runner.Tests;
+
+public partial class SessionProcessManagerOwnershipTests
+{
+    private const UnixFileMode Mode0700 = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
+    private const UnixFileMode Mode0711 = Mode0700 | UnixFileMode.GroupExecute | UnixFileMode.OtherExecute;
+    private const UnixFileMode Mode0755 = Mode0711 | UnixFileMode.GroupRead | UnixFileMode.OtherRead;
+
+    [Test]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public async Task StartSessionAsync_SealedKeepsDataOnTheSealedRootAndRemovesItAfterAFailedLaunch()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        LinuxTestPrerequisites.RequireRoot();
+
+        var (tempRoot, sealedRoot, options) = CreateSealedOptions("comfyui");
+        const string sessionId = "session-sealed";
+        var homeDirectory = Path.Combine(options.SessionRoot, sessionId);
+        var sealedDirectory = Path.Combine(sealedRoot, sessionId);
+        var commands = new RecordingCommandRunner(string.Empty);
+        SessionProcessManager.SessionPaths? captured = null;
+        var layout = new Dictionary<string, UnixFileMode>(StringComparer.Ordinal);
+
+        try
+        {
+            using var manager = new SessionProcessManager(options, new RecordingIsolationStrategy("sess_sealed", homeDirectory), new RunnerVfsEnvironmentBuilder(), commands);
+
+            // The entry point does not exist, so the launch fails after provisioning.
+            Assert.CatchAsync(() => manager.StartSessionAsync(
+                SealedStart(sessionId),
+                (paths, _) =>
+                {
+                    captured = paths;
+                    foreach (var entry in Directory.EnumerateFileSystemEntries(sealedDirectory).Append(sealedDirectory).Append(sealedRoot))
+                    {
+                        layout[entry] = File.GetUnixFileMode(entry);
+                    }
+
+                    return Task.CompletedTask;
+                },
+                CancellationToken.None));
+
+            var paths = captured!.Value;
+            Assert.Multiple(() =>
+            {
+                Assert.That(paths.SealedDirectory, Is.EqualTo(sealedDirectory));
+                Assert.That(paths.InputDirectory, Is.EqualTo(Path.Combine(sealedDirectory, "input")));
+                Assert.That(paths.OutputDirectory, Is.EqualTo(Path.Combine(sealedDirectory, "output")));
+                Assert.That(paths.TempDirectory, Is.EqualTo(Path.Combine(sealedDirectory, "temp")));
+                Assert.That(paths.UserDirectory, Is.EqualTo(Path.Combine(sealedDirectory, "user")));
+                Assert.That(paths.ScratchDirectory, Is.EqualTo(Path.Combine(sealedDirectory, "tmp")));
+                Assert.That(paths.ProfileDirectory, Is.EqualTo(Path.Combine(sealedDirectory, "home")));
+                Assert.That(paths.SealedAgentDirectory, Is.EqualTo(Path.Combine(sealedDirectory, ".agent")));
+                Assert.That(paths.VirtualEnvDirectory, Is.EqualTo(Path.Combine(homeDirectory, ".venv")));
+                Assert.That(paths.CustomNodesDirectory, Is.EqualTo(Path.Combine(homeDirectory, "custom_nodes")));
+                Assert.That(paths.ModelsDirectory, Is.EqualTo(Path.Combine(homeDirectory, "models")));
+                Assert.That(paths.TorchInductorCacheDirectory, Is.EqualTo(Path.Combine(homeDirectory, ".cache", "torchinductor")));
+
+                Assert.That(layout[sealedRoot], Is.EqualTo(Mode0711));
+                Assert.That(layout[sealedDirectory], Is.EqualTo(Mode0755));
+                foreach (var name in SessionProcessManager.SealedSessionDirectoryNames.Append(".agent"))
+                {
+                    Assert.That(layout[Path.Combine(sealedDirectory, name)], Is.EqualTo(Mode0700), name);
+                }
+
+                // Only the session's own directories are handed over; the parent and .agent stay root's.
+                var chownTargets = commands.Commands.Where(command => command.Arguments.Contains("-R")).Select(command => command.Arguments[^1]).ToArray();
+                Assert.That(chownTargets, Does.Contain(homeDirectory));
+                Assert.That(chownTargets, Is.SupersetOf(paths.SealedSessionOwnedDirectories));
+                Assert.That(chownTargets, Does.Not.Contain(sealedDirectory));
+                Assert.That(chownTargets, Does.Not.Contain(paths.SealedAgentDirectory));
+
+                // A failed launch removes the sealed data along with the home.
+                Assert.That(Directory.Exists(sealedDirectory), Is.False);
+                Assert.That(Directory.Exists(homeDirectory), Is.False);
+            });
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+            TryDelete(sealedRoot);
+        }
+    }
+
+    [Test]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public void StartSessionAsync_SealedRefusesBeforeProvisioningWhenTheRootIsUnusable()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+
+        var (tempRoot, _, options) = CreateSealedOptions("comfyui");
+        // A root on the disk-backed temp directory is not memory-backed.
+        options = WithSealing(options, new SealedStorageOptions
+        {
+            Mode = SealedStorageMode.Required,
+            Root = LinuxPathCanonicalizer.ResolveExistingPath(tempRoot) + "/sealed",
+            MinimumBytes = 1 << 20,
+        });
+        const string sessionId = "session-refused";
+        var homeDirectory = Path.Combine(options.SessionRoot, sessionId);
+        var isolation = new RecordingIsolationStrategy("sess_refused", homeDirectory);
+
+        try
+        {
+            using var manager = new SessionProcessManager(options, isolation, new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
+
+            var ex = Assert.ThrowsAsync<InvalidOperationException>(() => manager.StartSessionAsync(SealedStart(sessionId), CancellationToken.None));
+
+            Assert.That(ex!.Message, Does.Contain("Sealed storage is unavailable"));
+            Assert.That(Directory.Exists(homeDirectory), Is.False);
+            Assert.That(isolation.CleanupCallCount, Is.Zero);
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+        }
+    }
+
+    [Test]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public void StartSessionAsync_SealedRefusesARootSomeoneElseOwns()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        LinuxTestPrerequisites.RequireRoot();
+
+        var (tempRoot, sealedRoot, options) = CreateSealedOptions("comfyui");
+        Directory.CreateDirectory(sealedRoot);
+        File.SetUnixFileMode(sealedRoot, Mode0755 | UnixFileMode.OtherWrite);
+        const string sessionId = "session-planted";
+
+        try
+        {
+            using var manager = new SessionProcessManager(options, new RecordingIsolationStrategy("sess_planted", Path.Combine(options.SessionRoot, sessionId)), new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
+
+            var ex = Assert.ThrowsAsync<InvalidOperationException>(() => manager.StartSessionAsync(SealedStart(sessionId), CancellationToken.None));
+
+            Assert.That(ex!.Message, Does.Contain("writable only by root"));
+            Assert.That(Directory.Exists(Path.Combine(sealedRoot, sessionId)), Is.False);
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+            TryDelete(sealedRoot);
+        }
+    }
+
+    [Test]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public async Task StartSessionAsync_SealedForgeGetsADataDirectoryOnTheSealedRoot()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        LinuxTestPrerequisites.RequireRoot();
+
+        var (tempRoot, sealedRoot, options) = CreateSealedOptions("forge-neo");
+        const string sessionId = "session-forge-sealed";
+        var homeDirectory = Path.Combine(options.SessionRoot, sessionId);
+        string? extensionsTarget = null;
+        string? outputTarget = null;
+        SessionProcessManager.SessionPaths? captured = null;
+
+        try
+        {
+            using var manager = new SessionProcessManager(options, new RecordingIsolationStrategy("sess_forge", homeDirectory), new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
+
+            try
+            {
+                await manager.StartSessionAsync(
+                    SealedStart(sessionId, "forge-neo"),
+                    (paths, _) =>
+                    {
+                        captured = paths;
+                        extensionsTarget = new DirectoryInfo(Path.Combine(paths.ForgeDataDirectory, "extensions")).LinkTarget;
+                        outputTarget = new DirectoryInfo(Path.Combine(paths.ForgeDataDirectory, "output")).LinkTarget;
+                        return Task.CompletedTask;
+                    },
+                    CancellationToken.None);
+            }
+            catch (Exception)
+            {
+                // The entry point does not exist, so the launch fails after provisioning.
+            }
+
+            var paths = captured!.Value;
+            Assert.Multiple(() =>
+            {
+                Assert.That(paths.ForgeDataDirectory, Is.EqualTo(Path.Combine(sealedRoot, sessionId, "forge")));
+                Assert.That(extensionsTarget, Is.EqualTo(paths.CustomNodesDirectory));
+                Assert.That(outputTarget, Is.EqualTo(paths.OutputDirectory));
+                Assert.That(
+                    SessionProcessManager.BuildRuntimeArguments("forge-neo", 7860, paths, paths.ModelsDirectory),
+                    Is.EqualTo(new[] { "--port", "7860", "--api", "--data-dir", paths.ForgeDataDirectory, "--model-ref", paths.ModelsDirectory }));
+            });
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+            TryDelete(sealedRoot);
+        }
+    }
+
+    [Test]
+    public void BuildRuntimeArguments_SealedComfyNamesEachDataDirectory()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+
+        var paths = SealedPaths("/sessions/s", "/dev/shm/offloadr/s");
+
+        var args = SessionProcessManager.BuildRuntimeArguments("comfyui", 8188, paths, "/comfyui/models");
+
+        Assert.That(args, Is.EqualTo(new[]
+        {
+            "--port", "8188", "--disable-auto-launch",
+            "--base-directory", "/sessions/s",
+            "--input-directory", "/dev/shm/offloadr/s/input",
+            "--output-directory", "/dev/shm/offloadr/s/output",
+            "--temp-directory", "/dev/shm/offloadr/s",
+            "--user-directory", "/dev/shm/offloadr/s/user",
+        }));
+    }
+
+    [Test]
+    public void BuildSessionEnvironment_SealedMovesHomeAndNamesCompiledCaches()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+
+        var paths = SealedPaths("/sessions/s", "/dev/shm/offloadr/s");
+        var identity = new PreparedSessionIdentity("sess_s", "/sessions/s", CleanupIdentity: true);
+
+        var env = SessionProcessManager.BuildSessionEnvironment("s", identity, paths);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(env["HOME"], Is.EqualTo("/dev/shm/offloadr/s/home"));
+            Assert.That(env["TMPDIR"], Is.EqualTo("/dev/shm/offloadr/s/tmp"));
+            Assert.That(env["GRADIO_TEMP_DIR"], Is.EqualTo("/dev/shm/offloadr/s/tmp/gradio"));
+            Assert.That(env["XDG_CACHE_HOME"], Is.EqualTo("/sessions/s/.cache"));
+            Assert.That(env["TORCHINDUCTOR_CACHE_DIR"], Is.EqualTo("/sessions/s/.cache/torchinductor"));
+            Assert.That(env["TRITON_CACHE_DIR"], Is.EqualTo("/sessions/s/.cache/triton"));
+            Assert.That(env["CUDA_CACHE_PATH"], Is.EqualTo("/sessions/s/.cache/nv"));
+        });
+    }
+
+    [Test]
+    public void BuildSessionEnvironment_UnsealedSetsNoSealedVariables()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+
+        var paths = SealedPaths("/sessions/s", sealedDirectory: null);
+        var identity = new PreparedSessionIdentity("sess_s", "/sessions/s", CleanupIdentity: true);
+
+        var env = SessionProcessManager.BuildSessionEnvironment("s", identity, paths);
+
+        Assert.That(env["HOME"], Is.EqualTo("/sessions/s"));
+        Assert.That(env.Keys, Has.None.AnyOf("TRITON_CACHE_DIR", "CUDA_CACHE_PATH", "GRADIO_TEMP_DIR"));
+    }
+
+    [Test]
+    public void BuildManagerUvSyncStartInfo_SealedBuildsInDiskScratch()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+
+        var (tempRoot, _, options) = CreateSealedOptions("comfyui");
+        var paths = SealedPaths("/sessions/s", "/dev/shm/offloadr/s");
+        var identity = new PreparedSessionIdentity("sess_s", "/sessions/s", CleanupIdentity: true);
+
+        try
+        {
+            using var manager = new SessionProcessManager(options, new RecordingIsolationStrategy(identity.UserName, identity.HomeDirectory), new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
+
+            var psi = manager.BuildManagerUvSyncStartInfo("s", identity, paths);
+
+            Assert.That(psi.Environment["TMPDIR"], Is.EqualTo("/sessions/s/tmp"));
+            Assert.That(psi.Environment["HOME"], Is.EqualTo("/dev/shm/offloadr/s/home"));
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+        }
+    }
+
+    [Test]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public async Task CleanupStaleSessionsAsync_RemovesSealedDataOfAnEarlierRun()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        LinuxTestPrerequisites.RequireRoot();
+
+        var (tempRoot, sealedRoot, options) = CreateSealedOptions("comfyui");
+        Directory.CreateDirectory(Path.Combine(sealedRoot, "old-session", "output"));
+        File.WriteAllText(Path.Combine(sealedRoot, "old-session", "output", "image.png"), "left behind");
+        File.SetUnixFileMode(sealedRoot, Mode0711);
+
+        try
+        {
+            using var manager = new SessionProcessManager(options, new RecordingIsolationStrategy("unused", Path.Combine(options.SessionRoot, "unused")), new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
+
+            await manager.CleanupStaleSessionsAsync(CancellationToken.None);
+
+            Assert.That(Directory.Exists(sealedRoot), Is.True);
+            Assert.That(Directory.EnumerateFileSystemEntries(sealedRoot), Is.Empty);
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+            TryDelete(sealedRoot);
+        }
+    }
+
+    [Test]
+    public void SealedHostLockdown_RemovesSharedWriteOnlyFromDiskBackedDirectories()
+    {
+        var modes = new Dictionary<string, UnixFileMode>(StringComparer.Ordinal);
+        var sticky = UnixFileMode.StickyBit | Mode0755 | UnixFileMode.GroupWrite | UnixFileMode.OtherWrite;
+        var entries = new Dictionary<string, LinuxEntryStatus>(StringComparer.Ordinal)
+        {
+            ["/tmp"] = new(true, false, 0, sticky),
+            ["/var/tmp"] = new(true, false, 0, sticky),
+            ["/run/shm"] = new(true, false, 0, sticky),
+            ["/already"] = new(true, false, 0, Mode0755),
+            ["/link"] = new(false, true, 0, sticky),
+        };
+
+        var changed = SealedHostLockdown.RemoveSharedWriteAccess(
+            entries.Keys,
+            path => entries.TryGetValue(path, out var entry) ? entry : null,
+            path => new LinuxFileSystemStats(path == "/run/shm" ? 0x01021994 : 0xEF53, 4096, 1, 1),
+            (path, mode) => modes[path] = mode);
+
+        Assert.That(changed, Is.EqualTo(new[] { "/tmp", "/var/tmp" }));
+        Assert.That(modes["/tmp"], Is.EqualTo(UnixFileMode.StickyBit | Mode0755));
+    }
+
+    private static StartSessionCommand SealedStart(string sessionId, string runtimeKind = "comfyui")
+        => new()
+        {
+            SessionId = sessionId,
+            User = "user-1",
+            EditorRuntimeKind = runtimeKind,
+            LifecycleGeneration = 1,
+            RuntimeEpoch = 1,
+            RuntimeInstanceId = "44444444444444448444444444444444",
+        };
+
+    private static (string TempRoot, string SealedRoot, SessionProcessOptions Options) CreateSealedOptions(string runtimeKind)
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), $"runner-session-sealed-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(Path.Combine(tempRoot, "seed-custom_nodes"));
+        Directory.CreateDirectory(Path.Combine(tempRoot, "seed-input"));
+        var sealedRoot = $"/dev/shm/runner-sealed-tests-{Guid.NewGuid():N}";
+        var options = new SessionProcessOptions
+        {
+            SessionRoot = Path.Combine(tempRoot, "sessions"),
+            EntryPointPath = Path.Combine(tempRoot, "missing-entrypoint.sh"),
+            WorkingDirectory = tempRoot,
+            BundledCustomNodesSeedPath = Path.Combine(tempRoot, "seed-custom_nodes"),
+            BundledInputSeedPath = Path.Combine(tempRoot, "seed-input"),
+            SeedVirtualEnvPath = CreateEmptySeedVirtualEnv(tempRoot),
+            UvBinaryPath = FakeUvBinaryPath(tempRoot),
+            RuntimeKind = runtimeKind,
+            ComfyPort = 8188,
+            ShutdownGracePeriod = TimeSpan.FromSeconds(5),
+            ReadyTimeout = TimeSpan.FromSeconds(5),
+            ReadyHost = "127.0.0.1",
+            // The test container's /dev/shm is Docker's default 64 MiB.
+            Sealing = new SealedStorageOptions { Mode = SealedStorageMode.Required, Root = sealedRoot, MinimumBytes = 1 << 20 },
+        };
+        return (tempRoot, sealedRoot, options);
+    }
+
+    private static SessionProcessOptions WithSealing(SessionProcessOptions options, SealedStorageOptions sealing)
+        => new()
+        {
+            SessionRoot = options.SessionRoot,
+            EntryPointPath = options.EntryPointPath,
+            WorkingDirectory = options.WorkingDirectory,
+            BundledCustomNodesSeedPath = options.BundledCustomNodesSeedPath,
+            BundledInputSeedPath = options.BundledInputSeedPath,
+            SeedVirtualEnvPath = options.SeedVirtualEnvPath,
+            UvBinaryPath = options.UvBinaryPath,
+            RuntimeKind = options.RuntimeKind,
+            ComfyPort = options.ComfyPort,
+            ShutdownGracePeriod = options.ShutdownGracePeriod,
+            ReadyTimeout = options.ReadyTimeout,
+            ReadyHost = options.ReadyHost,
+            Sealing = sealing,
+        };
+
+    private static SessionProcessManager.SessionPaths SealedPaths(string home, string? sealedDirectory)
+    {
+        var data = sealedDirectory ?? home;
+        return new SessionProcessManager.SessionPaths
+        {
+            HomeDirectory = home,
+            SealedDirectory = sealedDirectory,
+            UserDirectory = $"{data}/user",
+            CustomNodesDirectory = $"{home}/custom_nodes",
+            ModelsDirectory = $"{home}/models",
+            VirtualEnvDirectory = $"{home}/.venv",
+            OutputDirectory = $"{data}/output",
+            InputDirectory = $"{data}/input",
+            TempDirectory = $"{data}/temp",
+            ScratchDirectory = $"{data}/tmp",
+            CacheDirectory = $"{home}/.cache",
+            UvCacheDirectory = $"{home}/.cache/uv",
+            TorchInductorCacheDirectory = sealedDirectory is null ? $"{home}/tmp/torchinductor" : $"{home}/.cache/torchinductor",
+            LogsDirectory = $"{home}/logs",
+        };
+    }
+}

@@ -59,6 +59,8 @@ internal sealed partial class SessionProcessManager : IDisposable
     private readonly RunnerVfsEnvironmentBuilder _vfsEnvironmentBuilder;
     private readonly ILinuxCommandRunner _signalCommandRunner;
     private readonly SessionProcessLogRelay? _processLogRelay;
+    private readonly SealedStorageOptions _sealing;
+    private readonly SealedStorageProbe _sealedStorageProbe;
 
     internal Func<string, RuntimeIdentity, int?, CancellationToken, Task>? UnexpectedSessionExitCleanup { get; set; }
 
@@ -83,7 +85,8 @@ internal sealed partial class SessionProcessManager : IDisposable
         RunnerVfsEnvironmentBuilder vfsEnvironmentBuilder,
         ILinuxCommandRunner signalCommandRunner,
         SessionProcessLogRelay? processLogRelay = null,
-        HttpMessageHandler? httpMessageHandler = null)
+        HttpMessageHandler? httpMessageHandler = null,
+        SealedStorageProbe? sealedStorageProbe = null)
     {
         ArgumentNullException.ThrowIfNull(options);
         _sessionIsolationStrategy = sessionIsolationStrategy ?? throw new ArgumentNullException(nameof(sessionIsolationStrategy));
@@ -103,6 +106,8 @@ internal sealed partial class SessionProcessManager : IDisposable
         _shutdownGracePeriod = options.ShutdownGracePeriod;
         _readyTimeout = options.ReadyTimeout;
         _readyHost = options.ReadyHost;
+        _sealing = options.Sealing;
+        _sealedStorageProbe = sealedStorageProbe ?? new SealedStorageProbe();
 
         var handler = httpMessageHandler ?? new SocketsHttpHandler
         {
@@ -199,6 +204,14 @@ internal sealed partial class SessionProcessManager : IDisposable
             throw new InvalidOperationException("Concurrent sessions are not supported yet on this runner.");
         }
 
+        // A session that must be sealed never falls back to disk: refuse it before anything is
+        // provisioned when the memory-backed root cannot take it.
+        var sealSession = ShouldSeal(command);
+        if (sealSession)
+        {
+            ThrowIfSealedStorageUnavailable();
+        }
+
         PreparedSessionIdentity identity = default;
         SessionContext? launchedContext = null;
         var prepared = false;
@@ -210,7 +223,7 @@ internal sealed partial class SessionProcessManager : IDisposable
             identity = await _sessionIsolationStrategy.PrepareAsync(sessionId, _sessionRoot, cancellationToken).ConfigureAwait(false);
             prepared = true;
             _preparedIdentities[sessionId] = identity;
-            var paths = await PrepareSessionDirectoriesAsync(sessionId, identity.HomeDirectory, cancellationToken).ConfigureAwait(false);
+            var paths = await PrepareSessionDirectoriesAsync(sessionId, identity.HomeDirectory, sealSession, cancellationToken).ConfigureAwait(false);
 
             // Copy bundled input seeds before the initializer can create input catalog placeholders.
             PrepareBundledInputSeeds(paths);
@@ -239,6 +252,14 @@ internal sealed partial class SessionProcessManager : IDisposable
                 await _signalCommandRunner
                     .RunAsync(LinuxCommandFactory.ChownRecursive(identity.UserName, identity.HomeDirectory), cancellationToken)
                     .ConfigureAwait(false);
+                // The sealed session directory itself stays root's, so the session cannot remove
+                // and recreate a data root as an ordinary directory; only its children are handed over.
+                foreach (var directory in paths.SealedSessionOwnedDirectories)
+                {
+                    await _signalCommandRunner
+                        .RunAsync(LinuxCommandFactory.ChownRecursive(identity.UserName, directory), cancellationToken)
+                        .ConfigureAwait(false);
+                }
             }
 
             if (string.Equals(_runtimeKind, "comfyui", StringComparison.OrdinalIgnoreCase))
@@ -474,6 +495,9 @@ internal sealed partial class SessionProcessManager : IDisposable
         {
             RunnerLog.Error<SessionProcessManager>(ex, $"Failed to remove stale session state: {ex.Message}");
         }
+
+        // Sealed data of a crashed run cannot be uploaded or used again; it only costs memory.
+        RemoveStaleSealedSessionDirectories();
     }
 
     /// <summary>The uid of the Linux user prepared for <paramref name="sessionId"/>, if any.</summary>
@@ -1045,31 +1069,158 @@ internal sealed partial class SessionProcessManager : IDisposable
         }
     }
 
+    /// <summary>Whether <paramref name="command"/> keeps its data on the memory-backed root.</summary>
+    internal bool ShouldSeal(StartSessionCommand command)
+        => _sealing.Mode == SealedStorageMode.Required;
+
+    private void ThrowIfSealedStorageUnavailable()
+    {
+        var status = _sealedStorageProbe.Probe(_sealing);
+        if (!status.Available)
+        {
+            throw new InvalidOperationException($"Sealed storage is unavailable: {status.Reason}.");
+        }
+    }
+
+    /// <summary>
+    /// Creates <c>root/sessionId</c> (root-owned 0755) with the session's data directories (0700,
+    /// handed to the session user after provisioning) and a root-only staging directory.
+    /// </summary>
+    private string PrepareSealedSessionDirectory(string sessionId)
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            throw new PlatformNotSupportedException("Sealed storage needs Linux.");
+        }
+
+        var root = _sealing.Root;
+        if (!Directory.Exists(root))
+        {
+            Directory.CreateDirectory(root);
+            File.SetUnixFileMode(root, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
+                UnixFileMode.GroupExecute | UnixFileMode.OtherExecute);
+        }
+
+        // Created under a world-writable parent such as /dev/shm: re-check what is there now.
+        ThrowIfSealedStorageUnavailable();
+        var directory = ResolveSealedSessionDirectory(sessionId)
+            ?? throw new InvalidOperationException($"Session id '{sessionId}' cannot name a sealed session directory.");
+        DeleteSealedSessionDirectory(sessionId);
+        Directory.CreateDirectory(directory, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
+            UnixFileMode.GroupRead | UnixFileMode.GroupExecute | UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+        foreach (var name in SealedSessionDirectoryNames.Append(".agent"))
+        {
+            Directory.CreateDirectory(Path.Combine(directory, name), UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+
+        return directory;
+    }
+
+    private string? ResolveSealedSessionDirectory(string sessionId)
+    {
+        if (string.IsNullOrEmpty(sessionId) || sessionId is "." or ".." || sessionId.IndexOfAny(['/', '\\', '\0']) >= 0)
+        {
+            return null;
+        }
+
+        return Path.Combine(_sealing.Root, sessionId);
+    }
+
+    private void DeleteSealedSessionDirectory(string sessionId)
+    {
+        if (ResolveSealedSessionDirectory(sessionId) is not { } directory)
+        {
+            return;
+        }
+
+        try
+        {
+            var info = new DirectoryInfo(directory);
+            if (info.LinkTarget is not null || File.Exists(directory))
+            {
+                File.Delete(directory);
+            }
+            else if (info.Exists)
+            {
+                Directory.Delete(directory, recursive: true);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            RunnerLog.Error<SessionProcessManager>(ex, $"Failed to remove sealed session directory '{directory}': {ex.Message}");
+        }
+    }
+
+    private void RemoveStaleSealedSessionDirectories()
+    {
+        if (_sealing.Mode == SealedStorageMode.Off ||
+            SealedStorageProbe.ReadEntryStatus(_sealing.Root) is not { IsDirectory: true, IsSymbolicLink: false, OwnerId: 0 })
+        {
+            return;
+        }
+
+        string[] entries;
+        try
+        {
+            entries = Directory.GetFileSystemEntries(_sealing.Root);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            RunnerLog.Error<SessionProcessManager>(ex, $"Failed to list sealed root '{_sealing.Root}': {ex.Message}");
+            return;
+        }
+
+        foreach (var entry in entries)
+        {
+            RunnerLog.Warning<SessionProcessManager>($"Removing sealed session data left by an earlier runner process: '{entry}'.");
+            DeleteSealedSessionDirectory(Path.GetFileName(entry));
+        }
+    }
+
     private async Task<SessionPaths> PrepareSessionDirectoriesAsync(
         string sessionId,
         string homeDirectory,
+        bool sealSession,
         CancellationToken cancellationToken)
     {
         // Ensure home exists (useradd --create-home should have handled this)
         Directory.CreateDirectory(homeDirectory);
 
+        // Sealed sessions keep user data on the memory-backed root; code, models, the virtualenv
+        // and compiled caches stay in the disk-backed home (the sealed root is mounted noexec).
+        var sealedDirectory = sealSession ? PrepareSealedSessionDirectory(sessionId) : null;
+        var dataDirectory = sealedDirectory ?? homeDirectory;
         var paths = new SessionPaths
         {
             HomeDirectory = homeDirectory,
-            UserDirectory = Path.Combine(homeDirectory, "user"),
+            SealedDirectory = sealedDirectory,
+            UserDirectory = Path.Combine(dataDirectory, "user"),
             CustomNodesDirectory = Path.Combine(homeDirectory, "custom_nodes"),
             ModelsDirectory = Path.Combine(homeDirectory, "models"),
             VirtualEnvDirectory = Path.Combine(homeDirectory, ".venv"),
-            OutputDirectory = Path.Combine(homeDirectory, "output"),
-            InputDirectory = Path.Combine(homeDirectory, "input"),
-            TempDirectory = Path.Combine(homeDirectory, "temp"),
-            ScratchDirectory = Path.Combine(homeDirectory, "tmp"),
+            OutputDirectory = Path.Combine(dataDirectory, "output"),
+            InputDirectory = Path.Combine(dataDirectory, "input"),
+            TempDirectory = Path.Combine(dataDirectory, "temp"),
+            ScratchDirectory = Path.Combine(dataDirectory, "tmp"),
             CacheDirectory = Path.Combine(homeDirectory, ".cache"),
             WebDirectory = Path.Combine(homeDirectory, "web"),
             UvCacheDirectory = Path.Combine(homeDirectory, ".cache", "uv"),
-            TorchInductorCacheDirectory = Path.Combine(homeDirectory, "tmp", "torchinductor"),
+            TorchInductorCacheDirectory = sealedDirectory is null
+                ? Path.Combine(homeDirectory, "tmp", "torchinductor")
+                : Path.Combine(homeDirectory, ".cache", "torchinductor"),
             LogsDirectory = Path.Combine(homeDirectory, "logs")
         };
+
+        if (paths.IsSealed)
+        {
+            Directory.CreateDirectory(paths.BuildScratchDirectory);
+            if (string.Equals(_runtimeKind, "forge-neo", StringComparison.OrdinalIgnoreCase))
+            {
+                // Forge derives its extensions and default output directories from --data-dir.
+                Directory.CreateSymbolicLink(Path.Combine(paths.ForgeDataDirectory, "extensions"), paths.CustomNodesDirectory);
+                Directory.CreateSymbolicLink(Path.Combine(paths.ForgeDataDirectory, "output"), paths.OutputDirectory);
+            }
+        }
 
         Directory.CreateDirectory(paths.UserDirectory);
         Directory.CreateDirectory(paths.CustomNodesDirectory);
@@ -1167,7 +1318,7 @@ internal sealed partial class SessionProcessManager : IDisposable
         {
             args.Add("--api");
             args.Add("--data-dir");
-            args.Add(paths.HomeDirectory);
+            args.Add(paths.ForgeDataDirectory);
             args.Add("--model-ref");
             args.Add(projectedModelsRoot);
             return args;
@@ -1176,6 +1327,19 @@ internal sealed partial class SessionProcessManager : IDisposable
         args.Add("--disable-auto-launch");
         args.Add("--base-directory");
         args.Add(paths.HomeDirectory);
+        if (paths.SealedDirectory is { } sealedDirectory)
+        {
+            args.Add("--input-directory");
+            args.Add(paths.InputDirectory);
+            args.Add("--output-directory");
+            args.Add(paths.OutputDirectory);
+            // ComfyUI appends "temp" to the temp directory it is given.
+            args.Add("--temp-directory");
+            args.Add(sealedDirectory);
+            args.Add("--user-directory");
+            args.Add(paths.UserDirectory);
+        }
+
         return args;
     }
 
@@ -1348,6 +1512,7 @@ internal sealed partial class SessionProcessManager : IDisposable
 
         _pendingTeardowns.TryRemove(new KeyValuePair<string, PreparedSessionIdentity>(sessionId, identity));
         DeleteSessionHomeDirectory(identity.HomeDirectory);
+        DeleteSealedSessionDirectory(sessionId);
     }
 
     /// <summary>
@@ -1408,6 +1573,8 @@ internal sealed partial class SessionProcessManager : IDisposable
         {
             File.Delete(home);
         }
+
+        DeleteSealedSessionDirectory(sessionId);
     }
 
     private void DeleteSessionHomeDirectory(string homeDirectory)
@@ -1479,9 +1646,9 @@ internal sealed partial class SessionProcessManager : IDisposable
         PreparedSessionIdentity identity,
         SessionPaths paths)
     {
-        return new Dictionary<string, string>(StringComparer.Ordinal)
+        var environment = new Dictionary<string, string>(StringComparer.Ordinal)
         {
-            ["HOME"] = paths.HomeDirectory,
+            ["HOME"] = paths.ProfileDirectory,
             ["VIRTUAL_ENV"] = paths.VirtualEnvDirectory,
             ["USER"] = identity.UserName,
             ["LOGNAME"] = identity.UserName,
@@ -1494,6 +1661,16 @@ internal sealed partial class SessionProcessManager : IDisposable
             ["TMPDIR"] = paths.ScratchDirectory,
             ["COMFYUI_SESSION_ID"] = sessionId
         };
+
+        if (paths.IsSealed)
+        {
+            // HOME is memory-backed and noexec, so caches of compiled code must be named explicitly.
+            environment["TRITON_CACHE_DIR"] = Path.Combine(paths.CacheDirectory, "triton");
+            environment["CUDA_CACHE_PATH"] = Path.Combine(paths.CacheDirectory, "nv");
+            environment["GRADIO_TEMP_DIR"] = Path.Combine(paths.ScratchDirectory, "gradio");
+        }
+
+        return environment;
     }
 
     private static string BuildSessionProcessPath(string virtualEnvDirectory)
@@ -1711,6 +1888,12 @@ internal sealed partial class SessionProcessManager : IDisposable
         }
 
         psi.Environment["COMFYUI_PATH"] = _workingDirectory;
+        if (paths.IsSealed)
+        {
+            // Dependency builds may compile and run helpers, which the noexec sealed TMPDIR forbids.
+            psi.Environment["TMPDIR"] = paths.BuildScratchDirectory;
+        }
+
         return psi;
     }
 
@@ -2965,7 +3148,38 @@ internal sealed partial class SessionProcessManager : IDisposable
         public string UvCacheDirectory { get; init; }
         public string TorchInductorCacheDirectory { get; init; }
         public string LogsDirectory { get; init; }
+
+        /// <summary>The session's directory on the memory-backed root, or null for an unsealed session.</summary>
+        public string? SealedDirectory { get; init; }
+
+        public bool IsSealed => SealedDirectory is not null;
+
+        /// <summary><c>HOME</c> for session processes.</summary>
+        public string ProfileDirectory => SealedDirectory is null ? HomeDirectory : Path.Combine(SealedDirectory, "home");
+
+        /// <summary>Forge's <c>--data-dir</c>: settings, styles and the last prompt's parameters.</summary>
+        public string ForgeDataDirectory => SealedDirectory is null ? HomeDirectory : Path.Combine(SealedDirectory, "forge");
+
+        /// <summary>Root-only staging space for the agent on the memory-backed root.</summary>
+        public string? SealedAgentDirectory => SealedDirectory is null ? null : Path.Combine(SealedDirectory, ".agent");
+
+        /// <summary>Disk-backed temporary space for dependency builds, which must be able to execute what they build.</summary>
+        public string BuildScratchDirectory => Path.Combine(HomeDirectory, "tmp");
+
+        public IEnumerable<string> SealedSessionOwnedDirectories
+        {
+            get
+            {
+                var sealedDirectory = SealedDirectory;
+                return sealedDirectory is null
+                    ? []
+                    : SealedSessionDirectoryNames.Select(name => Path.Combine(sealedDirectory, name));
+            }
+        }
     }
+
+    /// <summary>Children of a sealed session directory that belong to the session user.</summary>
+    internal static readonly string[] SealedSessionDirectoryNames = ["home", "input", "output", "temp", "user", "tmp", "forge"];
 
     internal sealed record ForgeQueueDataArityAdjustment(int FnIndex, int ReceivedCount, int ExpectedCount);
 
