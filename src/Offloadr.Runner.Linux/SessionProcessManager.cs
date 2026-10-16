@@ -1,6 +1,7 @@
 using Offloadr.Common.V1;
 using Offloadr.EditorRuntime.V1;
 using Offloadr.Runner.V1;
+using SealedStorageMode = Offloadr.Runner.Core.SealedStorageMode;
 using System.Buffers;
 using System.Collections.Concurrent;
 using System.Collections.Generic;

@@ -1,4 +1,5 @@
 using Offloadr.Runner.V1;
+using SealedStorageMode = Offloadr.Runner.Core.SealedStorageMode;
 
 namespace Offloadr.Runner.Tests;
 

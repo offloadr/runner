@@ -20,6 +20,56 @@ message RunnerResources {
     string gpu_model_name = 5;  // Free-form GPU model (e.g., "NVIDIA GeForce RTX 4090").
 }
 
+// Sealed sessions keep user data in memory-backed storage on the runner and seal artifact
+// transfers with the envelope format in docs/sealed-envelope.md.
+enum SealedStorageMode {
+    SEALED_STORAGE_MODE_UNSPECIFIED = 0;
+    SEALED_STORAGE_MODE_OFF = 1;      // Never seals; refuses starts that require it.
+    SEALED_STORAGE_MODE_AUTO = 2;     // Seals sessions whose start requires it.
+    SEALED_STORAGE_MODE_REQUIRED = 3; // Seals every session's workspace.
+}
+
+// What a runner can offer sealed sessions, reported with every registration.
+message RunnerSealedStorage {
+    SealedStorageMode mode = 1;
+    bool memory_workspace_available = 2; // The memory-backed root can take a session now.
+    uint64 budget_bytes = 3;             // Smaller of the root's free space and the container's memory headroom.
+    repeated string algorithms = 4;      // Sealing algorithm ids the runner accepts.
+}
+
+// A public key that envelopes are sealed to.
+message SealingPublicKey {
+    string key_id = 1;    // Chosen by the key's owner; 1 to 128 UTF-8 bytes.
+    string algorithm = 2; // "hpke-p256-sha256-aes128gcm+stream-aes256gcm-64k-v1"
+    bytes public_key = 3; // 65-byte uncompressed SEC1 P-256 point.
+}
+
+// Key material sent ahead of a sealed payload. The stream's chunk messages then carry the
+// payload ciphertext, which they may split anywhere.
+message SealedEnvelope {
+    bytes header = 1;           // Canonical header; names the recipient key and the object.
+    bytes encapsulated_key = 2; // HPKE enc (65 bytes).
+    bytes sealed_data_key = 3;  // HPKE-sealed data key (48 bytes).
+}
+
+// How a session's data is protected.
+message SessionSealing {
+    // The sealed-session profile: a memory-backed workspace, every upload sealed to
+    // output_recipient and every read answered sealed to the runner's reader key. A runner that
+    // cannot provide all of it refuses the start; inside the profile it never falls back to
+    // plaintext transfers.
+    bool required = 1;
+    // Recipient for uploads. When set outside the profile, uploads are still sealed to it.
+    SealingPublicKey output_recipient = 2;
+}
+
+// What the runner applied to a started session.
+message SessionSealingStatus {
+    bool memory_workspace = 1;         // The session's user data lives in memory-backed storage.
+    bool encrypted_uploads = 2;        // Every upload is sealed to the output recipient.
+    bool encrypted_reads_required = 3; // A read answered without an envelope fails.
+}
+
 // Command from Offloadr API instructing a runner to start a session for a user.
 message StartSessionCommand {
     reserved 12;
@@ -39,6 +89,8 @@ message StartSessionCommand {
     // across sessions. When set, the runner refuses a start older than the newest
     // assignment it has seen, so a delayed start cannot replace a newer session.
     uint64 assignment_sequence = 13;
+    // Optional. Absent means an unsealed session, unless the runner seals every session.
+    SessionSealing sealing = 14;
 }
 
 // Command instructing runner to stop a session (graceful cleanup + release).
@@ -248,6 +300,7 @@ message RegisterRunnerRequest {
     string active_session_id = 5; // Authoritative active session currently alive on this runner (empty means none).
     bool active_session_reported = 6; // True when active_session_id is intentionally reported by the runner.
     repeated string supported_editor_templates = 7; // Canonical editor templates this runner can execute.
+    RunnerSealedStorage sealed_storage = 8; // What this runner can offer sealed sessions.
 }
 
 // Response acknowledging registration.
@@ -266,6 +319,7 @@ message AcknowledgeSessionStartRequest {
     uint64 lifecycle_generation = 5;
     uint64 runtime_epoch = 6;
     string runtime_instance_id = 7;
+    SessionSealingStatus sealing = 8; // What the started session got; unset when it did not start.
 }
 
 message AcknowledgeEditorRuntimeQuiesceRequest {
@@ -308,6 +362,9 @@ message AcknowledgeSessionStopRequest {
     uint64 lifecycle_generation = 5;
     uint64 runtime_epoch = 6;
     string runtime_instance_id = 7;
+    // Artifacts that failed or were still uploading when the session's data was removed. They
+    // are lost; the session must not be reported as fully saved when this is not zero.
+    uint32 unsaved_artifact_count = 8;
 }
 
 message AcknowledgePromptResultRequest {
@@ -513,9 +570,10 @@ message RunnerArtifactServiceGetDownloadUrlResponse {
 
 message RunnerReadStreamMetadata {
     google.protobuf.StringValue content_type = 1;
-    google.protobuf.Int64Value size_bytes = 2;
-    google.protobuf.StringValue sha256 = 3;
+    google.protobuf.Int64Value size_bytes = 2; // Bytes on the wire: the ciphertext size when sealed.
+    google.protobuf.StringValue sha256 = 3;    // Of the bytes on the wire.
     google.protobuf.Timestamp modified_utc = 4;
+    SealedEnvelope envelope = 5; // Set when the chunks carry a payload sealed to the request's reader_key.
 }
 
 message RunnerArtifactServiceReadArtifactRequest {
@@ -523,6 +581,9 @@ message RunnerArtifactServiceReadArtifactRequest {
     string filename = 2;
     string type = 3;
     string subfolder = 4;
+    // The session's reader key. An encryption destination only: the read is authorized exactly
+    // as without it, and the response is then sealed to it.
+    SealingPublicKey reader_key = 5;
 }
 
 message RunnerArtifactServiceReadArtifactResponse {
@@ -547,6 +608,10 @@ message RunnerArtifactUploadMetadata {
     uint64 runtime_epoch = 12;
     string runtime_instance_id = 13;
     string runner_id = 14;
+    // Set when the chunks carry a payload sealed to the session's output recipient. size_bytes is
+    // then the plaintext size the header declares, and sha256 is not sent: a plaintext digest
+    // would reveal when two uploads carry equal content.
+    SealedEnvelope envelope = 15;
 }
 
 message RunnerArtifactServiceUploadArtifactRequest {
@@ -574,6 +639,7 @@ message RunnerWorkspaceServiceReadWorkspaceFileRequest {
     string editor_sid = 1;
     WorkspaceRoot root = 2;
     string relative_path = 3;
+    SealingPublicKey reader_key = 4; // As on RunnerArtifactServiceReadArtifactRequest.
 }
 
 message RunnerWorkspaceServiceReadWorkspaceFileResponse {
@@ -598,6 +664,7 @@ message RunnerWorkspaceServiceGetDownloadUrlResponse {
 message RunnerWorkspaceServiceReadWorkspaceSeedArchiveRequest {
     string editor_sid = 1;
     WorkspaceRoot root = 2;
+    SealingPublicKey reader_key = 3; // As on RunnerArtifactServiceReadArtifactRequest.
 }
 
 message RunnerWorkspaceServiceReadWorkspaceSeedArchiveResponse {

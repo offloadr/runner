@@ -1,4 +1,5 @@
 using Offloadr.Runner.V1;
+using SealedStorageMode = Offloadr.Runner.Core.SealedStorageMode;
 using Grpc.Net.Client;
 using Microsoft.Extensions.Logging;
 using System.Globalization;
