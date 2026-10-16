@@ -175,12 +175,27 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         }
     }
 
-    public async Task StopSessionAsync(string sessionId)
+    /// <summary>
+    /// Stops the session's uploads after a short drain. Returns how many artifacts were not
+    /// uploaded: they failed or were still pending, and are lost once the session's data is removed.
+    /// </summary>
+    public async Task<int> StopSessionAsync(string sessionId)
     {
-        if (_sessions.TryRemove(sessionId, out var uploader))
+        if (!_sessions.TryRemove(sessionId, out var uploader))
         {
-            await uploader.StopAsync().ConfigureAwait(false);
+            return 0;
         }
+
+        await uploader.StopAsync().ConfigureAwait(false);
+        if (uploader.UnsavedUploadCount > 0)
+        {
+            _logger.LogWarning(
+                "Session stopped with artifacts that were not uploaded session={SessionId} count={Count}",
+                sessionId,
+                uploader.UnsavedUploadCount);
+        }
+
+        return uploader.UnsavedUploadCount;
     }
 
     public async ValueTask DisposeAsync()
@@ -1438,6 +1453,11 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
         internal int PendingUploadCount => _pending.Count;
 
+        /// <summary>Uploads that failed or had not finished when the uploader stopped.</summary>
+        public int UnsavedUploadCount { get; private set; }
+
+        private int _failedUploadCount;
+
         public bool IsSealed => _paths.IsSealed;
 
         internal long EvictUploadedArtifacts(long bytesToFree, TimeSpan minimumIdle, DateTimeOffset now)
@@ -1601,6 +1621,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                             }
                             else
                             {
+                                Interlocked.Increment(ref _failedUploadCount);
                                 _logger.LogWarning(ex, "Failed to upload artifact {Path} after retries", item.FullPath);
                             }
                         }
@@ -1913,11 +1934,14 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
             if (cancelOutstandingWork)
             {
+                UnsavedUploadCount = _pending.Count + Volatile.Read(ref _failedUploadCount);
                 CancelOutstandingTransfers();
             }
             else
             {
                 await WaitForWorkerDrainAsync().ConfigureAwait(false);
+                // Anything still pending now is cancelled below and never reaches the control plane.
+                UnsavedUploadCount = _pending.Count + Volatile.Read(ref _failedUploadCount);
                 CancelOutstandingTransfers();
             }
 

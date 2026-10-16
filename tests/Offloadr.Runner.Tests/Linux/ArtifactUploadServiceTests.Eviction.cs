@@ -87,6 +87,35 @@ public partial class ArtifactUploadServiceTests
         }
     }
 
+    [Test]
+    public async Task StopSessionAsync_CountsAnUploadThatStopInterrupted()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = CreateEvictionPaths(root, sealedSession: true);
+            var neverAccepted = new TaskCompletionSource();
+            var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse())
+            {
+                UploadGate = neverAccepted.Task,
+            };
+            await using var service = new ArtifactUploadService("runner-secret-value", artifactClient, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            await File.WriteAllBytesAsync(Path.Combine(paths.OutputDirectory, "late.png"), [1, 2, 3]);
+            await artifactClient.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+
+            var unsaved = await service.StopSessionAsync("session-1");
+
+            Assert.That(unsaved, Is.EqualTo(1));
+            Assert.That(await service.StopSessionAsync("session-1"), Is.Zero, "a repeated stop has nothing left");
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
     private static async Task<long> EvictWhenRecordedAsync(ArtifactUploadService service, string sessionId)
     {
         // The upload is recorded once the control plane's response arrives.

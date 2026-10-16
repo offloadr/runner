@@ -332,6 +332,170 @@ public partial class SessionProcessManagerOwnershipTests
         Assert.That(modes["/tmp"], Is.EqualTo(UnixFileMode.StickyBit | Mode0755));
     }
 
+    [Test]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public async Task SealedSession_EditorWritesStayOffDiskAndAreRemovedAtStop()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        LinuxTestPrerequisites.RequireRoot();
+
+        var (tempRoot, sealedRoot, options) = CreateSealedOptions("comfyui");
+        // The script names the canary in two halves, so only files the editor writes contain it whole.
+        var first = Guid.NewGuid().ToString("n");
+        var second = Guid.NewGuid().ToString("n");
+        var canary = first + second;
+        var entryPoint = Path.Combine(tempRoot, "editor.sh");
+        File.WriteAllText(entryPoint, string.Join('\n',
+            "#!/bin/sh",
+            $"first={first}",
+            $"second={second}",
+            "while [ $# -gt 0 ]; do",
+            "  case \"$1\" in",
+            "    --input-directory) input=\"$2\"; shift ;;",
+            "    --output-directory) output=\"$2\"; shift ;;",
+            "    --temp-directory) temp=\"$2/temp\"; shift ;;",
+            "    --user-directory) user=\"$2\"; shift ;;",
+            "  esac",
+            "  shift",
+            "done",
+            "mkdir -p \"$temp\" \"$HOME\"",
+            "for directory in \"$input\" \"$output\" \"$temp\" \"$user\" \"$HOME\" \"$TMPDIR\"; do",
+            "  printf '%s%s' \"$first\" \"$second\" > \"$directory/canary.txt\"",
+            "done",
+            "echo \"editor output $first$second\"",
+            "touch \"$output/.written\"",
+            "exec /bin/sleep 600",
+            string.Empty));
+        File.SetUnixFileMode(entryPoint, Mode0755);
+        options = WithEntryPoint(options, entryPoint);
+        const string sessionId = "session-canary";
+        var homeDirectory = Path.Combine(options.SessionRoot, sessionId);
+        var sealedDirectory = Path.Combine(sealedRoot, sessionId);
+
+        try
+        {
+            using var manager = new SessionProcessManager(options, new RecordingIsolationStrategy(string.Empty, homeDirectory), new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
+            await manager.StartSessionAsync(SealedStart(sessionId), CancellationToken.None);
+            await WaitForFileAsync(Path.Combine(sealedDirectory, "output", ".written"));
+
+            var sealedHits = FindFilesContaining(sealedDirectory, canary);
+            var diskHits = new[] { options.SessionRoot, "/var/tmp", Path.GetTempPath() }
+                .SelectMany(directory => FindFilesContaining(directory, canary))
+                .ToArray();
+            Assert.That(sealedHits, Has.Length.EqualTo(6), string.Join(", ", sealedHits));
+            Assert.That(diskHits, Is.Empty);
+
+            await manager.StopSessionAsync(sessionId, CancellationToken.None);
+
+            Assert.That(Directory.Exists(sealedDirectory), Is.False);
+            Assert.That(Directory.Exists(homeDirectory), Is.False);
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+            TryDelete(sealedRoot);
+        }
+    }
+
+    [Test]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public async Task SealedSession_UnexpectedEditorExitRemovesTheSealedDirectory()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        LinuxTestPrerequisites.RequireRoot();
+
+        var (tempRoot, sealedRoot, options) = CreateSealedOptions("comfyui");
+        var entryPoint = Path.Combine(tempRoot, "crash.sh");
+        File.WriteAllText(entryPoint, "#!/bin/sh\nsleep 1\nexit 3\n");
+        File.SetUnixFileMode(entryPoint, Mode0755);
+        options = WithEntryPoint(options, entryPoint);
+        const string sessionId = "session-crash";
+        var sealedDirectory = Path.Combine(sealedRoot, sessionId);
+
+        try
+        {
+            using var manager = new SessionProcessManager(options, new RecordingIsolationStrategy(string.Empty, Path.Combine(options.SessionRoot, sessionId)), new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
+            await manager.StartSessionAsync(SealedStart(sessionId), CancellationToken.None);
+            Assert.That(Directory.Exists(sealedDirectory), Is.True);
+
+            var deadline = DateTime.UtcNow.AddSeconds(15);
+            while (Directory.Exists(sealedDirectory) && DateTime.UtcNow < deadline)
+            {
+                await Task.Delay(100);
+            }
+
+            Assert.That(Directory.Exists(sealedDirectory), Is.False);
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+            TryDelete(sealedRoot);
+        }
+    }
+
+    private static async Task WaitForFileAsync(string path)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(15);
+        while (!File.Exists(path))
+        {
+            if (DateTime.UtcNow > deadline)
+            {
+                Assert.Fail($"Timed out waiting for '{path}'.");
+            }
+
+            await Task.Delay(50);
+        }
+    }
+
+    private static string[] FindFilesContaining(string directory, string text)
+    {
+        if (!Directory.Exists(directory))
+        {
+            return [];
+        }
+
+        var needle = System.Text.Encoding.UTF8.GetBytes(text);
+        var hits = new List<string>();
+        var enumeration = new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true, AttributesToSkip = FileAttributes.ReparsePoint };
+        foreach (var file in Directory.EnumerateFiles(directory, "*", enumeration))
+        {
+            try
+            {
+                // FIFOs (the runtime's debugger pipes live in /tmp) and sockets report no length;
+                // opening one could block, and none can hold the canary.
+                var length = new FileInfo(file).Length;
+                if (length > 0 && length < 64 * 1024 * 1024 && File.ReadAllBytes(file).AsSpan().IndexOf(needle) >= 0)
+                {
+                    hits.Add(file);
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // Sockets and files that vanish while scanning cannot hold the canary.
+            }
+        }
+
+        return [.. hits];
+    }
+
+    private static SessionProcessOptions WithEntryPoint(SessionProcessOptions options, string entryPoint)
+        => new()
+        {
+            SessionRoot = options.SessionRoot,
+            EntryPointPath = entryPoint,
+            WorkingDirectory = options.WorkingDirectory,
+            BundledCustomNodesSeedPath = options.BundledCustomNodesSeedPath,
+            BundledInputSeedPath = options.BundledInputSeedPath,
+            SeedVirtualEnvPath = options.SeedVirtualEnvPath,
+            UvBinaryPath = options.UvBinaryPath,
+            RuntimeKind = options.RuntimeKind,
+            ComfyPort = options.ComfyPort,
+            ShutdownGracePeriod = TimeSpan.FromSeconds(1),
+            ReadyTimeout = options.ReadyTimeout,
+            ReadyHost = options.ReadyHost,
+            Sealing = options.Sealing,
+        };
+
     private static StartSessionCommand SealedStart(string sessionId, string runtimeKind = "comfyui")
         => new()
         {

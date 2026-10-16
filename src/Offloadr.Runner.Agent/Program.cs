@@ -55,7 +55,10 @@ RunnerLog.Info(
 if (options.Session.Sealing.Mode == SealedStorageMode.Required)
 {
     LinuxProcessHardening.DisableCoreDumps();
-    foreach (var directory in SealedHostLockdown.RemoveSharedWriteAccess(SealedHostLockdown.SharedTemporaryDirectories))
+    var sharedWritable = SealedHostLockdown.SharedTemporaryDirectories
+        .Concat(SealedHostLockdown.FindSharedWritableDirectories())
+        .Distinct(StringComparer.Ordinal);
+    foreach (var directory in SealedHostLockdown.RemoveSharedWriteAccess(sharedWritable))
     {
         RunnerLog.Info($"Sealed storage: '{directory}' is no longer writable by session users.");
     }

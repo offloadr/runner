@@ -68,6 +68,10 @@ For non-prod environments, add `-e OFFLOADR_API_GRPC=<environment-origin>`.
   - `RUNNER_UV_BINARY` (runner-owned `uv` executable used to create session virtualenvs, default `/usr/local/bin/uv`)
   - `RUNNER_PERSISTENT_RANGE_HYDRATION` (image-owned runtime capability; `1` for persistent ComfyUI model roots and `0` for Forge Neo)
   - `RUNNER_VFS_LOG` (`1` enables verbose native shim and VFS IPC tracing; default `0`)
+- Optional sealed storage (see [Sealed Storage](#sealed-storage))
+  - `RUNNER_SEALED_STORAGE` (`off`, `auto` or `required`; default `auto`. Any other value fails startup)
+  - `RUNNER_SEALED_ROOT` (memory-backed directory for sealed session data, default `/dev/shm/offloadr`)
+  - `RUNNER_SEALED_MIN_GB` (smallest usable budget in GiB, default `4`)
 - Optional live runtime telemetry
   - `RUNNER_GPU_STATS_INTERVAL_SEC` (poll interval for active-session runtime telemetry via `nvidia-smi`, `/proc/meminfo`, and the model download filesystem; default `5`, `0` disables)
 - Optional aria2 download tuning
@@ -163,6 +167,29 @@ Runtime restart notes:
 - Every child-originated event, log, download update, telemetry sample, artifact, and bridge report carries lifecycle generation, runtime epoch, and runtime instance. A bridge connection also has its own reconnect identity.
 - A failed child remains unavailable while the runner and allocation stay active. Another Manager reboot retries; allocation Stop always wins.
 
+## Sealed Storage
+
+Sealed storage keeps a session's user data in memory-backed storage instead of on the host's disk. It reduces what is left behind on a rented machine; it does not hide a running session from whoever controls the host, who can still read its memory.
+
+- `RUNNER_SEALED_STORAGE=required` seals every session. Startup fails unless `RUNNER_SEALED_ROOT` (default `/dev/shm/offloadr`) is on a tmpfs or ramfs, owned by root, writable only by root, and leaves at least `RUNNER_SEALED_MIN_GB` (default 4 GiB) in both free space and container memory headroom. `auto`, the default, seals only sessions whose start asks for it, which the control plane does not do yet. `off` never seals.
+- A sealed session's input, output, temp, ComfyUI `user`, `TMPDIR`, `HOME` and Forge Neo data directory (settings, styles and `params.txt`, which holds the last prompt) live under `<root>/<session>`, which only root can change. The virtualenv, models, custom nodes and the caches of compiled code (`XDG_CACHE_HOME`, TorchInductor, Triton, CUDA) stay on disk under `SESSION_ROOT`: `/dev/shm` is mounted `noexec`, so nothing can be executed or loaded as a library from the sealed root. Building and running a binary in `TMPDIR` fails for the same reason; ComfyUI-Manager's dependency sync gets a disk-backed `TMPDIR` of its own.
+- The workspace seed archive is staged on the sealed root, editor and dependency-sync output stays off the container log (it is still relayed to the control plane), and processes that load the VFS shim, as well as the agent, are non-dumpable. A static binary that does not load the shim stays dumpable.
+- In required mode the agent also removes write access for others from world-writable directories on disk, such as `/tmp`, `/var/tmp` and `/run/lock`, so a library that ignores `TMPDIR` fails instead of writing there.
+- A start that must be sealed is refused before anything is provisioned when the root cannot take it. When the budget falls below half the minimum, uploaded outputs and previews that have not changed for two minutes are replaced by empty placeholders and downloaded again when opened. Nothing ever falls back to disk: once nothing is left to evict, writes fail with "no space left on device".
+- The sealed directory is removed when the session stops, fails to start or its editor exits, and at agent startup. A stop first gives pending uploads a few seconds; artifacts that did not upload by then are lost with the session's data, and the agent logs how many.
+- What it does not cover: custom nodes can still write next to their own code on disk, models stay on disk, and swap can write memory, tmpfs included, to the host's disk unless the container's swap is off (`memory.swap.max` is `0`) or the tmpfs is mounted `noswap`. The status file reports what the runner can see.
+- tmpfs pages count against the container's memory limit, so the sealed budget and the editor's own memory compete.
+
+Observed `/dev/shm` on GPU rental providers (one RTX 3090 or 4090 pod each, October 2026):
+
+| Provider | `/dev/shm` by default | Override | Container memory limit | Swap |
+| --- | --- | --- | --- | --- |
+| Vast.ai | 10 GiB, sized by the provider | `--shm-size` in the template's Docker options | 49 GiB | Host swap partition, but `memory.swap.max` is `0` |
+| RunPod | 30 GiB | None offered | 62 GiB | None |
+| QuickPod | 64 MiB (Docker's default) | `--shm-size=16g` in Docker Options gives 16 GiB | Not visible (cgroup files absent); host has 32 GiB | 2–4 GiB host swap file, not limited |
+
+For a personal runner, add `--shm-size` to `docker run` together with `-e RUNNER_SEALED_STORAGE=required`.
+
 ## Runner Keys
 
 - Create and revoke personal runner keys in the Offloadr web app under Settings, Personal Runner Keys. The key is shown once.
@@ -187,11 +214,22 @@ The image sets `RUNNER_STATUS_FILE=/run/offloadr/status.json`. The agent rewrite
   "version": "0.1.0+<commit>",
   "supported_editor_templates": ["comfyui-latest"],
   "active_session_id": "",
-  "updated_utc": "2026-10-06T12:00:00+00:00"
+  "updated_utc": "2026-10-06T12:00:00+00:00",
+  "sealed_storage": {
+    "mode": "required",
+    "available": true,
+    "reason": null,
+    "root": "/dev/shm/offloadr",
+    "capacity_bytes": 10737418240,
+    "free_bytes": 10737418240,
+    "memory_headroom_bytes": 52177788928,
+    "budget_bytes": 10737418240,
+    "swap": { "devices_bytes": 64000000000, "cgroup_limit": "0", "tmpfs_noswap": false }
+  }
 }
 ```
 
-A supervisor can read it with `docker exec <container> cat /run/offloadr/status.json`. An empty `active_session_id` means restarting the container will not interrupt a session. The file never leaves the container; unset `RUNNER_STATUS_FILE` to disable it.
+`sealed_storage.budget_bytes` is the smaller of the sealed root's free space and the container's memory headroom. A supervisor can read it with `docker exec <container> cat /run/offloadr/status.json`. An empty `active_session_id` means restarting the container will not interrupt a session. The file never leaves the container; unset `RUNNER_STATUS_FILE` to disable it.
 
 ## Building the Images
 

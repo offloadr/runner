@@ -10,6 +10,58 @@ public static class SealedHostLockdown
 {
     public static readonly IReadOnlyList<string> SharedTemporaryDirectories = ["/tmp", "/var/tmp"];
 
+    /// <summary>
+    /// Directories near the top of <paramref name="root"/>'s filesystem that anyone may write,
+    /// such as <c>/tmp</c>, <c>/var/tmp</c>, <c>/run/lock</c> or Ubuntu's <c>/var/crash</c>. Other
+    /// filesystems (<c>/dev/shm</c>, <c>/proc</c>, mounts) and symlinks are not entered.
+    /// </summary>
+    public static IReadOnlyList<string> FindSharedWritableDirectories(string root = "/", int maxDepth = 3)
+    {
+        var found = new List<string>();
+        if (SealedStorageProbe.ReadEntryStatus(root) is not { IsDirectory: true } ||
+            !LinuxFileIdentityReader.TryRead(root, out var rootIdentity))
+        {
+            return found;
+        }
+
+        Walk(root, 0);
+        return found;
+
+        void Walk(string directory, int depth)
+        {
+            string[] children;
+            try
+            {
+                children = Directory.GetDirectories(directory);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                return;
+            }
+
+            foreach (var child in children)
+            {
+                if (SealedStorageProbe.ReadEntryStatus(child) is not { IsDirectory: true, IsSymbolicLink: false } entry ||
+                    !LinuxFileIdentityReader.TryRead(child, out var identity) ||
+                    identity.DeviceId != rootIdentity.DeviceId)
+                {
+                    continue;
+                }
+
+                if ((entry.Mode & UnixFileMode.OtherWrite) != 0)
+                {
+                    found.Add(child);
+                    continue;
+                }
+
+                if (depth + 1 < maxDepth)
+                {
+                    Walk(child, depth + 1);
+                }
+            }
+        }
+    }
+
     /// <summary>Removes group and other write access from each disk-backed directory; returns the ones changed.</summary>
     public static IReadOnlyList<string> RemoveSharedWriteAccess(IEnumerable<string> directories)
         => RemoveSharedWriteAccess(
