@@ -48,6 +48,13 @@ public sealed class RunnerVfsEnvironmentBuilder
         ".tar"
     ];
 
+    /// <summary>
+    /// True when the shim asks the agent before opening <paramref name="path"/> under an artifact
+    /// root, so an empty placeholder there is downloaded again on open.
+    /// </summary>
+    public static bool IsArtifactReadbackPath(string path)
+        => AdditionalExtensions.Contains(Path.GetExtension(path), StringComparer.OrdinalIgnoreCase);
+
     public string DefaultVfsLibraryPath { get; init; } = "/opt/offloadr/lib/liboffloadr_model_vfs.so";
     public string DefaultSocketPath { get; init; } = "/tmp/runner-agent/model-fetch.sock";
     public string DefaultRoots { get; init; } = string.Empty;

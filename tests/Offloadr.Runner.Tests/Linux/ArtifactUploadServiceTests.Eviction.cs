@@ -1,0 +1,125 @@
+using Microsoft.Extensions.Logging.Abstractions;
+using Offloadr.Runner.V1;
+
+namespace Offloadr.Runner.Tests;
+
+public partial class ArtifactUploadServiceTests
+{
+    [Test]
+    public async Task EvictUploadedArtifacts_ReplacesAnUploadedOutputAndDownloadsItAgainOnOpen()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = CreateEvictionPaths(root, sealedSession: true);
+            var content = "uploaded-output-bytes"u8.ToArray();
+            var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse())
+            {
+                ReadArtifactContent = content,
+            };
+            await using var service = new ArtifactUploadService("runner-secret-value", artifactClient, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+
+            var outputPath = Path.Combine(paths.OutputDirectory, "ComfyUI_00001_.png");
+            await File.WriteAllBytesAsync(outputPath, content);
+            await artifactClient.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            await using var openBeforeEviction = new FileStream(outputPath, FileMode.Open, FileAccess.Read);
+
+            var released = await EvictWhenRecordedAsync(service, "session-1");
+
+            Assert.That(released, Is.EqualTo(content.Length));
+            Assert.That(new FileInfo(outputPath).Length, Is.Zero);
+            // A reader that had it open still sees the uploaded bytes.
+            var stillOpen = new byte[content.Length];
+            await openBeforeEviction.ReadExactlyAsync(stillOpen);
+            Assert.That(stillOpen, Is.EqualTo(content));
+
+            Assert.That(await service.TryEnsureArtifactAvailableAsync(outputPath, highPriority: true, CancellationToken.None), Is.True);
+            Assert.That(await File.ReadAllBytesAsync(outputPath), Is.EqualTo(content));
+            Assert.That(artifactClient.LastReadArtifactRequest!.Filename, Is.EqualTo("ComfyUI_00001_.png"));
+            // Give the watcher time to see the placeholder and the download.
+            await Task.Delay(500);
+            Assert.That(artifactClient.UploadCount, Is.EqualTo(1), "neither the placeholder nor the download is uploaded");
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
+    public async Task EvictUploadedArtifacts_LeavesUnsealedChangedAndRecentArtifacts()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var unsealedPaths = CreateEvictionPaths(Path.Combine(root, "unsealed"), sealedSession: false);
+            var sealedPaths = CreateEvictionPaths(Path.Combine(root, "sealed"), sealedSession: true);
+            var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse());
+            await using var service = new ArtifactUploadService("runner-secret-value", artifactClient, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("unsealed", unsealedPaths, CancellationToken.None);
+            await service.ActivateSessionAsync("unsealed", "editor-1", "owner-1", CancellationToken.None);
+            var unsealedOutput = Path.Combine(unsealedPaths.OutputDirectory, "a.png");
+            await File.WriteAllBytesAsync(unsealedOutput, [1, 2, 3]);
+            await artifactClient.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            await Task.Delay(200);
+
+            Assert.That(service.EvictUploadedArtifacts("unsealed", long.MaxValue, TimeSpan.Zero), Is.Zero);
+            Assert.That(new FileInfo(unsealedOutput).Length, Is.EqualTo(3));
+            await service.StopSessionAsync("unsealed");
+
+            await service.StartSessionAsync("sealed", sealedPaths, CancellationToken.None);
+            await service.ActivateSessionAsync("sealed", "editor-2", "owner-1", CancellationToken.None);
+            var sealedOutput = Path.Combine(sealedPaths.OutputDirectory, "b.png");
+            await File.WriteAllBytesAsync(sealedOutput, [1, 2, 3]);
+            await artifactClient.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            await Task.Delay(200);
+
+            Assert.That(service.EvictUploadedArtifacts("sealed", long.MaxValue, TimeSpan.FromHours(1)), Is.Zero, "too recent");
+            await File.WriteAllBytesAsync(sealedOutput, [1, 2, 3, 4]);
+            Assert.That(service.EvictUploadedArtifacts("sealed", long.MaxValue, TimeSpan.Zero), Is.Zero, "changed since upload");
+            Assert.That(new FileInfo(sealedOutput).Length, Is.EqualTo(4));
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    private static async Task<long> EvictWhenRecordedAsync(ArtifactUploadService service, string sessionId)
+    {
+        // The upload is recorded once the control plane's response arrives.
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        while (true)
+        {
+            var released = service.EvictUploadedArtifacts(sessionId, long.MaxValue, TimeSpan.Zero);
+            if (released > 0 || DateTime.UtcNow > deadline)
+            {
+                return released;
+            }
+
+            await Task.Delay(50);
+        }
+    }
+
+    private static SessionProcessManager.SessionPaths CreateEvictionPaths(string root, bool sealedSession)
+    {
+        var data = sealedSession ? Path.Combine(root, "sealed") : root;
+        var paths = new SessionProcessManager.SessionPaths
+        {
+            HomeDirectory = root,
+            SealedDirectory = sealedSession ? data : null,
+            UserDirectory = Path.Combine(data, "user"),
+            OutputDirectory = Path.Combine(data, "output"),
+            InputDirectory = Path.Combine(data, "input"),
+            TempDirectory = Path.Combine(data, "temp"),
+            CacheDirectory = Path.Combine(root, ".cache"),
+            LogsDirectory = Path.Combine(root, "logs"),
+        };
+        Directory.CreateDirectory(paths.OutputDirectory);
+        Directory.CreateDirectory(paths.InputDirectory);
+        Directory.CreateDirectory(paths.TempDirectory);
+        return paths;
+    }
+}

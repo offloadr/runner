@@ -97,6 +97,18 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
     internal int GetPendingUploadCount(string sessionId)
         => _sessions.TryGetValue(sessionId, out var uploader) ? uploader.PendingUploadCount : 0;
 
+    /// <summary>
+    /// Frees memory on a sealed session's root by turning uploaded artifacts back into empty
+    /// catalog placeholders, oldest upload first, until at least <paramref name="bytesToFree"/>
+    /// bytes are released. Only artifacts the control plane accepted, unchanged since, idle for
+    /// <paramref name="minimumIdle"/> and readable again through the VFS are evicted; opening one
+    /// later downloads it again. Returns the bytes released (0 for an unsealed session).
+    /// </summary>
+    public long EvictUploadedArtifacts(string sessionId, long bytesToFree, TimeSpan minimumIdle)
+        => _sessions.TryGetValue(sessionId, out var uploader) && uploader.IsSealed
+            ? uploader.EvictUploadedArtifacts(bytesToFree, minimumIdle, DateTimeOffset.UtcNow)
+            : 0;
+
     public void RegisterInputSeeds(string sessionId)
     {
         if (_sessions.TryGetValue(sessionId, out var uploader))
@@ -1426,6 +1438,68 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
         internal int PendingUploadCount => _pending.Count;
 
+        public bool IsSealed => _paths.IsSealed;
+
+        internal long EvictUploadedArtifacts(long bytesToFree, TimeSpan minimumIdle, DateTimeOffset now)
+        {
+            long released = 0;
+            var candidates = _catalog.Values
+                .Where(state => state.Downloaded &&
+                                state.SizeBytes > 0 &&
+                                now - state.CreatedUtc >= minimumIdle &&
+                                RunnerVfsEnvironmentBuilder.IsArtifactReadbackPath(state.LocalPath))
+                .OrderBy(static state => state.CreatedUtc)
+                .ToArray();
+            foreach (var state in candidates)
+            {
+                if (released >= bytesToFree || _cts.IsCancellationRequested)
+                {
+                    break;
+                }
+
+                if (_pending.ContainsKey(state.LocalPath) ||
+                    !TryResolveSecureLocation(state.Type, state.LocalPath, out var root, out var relativePath))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    using var secureRoot = new LinuxSecureDirectoryRoot(root);
+                    var status = secureRoot.GetStatus(relativePath);
+                    if (!status.IsRegularFile || status.Length != state.SizeBytes)
+                    {
+                        continue;
+                    }
+
+                    // Replace rather than truncate: a reader or mapping that still has the file
+                    // open keeps the uploaded bytes until it closes, and memory is released then.
+                    using var placeholder = secureRoot.CreatePublication(relativePath);
+                    placeholder.SetModifiedUtc(status.LastWriteTimeUtc);
+                    var current = secureRoot.GetStatus(relativePath);
+                    if (!current.IsRegularFile || current.Length != status.Length || current.LastWriteTimeUtc != status.LastWriteTimeUtc)
+                    {
+                        continue;
+                    }
+
+                    placeholder.Commit();
+                    state.MarkEvicted();
+                    released += status.Length;
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    _logger.LogDebug(ex, "Could not evict artifact session={SessionId} type={Type}", _sessionId, state.Type);
+                }
+            }
+
+            if (released > 0)
+            {
+                _logger.LogInformation("Evicted uploaded artifacts session={SessionId} bytes={Bytes}", _sessionId, released);
+            }
+
+            return released;
+        }
+
         private RuntimeIdentity? CurrentRuntime()
             => _runtimeIdentities?.TryGet(_sessionId, out var identity) == true ? identity : null;
 
@@ -1813,6 +1887,8 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             }
 
             public void MarkDownloaded() => Downloaded = true;
+
+            public void MarkEvicted() => Downloaded = false;
 
             public bool HasSameCatalogGeneration(RemoteArtifactState other)
                 => SizeBytes == other.SizeBytes

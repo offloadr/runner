@@ -246,6 +246,11 @@ var commandTask = ServiceClientManager.CommandListenerLoopAsync(
     shutdown.Token);
 
 var runtimeTelemetryTask = runtimeTelemetryReporter.RunAsync(shutdown.Token);
+var sealedStorageEvictionTask = new SealedStorageEvictor(
+    options.Session.Sealing,
+    sealedStorageProbe,
+    logicalSessionState.GetActiveSessionId,
+    artifactUploadService.EvictUploadedArtifacts).RunAsync(shutdown.Token);
 
 var statusFilePath = RunnerStatusFileWriter.ResolvePath(Environment.GetEnvironmentVariable);
 var statusFileTask = statusFilePath is null
@@ -261,7 +266,7 @@ var statusFileTask = statusFilePath is null
 
 try
 {
-    await Task.WhenAll(commandTask, runtimeTelemetryTask, statusFileTask);
+    await Task.WhenAll(commandTask, runtimeTelemetryTask, statusFileTask, sealedStorageEvictionTask);
 }
 finally
 {

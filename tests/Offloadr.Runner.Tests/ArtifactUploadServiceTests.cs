@@ -1684,6 +1684,8 @@ public partial class ArtifactUploadServiceTests
                 () => { });
         }
 
+        public int UploadCount => _uploads.Count;
+
         public async Task<CapturedUpload> WaitForUploadAsync(TimeSpan timeout)
         {
             using var cts = new CancellationTokenSource(timeout);
