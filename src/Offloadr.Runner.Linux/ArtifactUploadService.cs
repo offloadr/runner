@@ -1236,7 +1236,13 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
             if (status.Length > 0 && ShouldKeepExistingArtifactFile(state, previousState, status.Length, secureRoot, relativePath))
             {
-                state.MarkDownloaded(status);
+                // A kept output may hold newer bytes than the catalog's: only a file known to equal
+                // the remote artifact (the version this uploader sent or fetched, or the catalog's
+                // digest) counts as saved or may be evicted.
+                var knownRemote = previousState?.MatchesLocalFile(status) == true ||
+                                  (!string.IsNullOrWhiteSpace(state.Sha256) &&
+                                   ExistingFileMatchesCatalogMetadata(state, status.Length, secureRoot, relativePath));
+                state.MarkDownloaded(knownRemote ? status : null);
                 return;
             }
 

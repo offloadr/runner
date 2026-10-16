@@ -251,6 +251,41 @@ public partial class ArtifactUploadServiceTests
         }
     }
 
+    [Test]
+    public async Task KeptOutputWithNewerBytes_IsNotTakenAsTheCatalogsVersion()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = CreateEvictionPaths(root, sealedSession: true);
+            var catalog = new RunnerArtifactServiceListArtifactsResponse();
+            catalog.Artifacts.Add(new Offloadr.EditorRuntime.V1.EditorArtifactMetadata
+            {
+                EditorSid = "editor-1",
+                Filename = "reused.png",
+                Type = "output",
+                Subfolder = string.Empty,
+                SizeBytes = 3,
+                CreatedUtc = Google.Protobuf.WellKnownTypes.Timestamp.FromDateTime(DateTime.UtcNow.AddHours(-1)),
+            });
+            // The control plane refuses the newer bytes, so it only holds its own older version.
+            var artifactClient = new FakeRunnerArtifactClient(catalog) { RejectUploads = true };
+            await using var service = new ArtifactUploadService("runner-secret-value", artifactClient, NullLogger<ArtifactUploadService>.Instance);
+            await File.WriteAllBytesAsync(Path.Combine(paths.OutputDirectory, "reused.png"), "newer"u8.ToArray());
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            await artifactClient.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+
+            Assert.That(service.EvictUploadedArtifacts("session-1", long.MaxValue, TimeSpan.Zero), Is.Zero);
+            Assert.That(await File.ReadAllBytesAsync(Path.Combine(paths.OutputDirectory, "reused.png")), Is.EqualTo("newer"u8.ToArray()));
+            Assert.That(await service.StopSessionAsync("session-1"), Is.EqualTo(1));
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
     private static async Task<long> EvictWhenRecordedAsync(ArtifactUploadService service, string sessionId)
     {
         // The upload is recorded once the control plane's response arrives.
