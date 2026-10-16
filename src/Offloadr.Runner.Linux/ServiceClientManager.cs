@@ -2276,14 +2276,6 @@ internal static class ServiceClientManager
         }
 
         deps.LogicalSessionState.ObserveAssignment(command.AssignmentSequence);
-        if (command.Sealing is { } sealing)
-        {
-            deps.WorkState.SessionSealing[command.SessionId] = sealing.Clone();
-        }
-        else
-        {
-            deps.WorkState.SessionSealing.TryRemove(command.SessionId, out _);
-        }
 
         return RunTrackedStartupAsync(
             deps,
@@ -2312,6 +2304,16 @@ internal static class ServiceClientManager
 
                         deps.RuntimeIdentities.Set(command.SessionId, command.LifecycleGeneration,
                             command.RuntimeEpoch, command.RuntimeInstanceId);
+                        // Retained for relaunches only by the start that was admitted, never by a
+                        // delivery that joined it.
+                        if (command.Sealing is { } sealing)
+                        {
+                            deps.WorkState.SessionSealing[command.SessionId] = sealing.Clone();
+                        }
+                        else
+                        {
+                            deps.WorkState.SessionSealing.TryRemove(command.SessionId, out _);
+                        }
                     }, cancellationToken).ConfigureAwait(false);
 
                     var preemptedSessionId = await PreemptActiveSessionIfNeededAsync(

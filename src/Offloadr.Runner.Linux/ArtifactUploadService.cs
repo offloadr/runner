@@ -1203,7 +1203,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
             if (status.Length > 0 && ShouldKeepExistingArtifactFile(state, previousState, status.Length, secureRoot, relativePath))
             {
-                state.MarkDownloaded();
+                state.MarkDownloaded(status);
                 return;
             }
 
@@ -1280,8 +1280,8 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     headers: _authHeaders,
                     cancellationToken: token);
 
-                await FetchToFileAsync(state, call.ResponseStream, token).ConfigureAwait(false);
-                state.MarkDownloaded();
+                var published = await FetchToFileAsync(state, call.ResponseStream, token).ConfigureAwait(false);
+                state.MarkDownloaded(published);
             }
             catch (RpcException ex) when (!token.IsCancellationRequested)
             {
@@ -1289,7 +1289,8 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             }
         }
 
-        private async Task FetchToFileAsync(RemoteArtifactState state, IAsyncStreamReader<RunnerArtifactServiceReadArtifactResponse> responseStream, CancellationToken cancellationToken)
+        /// <summary>Downloads and publishes the artifact; returns the published file's status.</summary>
+        private async Task<SecureFileStatus> FetchToFileAsync(RemoteArtifactState state, IAsyncStreamReader<RunnerArtifactServiceReadArtifactResponse> responseStream, CancellationToken cancellationToken)
         {
             if (!TryResolveSecureLocation(state.Type, state.LocalPath, out var root, out var relativePath))
             {
@@ -1394,6 +1395,8 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 // Disposing an uncommitted publication removes its temporary file.
                 publication.Commit();
             }
+
+            return secureRoot.GetStatus(relativePath);
         }
 
         private void OnFileEvent(string type, string fullPath, string source)
@@ -1481,10 +1484,59 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
         internal int PendingUploadCount => _pending.Count;
 
-        /// <summary>Uploads that failed or had not finished when the uploader stopped.</summary>
+        /// <summary>
+        /// Artifacts on disk that matched no uploaded version when the uploader stopped, whether their
+        /// upload failed, was still pending or never queued (a full queue drops files).
+        /// </summary>
         public int UnsavedUploadCount { get; private set; }
 
-        private int _failedUploadCount;
+        private int CountUnsavedArtifacts()
+        {
+            var unsaved = 0;
+            foreach (var (type, root) in new[] { ("output", _paths.OutputDirectory), ("temp", _paths.TempDirectory) })
+            {
+                if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    using var secureRoot = new LinuxSecureDirectoryRoot(root);
+                    var enumeration = new EnumerationOptions
+                    {
+                        RecurseSubdirectories = true,
+                        IgnoreInaccessible = true,
+                        AttributesToSkip = FileAttributes.ReparsePoint,
+                    };
+                    foreach (var file in Directory.EnumerateFiles(root, "*", enumeration))
+                    {
+                        if (!TryResolveSecureLocation(type, file, out _, out var relativePath))
+                        {
+                            continue;
+                        }
+
+                        var status = secureRoot.GetStatus(relativePath);
+                        // Empty files are catalog placeholders or evicted artifacts, held remotely.
+                        if (!status.IsRegularFile || status.Length == 0)
+                        {
+                            continue;
+                        }
+
+                        if (!_catalog.TryGetValue(NormalizePath(file), out var state) || !state.MatchesLocalFile(status))
+                        {
+                            unsaved++;
+                        }
+                    }
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    _logger.LogWarning(ex, "Could not count unsaved artifacts session={SessionId} type={Type}", _sessionId, type);
+                }
+            }
+
+            return unsaved;
+        }
 
         public bool IsSealed => _paths.IsSealed;
 
@@ -1492,8 +1544,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         {
             long released = 0;
             var candidates = _catalog.Values
-                .Where(state => state.Downloaded &&
-                                state.SizeBytes > 0 &&
+                .Where(state => state.LocalVersion is { Length: > 0 } &&
                                 now - state.CreatedUtc >= minimumIdle &&
                                 RunnerVfsEnvironmentBuilder.IsArtifactReadbackPath(state.LocalPath))
                 .OrderBy(static state => state.CreatedUtc)
@@ -1514,8 +1565,10 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 try
                 {
                     using var secureRoot = new LinuxSecureDirectoryRoot(root);
+                    // A rewrite of the same length is a different version: only the one the control
+                    // plane holds may be replaced, since opening the placeholder downloads that one.
                     var status = secureRoot.GetStatus(relativePath);
-                    if (!status.IsRegularFile || status.Length != state.SizeBytes)
+                    if (!state.MatchesLocalFile(status))
                     {
                         continue;
                     }
@@ -1649,7 +1702,6 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                             }
                             else
                             {
-                                Interlocked.Increment(ref _failedUploadCount);
                                 _logger.LogWarning(ex, "Failed to upload artifact {Path} after retries", item.FullPath);
                             }
                         }
@@ -1843,7 +1895,8 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     var localPath = NormalizePath(fullPath);
                     var remote = new RemoteArtifactState(_editorSid, type, subfolder, fileName, localPath, sizeBytes, null, createdUtc);
                     _catalog[remote.LocalPath] = remote;
-                    remote.MarkDownloaded();
+                    // A file that changed while it was sent matches no uploaded version yet.
+                    remote.MarkDownloaded(changedDuringUpload ? null : after);
 
                     _logger.LogInformation("Uploaded artifact session={SessionId} type={Type} path={Relative}", _sessionId, type, relPath);
                     if (changedDuringUpload && after.IsRegularFile && request.Attempt < 3)
@@ -1960,9 +2013,28 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 CreatedUtc = createdUtc;
             }
 
-            public void MarkDownloaded() => Downloaded = true;
+            /// <summary>Length and modification time of the local file that equals the remote artifact.</summary>
+            public SecureFileStatus? LocalVersion { get; private set; }
 
-            public void MarkEvicted() => Downloaded = false;
+            public void MarkDownloaded(SecureFileStatus? localVersion = null)
+            {
+                Downloaded = true;
+                LocalVersion = localVersion is { IsRegularFile: true } version ? version : null;
+            }
+
+            public void MarkEvicted()
+            {
+                Downloaded = false;
+                LocalVersion = null;
+            }
+
+            /// <summary>True when <paramref name="status"/> is the version the control plane holds.</summary>
+            public bool MatchesLocalFile(SecureFileStatus status)
+                => Downloaded &&
+                   LocalVersion is { } version &&
+                   status.IsRegularFile &&
+                   status.Length == version.Length &&
+                   status.LastWriteTimeUtc == version.LastWriteTimeUtc;
 
             public bool HasSameCatalogGeneration(RemoteArtifactState other)
                 => SizeBytes == other.SizeBytes
@@ -1987,14 +2059,11 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
             if (cancelOutstandingWork)
             {
-                UnsavedUploadCount = _pending.Count + Volatile.Read(ref _failedUploadCount);
                 CancelOutstandingTransfers();
             }
             else
             {
                 await WaitForWorkerDrainAsync().ConfigureAwait(false);
-                // Anything still pending now is cancelled below and never reaches the control plane.
-                UnsavedUploadCount = _pending.Count + Volatile.Read(ref _failedUploadCount);
                 CancelOutstandingTransfers();
             }
 
@@ -2010,6 +2079,9 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             {
                 await WaitAfterCancellationAsync(Task.WhenAll(downloadTasks), "artifact downloads").ConfigureAwait(false);
             }
+
+            // Uploads have stopped: whatever is not on the control plane now is lost with the session's data.
+            UnsavedUploadCount = CountUnsavedArtifacts();
         }
 
         private async Task WaitAfterCancellationAsync(Task task, string description)

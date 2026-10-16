@@ -124,6 +124,47 @@ public partial class ArtifactUploadServiceTests
         }
     }
 
+    [Test]
+    public async Task SameLengthRewrite_IsNeitherEvictedNorCountedAsSaved()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = CreateEvictionPaths(root, sealedSession: true);
+            var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse());
+            await using var service = new ArtifactUploadService("runner-secret-value", artifactClient, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            var outputPath = Path.Combine(paths.OutputDirectory, "same.png");
+            await File.WriteAllBytesAsync(outputPath, "version-1"u8.ToArray());
+            await artifactClient.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            await WaitUntilAsync(() => service.EvictUploadedArtifacts("session-1", 0, TimeSpan.Zero) == 0 && artifactClient.UploadCount == 1);
+            await Task.Delay(300);
+
+            // The control plane refuses the rewrite, so it only holds version 1.
+            artifactClient.RejectUploads = true;
+            await File.WriteAllBytesAsync(outputPath, "version-2"u8.ToArray());
+            File.SetLastWriteTimeUtc(outputPath, DateTime.UtcNow.AddSeconds(5));
+
+            Assert.That(service.EvictUploadedArtifacts("session-1", long.MaxValue, TimeSpan.Zero), Is.Zero);
+            Assert.That(await File.ReadAllBytesAsync(outputPath), Is.EqualTo("version-2"u8.ToArray()));
+            Assert.That(await service.StopSessionAsync("session-1"), Is.EqualTo(1), "the rewrite never reached the control plane");
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> condition)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        while (!condition() && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(50);
+        }
+    }
+
     private static async Task<long> EvictWhenRecordedAsync(ArtifactUploadService service, string sessionId)
     {
         // The upload is recorded once the control plane's response arrives.

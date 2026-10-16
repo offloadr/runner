@@ -53,6 +53,37 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
+    public async Task DuplicateStartDelivery_DoesNotReplaceTheAdmittedStartsSealing()
+    {
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var harness = new RuntimeCommandHarness { BeforeStart = (_, token) => release.Task.WaitAsync(token) };
+        var start = SealedStart(7, 3, InstanceA);
+        var duplicate = start.Clone();
+        duplicate.Sealing = null;
+
+        var admitted = ServiceClientManager.HandleStartSessionCommand(start, harness.Deps);
+        await WaitUntilStartedAsync(harness);
+        var joined = ServiceClientManager.HandleStartSessionCommand(duplicate, harness.Deps);
+        release.SetResult();
+        await Task.WhenAll(admitted, joined);
+        await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
+
+        await ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 4, InstanceB, revision: 1), harness.Deps);
+        await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 1);
+
+        Assert.That(harness.Starts.Last().Sealing, Is.EqualTo(start.Sealing));
+    }
+
+    private static async Task WaitUntilStartedAsync(RuntimeCommandHarness harness)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        while (harness.Starts.IsEmpty && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(20);
+        }
+    }
+
+    [Test]
     public async Task Stop_ReportsUnsavedArtifactsAndReplaysTheSameAcknowledgement()
     {
         var harness = RunningHarness(7, 3, InstanceA);

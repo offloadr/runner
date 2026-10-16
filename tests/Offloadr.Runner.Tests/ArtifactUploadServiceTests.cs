@@ -1603,6 +1603,8 @@ public partial class ArtifactUploadServiceTests
         public IAsyncStreamReader<RunnerArtifactServiceReadArtifactResponse>? BlockingReadArtifactReader { get; init; }
         /// <summary>When set, upload responses wait for this task, as on a stalled artifact API.</summary>
         public Task? UploadGate { get; init; }
+        /// <summary>Answers every upload with success=false, as a control plane refusing it would.</summary>
+        public bool RejectUploads { get; set; }
 
         private static async Task<RunnerArtifactServiceUploadArtifactResponse> WaitForGateAsync(
             Task gate,
@@ -1638,7 +1640,7 @@ public partial class ArtifactUploadServiceTests
             {
                 _uploads.Enqueue(captured);
                 _uploadSignals.Writer.TryWrite(captured);
-                response.TrySetResult(new RunnerArtifactServiceUploadArtifactResponse { Success = true });
+                response.TrySetResult(new RunnerArtifactServiceUploadArtifactResponse { Success = !RejectUploads, Message = RejectUploads ? "rejected" : string.Empty });
             });
             var gate = UploadGate;
 
