@@ -62,6 +62,9 @@ internal sealed partial class SessionProcessManager : IDisposable
     private readonly SessionProcessLogRelay? _processLogRelay;
     private readonly SealedStorageOptions _sealing;
     private readonly SealedStorageProbe _sealedStorageProbe;
+    // The transfer sealing of each session's current runtime; its reader key is released only
+    // after that runtime's data has been removed.
+    private readonly ConcurrentDictionary<string, SessionTransferSealing> _transferSealings = new(StringComparer.Ordinal);
 
     internal Func<string, RuntimeIdentity, int?, CancellationToken, Task>? UnexpectedSessionExitCleanup { get; set; }
 
@@ -213,6 +216,10 @@ internal sealed partial class SessionProcessManager : IDisposable
             ThrowIfSealedStorageUnavailable();
         }
 
+        // Validates the output recipient before anything is provisioned, too.
+        var transferSealing = SessionTransferSealing.Create(sessionId, command.Sealing, sealSession);
+        ReplaceTransferSealing(sessionId, transferSealing);
+
         PreparedSessionIdentity identity = default;
         SessionContext? launchedContext = null;
         var prepared = false;
@@ -224,7 +231,10 @@ internal sealed partial class SessionProcessManager : IDisposable
             identity = await _sessionIsolationStrategy.PrepareAsync(sessionId, _sessionRoot, cancellationToken).ConfigureAwait(false);
             prepared = true;
             _preparedIdentities[sessionId] = identity;
-            var paths = await PrepareSessionDirectoriesAsync(sessionId, identity.HomeDirectory, sealSession, cancellationToken).ConfigureAwait(false);
+            var paths = await PrepareSessionDirectoriesAsync(sessionId, identity.HomeDirectory, sealSession, cancellationToken).ConfigureAwait(false) with
+            {
+                TransferSealing = transferSealing
+            };
 
             // Copy bundled input seeds before the initializer can create input catalog placeholders.
             PrepareBundledInputSeeds(paths);
@@ -286,6 +296,10 @@ internal sealed partial class SessionProcessManager : IDisposable
             else if (prepared)
             {
                 await CleanupPreparedStartupAsync(identity, sessionId).ConfigureAwait(false);
+            }
+            else
+            {
+                ReleaseTransferSealing(sessionId, transferSealing);
             }
             throw;
         }
@@ -1070,9 +1084,78 @@ internal sealed partial class SessionProcessManager : IDisposable
         }
     }
 
-    /// <summary>Whether <paramref name="command"/> keeps its data on the memory-backed root.</summary>
+    /// <summary>
+    /// Whether <paramref name="command"/> keeps its data on the memory-backed root: always in
+    /// required mode, and when the start requires the sealed-session profile. Throws when it
+    /// requires the profile and sealing is off.
+    /// </summary>
     internal bool ShouldSeal(StartSessionCommand command)
-        => _sealing.Mode == SealedStorageMode.Required;
+    {
+        if (command.Sealing?.Required == true)
+        {
+            if (_sealing.Mode == SealedStorageMode.Off)
+            {
+                throw new InvalidOperationException("This runner does not offer sealed sessions (RUNNER_SEALED_STORAGE=off).");
+            }
+
+            return true;
+        }
+
+        return _sealing.Mode == SealedStorageMode.Required;
+    }
+
+    /// <summary>What the session's current runtime got, or null when none was started.</summary>
+    public SessionSealingStatus? GetSessionSealingStatus(string sessionId)
+        => _transferSealings.TryGetValue(sessionId, out var sealing) ? sealing.ToStatus() : null;
+
+    /// <summary>What this runner can offer sealed sessions, for registration.</summary>
+    public RunnerSealedStorage DescribeSealedStorage()
+    {
+        var status = _sealedStorageProbe.Probe(_sealing);
+        var described = new RunnerSealedStorage
+        {
+            Mode = _sealing.Mode switch
+            {
+                SealedStorageMode.Off => Offloadr.Runner.V1.SealedStorageMode.Off,
+                SealedStorageMode.Auto => Offloadr.Runner.V1.SealedStorageMode.Auto,
+                _ => Offloadr.Runner.V1.SealedStorageMode.Required,
+            },
+            MemoryWorkspaceAvailable = status.Available,
+            BudgetBytes = status.BudgetBytes is > 0 and var budget ? (ulong)budget : 0,
+        };
+        if (_sealing.Mode != SealedStorageMode.Off)
+        {
+            described.Algorithms.Add(Offloadr.Runner.Core.Sealing.SealedEnvelopeFormat.AlgorithmId);
+        }
+
+        return described;
+    }
+
+    private void ReplaceTransferSealing(string sessionId, SessionTransferSealing sealing)
+    {
+        if (_transferSealings.TryGetValue(sessionId, out var previous) && !ReferenceEquals(previous, sealing))
+        {
+            ReleaseTransferSealing(sessionId, previous);
+        }
+
+        _transferSealings[sessionId] = sealing;
+    }
+
+    private void ReleaseTransferSealing(string sessionId, SessionTransferSealing? expected = null)
+    {
+        if (expected is null)
+        {
+            if (_transferSealings.TryRemove(sessionId, out var removed))
+            {
+                removed.Dispose();
+            }
+
+            return;
+        }
+
+        ((ICollection<KeyValuePair<string, SessionTransferSealing>>)_transferSealings).Remove(new(sessionId, expected));
+        expected.Dispose();
+    }
 
     private void ThrowIfSealedStorageUnavailable()
     {
@@ -1528,6 +1611,7 @@ internal sealed partial class SessionProcessManager : IDisposable
         _pendingTeardowns.TryRemove(new KeyValuePair<string, PreparedSessionIdentity>(sessionId, identity));
         DeleteSessionHomeDirectory(identity.HomeDirectory);
         DeleteSealedSessionDirectory(sessionId);
+        ReleaseTransferSealing(sessionId);
     }
 
     /// <summary>
@@ -3171,6 +3255,9 @@ internal sealed partial class SessionProcessManager : IDisposable
 
         /// <summary>The session's directory on the memory-backed root, or null for an unsealed session.</summary>
         public string? SealedDirectory { get; init; }
+
+        /// <summary>How the runtime seals its transfers; null outside a managed session (tests).</summary>
+        public SessionTransferSealing? TransferSealing { get; init; }
 
         public bool IsSealed => SealedDirectory is not null;
 

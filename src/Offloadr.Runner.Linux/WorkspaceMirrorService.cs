@@ -2,6 +2,7 @@ using System.Buffers;
 using System.Collections.Concurrent;
 using System.IO.Compression;
 using System.Security.Cryptography;
+using Offloadr.Runner.Core.Sealing;
 using Offloadr.Runner.V1;
 using Google.Protobuf.WellKnownTypes;
 using Grpc.Core;
@@ -376,7 +377,8 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                 {
                     EditorSid = state.EditorSid,
                     Root = state.Root,
-                    RelativePath = state.RelativePath
+                    RelativePath = state.RelativePath,
+                    ReaderKey = _paths.TransferSealing?.ReaderKeyMessage
                 },
                 headers: _authHeaders,
                 cancellationToken: linkedCancellationToken);
@@ -391,12 +393,13 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                 new RunnerWorkspaceServiceReadWorkspaceSeedArchiveRequest
                 {
                     EditorSid = _editorSid!,
-                    Root = root
+                    Root = root,
+                    ReaderKey = _paths.TransferSealing?.ReaderKeyMessage
                 },
                 headers: _authHeaders,
                 cancellationToken: cancellationToken);
 
-            var tempPath = await DownloadArchiveAsync(call.ResponseStream, cancellationToken).ConfigureAwait(false);
+            var tempPath = await DownloadArchiveAsync(root, call.ResponseStream, cancellationToken).ConfigureAwait(false);
             try
             {
                 ExtractArchiveSafely(tempPath, destinationRoot, cancellationToken);
@@ -407,7 +410,10 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
             }
         }
 
-        private async Task<string> DownloadArchiveAsync(IAsyncStreamReader<RunnerWorkspaceServiceReadWorkspaceSeedArchiveResponse> responseStream, CancellationToken cancellationToken)
+        private async Task<string> DownloadArchiveAsync(
+            WorkspaceRoot root,
+            IAsyncStreamReader<RunnerWorkspaceServiceReadWorkspaceSeedArchiveResponse> responseStream,
+            CancellationToken cancellationToken)
         {
             // A sealed session stages its seed on the memory-backed root, never on disk.
             var tempPath = Path.Combine(_paths.SealedAgentDirectory ?? Path.GetTempPath(), $"workspace-seed-{_sessionId}-{Guid.NewGuid():N}.zip");
@@ -416,6 +422,7 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
             long? expectedSize = null;
             string? expectedSha256 = null;
             using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            using var sinkSlot = new SealedReadSinkSlot();
 
             try
             {
@@ -438,6 +445,11 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                                 expectedSha256 = response.Metadata.Sha256.Trim();
                             }
 
+                            sinkSlot.Replace(SealedReadSink.Open(
+                                destination,
+                                response.Metadata.Envelope,
+                                _paths.TransferSealing,
+                                () => new SealedSeedArchiveIdentity(_sessionId, SealedRootName(root))));
                             break;
                         case RunnerWorkspaceServiceReadWorkspaceSeedArchiveResponse.PayloadOneofCase.Chunk:
                             if (!sawMetadata)
@@ -453,7 +465,7 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                             }
 
                             hash.AppendData(response.Chunk.Span);
-                            await destination.WriteAsync(response.Chunk.Memory, cancellationToken).ConfigureAwait(false);
+                            await sinkSlot.Current.WriteAsync(response.Chunk.Memory, cancellationToken).ConfigureAwait(false);
                             break;
                     }
                 }
@@ -462,6 +474,8 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                 {
                     throw new InvalidOperationException("Workspace seed archive stream completed without metadata.");
                 }
+
+                await sinkSlot.Current.CompleteAsync(cancellationToken).ConfigureAwait(false);
 
                 // Only an archive that matches its declared size and digest seeds the workspace.
                 if (expectedSize is { } size && totalBytes != size)
@@ -485,6 +499,16 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                 throw;
             }
         }
+
+        /// <summary>The workspace root's name in a sealed envelope's identity.</summary>
+        private static string SealedRootName(WorkspaceRoot root)
+            => root switch
+            {
+                WorkspaceRoot.User => "user",
+                WorkspaceRoot.CustomNodes => "custom_nodes",
+                WorkspaceRoot.Input => "input",
+                _ => throw new InvalidOperationException($"Workspace root {root} has no sealed name."),
+            };
 
         private void ExtractArchiveSafely(string archivePath, string destinationRoot, CancellationToken cancellationToken)
         {
@@ -601,8 +625,12 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
             using var publication = _secureInputRoot.CreatePublication(state.RelativePath);
             var sawMetadata = false;
             string? expectedSha256 = null;
+            // Without a declared size, an unsealed stream is held to the catalog's size.
+            var catalogSize = state.SizeBytes;
+            long? declaredWireSize = null;
             long written = 0;
             using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            using var sinkSlot = new SealedReadSinkSlot();
             await using (var destination = publication.OpenWriteStream())
             {
                 while (await responseStream.MoveNext(cancellationToken).ConfigureAwait(false))
@@ -626,12 +654,24 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                                         $"Workspace file declares {response.Metadata.SizeBytes.Value} bytes, above the {MaxWorkspaceFileBytes} byte limit.");
                                 }
 
-                                state.SizeBytes = response.Metadata.SizeBytes.Value;
+                                declaredWireSize = response.Metadata.SizeBytes.Value;
                             }
 
                             if (!string.IsNullOrWhiteSpace(response.Metadata.Sha256))
                             {
                                 expectedSha256 = response.Metadata.Sha256.Trim();
+                            }
+
+                            var sink = sinkSlot.Replace(SealedReadSink.Open(
+                                destination,
+                                response.Metadata.Envelope,
+                                _paths.TransferSealing,
+                                () => new SealedWorkspaceFileIdentity(_sessionId, SealedRootName(state.Root), state.RelativePath)));
+                            declaredWireSize ??= sink.SealedCiphertextSize ?? catalogSize;
+                            // The state records the local file's size: a sealed header's plaintext size.
+                            if ((sink.SealedPlaintextSize ?? declaredWireSize) is { } localSize)
+                            {
+                                state.SizeBytes = localSize;
                             }
 
                             break;
@@ -642,7 +682,7 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                             }
 
                             written += response.Chunk.Length;
-                            if (state.SizeBytes is { } limit && written > limit)
+                            if (declaredWireSize is { } limit && written > limit)
                             {
                                 throw new InvalidOperationException(
                                     $"Workspace file stream exceeded its declared size of {limit} bytes.");
@@ -655,7 +695,7 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                             }
 
                             hash.AppendData(response.Chunk.Span);
-                            await destination.WriteAsync(response.Chunk.Memory, cancellationToken).ConfigureAwait(false);
+                            await sinkSlot.Current.WriteAsync(response.Chunk.Memory, cancellationToken).ConfigureAwait(false);
                             break;
                     }
                 }
@@ -667,7 +707,7 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
 
                 // A stream that ends early or carries other bytes must not become the input
                 // the editor reads: nothing is committed unless size and digest match.
-                if (state.SizeBytes is { } expectedSize && written != expectedSize)
+                if (declaredWireSize is { } expectedSize && written != expectedSize)
                 {
                     throw new InvalidOperationException(
                         $"Workspace file stream size mismatch: expected {expectedSize} bytes but received {written} bytes.");
@@ -679,6 +719,7 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                     throw new InvalidOperationException("Workspace file stream SHA-256 mismatch.");
                 }
 
+                await sinkSlot.Current.CompleteAsync(cancellationToken).ConfigureAwait(false);
                 await destination.FlushAsync(cancellationToken).ConfigureAwait(false);
                 if (state.ModifiedUtc.HasValue)
                 {

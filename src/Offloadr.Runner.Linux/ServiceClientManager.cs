@@ -474,6 +474,10 @@ internal static class ServiceClientManager
         public required Action<string?> SetDownloadActiveSession { get; init; }
         public required Func<Action, CancellationToken, Task> ActivateSession { get; init; }
         public required CancellationToken Shutdown { get; init; }
+        /// <summary>What a started session's runtime got, for its start acknowledgement.</summary>
+        public Func<string, SessionSealingStatus?>? GetSessionSealing { get; init; }
+        /// <summary>Artifacts lost when the session's data was removed, for its stop acknowledgement.</summary>
+        public Func<string, int>? GetUnsavedArtifactCount { get; init; }
     }
 
     internal sealed class RunnerCommandWorkState(CancellationToken shutdown)
@@ -483,6 +487,8 @@ internal static class ServiceClientManager
         // Retain successful Stops for the process lifetime, including reconnects.
         // Evicting a nonce would allow a delayed retry to stop a replacement runtime.
         public ConcurrentDictionary<Guid, StopCommandWork> Stops { get; } = new();
+        // The sealing each logical session was started with; a relaunch of its runtime keeps it.
+        public ConcurrentDictionary<string, SessionSealing> SessionSealing { get; } = new(StringComparer.Ordinal);
         private TrackedCommandWork? _activeStartup;
 
         public TrackedCommandWork? GetActiveStartup()
@@ -532,6 +538,8 @@ internal static class ServiceClientManager
             // the original spelling in every replay of the acknowledgement.
             delivery = delivery.Clone();
             delivery.CommandId = Acknowledgement.CommandId;
+            // Filled in from the completed stop, never by a delivery.
+            delivery.UnsavedArtifactCount = Acknowledgement.UnsavedArtifactCount;
             return Acknowledgement.Equals(delivery);
         }
     }
@@ -1005,7 +1013,8 @@ internal static class ServiceClientManager
                 supportedEditorTemplates,
                 minBackoff,
                 maxBackoff,
-                initialStatusApplied);
+                initialStatusApplied,
+                sessionManager.DescribeSealedStorage);
             var localModelTask = localModelSnapshotProvider is null
                 ? Task.CompletedTask
                 : RunLocalModelSyncLoopAsync(
@@ -1068,7 +1077,8 @@ internal static class ServiceClientManager
         IReadOnlyList<string> supportedEditorTemplates,
         TimeSpan minBackoff,
         TimeSpan maxBackoff,
-        TaskCompletionSource initialStatusApplied)
+        TaskCompletionSource initialStatusApplied,
+        Func<RunnerSealedStorage>? describeSealedStorage = null)
     {
         ArgumentNullException.ThrowIfNull(sessionSink);
 
@@ -1086,7 +1096,7 @@ internal static class ServiceClientManager
                 }
 
                 var response = await sessionSink.RegisterRunnerAsync(
-                    BuildStatusUpdateRequest(runnerId, instanceId, version, resources, getActiveSessionId, supportedEditorTemplates),
+                    BuildStatusUpdateRequest(runnerId, instanceId, version, resources, getActiveSessionId, supportedEditorTemplates, describeSealedStorage),
                     shutdown).ConfigureAwait(false);
 
                 RunnerLog.Info(nameof(ServiceClientManager), $"Status update accepted={response.Accepted} message='{response.Message}' next={response.RefreshSeconds}s");
@@ -1362,6 +1372,8 @@ internal static class ServiceClientManager
             SetDownloadActiveSession = downloadService.SetActiveSession,
             ActivateSession = gpuPowerLimitService.ActivateSessionAsync,
             Shutdown = shutdown,
+            GetSessionSealing = sessionManager.GetSessionSealingStatus,
+            GetUnsavedArtifactCount = artifactUploadService.GetUnsavedUploadCount,
         };
 
         while (!shutdown.IsCancellationRequested)
@@ -2114,6 +2126,11 @@ internal static class ServiceClientManager
             if (!work.Completed)
             {
                 work.Completed = await ExecuteStopSessionCommandAsync(command, deps).ConfigureAwait(false);
+                if (work.Completed)
+                {
+                    work.Acknowledgement.UnsavedArtifactCount =
+                        (uint)Math.Max(0, deps.GetUnsavedArtifactCount?.Invoke(command.SessionId) ?? 0);
+                }
             }
 
             if (work.Completed && (work.AcknowledgementTask is null || work.AcknowledgementTask.IsCompleted))
@@ -2170,6 +2187,7 @@ internal static class ServiceClientManager
 
         deps.LogicalSessionState.ClearAndRetire(command.SessionId, command.LifecycleGeneration);
         deps.RuntimeIdentities.Remove(command.SessionId);
+        deps.WorkState.SessionSealing.TryRemove(command.SessionId, out _);
         return true;
     }
 
@@ -2258,6 +2276,14 @@ internal static class ServiceClientManager
         }
 
         deps.LogicalSessionState.ObserveAssignment(command.AssignmentSequence);
+        if (command.Sealing is { } sealing)
+        {
+            deps.WorkState.SessionSealing[command.SessionId] = sealing.Clone();
+        }
+        else
+        {
+            deps.WorkState.SessionSealing.TryRemove(command.SessionId, out _);
+        }
 
         return RunTrackedStartupAsync(
             deps,
@@ -2316,6 +2342,7 @@ internal static class ServiceClientManager
             {
                 ack.Ready = outcome.Ready;
                 ack.Message = outcome.Message;
+                ack.Sealing = outcome.Ready ? deps.GetSessionSealing?.Invoke(command.SessionId) : null;
                 return ack;
             },
             deps.Sink.AckStartSessionAsync,
@@ -2511,6 +2538,7 @@ internal static class ServiceClientManager
             LifecycleGeneration = command.LifecycleGeneration,
             RuntimeEpoch = command.RuntimeEpoch,
             RuntimeInstanceId = command.RuntimeInstanceId,
+            Sealing = deps.WorkState.SessionSealing.TryGetValue(command.SessionId, out var sealing) ? sealing.Clone() : null,
         };
         start.InitialModels.AddRange(command.InitialModels);
         start.InitialArtifacts.AddRange(command.InitialArtifacts);
@@ -3602,13 +3630,14 @@ internal static class ServiceClientManager
             getActiveSessionId,
             ["comfyui-latest", "comfyui-master"]);
 
-    private static RegisterRunnerRequest BuildStatusUpdateRequest(
+    internal static RegisterRunnerRequest BuildStatusUpdateRequest(
         string runnerId,
         string instanceId,
         string version,
         RunnerResources resources,
         Func<string> getActiveSessionId,
-        IReadOnlyList<string> supportedEditorTemplates)
+        IReadOnlyList<string> supportedEditorTemplates,
+        Func<RunnerSealedStorage>? describeSealedStorage = null)
     {
         // Refresh dynamic metrics each call
         resources.SystemRamBytes = ResourceDetection.GetTotalRamBytes();
@@ -3623,6 +3652,16 @@ internal static class ServiceClientManager
             Resources = resources
         };
         request.SupportedEditorTemplates.AddRange(supportedEditorTemplates);
+        try
+        {
+            request.SealedStorage = describeSealedStorage?.Invoke();
+        }
+        catch (Exception ex)
+        {
+            // A failed probe must not stop heartbeats; the runner then offers no sealed sessions.
+            RunnerLog.Warning(nameof(ServiceClientManager), $"Could not describe sealed storage: {ex.Message}");
+        }
+
         return request;
     }
 

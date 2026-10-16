@@ -434,6 +434,132 @@ public partial class SessionProcessManagerOwnershipTests
         }
     }
 
+    [Test]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public async Task SealedProfile_StartGetsItsTransferSealingAndReleasesItWithTheData()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        LinuxTestPrerequisites.RequireRoot();
+
+        var (tempRoot, sealedRoot, options) = CreateSealedOptions("comfyui");
+        options = WithSealing(options, new SealedStorageOptions { Mode = SealedStorageMode.Auto, Root = sealedRoot, MinimumBytes = 1 << 20 });
+        const string sessionId = "session-profile";
+        using var recipient = Offloadr.Runner.Core.Sealing.SealingKeyPair.Generate("output-1");
+        var start = SealedStart(sessionId);
+        start.Sealing = new SessionSealing { Required = true, OutputRecipient = SessionTransferSealingTests.ToMessage(recipient.PublicKey) };
+        SessionSealingStatus? statusDuringStart = null;
+        SessionTransferSealing? captured = null;
+
+        try
+        {
+            using var manager = new SessionProcessManager(options, new RecordingIsolationStrategy("sess_profile", Path.Combine(options.SessionRoot, sessionId)), new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
+
+            Assert.CatchAsync(() => manager.StartSessionAsync(
+                start,
+                (paths, _) =>
+                {
+                    captured = paths.TransferSealing;
+                    statusDuringStart = manager.GetSessionSealingStatus(sessionId);
+                    return Task.CompletedTask;
+                },
+                CancellationToken.None));
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(captured, Is.Not.Null);
+                Assert.That(statusDuringStart, Is.EqualTo(new SessionSealingStatus { MemoryWorkspace = true, EncryptedUploads = true, EncryptedReadsRequired = true }));
+                // The failed launch removed the data, then released the reader key.
+                Assert.That(manager.GetSessionSealingStatus(sessionId), Is.Null);
+                Assert.That(Directory.Exists(Path.Combine(sealedRoot, sessionId)), Is.False);
+            });
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+            TryDelete(sealedRoot);
+        }
+    }
+
+    [Test]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public void SealedProfile_IsRefusedBeforeProvisioningWithoutSealingOrARecipient()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+
+        var (tempRoot, sealedRoot, options) = CreateSealedOptions("comfyui");
+        const string sessionId = "session-profile-refused";
+        var homeDirectory = Path.Combine(options.SessionRoot, sessionId);
+        var isolation = new RecordingIsolationStrategy("sess_refused", homeDirectory);
+
+        try
+        {
+            var off = WithSealing(options, new SealedStorageOptions { Mode = SealedStorageMode.Off, Root = sealedRoot });
+            using (var manager = new SessionProcessManager(off, isolation, new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty)))
+            {
+                var start = SealedStart(sessionId);
+                start.Sealing = new SessionSealing { Required = true };
+                var ex = Assert.ThrowsAsync<InvalidOperationException>(() => manager.StartSessionAsync(start, CancellationToken.None));
+                Assert.That(ex!.Message, Does.Contain("does not offer sealed sessions"));
+            }
+
+            if (OperatingSystem.IsLinux() && Environment.UserName == "root")
+            {
+                using var manager = new SessionProcessManager(options, isolation, new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
+                var start = SealedStart(sessionId);
+                start.Sealing = new SessionSealing { Required = true };
+                var ex = Assert.ThrowsAsync<InvalidOperationException>(() => manager.StartSessionAsync(start, CancellationToken.None));
+                Assert.That(ex!.Message, Does.Contain("output recipient"));
+                Assert.That(manager.GetSessionSealingStatus(sessionId), Is.Null);
+            }
+
+            Assert.That(Directory.Exists(homeDirectory), Is.False);
+            Assert.That(isolation.CleanupCallCount, Is.Zero);
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+            TryDelete(sealedRoot);
+        }
+    }
+
+    [Test]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public void DescribeSealedStorage_ReportsModeBudgetAndAlgorithm()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        LinuxTestPrerequisites.RequireRoot();
+
+        var (tempRoot, sealedRoot, options) = CreateSealedOptions("comfyui");
+        try
+        {
+            using var manager = new SessionProcessManager(options, new RecordingIsolationStrategy("unused", Path.Combine(options.SessionRoot, "unused")), new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
+            using var off = new SessionProcessManager(
+                WithSealing(options, new SealedStorageOptions { Mode = SealedStorageMode.Off, Root = sealedRoot }),
+                new RecordingIsolationStrategy("unused", Path.Combine(options.SessionRoot, "unused")),
+                new RunnerVfsEnvironmentBuilder(),
+                new RecordingCommandRunner(string.Empty));
+
+            var described = manager.DescribeSealedStorage();
+            var disabled = off.DescribeSealedStorage();
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(described.Mode, Is.EqualTo(Offloadr.Runner.V1.SealedStorageMode.Required));
+                Assert.That(described.MemoryWorkspaceAvailable, Is.True);
+                Assert.That(described.BudgetBytes, Is.GreaterThan(0));
+                Assert.That(described.Algorithms, Is.EqualTo(new[] { Offloadr.Runner.Core.Sealing.SealedEnvelopeFormat.AlgorithmId }));
+                Assert.That(disabled.Mode, Is.EqualTo(Offloadr.Runner.V1.SealedStorageMode.Off));
+                Assert.That(disabled.MemoryWorkspaceAvailable, Is.False);
+                Assert.That(disabled.Algorithms, Is.Empty);
+            });
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+            TryDelete(sealedRoot);
+        }
+    }
+
     private static async Task WaitForFileAsync(string path)
     {
         var deadline = DateTime.UtcNow.AddSeconds(15);

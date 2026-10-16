@@ -714,6 +714,142 @@ public class WorkspaceMirrorServiceTests
         }
     }
 
+    [Test]
+    public async Task SealedSession_InputsAndSeedsOpenWithTheReaderKey()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        const string sessionId = "session-sealed-reads";
+        var tempRoot = CreateTempDirectory();
+        using var sealing = SessionTransferSealing.Create(sessionId, null, memoryWorkspace: true);
+
+        try
+        {
+            var paths = CreateSessionPaths(tempRoot) with { TransferSealing = sealing };
+            var readerKey = SessionTransferSealingTests.ReaderPublicKey(sealing);
+            var input = "private input image"u8.ToArray();
+            var (inputEnvelope, inputCiphertext) = await SessionTransferSealingTests.SealAsync(
+                readerKey,
+                new Offloadr.Runner.Core.Sealing.SealedWorkspaceFileIdentity(sessionId, "input", "photo.png"),
+                input);
+            var seed = CreateZipBytes(("workflows/w.json", "{\"sealed\":true}"));
+            var (seedEnvelope, seedCiphertext) = await SessionTransferSealingTests.SealAsync(
+                readerKey,
+                new Offloadr.Runner.Core.Sealing.SealedSeedArchiveIdentity(sessionId, "user"),
+                seed);
+            var workspaceClient = new FakeRunnerWorkspaceClient
+            {
+                SeedArchiveBytes = seedCiphertext,
+                SeedArchiveEnvelope = seedEnvelope,
+                RawFilesByRelativePath = new Dictionary<string, (byte[], SealedEnvelope?)>(StringComparer.Ordinal)
+                {
+                    ["photo.png"] = (inputCiphertext, inputEnvelope),
+                },
+            };
+            await using var service = new WorkspaceMirrorService(workspaceClient, "runner-secret-value", NullLogger<WorkspaceMirrorService>.Instance);
+
+            // The custom_nodes seed is the same sealed archive, which names the user root: it must not open.
+            var ex = Assert.ThrowsAsync<InvalidOperationException>(async () => await service.PrepareSessionAsync(
+                sessionId,
+                paths,
+                "editor-1",
+                "comfyui",
+                [new WorkspaceFileMetadata { Root = WorkspaceRoot.Input, RelativePath = "photo.png", SizeBytes = input.Length }],
+                CancellationToken.None));
+            Assert.That(ex!.Message, Does.Contain("did not open"));
+            Assert.That(File.ReadAllText(Path.Combine(paths.UserDirectory, "workflows", "w.json")), Is.EqualTo("{\"sealed\":true}"));
+            Assert.That(workspaceClient.SeedArchiveRequests, Is.EqualTo(new[] { WorkspaceRoot.User, WorkspaceRoot.CustomNodes }));
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+        }
+    }
+
+    [Test]
+    public async Task SealedSession_InputFileOpensWithTheReaderKey()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        const string sessionId = "session-sealed-input";
+        var tempRoot = CreateTempDirectory();
+        using var sealing = SessionTransferSealing.Create(sessionId, null, memoryWorkspace: true);
+
+        try
+        {
+            var paths = CreateSessionPaths(tempRoot) with { TransferSealing = sealing };
+            var input = "private input image"u8.ToArray();
+            var (envelope, ciphertext) = await SessionTransferSealingTests.SealAsync(
+                SessionTransferSealingTests.ReaderPublicKey(sealing),
+                new Offloadr.Runner.Core.Sealing.SealedWorkspaceFileIdentity(sessionId, "input", "photo.png"),
+                input);
+            var workspaceClient = new FakeRunnerWorkspaceClient
+            {
+                RawFilesByRelativePath = new Dictionary<string, (byte[], SealedEnvelope?)>(StringComparer.Ordinal)
+                {
+                    ["photo.png"] = (ciphertext, envelope),
+                },
+            };
+            await using var service = new WorkspaceMirrorService(workspaceClient, "runner-secret-value", NullLogger<WorkspaceMirrorService>.Instance);
+            await service.PrepareSessionAsync(
+                sessionId,
+                paths,
+                "editor-1",
+                "comfyui",
+                [new WorkspaceFileMetadata { Root = WorkspaceRoot.Input, RelativePath = "photo.png", SizeBytes = input.Length }],
+                CancellationToken.None);
+            var localPath = Path.Combine(paths.InputDirectory, "photo.png");
+
+            Assert.That(await service.TryEnsureWorkspaceFileAvailableAsync(localPath, highPriority: true, CancellationToken.None), Is.True);
+
+            Assert.That(await File.ReadAllBytesAsync(localPath), Is.EqualTo(input));
+            Assert.That(workspaceClient.DownloadRequests.Single().ReaderKey, Is.EqualTo(sealing.ReaderKeyMessage));
+            Assert.That(workspaceClient.SeedArchiveRequests, Is.Not.Empty);
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+        }
+    }
+
+    [Test]
+    public async Task SealedProfile_RefusesAPlaintextInput()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        const string sessionId = "session-sealed-refuse";
+        var tempRoot = CreateTempDirectory();
+        using var recipient = Offloadr.Runner.Core.Sealing.SealingKeyPair.Generate("output-1");
+        using var sealing = SessionTransferSealing.Create(
+            sessionId,
+            new SessionSealing { Required = true, OutputRecipient = SessionTransferSealingTests.ToMessage(recipient.PublicKey) },
+            memoryWorkspace: true);
+
+        try
+        {
+            var paths = CreateSessionPaths(tempRoot) with { TransferSealing = sealing };
+            var workspaceClient = new FakeRunnerWorkspaceClient
+            {
+                RawFilesByRelativePath = new Dictionary<string, (byte[], SealedEnvelope?)>(StringComparer.Ordinal)
+                {
+                    ["photo.png"] = ("plaintext"u8.ToArray(), null),
+                },
+            };
+            await using var service = new WorkspaceMirrorService(workspaceClient, "runner-secret-value", NullLogger<WorkspaceMirrorService>.Instance);
+
+            // The seed archives arrive unsealed too, so preparing the session already fails.
+            Assert.ThrowsAsync<InvalidOperationException>(async () => await service.PrepareSessionAsync(
+                sessionId,
+                paths,
+                "editor-1",
+                "comfyui",
+                [new WorkspaceFileMetadata { Root = WorkspaceRoot.Input, RelativePath = "photo.png", SizeBytes = 9 }],
+                CancellationToken.None));
+            Assert.That(Directory.EnumerateFiles(paths.UserDirectory, "*", SearchOption.AllDirectories), Is.Empty);
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+        }
+    }
+
     private static SessionProcessManager.SessionPaths CreateSessionPaths(string root)
     {
         var paths = new SessionProcessManager.SessionPaths
@@ -795,6 +931,9 @@ public class WorkspaceMirrorServiceTests
         public long? SeedArchiveDeclaredSize { get; init; }
         public string? SeedArchiveDeclaredSha256 { get; init; }
         public IReadOnlyDictionary<string, string> FileContentsByRelativePath { get; init; } = new Dictionary<string, string>(StringComparer.Ordinal);
+        /// <summary>Raw (for example sealed) contents with the envelope sent in their metadata; wins over FileContentsByRelativePath.</summary>
+        public IReadOnlyDictionary<string, (byte[] Content, SealedEnvelope? Envelope)> RawFilesByRelativePath { get; init; } = new Dictionary<string, (byte[], SealedEnvelope?)>(StringComparer.Ordinal);
+        public SealedEnvelope? SeedArchiveEnvelope { get; init; }
         public IReadOnlyDictionary<string, DateTime> FileModifiedUtcByRelativePath { get; init; } = new Dictionary<string, DateTime>(StringComparer.Ordinal);
         /// <summary>Metadata sizes that differ from the streamed content, as a faulty server might send.</summary>
         public IReadOnlyDictionary<string, long> DeclaredSizeByRelativePath { get; init; } = new Dictionary<string, long>(StringComparer.Ordinal);
@@ -819,7 +958,8 @@ public class WorkspaceMirrorServiceTests
                             {
                                 ContentType = "application/zip",
                                 SizeBytes = SeedArchiveDeclaredSize ?? SeedArchiveBytes.LongLength,
-                                Sha256 = SeedArchiveDeclaredSha256
+                                Sha256 = SeedArchiveDeclaredSha256,
+                                Envelope = SeedArchiveEnvelope
                             }
                         },
                         new RunnerWorkspaceServiceReadWorkspaceSeedArchiveResponse
@@ -847,6 +987,20 @@ public class WorkspaceMirrorServiceTests
             if (BlockingInputReader is not null)
             {
                 responseStream = BlockingInputReader;
+            }
+            else if (RawFilesByRelativePath.TryGetValue(request.RelativePath, out var raw))
+            {
+                responseStream = new SequenceAsyncStreamReader<RunnerWorkspaceServiceReadWorkspaceFileResponse>(
+                    [
+                        new RunnerWorkspaceServiceReadWorkspaceFileResponse
+                        {
+                            Metadata = new RunnerReadStreamMetadata { SizeBytes = raw.Content.LongLength, Envelope = raw.Envelope }
+                        },
+                        new RunnerWorkspaceServiceReadWorkspaceFileResponse
+                        {
+                            Chunk = Google.Protobuf.ByteString.CopyFrom(raw.Content)
+                        }
+                    ]);
             }
             else if (FileContentsByRelativePath.TryGetValue(request.RelativePath, out var content))
             {

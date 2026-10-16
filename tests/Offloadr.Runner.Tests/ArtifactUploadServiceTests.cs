@@ -1593,6 +1593,8 @@ public partial class ArtifactUploadServiceTests
         public Metadata? LastListHeaders { get; private set; }
         public Metadata? LastUploadHeaders { get; private set; }
         public byte[] ReadArtifactContent { get; set; } = [1, 2, 3, 4];
+        /// <summary>Sent with the read metadata; ReadArtifactContent then holds the ciphertext.</summary>
+        public SealedEnvelope? ReadArtifactEnvelope { get; set; }
         public DateTime ReadArtifactModifiedUtc { get; set; } = DateTime.UtcNow;
         public long? ReadArtifactMetadataSizeBytes { get; set; }
         public string? ReadArtifactSha256 { get; set; }
@@ -1668,7 +1670,8 @@ public partial class ArtifactUploadServiceTests
                             {
                                 SizeBytes = ReadArtifactMetadataSizeBytes ?? ReadArtifactContent.LongLength,
                                 Sha256 = string.IsNullOrWhiteSpace(ReadArtifactSha256) ? null : ReadArtifactSha256,
-                                ModifiedUtc = Timestamp.FromDateTime(ReadArtifactModifiedUtc)
+                                ModifiedUtc = Timestamp.FromDateTime(ReadArtifactModifiedUtc),
+                                Envelope = ReadArtifactEnvelope
                             }
                         },
                         new RunnerArtifactServiceReadArtifactResponse
@@ -1728,16 +1731,18 @@ public partial class ArtifactUploadServiceTests
             }
 
             var metadata = snapshot.FirstOrDefault(m => m.PayloadCase == RunnerArtifactServiceUploadArtifactRequest.PayloadOneofCase.Metadata)?.Metadata;
-            var chunkBytes = snapshot
+            var chunks = snapshot
                 .Where(m => m.PayloadCase == RunnerArtifactServiceUploadArtifactRequest.PayloadOneofCase.Chunk)
-                .Sum(m => (long)m.Chunk.Length);
+                .ToArray();
+            var chunkBytes = chunks.Sum(m => (long)m.Chunk.Length);
+            var payload = chunks.SelectMany(m => m.Chunk.ToByteArray()).ToArray();
 
-            _onComplete(new CapturedUpload(metadata, chunkBytes));
+            _onComplete(new CapturedUpload(metadata, chunkBytes, payload));
             return Task.CompletedTask;
         }
     }
 
-    private sealed record CapturedUpload(RunnerArtifactUploadMetadata? Metadata, long ChunkBytes);
+    private sealed record CapturedUpload(RunnerArtifactUploadMetadata? Metadata, long ChunkBytes, byte[] Payload);
 
     private sealed class SequenceAsyncStreamReader<T>(IReadOnlyList<T> messages) : IAsyncStreamReader<T>
     {

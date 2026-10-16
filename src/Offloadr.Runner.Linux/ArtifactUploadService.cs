@@ -1,5 +1,6 @@
 using Offloadr.Runner.V1;
 using Offloadr.EditorRuntime.V1;
+using Offloadr.Runner.Core.Sealing;
 using Google.Protobuf.WellKnownTypes;
 using Grpc.Core;
 using Microsoft.Extensions.Logging;
@@ -36,6 +37,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
     private readonly RuntimeIdentityRegistry? _runtimeIdentities;
     private readonly string _runnerId;
     private readonly ConcurrentDictionary<string, SessionUploader> _sessions = new(StringComparer.Ordinal);
+    private (string SessionId, int Count)? _lastStopped;
 
     public ArtifactUploadService(string? runnerSecret, RunnerArtifactService.RunnerArtifactServiceClient artifactClient, ILogger<ArtifactUploadService> logger, RuntimeIdentityRegistry? runtimeIdentities = null, string? runnerId = null)
     {
@@ -93,6 +95,12 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             await uploader.SeedSnapshotAsync(editorSid, owner, initialArtifacts, cancellationToken).ConfigureAwait(false);
         }
     }
+
+    /// <summary>Unsaved artifacts of the session whose uploads stopped most recently, for its stop acknowledgement.</summary>
+    public int GetUnsavedUploadCount(string sessionId)
+        => _lastStopped is { } stopped && string.Equals(stopped.SessionId, sessionId, StringComparison.Ordinal)
+            ? stopped.Count
+            : 0;
 
     internal int GetPendingUploadCount(string sessionId)
         => _sessions.TryGetValue(sessionId, out var uploader) ? uploader.PendingUploadCount : 0;
@@ -187,6 +195,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         }
 
         await uploader.StopAsync().ConfigureAwait(false);
+        _lastStopped = (sessionId, uploader.UnsavedUploadCount);
         if (uploader.UnsavedUploadCount > 0)
         {
             _logger.LogWarning(
@@ -1258,7 +1267,8 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         EditorSid = state.EditorSid,
                         Filename = state.Filename,
                         Type = state.Type,
-                        Subfolder = state.Subfolder
+                        Subfolder = state.Subfolder,
+                        ReaderKey = _paths.TransferSealing?.ReaderKeyMessage
                     },
                     headers: _authHeaders,
                     cancellationToken: token);
@@ -1287,6 +1297,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 long bytesWritten = 0;
                 long? expectedSizeBytes = null;
                 string? expectedSha256 = null;
+                using var sinkSlot = new SealedReadSinkSlot();
                 await using (var destination = publication.OpenWriteStream())
                 using (var hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA256))
                 {
@@ -1307,9 +1318,16 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                                 }
 
                                 expectedSha256 = string.IsNullOrWhiteSpace(metadata.Sha256) ? null : metadata.Sha256;
+                                var sink = sinkSlot.Replace(SealedReadSink.Open(
+                                    destination,
+                                    metadata.Envelope,
+                                    _paths.TransferSealing,
+                                    () => new SealedArtifactIdentity(_sessionId, state.EditorSid, state.Type, state.Subfolder, state.Filename)));
+                                // The catalog records the local file's size: the plaintext a sealed
+                                // header declares, not its ciphertext on the wire.
                                 state.UpdateMetadata(
-                                    expectedSizeBytes,
-                                    expectedSha256,
+                                    sink.SealedPlaintextSize ?? expectedSizeBytes,
+                                    sink.IsSealed ? null : expectedSha256,
                                     ToDateTimeOffset(metadata.ModifiedUtc));
                                 break;
                             case RunnerArtifactServiceReadArtifactResponse.PayloadOneofCase.Chunk:
@@ -1320,14 +1338,14 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
                                 // Bound the write as it happens, so a stream larger than declared
                                 // (or unbounded, when no size is declared) cannot fill the disk.
-                                var limit = expectedSizeBytes ?? MaxUploadBytes;
+                                var limit = expectedSizeBytes ?? sinkSlot.Current.SealedCiphertextSize ?? MaxUploadBytes;
                                 if (bytesWritten + response.Chunk.Length > limit)
                                 {
                                     throw new InvalidOperationException(
                                         $"Artifact stream exceeds its {(expectedSizeBytes.HasValue ? "declared size" : "size limit")} of {limit} bytes.");
                                 }
 
-                                await destination.WriteAsync(response.Chunk.Memory, cancellationToken).ConfigureAwait(false);
+                                await sinkSlot.Current.WriteAsync(response.Chunk.Memory, cancellationToken).ConfigureAwait(false);
                                 hasher.AppendData(response.Chunk.Memory.Span);
                                 bytesWritten += response.Chunk.Length;
                                 break;
@@ -1352,6 +1370,9 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                             throw new InvalidOperationException("Artifact stream SHA-256 mismatch.");
                         }
                     }
+
+                    // A sealed payload is usable only once its final chunk has verified.
+                    await sinkSlot.Current.CompleteAsync(cancellationToken).ConfigureAwait(false);
                 }
 
                 try
@@ -1714,6 +1735,18 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         SizeBytes = sizeBytes
                     };
 
+                    // Every attempt seals afresh: a new data key and encapsulation, never a resend.
+                    using var writer = _paths.TransferSealing?.OutputRecipient is { } recipient
+                        ? SealedEnvelopeWriter.Create(
+                            recipient,
+                            new SealedArtifactIdentity(_sessionId, _editorSid, type, subfolder, fileName),
+                            sizeBytes)
+                        : null;
+                    if (writer is not null)
+                    {
+                        metadata.Envelope = SessionTransferSealing.ToMessage(writer.Envelope);
+                    }
+
                     if (!string.IsNullOrWhiteSpace(_owner))
                     {
                         metadata.Owner = _owner;
@@ -1742,11 +1775,24 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     var call = _artifactClient.UploadArtifact(headers: _authHeaders, cancellationToken: _cts.Token);
                     await call.RequestStream.WriteAsync(new RunnerArtifactServiceUploadArtifactRequest { Metadata = metadata }).ConfigureAwait(false);
 
+                    if (writer is not null)
+                    {
+                        // Seal exactly the size declared in the header, even if the file grows.
+                        await using var limited = new LengthLimitedReadStream(stream, sizeBytes);
+                        await foreach (var sealedChunk in writer.EncryptChunksAsync(limited, _cts.Token).ConfigureAwait(false))
+                        {
+                            await call.RequestStream.WriteAsync(new RunnerArtifactServiceUploadArtifactRequest
+                            {
+                                Chunk = Google.Protobuf.ByteString.CopyFrom(sealedChunk.Span)
+                            }).ConfigureAwait(false);
+                        }
+                    }
+
                     var buffer = ArrayPool<byte>.Shared.Rent(128 * 1024);
                     try
                     {
                         // Send at most the size declared in the metadata, even if the file grows.
-                        var remaining = sizeBytes;
+                        var remaining = writer is null ? sizeBytes : 0;
                         int read;
                         while (remaining > 0 &&
                                (read = await stream.ReadAsync(buffer.AsMemory(0, (int)Math.Min(buffer.Length, remaining)), _cts.Token).ConfigureAwait(false)) > 0)
