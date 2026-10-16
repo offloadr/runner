@@ -46,9 +46,10 @@ jobs:
       - name: Install native prerequisites
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends git gcc libc6-dev aria2
+          apt-get install -y --no-install-recommends git gcc libc6-dev aria2 nodejs
           gcc --version
           aria2c --version
+          node --version
 
       - uses: actions/checkout@v7
 
