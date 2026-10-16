@@ -26,7 +26,7 @@ public partial class SessionProcessManagerOwnershipTests
 
         try
         {
-            using var manager = new SessionProcessManager(options, new RecordingIsolationStrategy("sess_sealed", homeDirectory), new RunnerVfsEnvironmentBuilder(), commands);
+            using var manager = new SessionProcessManager(options, new RecordingIsolationStrategy("sess_sealed", homeDirectory), SealedVfsBuilder(), commands);
 
             // The entry point does not exist, so the launch fails after provisioning.
             Assert.CatchAsync(() => manager.StartSessionAsync(
@@ -105,7 +105,7 @@ public partial class SessionProcessManagerOwnershipTests
 
         try
         {
-            using var manager = new SessionProcessManager(options, isolation, new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
+            using var manager = new SessionProcessManager(options, isolation, SealedVfsBuilder(), new RecordingCommandRunner(string.Empty));
 
             var ex = Assert.ThrowsAsync<InvalidOperationException>(() => manager.StartSessionAsync(SealedStart(sessionId), CancellationToken.None));
 
@@ -133,7 +133,7 @@ public partial class SessionProcessManagerOwnershipTests
 
         try
         {
-            using var manager = new SessionProcessManager(options, new RecordingIsolationStrategy("sess_planted", Path.Combine(options.SessionRoot, sessionId)), new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
+            using var manager = new SessionProcessManager(options, new RecordingIsolationStrategy("sess_planted", Path.Combine(options.SessionRoot, sessionId)), SealedVfsBuilder(), new RecordingCommandRunner(string.Empty));
 
             var ex = Assert.ThrowsAsync<InvalidOperationException>(() => manager.StartSessionAsync(SealedStart(sessionId), CancellationToken.None));
 
@@ -163,7 +163,7 @@ public partial class SessionProcessManagerOwnershipTests
 
         try
         {
-            using var manager = new SessionProcessManager(options, new RecordingIsolationStrategy("sess_forge", homeDirectory), new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
+            using var manager = new SessionProcessManager(options, new RecordingIsolationStrategy("sess_forge", homeDirectory), SealedVfsBuilder(), new RecordingCommandRunner(string.Empty));
 
             try
             {
@@ -268,7 +268,7 @@ public partial class SessionProcessManagerOwnershipTests
 
         try
         {
-            using var manager = new SessionProcessManager(options, new RecordingIsolationStrategy(identity.UserName, identity.HomeDirectory), new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
+            using var manager = new SessionProcessManager(options, new RecordingIsolationStrategy(identity.UserName, identity.HomeDirectory), SealedVfsBuilder(), new RecordingCommandRunner(string.Empty));
 
             var psi = manager.BuildManagerUvSyncStartInfo("s", identity, paths);
 
@@ -295,7 +295,7 @@ public partial class SessionProcessManagerOwnershipTests
 
         try
         {
-            using var manager = new SessionProcessManager(options, new RecordingIsolationStrategy("unused", Path.Combine(options.SessionRoot, "unused")), new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
+            using var manager = new SessionProcessManager(options, new RecordingIsolationStrategy("unused", Path.Combine(options.SessionRoot, "unused")), SealedVfsBuilder(), new RecordingCommandRunner(string.Empty));
 
             await manager.CleanupStaleSessionsAsync(CancellationToken.None);
 
@@ -378,7 +378,7 @@ public partial class SessionProcessManagerOwnershipTests
 
         try
         {
-            using var manager = new SessionProcessManager(options, new RecordingIsolationStrategy(string.Empty, homeDirectory), new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
+            using var manager = new SessionProcessManager(options, new RecordingIsolationStrategy(string.Empty, homeDirectory), SealedVfsBuilder(), new RecordingCommandRunner(string.Empty));
             await manager.StartSessionAsync(SealedStart(sessionId), CancellationToken.None);
             await WaitForFileAsync(Path.Combine(sealedDirectory, "output", ".written"));
 
@@ -418,7 +418,7 @@ public partial class SessionProcessManagerOwnershipTests
 
         try
         {
-            using var manager = new SessionProcessManager(options, new RecordingIsolationStrategy(string.Empty, Path.Combine(options.SessionRoot, sessionId)), new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
+            using var manager = new SessionProcessManager(options, new RecordingIsolationStrategy(string.Empty, Path.Combine(options.SessionRoot, sessionId)), SealedVfsBuilder(), new RecordingCommandRunner(string.Empty));
             await manager.StartSessionAsync(SealedStart(sessionId), CancellationToken.None);
             Assert.That(Directory.Exists(sealedDirectory), Is.True);
 
@@ -455,7 +455,7 @@ public partial class SessionProcessManagerOwnershipTests
 
         try
         {
-            using var manager = new SessionProcessManager(options, new RecordingIsolationStrategy("sess_profile", Path.Combine(options.SessionRoot, sessionId)), new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
+            using var manager = new SessionProcessManager(options, new RecordingIsolationStrategy("sess_profile", Path.Combine(options.SessionRoot, sessionId)), SealedVfsBuilder(), new RecordingCommandRunner(string.Empty));
 
             Assert.CatchAsync(() => manager.StartSessionAsync(
                 start,
@@ -497,7 +497,7 @@ public partial class SessionProcessManagerOwnershipTests
         try
         {
             var off = WithSealing(options, new SealedStorageOptions { Mode = SealedStorageMode.Off, Root = sealedRoot });
-            using (var manager = new SessionProcessManager(off, isolation, new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty)))
+            using (var manager = new SessionProcessManager(off, isolation, SealedVfsBuilder(), new RecordingCommandRunner(string.Empty)))
             {
                 var start = SealedStart(sessionId);
                 start.Sealing = new SessionSealing { Required = true };
@@ -507,7 +507,7 @@ public partial class SessionProcessManagerOwnershipTests
 
             if (OperatingSystem.IsLinux() && Environment.UserName == "root")
             {
-                using var manager = new SessionProcessManager(options, isolation, new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
+                using var manager = new SessionProcessManager(options, isolation, SealedVfsBuilder(), new RecordingCommandRunner(string.Empty));
                 var start = SealedStart(sessionId);
                 start.Sealing = new SessionSealing { Required = true };
                 var ex = Assert.ThrowsAsync<InvalidOperationException>(() => manager.StartSessionAsync(start, CancellationToken.None));
@@ -535,11 +535,11 @@ public partial class SessionProcessManagerOwnershipTests
         var (tempRoot, sealedRoot, options) = CreateSealedOptions("comfyui");
         try
         {
-            using var manager = new SessionProcessManager(options, new RecordingIsolationStrategy("unused", Path.Combine(options.SessionRoot, "unused")), new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
+            using var manager = new SessionProcessManager(options, new RecordingIsolationStrategy("unused", Path.Combine(options.SessionRoot, "unused")), SealedVfsBuilder(), new RecordingCommandRunner(string.Empty));
             using var off = new SessionProcessManager(
                 WithSealing(options, new SealedStorageOptions { Mode = SealedStorageMode.Off, Root = sealedRoot }),
                 new RecordingIsolationStrategy("unused", Path.Combine(options.SessionRoot, "unused")),
-                new RunnerVfsEnvironmentBuilder(),
+                SealedVfsBuilder(),
                 new RecordingCommandRunner(string.Empty));
 
             var described = manager.DescribeSealedStorage();
@@ -625,6 +625,47 @@ public partial class SessionProcessManagerOwnershipTests
             ReadyHost = options.ReadyHost,
             Sealing = options.Sealing,
         };
+
+    [Test]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public void StartSessionAsync_SealedRefusesWithoutTheShimThatPreventsCoreDumps()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        LinuxTestPrerequisites.RequireRoot();
+
+        var (tempRoot, sealedRoot, options) = CreateSealedOptions("comfyui");
+        const string sessionId = "session-no-shim";
+        var homeDirectory = Path.Combine(options.SessionRoot, sessionId);
+        var missingShim = new RunnerVfsEnvironmentBuilder { DefaultVfsLibraryPath = Path.Combine(tempRoot, "missing.so") };
+
+        try
+        {
+            using var manager = new SessionProcessManager(options, new RecordingIsolationStrategy("sess_no_shim", homeDirectory), missingShim, new RecordingCommandRunner(string.Empty));
+
+            var ex = Assert.ThrowsAsync<InvalidOperationException>(() => manager.StartSessionAsync(SealedStart(sessionId), CancellationToken.None));
+
+            Assert.That(ex!.Message, Does.Contain("non-dumpable"));
+            Assert.That(Directory.Exists(homeDirectory), Is.False);
+            Assert.That(manager.DescribeSealedStorage().MemoryWorkspaceAvailable, Is.False);
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+            TryDelete(sealedRoot);
+        }
+    }
+
+    /// <summary>A builder whose shim exists, as in the images; the file is not a real library.</summary>
+    private static RunnerVfsEnvironmentBuilder SealedVfsBuilder()
+    {
+        var shim = Path.Combine(Path.GetTempPath(), "runner-sealed-tests-shim.so");
+        if (!File.Exists(shim))
+        {
+            File.WriteAllText(shim, string.Empty);
+        }
+
+        return new RunnerVfsEnvironmentBuilder { DefaultVfsLibraryPath = shim };
+    }
 
     private static StartSessionCommand SealedStart(string sessionId, string runtimeKind = "comfyui")
         => new()

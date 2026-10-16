@@ -87,6 +87,8 @@ public sealed class SessionTransferSealing : IDisposable
             throw new InvalidOperationException("A sealed session needs a memory-backed workspace.");
         }
 
+        // The private key must never reach a core dump of the agent.
+        LinuxProcessHardening.DisableCoreDumps();
         var readerKey = SealingKeyPair.Generate($"reader-{Guid.NewGuid():N}");
         return new SessionTransferSealing(sessionId, memoryWorkspace, profileRequired, recipient, readerKey);
     }

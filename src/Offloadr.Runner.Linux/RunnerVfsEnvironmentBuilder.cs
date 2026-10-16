@@ -61,6 +61,10 @@ public sealed class RunnerVfsEnvironmentBuilder
     public string DefaultExtensions { get; init; } = ".safetensors,.pt,.pth,.bin,.ckpt,.onnx,.emb,.gguf";
     public string DefaultLogValue { get; init; } = "0";
 
+    /// <summary>Whether the shim that makes session processes non-dumpable is installed.</summary>
+    public bool CanDisableCoreDumps(Func<string, string?>? getEnv = null, Func<string, bool>? fileExists = null)
+        => (fileExists ?? File.Exists)((getEnv ?? Environment.GetEnvironmentVariable)("RUNNER_VFS_LIB") ?? DefaultVfsLibraryPath);
+
     /// <summary>
     /// Loads the shim into a process that reads no models or artifacts, only so it becomes
     /// non-dumpable: no roots are managed. Empty when the library is missing.

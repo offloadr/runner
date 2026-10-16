@@ -1120,7 +1120,7 @@ internal sealed partial class SessionProcessManager : IDisposable
                 SealedStorageMode.Auto => Offloadr.Runner.V1.SealedStorageMode.Auto,
                 _ => Offloadr.Runner.V1.SealedStorageMode.Required,
             },
-            MemoryWorkspaceAvailable = status.Available,
+            MemoryWorkspaceAvailable = status.Available && _vfsEnvironmentBuilder.CanDisableCoreDumps(),
             BudgetBytes = status.BudgetBytes is > 0 and var budget ? (ulong)budget : 0,
         };
         if (_sealing.Mode != SealedStorageMode.Off)
@@ -1163,6 +1163,12 @@ internal sealed partial class SessionProcessManager : IDisposable
         if (!status.Available)
         {
             throw new InvalidOperationException($"Sealed storage is unavailable: {status.Reason}.");
+        }
+
+        // Without the shim, session processes would stay dumpable.
+        if (!_vfsEnvironmentBuilder.CanDisableCoreDumps())
+        {
+            throw new InvalidOperationException("Sealed storage is unavailable: the VFS shim that makes session processes non-dumpable is missing.");
         }
     }
 
