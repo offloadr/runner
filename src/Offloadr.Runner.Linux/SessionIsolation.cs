@@ -54,6 +54,9 @@ public sealed class LinuxUserIsolationStrategy : ISessionIsolationStrategy
     }
 
     public void ValidatePrerequisites(ICollection<string> errors)
+        => ValidatePrerequisites(errors, File.Exists);
+
+    internal void ValidatePrerequisites(ICollection<string> errors, Func<string, bool> fileExists)
     {
         ArgumentNullException.ThrowIfNull(errors);
 
@@ -62,24 +65,34 @@ public sealed class LinuxUserIsolationStrategy : ISessionIsolationStrategy
             errors.Add("Linux user isolation requires running as root so useradd/chown/userdel can execute.");
         }
 
-        if (!File.Exists("/usr/bin/id"))
+        if (!fileExists("/usr/bin/id"))
         {
             errors.Add("Missing '/usr/bin/id' required for Linux user isolation.");
         }
 
-        if (!File.Exists("/usr/sbin/useradd"))
+        if (!fileExists("/usr/sbin/useradd"))
         {
             errors.Add("Missing '/usr/sbin/useradd' required for Linux user isolation.");
         }
 
-        if (!File.Exists("/bin/chown"))
+        if (!fileExists("/bin/chown"))
         {
             errors.Add("Missing '/bin/chown' required for Linux user isolation.");
         }
 
-        if (!File.Exists("/usr/sbin/userdel"))
+        if (!fileExists("/usr/sbin/userdel"))
         {
             errors.Add("Missing '/usr/sbin/userdel' required for Linux user isolation.");
+        }
+
+        // A session's System V IPC objects are removed as its user; without these a teardown
+        // after any such object could never complete.
+        foreach (var tool in new[] { "/usr/sbin/runuser", "/usr/bin/ipcrm" })
+        {
+            if (!fileExists(tool))
+            {
+                errors.Add($"Missing '{tool}' (util-linux) required to remove session users' IPC objects.");
+            }
         }
     }
 

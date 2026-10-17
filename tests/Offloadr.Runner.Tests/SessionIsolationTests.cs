@@ -171,6 +171,18 @@ public class SessionIsolationTests
     }
 
     [Test]
+    public void ValidatePrerequisites_NeedsTheToolsThatRemoveIpcObjects()
+    {
+        var strategy = new LinuxUserIsolationStrategy(new RecordingCommandRunner(userExists: true), static (_, _) => Task.FromResult(true), residueRoots: []);
+        var errors = new List<string>();
+
+        strategy.ValidatePrerequisites(errors, static path => path is not ("/usr/sbin/runuser" or "/usr/bin/ipcrm"));
+
+        Assert.That(errors, Has.Some.Contains("/usr/sbin/runuser"));
+        Assert.That(errors, Has.Some.Contains("/usr/bin/ipcrm"));
+    }
+
+    [Test]
     public void CleanupAsync_FailsWhenUserdelFails()
     {
         var runner = new RecordingCommandRunner(userExists: true, userdelExitCode: 12);
