@@ -480,6 +480,8 @@ internal static class ServiceClientManager
         public required CancellationToken Shutdown { get; init; }
         /// <summary>What a started session's runtime got, for its start acknowledgement.</summary>
         public Func<string, SessionSealingStatus?>? GetSessionSealing { get; init; }
+        /// <summary>Whether this runner seals a start that does not ask for it (required mode).</summary>
+        public Func<StartSessionCommand, bool>? SealsStart { get; init; }
         /// <summary>Takes the artifacts the session lost when its runtimes' data was removed, for its stop acknowledgement.</summary>
         public Func<string, int>? TakeUnsavedArtifactCount { get; init; }
     }
@@ -1377,6 +1379,7 @@ internal static class ServiceClientManager
             ActivateSession = gpuPowerLimitService.ActivateSessionAsync,
             Shutdown = shutdown,
             GetSessionSealing = sessionManager.GetSessionSealingStatus,
+            SealsStart = start => start.Sealing?.Required != true && sessionManager.ShouldSeal(start),
             TakeUnsavedArtifactCount = artifactUploadService.TakeUnsavedUploadCount,
         };
 
@@ -2350,7 +2353,7 @@ internal static class ServiceClientManager
                 }
                 catch (Exception ex)
                 {
-                    RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed to start session {command.SessionId}: {ex.Message}");
+                    LogStartFailure(command, deps, ex, $"Failed to start session {command.SessionId}");
                     await CleanUpFailedStartupAsync(command.SessionId, runtimeIdentity, deps).ConfigureAwait(false);
                     return new StartupOutcome(false, ex.Message);
                 }
@@ -2364,6 +2367,22 @@ internal static class ServiceClientManager
             },
             deps.Sink.AckStartSessionAsync,
             command.SessionId);
+    }
+
+    /// <summary>
+    /// Logs why a start or launch failed. For a sealed one only the exception's type is logged: its
+    /// message can name session files (a workspace seed's entries, say), and the console reaches
+    /// the host's disk. The acknowledgement still carries the message to the control plane.
+    /// </summary>
+    private static void LogStartFailure(StartSessionCommand start, RuntimeCommandDependencies deps, Exception ex, string context)
+    {
+        if (start.Sealing?.Required == true || deps.SealsStart?.Invoke(start) == true)
+        {
+            RunnerLog.Error(nameof(ServiceClientManager), $"{context}: {ex.GetType().Name} (details withheld for a sealed session).");
+            return;
+        }
+
+        RunnerLog.Error(nameof(ServiceClientManager), ex, $"{context}: {ex.Message}");
     }
 
     internal static async Task HandleQuiesceRuntimeCommandAsync(
@@ -2579,7 +2598,7 @@ internal static class ServiceClientManager
                 }
                 catch (Exception ex)
                 {
-                    RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed launching runtime for restart {command.RestartId}: {ex.Message}");
+                    LogStartFailure(start, deps, ex, $"Failed launching runtime for restart {command.RestartId}");
                     // Clean up only this launch's runtime, never a valid runtime of
                     // another identity that happens to share the session id.
                     await CleanUpFailedStartupAsync(command.SessionId, runtimeIdentity, deps).ConfigureAwait(false);

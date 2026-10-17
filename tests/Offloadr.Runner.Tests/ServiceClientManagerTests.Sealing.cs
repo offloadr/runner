@@ -1,5 +1,6 @@
 namespace Offloadr.Runner.Tests;
 
+using Microsoft.Extensions.Logging;
 using Offloadr.Runner.V1;
 
 public partial class ServiceClientManagerTests
@@ -34,6 +35,49 @@ public partial class ServiceClientManagerTests
         Assert.That(ack.Ready, Is.False);
         Assert.That(ack.Message, Does.Contain("Sealed storage is unavailable"));
         Assert.That(ack.Sealing, Is.Null);
+    }
+
+    [TestCase(true, false)]
+    [TestCase(false, true)]
+    [TestCase(false, false)]
+    public async Task FailedSealedStart_LogsNoSessionFileNames(bool sealingRequested, bool sealedByRunner)
+    {
+        var logs = new List<string>();
+        using var loggerFactory = LoggerFactory.Create(builder => builder.AddProvider(new ConsoleLikeLoggerProvider(logs)));
+        RunnerLog.Configure(loggerFactory);
+        try
+        {
+            var harness = new RuntimeCommandHarness
+            {
+                BeforeStart = (_, _) => throw new InvalidOperationException("Workspace seed entry 'my-secret-portrait.png' is invalid."),
+                SealsStart = _ => sealedByRunner,
+            };
+            var start = sealingRequested ? SealedStart(7, 3, InstanceA) : Start(7, 3, InstanceA);
+
+            await ServiceClientManager.HandleStartSessionCommand(start, harness.Deps);
+
+            var ack = await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
+            Assert.That(ack.Message, Does.Contain("my-secret-portrait.png"), "the control plane still learns why");
+            List<string> lines;
+            lock (logs)
+            {
+                lines = [.. logs];
+            }
+
+            if (sealingRequested || sealedByRunner)
+            {
+                Assert.That(lines, Has.None.Contains("my-secret-portrait"));
+                Assert.That(lines, Has.Some.Contains("InvalidOperationException"));
+            }
+            else
+            {
+                Assert.That(lines, Has.Some.Contains("my-secret-portrait.png"));
+            }
+        }
+        finally
+        {
+            RunnerLog.Configure(null);
+        }
     }
 
     [Test]
@@ -169,6 +213,39 @@ public partial class ServiceClientManagerTests
 
         Assert.That(request.SealedStorage, Is.EqualTo(sealedStorage));
         Assert.That(failing.SealedStorage, Is.Null, "a failed probe offers no sealed sessions but keeps heartbeating");
+    }
+
+    /// <summary>Records what a console sink would print: the message plus any attached exception.</summary>
+    private sealed class ConsoleLikeLoggerProvider(List<string> lines) : ILoggerProvider
+    {
+        public ILogger CreateLogger(string categoryName) => new Logger(lines);
+
+        public void Dispose()
+        {
+        }
+
+        private sealed class Logger(List<string> lines) : ILogger
+        {
+            public IDisposable? BeginScope<TState>(TState state)
+                where TState : notnull
+                => null;
+
+            public bool IsEnabled(LogLevel logLevel) => true;
+
+            public void Log<TState>(
+                LogLevel logLevel,
+                EventId eventId,
+                TState state,
+                Exception? exception,
+                Func<TState, Exception?, string> formatter)
+            {
+                var line = formatter(state, exception) + (exception is null ? string.Empty : " " + exception);
+                lock (lines)
+                {
+                    lines.Add(line);
+                }
+            }
+        }
     }
 
     private static StartSessionCommand SealedStart(ulong generation, ulong epoch, string instance)

@@ -1393,6 +1393,8 @@ public partial class ServiceClientManagerTests
         public string InstanceId { get; set; } = "process-1";
         public SessionSealingStatus? SealingStatus { get; set; }
 
+        public Func<StartSessionCommand, bool>? SealsStart { get; set; }
+
         /// <summary>Lost artifacts the next completed Stop takes, as the uploader keeps them.</summary>
         public int UnsavedArtifacts
         {
@@ -1481,6 +1483,7 @@ public partial class ServiceClientManagerTests
             },
             Shutdown = Shutdown.Token,
             GetSessionSealing = _ => SealingStatus,
+            SealsStart = SealsStart,
             TakeUnsavedArtifactCount = _ => Interlocked.Exchange(ref _unsavedArtifacts, 0),
         };
 
