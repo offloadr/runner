@@ -104,6 +104,34 @@ public class SealedProcessHardeningLinuxTests
     }
 
     [Test]
+    public async Task CoreSizeLimit_IsInheritedAndCannotBeRaisedByASessionUser()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        LinuxTestPrerequisites.RequireRoot();
+
+        // DisableCoreDumps itself would also make the test host non-dumpable, for good: only the
+        // limit it sets is applied here, and restored (as root) afterwards.
+        var original = LinuxProcessHardening.ReadCoreSizeLimit()!.Value;
+        try
+        {
+            Assert.That(LinuxProcessHardening.SetCoreSizeLimit(1, 1), Is.True);
+            await using var user = await LinuxTestUser.CreateAsync();
+
+            // A child as the session user sees the hard limit and cannot raise it.
+            var result = await VfsShimLinuxTests.RunProcessAsync(
+                "/usr/sbin/runuser",
+                ["-u", user.Name, "--", "/bin/sh", "-c", "ulimit -H -c; ulimit -H -c unlimited 2>/dev/null && echo raised || echo refused"],
+                Path.GetTempPath());
+
+            Assert.That(result.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries), Is.EqualTo(new[] { "0", "refused" }));
+        }
+        finally
+        {
+            LinuxProcessHardening.SetCoreSizeLimit(original.Soft, original.Hard);
+        }
+    }
+
+    [Test]
     public void ProcessHardening_ReadsTheDumpableFlag()
     {
         LinuxTestPrerequisites.RequireLinux();

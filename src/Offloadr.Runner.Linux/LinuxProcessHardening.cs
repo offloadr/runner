@@ -7,13 +7,41 @@ public static class LinuxProcessHardening
 {
     private const int PrGetDumpable = 3;
     private const int PrSetDumpable = 4;
+    private const int RlimitCore = 4;
 
     /// <summary>
     /// Makes this process non-dumpable: no core dump (even one piped to a host helper) and no
-    /// ptrace by same-uid processes. Returns false where it is not supported.
+    /// ptrace by same-uid processes. Its core size limit drops to 1 byte, hard limit included, so
+    /// processes started from it after this cannot dump either, even if their code sets itself
+    /// dumpable again: 1 byte is below any core file, and the kernel skips a piped core handler
+    /// at exactly that limit. Only a process with CAP_SYS_RESOURCE could raise it again, which
+    /// session users lack. Returns false where it is not supported.
     /// </summary>
     public static bool DisableCoreDumps()
-        => OperatingSystem.IsLinux() && prctl(PrSetDumpable, 0, 0, 0, 0) == 0;
+        => OperatingSystem.IsLinux() && prctl(PrSetDumpable, 0, 0, 0, 0) == 0 && LimitCoreSize(1);
+
+    /// <summary>The core size limits (soft, hard), or null where they cannot be read.</summary>
+    internal static (ulong Soft, ulong Hard)? ReadCoreSizeLimit()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            return null;
+        }
+
+        var limit = new Rlimit();
+        return getrlimit(RlimitCore, ref limit) == 0 ? (limit.Current, limit.Maximum) : null;
+    }
+
+    /// <summary>Sets both core size limits; raising them back needs root (tests only).</summary>
+    internal static bool SetCoreSizeLimit(ulong soft, ulong hard)
+    {
+        var limit = new Rlimit { Current = soft, Maximum = hard };
+        return OperatingSystem.IsLinux() && setrlimit(RlimitCore, ref limit) == 0;
+    }
+
+    private static bool LimitCoreSize(ulong bytes)
+        => ReadCoreSizeLimit() is { } current && current.Hard <= bytes && current.Soft <= bytes
+            || SetCoreSizeLimit(bytes, bytes);
 
     /// <summary>
     /// Makes this process non-dumpable, and throws on Linux when the host forbids it (a seccomp
@@ -38,6 +66,19 @@ public static class LinuxProcessHardening
         var value = prctl(PrGetDumpable, 0, 0, 0, 0);
         return value < 0 ? null : value;
     }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Rlimit
+    {
+        public ulong Current;
+        public ulong Maximum;
+    }
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int getrlimit(int resource, ref Rlimit limit);
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int setrlimit(int resource, ref Rlimit limit);
 
     [DllImport("libc", SetLastError = true, EntryPoint = "prctl")]
     private static extern int prctl(int option, nuint arg2, nuint arg3, nuint arg4, nuint arg5);
