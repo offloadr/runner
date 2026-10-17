@@ -162,11 +162,28 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
     {
         lock (_stopGate)
         {
+            // An unfenced Stop (no generation) is for whatever lifecycle the session has.
+            var unfenced = lifecycleGeneration == 0;
+
             // A stop still running has not counted yet: what it would find is not known.
             if (_stopping.TryGetValue(sessionId, out var inFlight) && !inFlight.Task.IsCompleted &&
-                inFlight.Uploader.LifecycleGeneration == lifecycleGeneration)
+                (unfenced || inFlight.Uploader.LifecycleGeneration == lifecycleGeneration))
             {
                 RecordWithoutWaiting(sessionId, inFlight);
+            }
+
+            if (unfenced)
+            {
+                UnsavedUploads all = default;
+                foreach (var key in _unsavedBySession.Keys.Where(key => key.SessionId == sessionId).ToArray())
+                {
+                    if (_unsavedBySession.TryRemove(key, out var lost))
+                    {
+                        all = all.Add(lost);
+                    }
+                }
+
+                return all;
             }
 
             foreach (var older in _unsavedBySession.Keys.Where(key => key.SessionId == sessionId && key.Generation < lifecycleGeneration))

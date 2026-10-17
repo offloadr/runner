@@ -177,6 +177,16 @@ public partial class ArtifactUploadServiceTests
 
             Assert.That(service.TakeUnsavedUploadCount("session-1", 2), Is.Zero, "the older lifecycle's loss is not this one's");
             Assert.That(service.TakeUnsavedUploadCount("session-1", 1), Is.Zero, "and is dropped once a newer lifecycle reported");
+
+            // An unfenced Stop (no generation) takes whatever the session lost, in any lifecycle.
+            identities.Set("session-1", 3, 1, "instance-3");
+            var third = CreateEvictionPaths(Path.Combine(root, "third"), sealedSession: true);
+            await service.StartSessionAsync("session-1", third, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            await File.WriteAllBytesAsync(Path.Combine(third.OutputDirectory, "late.png"), [4, 5, 6]);
+            await artifactClient.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            Assert.That(await service.StopSessionAsync("session-1"), Is.EqualTo(1));
+            Assert.That(service.TakeUnsavedUploadCount("session-1", 0), Is.EqualTo(1));
         }
         finally
         {

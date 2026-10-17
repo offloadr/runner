@@ -116,6 +116,26 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
+    public async Task LaunchRuntime_ThatWouldDropTheOutputRecipientIsRefused()
+    {
+        var harness = new RuntimeCommandHarness();
+        // Encrypted uploads without the full sealed profile.
+        var start = SealedStart(7, 3, InstanceA);
+        start.Sealing.Required = false;
+        await ServiceClientManager.HandleStartSessionCommand(start, harness.Deps);
+        await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
+        var startsBefore = harness.Starts.Count;
+
+        var launch = Launch(7, 4, InstanceB, revision: 1);
+        launch.Sealing = new SessionSealing();
+        await ServiceClientManager.HandleLaunchRuntimeCommand(launch, harness.Deps);
+
+        var ack = await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 1);
+        Assert.That(ack.Ready, Is.False);
+        Assert.That(harness.Starts, Has.Count.EqualTo(startsBefore));
+    }
+
+    [Test]
     public async Task LaunchRuntime_ThatWouldWeakenTheSessionsSealingIsRefused()
     {
         var harness = new RuntimeCommandHarness();
@@ -129,7 +149,7 @@ public partial class ServiceClientManagerTests
 
         var ack = await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 1);
         Assert.That(ack.Ready, Is.False);
-        Assert.That(ack.Message, Does.Contain("cannot run it unsealed"));
+        Assert.That(ack.Message, Does.Contain("cannot run it with less sealing"));
         Assert.That(harness.Starts, Has.Count.EqualTo(startsBefore), "no runtime was started");
     }
 
@@ -162,6 +182,25 @@ public partial class ServiceClientManagerTests
         {
             await Task.Delay(20);
         }
+    }
+
+    [Test]
+    public async Task Stop_WithAnUnknownCountReplaysTheSameAcknowledgement()
+    {
+        var harness = RunningHarness(7, 3, InstanceA);
+        harness.UnsavedArtifacts = 1;
+        harness.UnsavedArtifactsIncomplete = true;
+        var stop = Stop(7, 3, InstanceA);
+
+        await ServiceClientManager.HandleStopSessionCommandAsync(stop, harness.Deps);
+        var first = await harness.Sink.WaitForAsync(harness.Sink.StopAcks, 1);
+        // The first acknowledgement loop has ended; the control plane delivers the Stop again.
+        await Task.Delay(200);
+        await ServiceClientManager.HandleStopSessionCommandAsync(stop.Clone(), harness.Deps);
+        var replayed = await harness.Sink.WaitForAsync(harness.Sink.StopAcks, 2);
+
+        Assert.That(replayed, Is.EqualTo(first));
+        Assert.That(replayed.UnsavedArtifactsUnknown, Is.True);
     }
 
     [Test]

@@ -546,6 +546,7 @@ internal static class ServiceClientManager
             delivery.CommandId = Acknowledgement.CommandId;
             // Filled in from the completed stop, never by a delivery.
             delivery.UnsavedArtifactCount = Acknowledgement.UnsavedArtifactCount;
+            delivery.UnsavedArtifactsUnknown = Acknowledgement.UnsavedArtifactsUnknown;
             return Acknowledgement.Equals(delivery);
         }
     }
@@ -2581,8 +2582,11 @@ internal static class ServiceClientManager
             // The launch's own sealing wins; the start's covers a control plane that omits it.
             Sealing = command.Sealing?.Clone() ?? startSealing?.Clone(),
         };
-        // A restart keeps the logical session: it never runs it with less sealing than it started with.
-        var weakensSealing = startSealing?.Required == true && command.Sealing is { Required: false };
+        // A restart keeps the logical session: it never runs it with less sealing than it started
+        // with, neither unsealed nor without the output recipient that encrypts its uploads.
+        var weakensSealing = command.Sealing is { } launchSealing && startSealing is not null &&
+            ((startSealing.Required && !launchSealing.Required) ||
+             (startSealing.OutputRecipient is not null && launchSealing.OutputRecipient is null));
         start.InitialModels.AddRange(command.InitialModels);
         start.InitialArtifacts.AddRange(command.InitialArtifacts);
         start.InitialWorkspaceFiles.AddRange(command.InitialWorkspaceFiles);
@@ -2597,7 +2601,7 @@ internal static class ServiceClientManager
                 {
                     if (weakensSealing)
                     {
-                        throw new InvalidOperationException("The session started sealed; a runtime launch cannot run it unsealed.");
+                        throw new InvalidOperationException("The session started sealed; a runtime launch cannot run it with less sealing.");
                     }
 
                     await deps.StartRuntimeAndWaitForReady(start, cancellationToken).ConfigureAwait(false);
