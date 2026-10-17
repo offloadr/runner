@@ -713,6 +713,45 @@ public partial class SessionProcessManagerOwnershipTests
 
     private static string? HostLockedDown() => null;
 
+    [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "umask")]
+    private static extern uint SetUmask(uint mask);
+
+    [Test]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public void SealedSessionDirectory_StaysTraversableUnderARestrictiveUmask()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        LinuxTestPrerequisites.RequireRoot();
+
+        var (tempRoot, sealedRoot, options) = CreateSealedOptions("comfyui");
+        const string sessionId = "session-umask";
+        var sealedDirectory = Path.Combine(sealedRoot, sessionId);
+        UnixFileMode? modeDuringStart = null;
+        var previous = SetUmask(Convert.ToUInt32("077", 8));
+        try
+        {
+            using var manager = new SessionProcessManager(options, new RecordingIsolationStrategy("sess_umask", Path.Combine(options.SessionRoot, sessionId)), SealedVfsBuilder(), new RecordingCommandRunner(string.Empty)) { PrepareSealedHost = HostLockedDown };
+
+            // The entry point does not exist, so the launch fails after provisioning.
+            Assert.CatchAsync(() => manager.StartSessionAsync(
+                SealedStart(sessionId),
+                (_, _) =>
+                {
+                    modeDuringStart = File.GetUnixFileMode(sealedDirectory);
+                    return Task.CompletedTask;
+                },
+                CancellationToken.None));
+
+            Assert.That(modeDuringStart, Is.EqualTo(Mode0755));
+        }
+        finally
+        {
+            SetUmask(previous);
+            TryDelete(tempRoot);
+            TryDelete(sealedRoot);
+        }
+    }
+
     [Test]
     [System.Runtime.Versioning.SupportedOSPlatform("linux")]
     public async Task SealedTeardown_StaysPendingWhileItsDataCannotBeRemoved()

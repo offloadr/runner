@@ -1244,8 +1244,11 @@ internal sealed partial class SessionProcessManager : IDisposable
             throw new InvalidOperationException($"Sealed storage is unavailable: '{directory}' exists and is not a sealed session directory.");
         }
 
-        Directory.CreateDirectory(directory, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
-            UnixFileMode.GroupRead | UnixFileMode.GroupExecute | UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+        var traversable = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
+            UnixFileMode.GroupRead | UnixFileMode.GroupExecute | UnixFileMode.OtherRead | UnixFileMode.OtherExecute;
+        Directory.CreateDirectory(directory, traversable);
+        // The umask may have taken bits away; the session user must traverse this directory.
+        File.SetUnixFileMode(directory, traversable);
         // The marker is what lets cleanup tell this directory from anything else under the root.
         Directory.CreateDirectory(Path.Combine(directory, ".agent"), UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         using (var marker = new FileStream(
