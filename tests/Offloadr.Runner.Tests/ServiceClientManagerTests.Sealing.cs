@@ -21,6 +21,22 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
+    public async Task LaunchSeenWithoutItsStart_KeepsItsSealingForTheNextLaunch()
+    {
+        var harness = new RuntimeCommandHarness();
+        // This runner never saw the lifecycle's Start (a restart of the agent, say).
+        var first = Launch(7, 4, InstanceA, revision: 1);
+        first.Sealing = SealedStart(7, 4, InstanceA).Sealing;
+        await ServiceClientManager.HandleLaunchRuntimeCommand(first, harness.Deps);
+        await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 1);
+
+        await ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 5, InstanceB, revision: 2), harness.Deps);
+        await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 2);
+
+        Assert.That(harness.Starts.Last().Sealing, Is.EqualTo(first.Sealing), "the child's restart stays sealed");
+    }
+
+    [Test]
     public async Task RefusedLaunch_KeepsTheSealingForTheNextLaunch()
     {
         var harness = new RuntimeCommandHarness();

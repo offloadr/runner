@@ -2623,6 +2623,18 @@ internal static class ServiceClientManager
                     }
 
                     await deps.StartRuntimeAndWaitForReady(start, cancellationToken).ConfigureAwait(false);
+                    if (startSealing is null && command.Sealing is { } learned)
+                    {
+                        // This runner did not see the lifecycle's Start: the first launch that
+                        // brought sealing stands in for it, so a later launch that omits sealing
+                        // keeps it. A newer lifecycle's sealing is never replaced.
+                        var retainedFromLaunch = new RetainedSealing(runtimeIdentity, learned.Clone());
+                        deps.WorkState.SessionSealing.AddOrUpdate(
+                            command.SessionId,
+                            retainedFromLaunch,
+                            (_, existing) => existing.StartRuntime.LifecycleGeneration < command.LifecycleGeneration ? retainedFromLaunch : existing);
+                    }
+
                     return new StartupOutcome(
                         true,
                         IsComfyRuntime(command.EditorRuntimeKind) ? "ComfyUI ready" : "GPU runtime ready",
