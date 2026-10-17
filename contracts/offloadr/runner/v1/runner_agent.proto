@@ -369,6 +369,10 @@ message AcknowledgeSessionStopRequest {
     // Artifacts that failed or were still uploading when the session's data was removed. They
     // are lost; the session must not be reported as fully saved when this is not zero.
     uint32 unsaved_artifact_count = 8;
+    // True when the runner could not count every artifact it lost (its uploads did not stop in
+    // time, or an artifact folder could not be read): unsaved_artifact_count is then only what
+    // it could see, and the session must not be reported as fully saved.
+    bool unsaved_artifacts_unknown = 9;
 }
 
 message AcknowledgePromptResultRequest {

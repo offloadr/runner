@@ -139,6 +139,7 @@ public partial class ArtifactUploadServiceTests
             await service.StartSessionAsync("session-1", paths, CancellationToken.None);
 
             Assert.That(await service.StopSessionAsync("session-1"), Is.GreaterThanOrEqualTo(1));
+            Assert.That(service.TakeUnsavedUploads("session-1").Incomplete, Is.True, "the count may be short");
         }
         finally
         {
@@ -211,7 +212,7 @@ public partial class ArtifactUploadServiceTests
 
             Assert.That(finished, Is.SameAs(stopped), "the stop does not wait for the drain");
             Assert.That(await stopped, Is.GreaterThanOrEqualTo(1));
-            Assert.That(service.TakeUnsavedUploadCount("session-1"), Is.EqualTo(await stopped));
+            Assert.That(service.TakeUnsavedUploads("session-1"), Is.EqualTo(new UnsavedUploads(await stopped, Incomplete: true)));
 
             // The uploader finishes later (after its 5 s drain and the wait for its worker); what it
             // counts then is not added again.

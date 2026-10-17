@@ -483,7 +483,7 @@ internal static class ServiceClientManager
         /// <summary>Whether this runner seals a start that does not ask for it (required mode).</summary>
         public Func<StartSessionCommand, bool>? SealsStart { get; init; }
         /// <summary>Takes the artifacts the session lost when its runtimes' data was removed, for its stop acknowledgement.</summary>
-        public Func<string, ulong, int>? TakeUnsavedArtifactCount { get; init; }
+        public Func<string, ulong, UnsavedUploads>? TakeUnsavedArtifacts { get; init; }
     }
 
     internal sealed class RunnerCommandWorkState(CancellationToken shutdown)
@@ -1380,7 +1380,7 @@ internal static class ServiceClientManager
             Shutdown = shutdown,
             GetSessionSealing = sessionManager.GetSessionSealingStatus,
             SealsStart = start => start.Sealing?.Required != true && sessionManager.ShouldSeal(start),
-            TakeUnsavedArtifactCount = artifactUploadService.TakeUnsavedUploadCount,
+            TakeUnsavedArtifacts = artifactUploadService.TakeUnsavedUploads,
         };
 
         while (!shutdown.IsCancellationRequested)
@@ -2138,8 +2138,9 @@ internal static class ServiceClientManager
                 // Stop leaves the count for the current runtime's Stop.
                 if (outcome == StopOutcome.Stopped)
                 {
-                    work.Acknowledgement.UnsavedArtifactCount =
-                        (uint)Math.Max(0, deps.TakeUnsavedArtifactCount?.Invoke(command.SessionId, command.LifecycleGeneration) ?? 0);
+                    var unsaved = deps.TakeUnsavedArtifacts?.Invoke(command.SessionId, command.LifecycleGeneration) ?? default;
+                    work.Acknowledgement.UnsavedArtifactCount = (uint)Math.Max(0, unsaved.Count);
+                    work.Acknowledgement.UnsavedArtifactsUnknown = unsaved.Incomplete;
                 }
             }
 

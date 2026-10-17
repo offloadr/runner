@@ -1404,6 +1404,9 @@ public partial class ServiceClientManagerTests
 
         private int _unsavedArtifacts;
 
+        /// <summary>Whether the uploader could not count every lost artifact.</summary>
+        public bool UnsavedArtifactsIncomplete { get; set; }
+
         /// <summary>Runs before a start registers its runtime; may block or throw.</summary>
         public Func<StartSessionCommand, CancellationToken, Task> BeforeStart { get; set; } = (_, _) => Task.CompletedTask;
 
@@ -1484,7 +1487,7 @@ public partial class ServiceClientManagerTests
             Shutdown = Shutdown.Token,
             GetSessionSealing = _ => SealingStatus,
             SealsStart = SealsStart,
-            TakeUnsavedArtifactCount = (_, _) => Interlocked.Exchange(ref _unsavedArtifacts, 0),
+            TakeUnsavedArtifacts = (_, _) => new UnsavedUploads(Interlocked.Exchange(ref _unsavedArtifacts, 0), UnsavedArtifactsIncomplete),
         };
 
         private Task Record(string call)

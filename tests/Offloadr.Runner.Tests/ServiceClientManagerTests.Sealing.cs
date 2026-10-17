@@ -165,6 +165,20 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
+    public async Task Stop_ReportsAnIncompleteCountAsUnknown()
+    {
+        var harness = RunningHarness(7, 3, InstanceA);
+        harness.UnsavedArtifacts = 1;
+        harness.UnsavedArtifactsIncomplete = true;
+
+        await ServiceClientManager.HandleStopSessionCommandAsync(Stop(7, 3, InstanceA), harness.Deps);
+        var ack = await harness.Sink.WaitForAsync(harness.Sink.StopAcks, 1);
+
+        Assert.That(ack.UnsavedArtifactsUnknown, Is.True);
+        Assert.That(ack.UnsavedArtifactCount, Is.EqualTo(1));
+    }
+
+    [Test]
     public async Task Stop_ReportsUnsavedArtifactsAndReplaysTheSameAcknowledgement()
     {
         var harness = RunningHarness(7, 3, InstanceA);

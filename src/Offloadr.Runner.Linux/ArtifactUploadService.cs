@@ -17,6 +17,12 @@ using System.Threading.Tasks;
 
 namespace Offloadr.Runner.Linux;
 
+/// <summary>Artifacts a session lost; when <paramref name="Incomplete"/> the runner could not count them all.</summary>
+internal readonly record struct UnsavedUploads(int Count, bool Incomplete)
+{
+    public UnsavedUploads Add(UnsavedUploads other) => new(Count + other.Count, Incomplete || other.Incomplete);
+}
+
 internal sealed class ArtifactUploadService : IAsyncDisposable
 {
     /// <summary>Largest session file the uploader will send; larger files are skipped.</summary>
@@ -60,7 +66,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
     // runtime's data too, and the session's Stop must still report what was lost then.
     // Keyed by lifecycle generation too: a session id is reused by a newer lifecycle, whose Stop
     // must not report an older one's losses.
-    private readonly ConcurrentDictionary<(string SessionId, ulong Generation), int> _unsavedBySession = new();
+    private readonly ConcurrentDictionary<(string SessionId, ulong Generation), UnsavedUploads> _unsavedBySession = new();
     private readonly object _stopGate = new();
     private readonly Dictionary<string, StopInFlight> _stopping = new(StringComparer.Ordinal);
 
@@ -149,6 +155,10 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
     /// older lifecycles of the session left unreported.
     /// </summary>
     public int TakeUnsavedUploadCount(string sessionId, ulong lifecycleGeneration = 0)
+        => TakeUnsavedUploads(sessionId, lifecycleGeneration).Count;
+
+    /// <inheritdoc cref="TakeUnsavedUploadCount"/>
+    public UnsavedUploads TakeUnsavedUploads(string sessionId, ulong lifecycleGeneration = 0)
     {
         lock (_stopGate)
         {
@@ -164,9 +174,12 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 _unsavedBySession.TryRemove(older, out _);
             }
 
-            return _unsavedBySession.TryRemove((sessionId, lifecycleGeneration), out var count) ? count : 0;
+            return _unsavedBySession.TryRemove((sessionId, lifecycleGeneration), out var unsaved) ? unsaved : default;
         }
     }
+
+    private void Record(string sessionId, ulong lifecycleGeneration, UnsavedUploads unsaved)
+        => _unsavedBySession.AddOrUpdate((sessionId, lifecycleGeneration), unsaved, (_, earlier) => earlier.Add(unsaved));
 
     internal int GetPendingUploadCount(string sessionId)
         => _sessions.TryGetValue(sessionId, out var uploader) ? uploader.PendingUploadCount : 0;
@@ -305,9 +318,9 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             }
 
             stopping.RecordedCount = unsaved;
-            if (unsaved > 0)
+            if (unsaved > 0 || stopping.Uploader.UnsavedCountIncomplete)
             {
-                _unsavedBySession.AddOrUpdate((sessionId, stopping.Uploader.LifecycleGeneration), unsaved, (_, earlier) => earlier + unsaved);
+                Record(sessionId, stopping.Uploader.LifecycleGeneration, new UnsavedUploads(unsaved, stopping.Uploader.UnsavedCountIncomplete));
             }
         }
 
@@ -323,9 +336,9 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
     }
 
     /// <summary>
-    /// Records a stop that has not finished as losing every pending upload, and at least one: the
-    /// session must not be reported as fully saved on a count that does not exist yet. Called
-    /// under <see cref="_stopGate"/>.
+    /// Records a stop that has not finished as losing every pending upload, and at least one, and
+    /// marks the count incomplete: what the uploader would have found is not known, and the
+    /// session must not be reported as fully saved. Called under <see cref="_stopGate"/>.
     /// </summary>
     private int RecordWithoutWaiting(string sessionId, StopInFlight stopping)
     {
@@ -336,7 +349,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
         var unsaved = Math.Max(1, stopping.Uploader.PendingUploadCount);
         stopping.RecordedCount = unsaved;
-        _unsavedBySession.AddOrUpdate((sessionId, stopping.Uploader.LifecycleGeneration), unsaved, (_, earlier) => earlier + unsaved);
+        Record(sessionId, stopping.Uploader.LifecycleGeneration, new UnsavedUploads(unsaved, Incomplete: true));
         _logger.LogWarning(
             "Artifact uploads of session={SessionId} did not stop in time; counting {Count} as not uploaded",
             sessionId,
@@ -1651,6 +1664,9 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         /// </summary>
         public int UnsavedUploadCount { get; private set; }
 
+        /// <summary>Whether an artifact folder could not be read, so <see cref="UnsavedUploadCount"/> may be short.</summary>
+        public bool UnsavedCountIncomplete { get; private set; }
+
         private int CountUnsavedArtifacts()
         {
             var unsaved = 0;
@@ -1690,6 +1706,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     // Files past this point went uncounted: the session must not be reported as
                     // fully saved on a partial count.
                     unsaved++;
+                    UnsavedCountIncomplete = true;
                     _logger.LogWarning(ex, "Could not count unsaved artifacts session={SessionId} type={Type}", _sessionId, type);
                 }
             }
