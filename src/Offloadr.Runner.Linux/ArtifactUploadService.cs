@@ -109,9 +109,17 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
     public async Task StartSessionAsync(string sessionId, SessionProcessManager.SessionPaths paths, CancellationToken cancellationToken)
     {
-        if (_sessions.ContainsKey(sessionId))
+        if (_sessions.TryGetValue(sessionId, out var existing))
         {
-            return;
+            // A repeated start of the same runtime keeps its uploader. One left by an earlier
+            // runtime (it exited while a relaunch was already admitted, so nothing stopped it) is
+            // stopped, which records what it lost, and replaced: its reads name that runtime.
+            if (existing.CreatedFor == CurrentRuntime(sessionId))
+            {
+                return;
+            }
+
+            await StopSessionAsync(sessionId).ConfigureAwait(false);
         }
 
         // A sealed session's artifact names stay out of the console, which reaches the host's disk.
@@ -241,6 +249,9 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             return _unsavedBySession.TryRemove((sessionId, lifecycleGeneration), out var unsaved) ? unsaved : default;
         }
     }
+
+    private RuntimeIdentity? CurrentRuntime(string sessionId)
+        => _runtimeIdentities?.TryGet(sessionId, out var identity) == true ? identity.Normalized() : null;
 
     private void Record(string sessionId, ulong lifecycleGeneration, UnsavedUploads unsaved)
         => _unsavedBySession.AddOrUpdate((sessionId, lifecycleGeneration), unsaved, (_, earlier) => earlier.Add(unsaved));
@@ -501,6 +512,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         public SessionUploader(string? runnerSecret, RunnerArtifactService.RunnerArtifactServiceClient artifactClient, Metadata? authHeaders, string sessionId, SessionProcessManager.SessionPaths paths, ILogger logger, RuntimeIdentityRegistry? runtimeIdentities = null, string? runnerId = null, RunnerReadRequesterIdentity? requester = null)
         {
             _readRequester = (requester ?? new RunnerReadRequesterIdentity(runnerId, null, runtimeIdentities)).For(sessionId);
+            CreatedFor = runtimeIdentities?.TryGet(sessionId, out var createdFor) == true ? createdFor.Normalized() : null;
             _runnerSecret = runnerSecret;
             _artifactClient = artifactClient;
             _authHeaders = authHeaders;
@@ -516,6 +528,9 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 SingleWriter = false
             });
         }
+
+        /// <summary>The runtime registered for the session when this uploader was created, if any.</summary>
+        public RuntimeIdentity? CreatedFor { get; }
 
         /// <summary>The lifecycle this uploader's runtime belongs to (0 without a registry).</summary>
         public ulong LifecycleGeneration { get; }

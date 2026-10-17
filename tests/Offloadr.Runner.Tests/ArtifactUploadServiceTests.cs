@@ -280,6 +280,52 @@ public partial class ArtifactUploadServiceTests
     }
 
     [Test]
+    public async Task StartSessionAsync_ForANewerRuntimeReplacesAnUploaderLeftByAnEarlierOne()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var outputDirectory = Path.Combine(root, "output");
+            Directory.CreateDirectory(outputDirectory);
+            const string filename = "ComfyUI_00008_.png";
+            var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse());
+            var identities = new RuntimeIdentityRegistry();
+            identities.Set("session-1", 5, 2, "instance-a");
+            await using var service = new ArtifactUploadService("runner-secret-value", artifactClient, NullLogger<ArtifactUploadService>.Instance, identities, "runner-1", "process-1");
+            var paths = new SessionProcessManager.SessionPaths
+            {
+                HomeDirectory = root,
+                UserDirectory = root,
+                OutputDirectory = outputDirectory,
+                InputDirectory = root,
+                TempDirectory = Path.Combine(root, "temp"),
+                CacheDirectory = root,
+                LogsDirectory = root
+            };
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+
+            // A relaunch at epoch 3 was admitted, then the epoch-2 child exited on its own: nothing
+            // stopped its uploader before the new runtime starts.
+            identities.Set("session-1", 5, 3, "instance-b");
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.SeedSessionAsync(
+                "session-1",
+                "editor-1",
+                "owner-1",
+                [new EditorArtifactMetadata { EditorSid = "editor-1", Filename = filename, Type = "output", Subfolder = string.Empty, SizeBytes = 4 }],
+                CancellationToken.None);
+
+            Assert.That(await service.TryEnsureArtifactAvailableAsync(Path.Combine(outputDirectory, filename), highPriority: false, CancellationToken.None), Is.True);
+            Assert.That(artifactClient.LastReadArtifactRequest!.Requester.RuntimeEpoch, Is.EqualTo(3), "reads name the runtime that now runs");
+            Assert.That(artifactClient.LastReadArtifactRequest.Requester.RuntimeInstanceId, Is.EqualTo("instance-b"));
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
     public async Task Readback_ThatSendsMetadataTwicePublishesNothing()
     {
         var root = CreateTempDirectory();
