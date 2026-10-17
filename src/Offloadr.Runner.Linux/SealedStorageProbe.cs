@@ -74,6 +74,12 @@ public sealed class SealedStorageProbe
             {
                 return Unavailable("sealed root must be owned by root and writable only by root", new SealedStorageSwapStatus(swapDevices, swapLimit, false));
             }
+
+            // Session users reach their directories below it; the runner creates it as 0711.
+            if ((entry.Mode & UnixFileMode.OtherExecute) == 0)
+            {
+                return Unavailable("sealed root must let session users traverse it (execute for others, as in 0711)", new SealedStorageSwapStatus(swapDevices, swapLimit, false));
+            }
         }
         else
         {
