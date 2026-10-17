@@ -12,7 +12,6 @@ public static class LinuxSessionResidue
 {
     public static readonly IReadOnlyList<string> SharedTemporaryRoots = ["/tmp", "/var/tmp", "/dev/shm"];
 
-    private const int MaxDepth = 16;
     private const int AtFdcwd = -100;
     private const int AtSymlinkNofollow = 0x100;
     private const uint StatxType = 0x0001;
@@ -51,7 +50,7 @@ public static class LinuxSessionResidue
             // Never act through a link at the root itself.
             if (TryReadOwner(root, out _, out var isDirectory) && isDirectory)
             {
-                removed += RemoveOwnedEntries(root, userId, depth: 0, ref remaining);
+                removed += RemoveOwnedEntries(root, userId, ref remaining);
             }
         }
 
@@ -116,43 +115,58 @@ public static class LinuxSessionResidue
         return users;
     }
 
-    private static int RemoveOwnedEntries(string directory, uint userId, int depth, ref int remaining)
+    /// <summary>
+    /// Walks <paramref name="root"/> at any depth, without recursion, and visits each directory
+    /// once (a bind mount can show one again), so no subtree is skipped by a depth cutoff.
+    /// </summary>
+    private static int RemoveOwnedEntries(string root, uint userId, ref int remaining)
     {
         var removed = 0;
-        if (!TryEnumerateEntries(directory, out var entries))
+        var visited = new HashSet<(ulong Device, ulong Inode)>();
+        var pending = new Stack<string>();
+        pending.Push(root);
+        while (pending.TryPop(out var directory))
         {
-            // What lies below is unknown; some of it may be the user's.
-            remaining++;
-            return removed;
-        }
-
-        foreach (var entry in entries)
-        {
-            if (!TryReadOwner(entry, out var ownerId, out var isDirectory))
+            if (LinuxFileIdentityReader.TryRead(directory, out var identity) && !visited.Add((identity.DeviceId, identity.Inode)))
             {
-                // Gone since the listing is fine; there but unreadable may still be the user's.
-                if (!SealedHostLockdown.IsGone(entry))
-                {
-                    remaining++;
-                }
-
                 continue;
             }
 
-            if (ownerId == userId)
+            if (!TryEnumerateEntries(directory, out var entries))
             {
-                if (TryRemove(entry, isDirectory))
-                {
-                    removed++;
-                }
-                else
-                {
-                    remaining++;
-                }
+                // What lies below is unknown; some of it may be the user's.
+                remaining++;
+                continue;
             }
-            else if (isDirectory && depth < MaxDepth)
+
+            foreach (var entry in entries)
             {
-                removed += RemoveOwnedEntries(entry, userId, depth + 1, ref remaining);
+                if (!TryReadOwner(entry, out var ownerId, out var isDirectory))
+                {
+                    // Gone since the listing is fine; there but unreadable may still be the user's.
+                    if (!SealedHostLockdown.IsGone(entry))
+                    {
+                        remaining++;
+                    }
+
+                    continue;
+                }
+
+                if (ownerId == userId)
+                {
+                    if (TryRemove(entry, isDirectory))
+                    {
+                        removed++;
+                    }
+                    else
+                    {
+                        remaining++;
+                    }
+                }
+                else if (isDirectory)
+                {
+                    pending.Push(entry);
+                }
             }
         }
 
