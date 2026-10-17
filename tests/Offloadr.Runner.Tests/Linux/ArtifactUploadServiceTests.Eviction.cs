@@ -286,6 +286,67 @@ public partial class ArtifactUploadServiceTests
         }
     }
 
+    [Test]
+    public async Task ReplacementWithTheSameLengthAndTime_IsNotTakenAsTheUploadedVersion()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = CreateEvictionPaths(root, sealedSession: true);
+            var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse());
+            await using var service = new ArtifactUploadService("runner-secret-value", artifactClient, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            var outputPath = Path.Combine(paths.OutputDirectory, "copied.png");
+            await File.WriteAllBytesAsync(outputPath, "version-1"u8.ToArray());
+            await artifactClient.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            await Task.Delay(500);
+            var uploadedTime = File.GetLastWriteTimeUtc(outputPath);
+
+            // As cp -p and a rename would: other bytes, same length and modification time.
+            artifactClient.RejectUploads = true;
+            var staged = Path.Combine(root, "staged.png");
+            await File.WriteAllBytesAsync(staged, "version-2"u8.ToArray());
+            File.SetLastWriteTimeUtc(staged, uploadedTime);
+            File.Move(staged, outputPath, overwrite: true);
+
+            Assert.That(service.EvictUploadedArtifacts("session-1", long.MaxValue, TimeSpan.Zero), Is.Zero);
+            Assert.That(await File.ReadAllBytesAsync(outputPath), Is.EqualTo("version-2"u8.ToArray()));
+            Assert.That(await service.StopSessionAsync("session-1"), Is.EqualTo(1));
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
+    public async Task EmptyRewriteOfAnUploadedArtifact_CountsAsUnsavedWhenItsUploadFails()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = CreateEvictionPaths(root, sealedSession: true);
+            var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse());
+            await using var service = new ArtifactUploadService("runner-secret-value", artifactClient, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            var outputPath = Path.Combine(paths.OutputDirectory, "cleared.txt");
+            await File.WriteAllBytesAsync(outputPath, "content"u8.ToArray());
+            await artifactClient.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            await Task.Delay(500);
+
+            artifactClient.RejectUploads = true;
+            await File.WriteAllBytesAsync(outputPath, []);
+
+            Assert.That(await service.StopSessionAsync("session-1"), Is.EqualTo(1));
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
     private static async Task<long> EvictWhenRecordedAsync(ArtifactUploadService service, string sessionId)
     {
         // The upload is recorded once the control plane's response arrives.

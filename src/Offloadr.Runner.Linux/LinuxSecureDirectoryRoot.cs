@@ -37,7 +37,10 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
     private const uint StatxMtime = 0x0040;
     private const uint StatxSize = 0x0200;
     private const uint StatxIno = 0x0100;
+    private const uint StatxCtime = 0x0080;
     private const int StatxInoOffset = 32;
+    private const int StatxCtimeSecondsOffset = 96;
+    private const int StatxCtimeNanosecondsOffset = 104;
     private const uint RenameExchange = 2;
     private const int StatxBufferSize = 256;
     private const int StatxNlinkOffset = 16;
@@ -221,6 +224,15 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
         }
 
         using var entry = new SafeFileHandle((nint)descriptor, ownsHandle: true);
+        return ReadVersion(entry, relativePath);
+    }
+
+    /// <summary>The version of a file this process has open, as it was read.</summary>
+    public static SecureFileVersion? GetOpenFileVersion(SafeFileHandle file, string relativePath)
+        => ReadVersion(file, relativePath);
+
+    private static SecureFileVersion? ReadVersion(SafeFileHandle entry, string relativePath)
+    {
         var status = ReadStatus(entry, relativePath);
         if (!status.IsRegularFile)
         {
@@ -230,12 +242,17 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
         var buffer = Marshal.AllocHGlobal(StatxBufferSize);
         try
         {
-            if (statx(GetDescriptor(entry), string.Empty, AtEmptyPath | AtSymlinkNoFollow, StatxIno, buffer) != 0)
+            if (statx(GetDescriptor(entry), string.Empty, AtEmptyPath | AtSymlinkNoFollow, StatxIno | StatxCtime, buffer) != 0)
             {
                 return null;
             }
 
-            return new SecureFileVersion(status, unchecked((ulong)Marshal.ReadInt64(buffer, StatxInoOffset)));
+            var seconds = Marshal.ReadInt64(buffer, StatxCtimeSecondsOffset);
+            var nanoseconds = unchecked((uint)Marshal.ReadInt32(buffer, StatxCtimeNanosecondsOffset));
+            return new SecureFileVersion(
+                status,
+                unchecked((ulong)Marshal.ReadInt64(buffer, StatxInoOffset)),
+                DateTime.UnixEpoch.AddTicks((seconds * TimeSpan.TicksPerSecond) + (nanoseconds / 100)));
         }
         finally
         {
@@ -840,8 +857,9 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
                 return false;
             }
 
-            // The temporary name now holds the displaced file.
-            if (ReadVersion(_parent, _temporaryName, _relativePath) == expected)
+            // The temporary name now holds the displaced file. The rename itself moved its change
+            // time, so the comparison leaves that out.
+            if (ReadVersion(_parent, _temporaryName, _relativePath) is { } displaced && displaced.IsSameFileAs(expected))
             {
                 _ = unlinkat(GetDescriptor(_parent), _temporaryName, 0);
                 _committed = true;
@@ -959,5 +977,14 @@ internal readonly record struct SecureFileStatus(SecureEntryKind Kind, long Leng
     public bool IsRegularFile => Kind == SecureEntryKind.RegularFile;
 }
 
-/// <summary>One regular file: its status and its inode, which a rewrite through a rename changes.</summary>
-internal readonly record struct SecureFileVersion(SecureFileStatus Status, ulong Inode);
+/// <summary>
+/// One version of a regular file. A rewrite through a rename changes the inode; a rewrite in place
+/// changes the change time, which programs cannot set back, even when they restore the length and
+/// modification time (<c>cp -p</c>).
+/// </summary>
+internal readonly record struct SecureFileVersion(SecureFileStatus Status, ulong Inode, DateTime ChangeTimeUtc)
+{
+    /// <summary>Same inode, length and modification time; a rename of the file changes only its change time.</summary>
+    public bool IsSameFileAs(SecureFileVersion other)
+        => Inode == other.Inode && Status == other.Status;
+}
