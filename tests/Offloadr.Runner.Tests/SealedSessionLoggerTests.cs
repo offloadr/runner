@@ -26,6 +26,27 @@ public class SealedSessionLoggerTests
     }
 
     [Test]
+    public void Log_ReplacesEveryValueNotKnownToBeSafe()
+    {
+        var inner = new CapturingLogger();
+        ILogger logger = new SealedSessionLogger(inner);
+
+        logger.LogDebug(
+            "Artifact watcher event session={SessionId} event={Event} path={Path} oldPath={OldPath} bytes={Bytes} root={Root} other={SomethingNew}",
+            "session-1",
+            "Renamed",
+            "/dev/shm/offloadr/s/output/new.png",
+            "/dev/shm/offloadr/s/output/alice.png",
+            12,
+            "/dev/shm/offloadr/s/output",
+            "anything");
+
+        Assert.That(
+            inner.Messages.Single(),
+            Is.EqualTo("Artifact watcher event session=session-1 event=Renamed path=[sealed] oldPath=[sealed] bytes=12 root=[sealed] other=[sealed]"));
+    }
+
+    [Test]
     public void Log_KeepsOnlyTheExceptionsType()
     {
         var inner = new CapturingLogger();

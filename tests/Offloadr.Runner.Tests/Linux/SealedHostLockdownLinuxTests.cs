@@ -36,9 +36,9 @@ public class SealedHostLockdownLinuxTests
             var found = SealedHostLockdown.FindSharedWritableDirectories(root);
             var mounts = SealedHostLockdown.FindSharedWritableDirectories("/");
 
-            // Below a world-writable directory, every world-writable entry is closed too, at any depth;
-            // elsewhere the scan stays near the top.
-            Assert.That(found, Is.EquivalentTo(new[] { shallow, nested, inside, deepInside, writableFile }));
+            // Every world-writable directory counts, however deep below directories a session can
+            // traverse; below one, world-writable files do too.
+            Assert.That(found, Is.EquivalentTo(new[] { shallow, nested, deep, inside, deepInside, writableFile }));
             // /dev/shm lies on another filesystem below /dev, which is never entered.
             Assert.That(mounts, Has.None.EqualTo("/dev/shm"));
         }
@@ -83,9 +83,8 @@ public class SealedHostLockdownLinuxTests
 
         var found = SealedHostLockdown.FindSharedWritableDirectories(
             "/",
-            3,
             path => entries.TryGetValue(path, out var entry) ? entry.Status : null,
-            path => entries.TryGetValue(path, out var entry) ? entry.Device : null,
+            path => entries.TryGetValue(path, out var entry) ? new LinuxFileIdentity(entry.Device, InodeOf(path), 0) : null,
             (path, _) => entries[path].Children,
             mounts);
 
@@ -94,6 +93,33 @@ public class SealedHostLockdownLinuxTests
             "/workspace", "/workspace/jobs", "/workspace/mnt/deep", "/workspace/mnt/deep/file", "/tmp", "/media",
         }));
     }
+
+    [Test]
+    public void FindSharedWritableDirectories_VisitsADirectoryOnceThroughABindMountLoop()
+    {
+        var shared = Mode0755 | UnixFileMode.OtherWrite;
+        // /data/loop is /data bind-mounted below itself: the same directory, reached again.
+        var entries = new Dictionary<string, (LinuxEntryStatus Status, ulong Inode, string[] Children)>(StringComparer.Ordinal)
+        {
+            ["/"] = (new(true, false, 0, Mode0755), 1, ["/data"]),
+            ["/data"] = (new(true, false, 0, Mode0755), 2, ["/data/loop", "/data/open"]),
+            ["/data/loop"] = (new(true, false, 0, Mode0755), 2, ["/data/loop/loop", "/data/loop/open"]),
+            ["/data/open"] = (new(true, false, 0, shared), 3, []),
+            ["/data/loop/open"] = (new(true, false, 0, shared), 3, []),
+            ["/data/loop/loop"] = (new(true, false, 0, Mode0755), 2, []),
+        };
+
+        var found = SealedHostLockdown.FindSharedWritableDirectories(
+            "/",
+            path => entries.TryGetValue(path, out var entry) ? entry.Status : null,
+            path => entries.TryGetValue(path, out var entry) ? new LinuxFileIdentity(1, entry.Inode, 0) : null,
+            (path, _) => entries[path].Children,
+            []);
+
+        Assert.That(found, Is.EqualTo(new[] { "/data/open" }));
+    }
+
+    private static ulong InodeOf(string path) => (ulong)(uint)StringComparer.Ordinal.GetHashCode(path);
 
     /// <summary>
     /// Inventory of the disk-backed places a fresh session user can write on the root filesystem

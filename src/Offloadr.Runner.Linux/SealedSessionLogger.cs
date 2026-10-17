@@ -4,23 +4,35 @@ using Microsoft.Extensions.Logging;
 namespace Offloadr.Runner.Linux;
 
 /// <summary>
-/// Logs for a sealed session's services. The console reaches the host's disk, so values that name
-/// session files (paths, filenames) are replaced, and an exception is logged by its type only:
+/// Logs for a sealed session's services. The console reaches the host's disk, so only values
+/// known not to name session files (ids, counts, sizes, limits) are written; every other value,
+/// such as a path, filename or root, is replaced. An exception is logged by its type only:
 /// filesystem errors carry the path in their message.
 /// </summary>
 internal sealed partial class SealedSessionLogger(ILogger inner) : ILogger
 {
     private const string Redacted = "[sealed]";
 
-    private static readonly HashSet<string> FileValueNames = new(StringComparer.OrdinalIgnoreCase)
+    private static readonly HashSet<string> SafeValueNames = new(StringComparer.OrdinalIgnoreCase)
     {
-        "Path",
-        "Relative",
-        "RelativePath",
-        "Latest",
-        "Filename",
-        "File",
-        "Subfolder",
+        "SessionId",
+        "EditorSid",
+        "Type",
+        "Event",
+        "Exists",
+        "Count",
+        "Bytes",
+        "Size",
+        "Limit",
+        "Attempt",
+        "Dropped",
+        "Description",
+        "TimeoutSeconds",
+        "MaxUploadBytes",
+        "MaxWorkspaceFileBytes",
+        "MaxArchiveBytes",
+        "MaxExpandedBytes",
+        "MaxArchiveEntries",
     };
 
     public IDisposable? BeginScope<TState>(TState state)
@@ -64,7 +76,7 @@ internal sealed partial class SealedSessionLogger(ILogger inner) : ILogger
         return Placeholder().Replace(template, match =>
         {
             var name = match.Groups["name"].Value;
-            if (FileValueNames.Contains(name))
+            if (!SafeValueNames.Contains(name))
             {
                 return Redacted;
             }
