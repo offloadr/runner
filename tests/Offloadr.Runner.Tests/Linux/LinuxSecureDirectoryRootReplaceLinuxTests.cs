@@ -27,9 +27,11 @@ public class LinuxSecureDirectoryRootReplaceLinuxTests
         }
     }
 
-    [TestCase(true)]
-    [TestCase(false)]
-    public void CommitReplacing_KeepsARewriteThatLandedAfterTheCheck(bool throughRename)
+    [TestCase(true, false)]
+    [TestCase(false, false)]
+    [TestCase(true, true)]
+    [TestCase(false, true)]
+    public void CommitReplacing_KeepsARewriteThatLandedAfterTheCheck(bool throughRename, bool rightBeforeTheExchange)
     {
         LinuxTestPrerequisites.RequireLinux();
         var root = CreateRoot();
@@ -43,19 +45,63 @@ public class LinuxSecureDirectoryRootReplaceLinuxTests
             using var placeholder = secureRoot.CreatePublication("a.png");
 
             // The editor saves a new version of the same length and time, by an atomic rename
-            // (new inode) or in place.
-            if (throughRename)
+            // (new inode) or in place, after the caller's check or even after the last one.
+            void Rewrite()
             {
-                var saved = Path.Combine(root, "a.png.new");
-                File.WriteAllText(saved, "rewrite!");
-                File.SetLastWriteTimeUtc(saved, modified);
-                File.Move(saved, path, overwrite: true);
+                if (throughRename)
+                {
+                    var saved = Path.Combine(root, "a.png.new");
+                    File.WriteAllText(saved, "rewrite!");
+                    File.SetLastWriteTimeUtc(saved, modified);
+                    File.Move(saved, path, overwrite: true);
+                }
+                else
+                {
+                    File.WriteAllText(path, "rewrite!");
+                    File.SetLastWriteTimeUtc(path, modified.AddSeconds(1));
+                }
+            }
+
+            if (rightBeforeTheExchange)
+            {
+                placeholder.BeforeExchange = Rewrite;
             }
             else
             {
-                File.WriteAllText(path, "rewrite!");
-                File.SetLastWriteTimeUtc(path, modified.AddSeconds(1));
+                Rewrite();
             }
+
+            Assert.That(placeholder.CommitReplacing(version), Is.False);
+            Assert.That(File.ReadAllText(path), Is.EqualTo("rewrite!"));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Test]
+    public void CommitReplacing_KeepsAnInPlaceRewriteThatRestoresLengthAndTime()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = CreateRoot();
+        try
+        {
+            var path = Path.Combine(root, "a.png");
+            File.WriteAllText(path, "uploaded");
+            var modified = File.GetLastWriteTimeUtc(path);
+            using var secureRoot = new LinuxSecureDirectoryRoot(root);
+            var version = secureRoot.GetVersion("a.png")!.Value;
+            using var placeholder = secureRoot.CreatePublication("a.png");
+
+            // Same inode, same length, modification time set back (cp -p would do this): only the
+            // change time tells the new bytes from the uploaded ones.
+            using (var stream = new FileStream(path, FileMode.Open, FileAccess.Write))
+            {
+                stream.Write("rewrite!"u8);
+            }
+
+            File.SetLastWriteTimeUtc(path, modified);
 
             Assert.That(placeholder.CommitReplacing(version), Is.False);
             Assert.That(File.ReadAllText(path), Is.EqualTo("rewrite!"));
@@ -79,9 +125,9 @@ public class LinuxSecureDirectoryRootReplaceLinuxTests
             var version = secureRoot.GetVersion("a.png")!.Value;
             using var placeholder = secureRoot.CreatePublication("a.png");
 
-            // A first rewrite before the exchange, then a second one saved over the placeholder
+            // A first rewrite right before the exchange, then a second one saved over the placeholder
             // right after it: the second is the newest and must survive.
-            ReplaceAtomically(root, path, "rewrite-1");
+            placeholder.BeforeExchange = () => ReplaceAtomically(root, path, "rewrite-1");
             placeholder.AfterExchange = () => ReplaceAtomically(root, path, "rewrite-2");
 
             Assert.That(placeholder.CommitReplacing(version), Is.False);
@@ -106,9 +152,9 @@ public class LinuxSecureDirectoryRootReplaceLinuxTests
             var version = secureRoot.GetVersion("a.png")!.Value;
             using var placeholder = secureRoot.CreatePublication("a.png");
 
-            // A rewrite before the exchange, then the editor opens the placeholder now at the
+            // A rewrite right before the exchange, then the editor opens the placeholder now at the
             // destination and saves into it in place (same inode): that save must survive.
-            ReplaceAtomically(root, path, "rewrite-1");
+            placeholder.BeforeExchange = () => ReplaceAtomically(root, path, "rewrite-1");
             placeholder.AfterExchange = () => File.WriteAllText(path, "rewrite-2");
 
             Assert.That(placeholder.CommitReplacing(version), Is.False);

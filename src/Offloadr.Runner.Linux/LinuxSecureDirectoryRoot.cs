@@ -840,9 +840,12 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
 
         /// <summary>
         /// Swaps the publication with the existing destination in one step and keeps the swap only
-        /// when the file it displaced is <paramref name="expected"/>, same inode, length and
-        /// modification time; otherwise swaps back. A rewrite that lands between a caller's check
-        /// and this call is therefore never discarded. Returns whether the publication replaced it.
+        /// when the destination is <paramref name="expected"/>: checked in full, change time
+        /// included, right before the exchange, and by inode, length and modification time on the
+        /// displaced file after it (the exchange moves its change time). Otherwise it swaps back,
+        /// so a rewrite that lands after a caller's check is not discarded. What remains is a
+        /// rewrite in place within the moment between the last check and the exchange that also
+        /// restores length and modification time. Returns whether the publication replaced it.
         /// </summary>
         public bool CommitReplacing(SecureFileVersion expected)
         {
@@ -851,9 +854,18 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
                 throw CreateException($"setting published workspace file mode for '{_relativePath}'");
             }
 
+            // The caller's check may be a while ago. An in-place rewrite that restores length and
+            // modification time moves only the change time, which the exchange overwrites, so it
+            // is compared here, as late as possible.
+            if (ReadVersion(_parent, _destinationName, _relativePath) is not { } before || before != expected)
+            {
+                return false;
+            }
+
             // Taken before the exchange: once the placeholder is at the destination the editor can
             // rewrite it in place, which only a version from before shows.
             var placeholder = ReadVersion(_file, _relativePath);
+            BeforeExchange?.Invoke();
             if (renameat2(GetDescriptor(_parent), _temporaryName, GetDescriptor(_parent), _destinationName, RenameExchange) != 0)
             {
                 // The destination went away or cannot be exchanged: nothing was replaced.
@@ -885,6 +897,9 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
 
             return false;
         }
+
+        /// <summary>Runs right before the first exchange, after the last check; lets tests rewrite the destination then.</summary>
+        internal Action? BeforeExchange { get; set; }
 
         /// <summary>Runs right after the first exchange; lets tests replace the destination at that moment.</summary>
         internal Action? AfterExchange { get; set; }
