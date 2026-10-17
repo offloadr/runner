@@ -19,7 +19,8 @@ public static class SealedHostLockdown
     /// folder on a volume, and every world-writable regular file there. Inside a world-writable
     /// directory everything below is walked too, since closing only the top would leave it usable.
     /// Read-only, memory-backed and kernel filesystems are not entered, symlinks are not
-    /// followed, each directory is visited once (bind mounts can repeat one) and sockets are left
+    /// followed, each directory is visited at most once outside and once inside a shared
+    /// directory (bind mounts can repeat one) and sockets are left
     /// alone. A
     /// directory that cannot be listed (a FUSE or network mount refusing root) goes to
     /// <paramref name="unlisted"/>: what a session can write below it is unknown.
@@ -57,14 +58,34 @@ public static class SealedHostLockdown
             .Where(static group => group.Name.StartsWith("sess_", StringComparison.Ordinal))
             .Select(static group => group.GroupId)
             .ToHashSet();
-        return Scan(
+        // Both databases list root at least: an empty one could not be read, and every id would
+        // look free. Then nothing is judged by it (or handed to root), and the scan is incomplete.
+        var accountsUnread = new List<string>();
+        if (users.Count == 0)
+        {
+            accountsUnread.Add(passwdPath);
+        }
+
+        if (groups.Count == 0)
+        {
+            accountsUnread.Add(groupPath);
+        }
+
+        var scan = Scan(
             root,
             SealedStorageProbe.ReadEntryStatus,
             static path => LinuxFileIdentityReader.TryRead(path, out var identity) ? identity : null,
             static path => Directory.GetFileSystemEntries(path),
             ReadMounts(),
-            userId => userId != 0 && (!liveUserIds.Contains(userId) || sessionUserIds.Contains(userId)),
-            groupId => groupId != 0 && (!liveGroupIds.Contains(groupId) || sessionGroupIds.Contains(groupId)));
+            users.Count == 0
+                ? static _ => false
+                : userId => userId != 0 && (!liveUserIds.Contains(userId) || sessionUserIds.Contains(userId)),
+            groups.Count == 0
+                ? static _ => false
+                : groupId => groupId != 0 && (!liveGroupIds.Contains(groupId) || sessionGroupIds.Contains(groupId)));
+        return accountsUnread.Count == 0
+            ? scan
+            : scan with { Unchecked = [.. accountsUnread, .. scan.Unchecked] };
     }
 
     /// <summary>Names and ids from a group database; empty when it cannot be read.</summary>
@@ -131,7 +152,9 @@ public static class SealedHostLockdown
         }
 
         var shared = new HashSet<string>(StringComparer.Ordinal);
-        var visited = new HashSet<(ulong Device, ulong Inode)>();
+        // A directory is walked once per context: a bind mount can show it again below a shared
+        // directory, where its entries count differently, but never a third time.
+        var visited = new HashSet<(ulong Device, ulong Inode, bool InsideShared)>();
         if (statEntry(root) is not { IsDirectory: true } || identityOf(root) is not { } rootIdentity)
         {
             // Nothing below it was checked.
@@ -139,7 +162,7 @@ public static class SealedHostLockdown
             return result;
         }
 
-        visited.Add((rootIdentity.DeviceId, rootIdentity.Inode));
+        visited.Add((rootIdentity.DeviceId, rootIdentity.Inode, false));
         Walk(root, rootIdentity.DeviceId, insideShared: false);
 
         // Each other filesystem a session can traverse into is walked on its own: inside, as a
@@ -173,12 +196,13 @@ public static class SealedHostLockdown
                 continue;
             }
 
-            if (!visited.Add((identity.DeviceId, identity.Inode)))
+            var mountShared = IsSharedOrBelowShared(mount.MountPoint);
+            if (!visited.Add((identity.DeviceId, identity.Inode, mountShared)))
             {
                 continue;
             }
 
-            Walk(mount.MountPoint, identity.DeviceId, insideShared: IsSharedOrBelowShared(mount.MountPoint));
+            Walk(mount.MountPoint, identity.DeviceId, insideShared: mountShared);
         }
 
         return result;
@@ -258,12 +282,13 @@ public static class SealedHostLockdown
                 }
 
                 // Another filesystem is walked from the mount table, if a session can reach it.
-                if (identity.DeviceId != walkDevice || !visited.Add((identity.DeviceId, identity.Inode)))
+                var childShared = worldWritable || insideShared;
+                if (identity.DeviceId != walkDevice || !visited.Add((identity.DeviceId, identity.Inode, childShared)))
                 {
                     continue;
                 }
 
-                Walk(child, walkDevice, insideShared: worldWritable || insideShared);
+                Walk(child, walkDevice, insideShared: childShared);
             }
         }
     }

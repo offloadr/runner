@@ -277,6 +277,59 @@ public class SealedHostLockdownLinuxTests
     }
 
     [Test]
+    public void Scan_WalksABindAliasAgainBelowASharedDirectory()
+    {
+        var shared = Mode0755 | UnixFileMode.OtherWrite;
+        const UnixFileMode Private = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
+        // /srv/cache (root-only path) is bind-mounted at /tmp/cache: the same directory, seen
+        // first where sessions cannot reach it. Its residue counts once seen below /tmp.
+        var entries = new Dictionary<string, (LinuxEntryStatus Status, ulong Inode, string[] Children)>(StringComparer.Ordinal)
+        {
+            ["/"] = (new(true, false, 0, Mode0755), 1, ["/srv", "/tmp"]),
+            ["/srv"] = (new(true, false, 0, Private), 2, ["/srv/cache"]),
+            ["/srv/cache"] = (new(true, false, 0, Mode0755), 3, ["/srv/cache/old"]),
+            ["/srv/cache/old"] = (new(true, false, 1001, Private), 4, []),
+            ["/tmp"] = (new(true, false, 0, shared), 5, ["/tmp/cache"]),
+            ["/tmp/cache"] = (new(true, false, 0, Mode0755), 3, ["/tmp/cache/old"]),
+            ["/tmp/cache/old"] = (new(true, false, 1001, Private), 4, []),
+        };
+
+        var scan = SealedHostLockdown.Scan(
+            "/",
+            path => entries.TryGetValue(path, out var entry) ? entry.Status : null,
+            path => entries.TryGetValue(path, out var entry) ? new LinuxFileIdentity(1, entry.Inode, 0) : null,
+            path => entries[path].Children,
+            mounts: [],
+            isReusableOwner: userId => userId == 1001);
+
+        Assert.That(scan.ReusablyOwned, Is.EqualTo(new[] { "/tmp/cache/old" }));
+    }
+
+    [Test]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public void Scan_FailsWithoutReadableAccountDatabases()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+
+        var root = Path.Combine(Path.GetTempPath(), $"runner-accounts-{Guid.NewGuid():N}");
+        try
+        {
+            Directory.CreateDirectory(root);
+            var missingPasswd = Path.Combine(root, "passwd");
+            var missingGroup = Path.Combine(root, "group");
+
+            var scan = SealedHostLockdown.Scan(root, missingPasswd, missingGroup);
+
+            Assert.That(scan.Unchecked, Is.EqualTo(new[] { missingPasswd, missingGroup }));
+            Assert.That(scan.ReusablyOwned, Is.Empty, "no id is judged free without the databases");
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Test]
     public void Scan_CountsARootItCannotIdentifyAsUnchecked()
     {
         // statx blocked or unsupported: nothing could be checked, not "nothing found".
