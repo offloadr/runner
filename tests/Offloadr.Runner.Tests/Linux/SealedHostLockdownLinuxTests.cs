@@ -306,6 +306,50 @@ public class SealedHostLockdownLinuxTests
     }
 
     [Test]
+    public void Scan_ClosesTheMaskOfAnAclThatMayGrantWrite()
+    {
+        var groupWritable = Mode0755 | UnixFileMode.GroupWrite;
+        // root:root, group write is the ACL's mask: a named entry may let any uid write.
+        var entries = new Dictionary<string, (LinuxEntryStatus Status, string[] Children)>(StringComparer.Ordinal)
+        {
+            ["/"] = (new(true, false, 0, Mode0755), ["/opt"]),
+            ["/opt"] = (new(true, false, 0, Mode0755), ["/opt/acl", "/opt/plain", "/opt/readonly"]),
+            ["/opt/acl"] = (new(true, false, 0, groupWritable), []),
+            ["/opt/plain"] = (new(true, false, 0, groupWritable), []),
+            ["/opt/readonly"] = (new(true, false, 0, Mode0755), []),
+        };
+
+        var scan = SealedHostLockdown.Scan(
+            "/",
+            path => entries.TryGetValue(path, out var entry) ? entry.Status : null,
+            path => entries.ContainsKey(path) ? new LinuxFileIdentity(1, InodeOf(path), 0) : null,
+            path => entries[path].Children,
+            mounts: [],
+            isReusableOwner: static _ => false,
+            hasAccessAcl: path => path is "/opt/acl" or "/opt/readonly");
+
+        Assert.That(scan.SharedWritable, Is.EqualTo(new[] { "/opt/acl" }));
+    }
+
+    [Test]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public void HasAccessAcl_IsFalseForAPlainFile()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+
+        var file = Path.Combine(Path.GetTempPath(), $"runner-acl-{Guid.NewGuid():N}");
+        try
+        {
+            File.WriteAllText(file, string.Empty);
+            Assert.That(SealedHostLockdown.HasAccessAcl(file), Is.False);
+        }
+        finally
+        {
+            File.Delete(file);
+        }
+    }
+
+    [Test]
     [System.Runtime.Versioning.SupportedOSPlatform("linux")]
     public void Scan_FailsWithoutReadableAccountDatabases()
     {

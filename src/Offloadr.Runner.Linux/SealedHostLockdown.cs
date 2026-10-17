@@ -82,7 +82,8 @@ public static class SealedHostLockdown
                 : userId => userId != 0 && (!liveUserIds.Contains(userId) || sessionUserIds.Contains(userId)),
             groups.Count == 0
                 ? static _ => false
-                : groupId => groupId != 0 && (!liveGroupIds.Contains(groupId) || sessionGroupIds.Contains(groupId)));
+                : groupId => groupId != 0 && (!liveGroupIds.Contains(groupId) || sessionGroupIds.Contains(groupId)),
+            HasAccessAcl);
         return accountsUnread.Count == 0
             ? scan
             : scan with { Unchecked = [.. accountsUnread, .. scan.Unchecked] };
@@ -138,9 +139,11 @@ public static class SealedHostLockdown
         Func<string, string[]> listChildren,
         IReadOnlyList<Mount>? mounts,
         Func<uint, bool> isReusableOwner,
-        Func<uint, bool>? isReusableGroup = null)
+        Func<uint, bool>? isReusableGroup = null,
+        Func<string, bool>? hasAccessAcl = null)
     {
         isReusableGroup ??= static _ => false;
+        hasAccessAcl ??= static _ => false;
         var found = new List<string>();
         var reusablyOwned = new List<string>();
         var unlisted = new List<string>();
@@ -262,9 +265,12 @@ public static class SealedHostLockdown
                     reusablyOwned.Add(child);
                 }
 
-                // Writable by every session user, or by one that gets a freed group id again.
+                // Writable by every session user, or by one that gets a freed group id again. With
+                // an access ACL the group bits are its mask: some named user or group may write, so
+                // the mask is closed too (closing the group write bit clears it in the mask).
+                var groupWrite = (entry.Mode & UnixFileMode.GroupWrite) != 0;
                 var worldWritable = (entry.Mode & UnixFileMode.OtherWrite) != 0 ||
-                    ((entry.Mode & UnixFileMode.GroupWrite) != 0 && entry.GroupId != 0 && isReusableGroup(entry.GroupId));
+                    (groupWrite && ((entry.GroupId != 0 && isReusableGroup(entry.GroupId)) || hasAccessAcl(child)));
                 if (!entry.IsDirectory)
                 {
                     // Anywhere: a session that knows the name can write it through any folder it can traverse.
@@ -387,6 +393,32 @@ public static class SealedHostLockdown
 
     [DllImport("libc", SetLastError = true)]
     private static extern int lchown(string path, uint owner, uint group);
+
+    private const int NoData = 61;
+    private const int NotSupported = 95;
+
+    /// <summary>
+    /// Whether the entry carries a POSIX access ACL (not following links). An error other than
+    /// "none" or "not supported" counts as one: closing its mask is the safe side.
+    /// </summary>
+    internal static bool HasAccessAcl(string path)
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            return false;
+        }
+
+        var size = lgetxattr(path, "system.posix_acl_access", 0, 0);
+        if (size >= 0)
+        {
+            return size > 0;
+        }
+
+        return Marshal.GetLastPInvokeError() is not (NoData or NotSupported);
+    }
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern nint lgetxattr(string path, string name, nint value, nuint size);
 
     /// <summary>What the lockdown closed, and what it could not close although others can still write it.</summary>
     public sealed record Result(IReadOnlyList<string> Closed, IReadOnlyList<string> StillWritable);

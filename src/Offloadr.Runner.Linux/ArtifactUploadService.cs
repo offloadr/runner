@@ -27,6 +27,18 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
     private static readonly TimeSpan DropWarningInterval = TimeSpan.FromMinutes(1);
 
+    /// <summary>
+    /// Every file below an artifact root, failing on a directory it cannot read rather than
+    /// skipping it; replaceable so tests can make it fail.
+    /// </summary>
+    internal static Func<string, IEnumerable<string>> EnumerateArtifactFiles { get; set; } = static root =>
+        Directory.EnumerateFiles(root, "*", new EnumerationOptions
+        {
+            RecurseSubdirectories = true,
+            IgnoreInaccessible = false,
+            AttributesToSkip = FileAttributes.ReparsePoint,
+        });
+
     /// <summary>How long Stop waits for cancelled upload and download work before moving on.</summary>
     internal static TimeSpan StopWaitTimeout { get; set; } = TimeSpan.FromSeconds(10);
 
@@ -1652,13 +1664,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 try
                 {
                     using var secureRoot = new LinuxSecureDirectoryRoot(root);
-                    var enumeration = new EnumerationOptions
-                    {
-                        RecurseSubdirectories = true,
-                        IgnoreInaccessible = true,
-                        AttributesToSkip = FileAttributes.ReparsePoint,
-                    };
-                    foreach (var file in Directory.EnumerateFiles(root, "*", enumeration))
+                    foreach (var file in EnumerateArtifactFiles(root))
                     {
                         if (!TryResolveSecureLocation(type, file, out _, out var relativePath))
                         {
@@ -1681,6 +1687,9 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
                 {
+                    // Files past this point went uncounted: the session must not be reported as
+                    // fully saved on a partial count.
+                    unsaved++;
                     _logger.LogWarning(ex, "Could not count unsaved artifacts session={SessionId} type={Type}", _sessionId, type);
                 }
             }

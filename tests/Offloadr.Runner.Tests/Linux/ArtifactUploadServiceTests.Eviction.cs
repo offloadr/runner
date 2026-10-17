@@ -125,6 +125,29 @@ public partial class ArtifactUploadServiceTests
     }
 
     [Test]
+    public async Task StopSessionAsync_CountsALossWhenItCannotListEveryArtifact()
+    {
+        var root = CreateTempDirectory();
+        var enumerate = ArtifactUploadService.EnumerateArtifactFiles;
+        // The listing breaks off, as on an unreadable subtree: what lies beyond is unknown.
+        ArtifactUploadService.EnumerateArtifactFiles = static _ => throw new UnauthorizedAccessException("unreadable subtree");
+        try
+        {
+            var paths = CreateEvictionPaths(root, sealedSession: true);
+            var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse());
+            await using var service = new ArtifactUploadService("runner-secret-value", artifactClient, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+
+            Assert.That(await service.StopSessionAsync("session-1"), Is.GreaterThanOrEqualTo(1));
+        }
+        finally
+        {
+            ArtifactUploadService.EnumerateArtifactFiles = enumerate;
+            TryDelete(root);
+        }
+    }
+
+    [Test]
     public async Task UnsavedCount_BelongsToTheLifecycleThatLostTheArtifacts()
     {
         var root = CreateTempDirectory();
