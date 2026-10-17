@@ -760,6 +760,32 @@ public partial class SessionProcessManagerOwnershipTests
 
     private static string? HostLockedDown() => null;
 
+    [TestCase("session\nother")]
+    [TestCase("session\rother")]
+    [TestCase("session\tother")]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public void SealedStart_RefusesASessionIdWithControlCharacters(string sessionId)
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        LinuxTestPrerequisites.RequireRoot();
+
+        var (tempRoot, sealedRoot, options) = CreateSealedOptions("comfyui");
+        try
+        {
+            using var manager = new SessionProcessManager(options, new RecordingIsolationStrategy("sess_ctl", Path.Combine(options.SessionRoot, "ctl")), SealedVfsBuilder(), new RecordingCommandRunner(string.Empty)) { PrepareSealedHost = HostLockedDown };
+
+            var refused = Assert.CatchAsync(() => manager.StartSessionAsync(SealedStart(sessionId), CancellationToken.None));
+
+            Assert.That(refused!.Message, Does.Contain("cannot name a sealed session directory"));
+            Assert.That(Directory.Exists(sealedRoot) ? Directory.EnumerateFileSystemEntries(sealedRoot) : [], Is.Empty);
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+            TryDelete(sealedRoot);
+        }
+    }
+
     [Test]
     [System.Runtime.Versioning.SupportedOSPlatform("linux")]
     public async Task StaleSealedData_ThatCannotBeRemovedKeepsTheSessionsStopPending()

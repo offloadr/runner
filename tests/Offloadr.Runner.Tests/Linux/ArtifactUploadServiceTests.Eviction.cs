@@ -440,6 +440,43 @@ public partial class ArtifactUploadServiceTests
     }
 
     [Test]
+    public async Task EvictUploadedArtifacts_SkipsAnEntryARefreshPrunedMidPass()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = CreateEvictionPaths(root, sealedSession: true);
+            // The catalog the refresh brings no longer lists the uploaded file.
+            var listing = new RunnerArtifactServiceListArtifactsResponse();
+            listing.Artifacts.Add(new Offloadr.EditorRuntime.V1.EditorArtifactMetadata { EditorSid = "editor-1", Type = "output", Subfolder = string.Empty, Filename = "other.png", SizeBytes = 3 });
+            var artifactClient = new FakeRunnerArtifactClient(listing);
+            await using var service = new ArtifactUploadService("runner-secret-value", artifactClient, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            var outputPath = Path.Combine(paths.OutputDirectory, "pruned.png");
+            await File.WriteAllBytesAsync(outputPath, [1, 2, 3]);
+            await artifactClient.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            await Task.Delay(200);
+
+            service.SetBeforeEvictionCandidate("session-1", path =>
+            {
+                if (path.EndsWith("pruned.png", StringComparison.Ordinal))
+                {
+                    service.RefreshSessionAsync("session-1").GetAwaiter().GetResult();
+                }
+            });
+            service.EvictUploadedArtifacts("session-1", long.MaxValue, TimeSpan.Zero);
+
+            // Without its catalog entry an emptied file could never be downloaded again.
+            Assert.That(File.ReadAllBytes(outputPath), Is.EqualTo(new byte[] { 1, 2, 3 }));
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
     public async Task EvictUploadedArtifacts_LeavesAnArtifactTheVfsJustServed()
     {
         var root = CreateTempDirectory();

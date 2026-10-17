@@ -1202,11 +1202,16 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
         private void PruneCatalogEntries(HashSet<string> currentPaths)
         {
-            foreach (var (path, _) in _catalog)
+            // Under the eviction gate, as every catalog replacement: a pass must not empty a file
+            // whose entry, the only way to download it again, is being removed.
+            lock (_evictionGate)
             {
-                if (!currentPaths.Contains(path))
+                foreach (var (path, _) in _catalog)
                 {
-                    _catalog.TryRemove(path, out _);
+                    if (!currentPaths.Contains(path))
+                    {
+                        _catalog.TryRemove(path, out _);
+                    }
                 }
             }
         }

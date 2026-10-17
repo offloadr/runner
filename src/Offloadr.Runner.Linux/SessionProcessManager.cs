@@ -1314,7 +1314,10 @@ internal sealed partial class SessionProcessManager : IDisposable
 
     private string? ResolveSealedSessionDirectory(string sessionId)
     {
-        if (string.IsNullOrEmpty(sessionId) || sessionId is "." or ".." || sessionId.IndexOfAny(['/', '\\', '\0']) >= 0)
+        // No control characters either: the marker names the session on its first line, and a
+        // line break in the id would make it name another, so cleanup would not recognise it.
+        if (string.IsNullOrEmpty(sessionId) || sessionId is "." or ".." || sessionId.IndexOfAny(['/', '\\', '\0']) >= 0 ||
+            sessionId.Any(char.IsControl))
         {
             return null;
         }
