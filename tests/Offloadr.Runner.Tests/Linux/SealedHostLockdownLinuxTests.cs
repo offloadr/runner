@@ -119,6 +119,35 @@ public class SealedHostLockdownLinuxTests
         Assert.That(found, Is.EqualTo(new[] { "/data/open" }));
     }
 
+    [Test]
+    public void FindSharedWritableDirectories_ReportsDirectoriesItCannotList()
+    {
+        var shared = Mode0755 | UnixFileMode.OtherWrite;
+        // /tmp/fuse refuses to be listed; /tmp/gone disappeared after it was seen.
+        var entries = new Dictionary<string, (LinuxEntryStatus Status, string[]? Children)>(StringComparer.Ordinal)
+        {
+            ["/"] = (new(true, false, 0, Mode0755), ["/tmp"]),
+            ["/tmp"] = (new(true, false, 0, shared), ["/tmp/fuse", "/tmp/gone", "/tmp/open"]),
+            ["/tmp/fuse"] = (new(true, false, 0, Mode0755), null),
+            ["/tmp/gone"] = (new(true, false, 0, Mode0755), null),
+            ["/tmp/open"] = (new(true, false, 0, shared), []),
+        };
+        var unlisted = new List<string>();
+
+        var found = SealedHostLockdown.FindSharedWritableDirectories(
+            "/",
+            path => entries.TryGetValue(path, out var entry) ? entry.Status : null,
+            path => entries.ContainsKey(path) ? new LinuxFileIdentity(1, InodeOf(path), 0) : null,
+            (path, _) => entries[path].Children ?? throw (path == "/tmp/gone"
+                ? new DirectoryNotFoundException(path)
+                : new UnauthorizedAccessException(path)),
+            [],
+            unlisted);
+
+        Assert.That(found, Is.EquivalentTo(new[] { "/tmp", "/tmp/open" }));
+        Assert.That(unlisted, Is.EqualTo(new[] { "/tmp/fuse" }));
+    }
+
     private static ulong InodeOf(string path) => (ulong)(uint)StringComparer.Ordinal.GetHashCode(path);
 
     /// <summary>

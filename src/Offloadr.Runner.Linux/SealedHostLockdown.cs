@@ -18,22 +18,26 @@ public static class SealedHostLockdown
     /// since closing only the top would leave them usable. That includes filesystems mounted
     /// anywhere below one, which a session can still traverse into; read-only and memory-backed
     /// ones are not entered. Other filesystems are not entered, symlinks are not followed, each
-    /// directory is visited once (bind mounts can repeat one) and sockets are left alone.
+    /// directory is visited once (bind mounts can repeat one) and sockets are left alone. A
+    /// directory that cannot be listed (a FUSE or network mount refusing root) goes to
+    /// <paramref name="unlisted"/>: what a session can write below it is unknown.
     /// </summary>
-    public static IReadOnlyList<string> FindSharedWritableDirectories(string root = "/")
+    public static IReadOnlyList<string> FindSharedWritableDirectories(string root = "/", ICollection<string>? unlisted = null)
         => FindSharedWritableDirectories(
             root,
             SealedStorageProbe.ReadEntryStatus,
             static path => LinuxFileIdentityReader.TryRead(path, out var identity) ? identity : null,
             static (path, everything) => everything ? Directory.GetFileSystemEntries(path) : Directory.GetDirectories(path),
-            ReadMounts());
+            ReadMounts(),
+            unlisted);
 
     internal static IReadOnlyList<string> FindSharedWritableDirectories(
         string root,
         Func<string, LinuxEntryStatus?> statEntry,
         Func<string, LinuxFileIdentity?> identityOf,
         Func<string, bool, string[]> listChildren,
-        IReadOnlyList<Mount> mounts)
+        IReadOnlyList<Mount> mounts,
+        ICollection<string>? unlisted = null)
     {
         var found = new List<string>();
         var shared = new HashSet<string>(StringComparer.Ordinal);
@@ -87,8 +91,14 @@ public static class SealedHostLockdown
             {
                 children = listChildren(directory, insideShared);
             }
+            catch (DirectoryNotFoundException)
+            {
+                // Removed since it was seen: nothing below it to write.
+                return;
+            }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
+                unlisted?.Add(directory);
                 return;
             }
 

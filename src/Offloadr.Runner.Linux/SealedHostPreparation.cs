@@ -20,9 +20,10 @@ public sealed class SealedHostPreparation
                 return null;
             }
 
+            var unlisted = new List<string>();
             var lockdown = SealedHostLockdown.RemoveSharedWriteAccess(
                 SealedHostLockdown.SharedTemporaryDirectories
-                    .Concat(SealedHostLockdown.FindSharedWritableDirectories())
+                    .Concat(SealedHostLockdown.FindSharedWritableDirectories(unlisted: unlisted))
                     .Distinct(StringComparer.Ordinal));
             foreach (var directory in lockdown.Closed)
             {
@@ -33,6 +34,13 @@ public sealed class SealedHostPreparation
             {
                 // Sessions could write their data to these disk-backed places.
                 return "these disk-backed paths stay writable by session users: " + string.Join(", ", lockdown.StillWritable);
+            }
+
+            if (unlisted.Count > 0)
+            {
+                // A session may still reach a writable place below these, which the scan could not see.
+                return "these directories could not be listed to check what session users can write below them: " +
+                    string.Join(", ", unlisted);
             }
 
             _applied = true;
