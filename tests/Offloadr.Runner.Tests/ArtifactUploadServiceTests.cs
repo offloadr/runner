@@ -1606,6 +1606,16 @@ public partial class ArtifactUploadServiceTests
         /// <summary>Answers every upload with success=false, as a control plane refusing it would.</summary>
         public bool RejectUploads { get; set; }
 
+        /// <summary>Runs when an upload's metadata frame is written, before any chunk.</summary>
+        public Action? AfterUploadMetadata { get; set; }
+
+        public int UploadCallsStarted => Volatile.Read(ref _uploadCallsStarted);
+
+        public int UploadCallsDisposed => Volatile.Read(ref _uploadCallsDisposed);
+
+        private int _uploadCallsStarted;
+        private int _uploadCallsDisposed;
+
         private static async Task<RunnerArtifactServiceUploadArtifactResponse> WaitForGateAsync(
             Task gate,
             Task<RunnerArtifactServiceUploadArtifactResponse> response)
@@ -1635,8 +1645,9 @@ public partial class ArtifactUploadServiceTests
         public override AsyncClientStreamingCall<RunnerArtifactServiceUploadArtifactRequest, RunnerArtifactServiceUploadArtifactResponse> UploadArtifact(CallOptions options)
         {
             LastUploadHeaders = options.Headers;
+            Interlocked.Increment(ref _uploadCallsStarted);
             var response = new TaskCompletionSource<RunnerArtifactServiceUploadArtifactResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
-            var writer = new CaptureUploadStreamWriter(captured =>
+            var writer = new CaptureUploadStreamWriter(AfterUploadMetadata, captured =>
             {
                 _uploads.Enqueue(captured);
                 _uploadSignals.Writer.TryWrite(captured);
@@ -1650,7 +1661,7 @@ public partial class ArtifactUploadServiceTests
                 Task.FromResult(new Metadata()),
                 () => Status.DefaultSuccess,
                 () => new Metadata(),
-                () => { });
+                () => Interlocked.Increment(ref _uploadCallsDisposed));
         }
 
         public override AsyncServerStreamingCall<RunnerArtifactServiceReadArtifactResponse> ReadArtifact(RunnerArtifactServiceReadArtifactRequest request, CallOptions options)
@@ -1706,7 +1717,7 @@ public partial class ArtifactUploadServiceTests
         }
     }
 
-    private sealed class CaptureUploadStreamWriter(Action<CapturedUpload> onComplete) : IClientStreamWriter<RunnerArtifactServiceUploadArtifactRequest>
+    private sealed class CaptureUploadStreamWriter(Action? afterMetadata, Action<CapturedUpload> onComplete) : IClientStreamWriter<RunnerArtifactServiceUploadArtifactRequest>
     {
         private readonly Action<CapturedUpload> _onComplete = onComplete;
         private readonly object _gate = new();
@@ -1719,6 +1730,11 @@ public partial class ArtifactUploadServiceTests
             lock (_gate)
             {
                 _messages.Add(message.Clone());
+            }
+
+            if (message.PayloadCase == RunnerArtifactServiceUploadArtifactRequest.PayloadOneofCase.Metadata)
+            {
+                afterMetadata?.Invoke();
             }
 
             return Task.CompletedTask;

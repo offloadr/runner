@@ -50,6 +50,44 @@ public partial class ArtifactUploadServiceTests
     }
 
     [Test]
+    public async Task SealedUpload_ThatFailsMidwayDisposesItsCall()
+    {
+        var root = CreateTempDirectory();
+        using var recipient = SealingKeyPair.Generate("output-1");
+        using var sealing = SessionTransferSealing.Create(
+            "session-1",
+            new SessionSealing { OutputRecipient = SessionTransferSealingTests.ToMessage(recipient.PublicKey) },
+            memoryWorkspace: true);
+        try
+        {
+            var paths = CreateEvictionPaths(root, sealedSession: true) with { TransferSealing = sealing };
+            var outputPath = Path.Combine(paths.OutputDirectory, "shrinking.png");
+            var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse());
+            // The editor truncates the output once the upload has started: sealing then runs short.
+            artifactClient.AfterUploadMetadata = () => File.WriteAllBytes(outputPath, [1]);
+            await using var service = new ArtifactUploadService("runner-secret-value", artifactClient, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+
+            await File.WriteAllBytesAsync(outputPath, new byte[100_000]);
+
+            var deadline = DateTime.UtcNow.AddSeconds(10);
+            while (artifactClient.UploadCallsStarted == 0 && DateTime.UtcNow < deadline)
+            {
+                await Task.Delay(50);
+            }
+
+            await Task.Delay(1000);
+            Assert.That(artifactClient.UploadCallsStarted, Is.GreaterThan(0));
+            Assert.That(artifactClient.UploadCallsDisposed, Is.EqualTo(artifactClient.UploadCallsStarted), "no upload call is left open");
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
     public async Task SealedSession_ReadbackOpensWithTheReaderKeyAndIsNotUploadedAgain()
     {
         var root = CreateTempDirectory();

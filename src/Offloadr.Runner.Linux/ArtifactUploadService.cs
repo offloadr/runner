@@ -1939,7 +1939,8 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         relPath,
                         sizeBytes);
 
-                    var call = _artifactClient.UploadArtifact(headers: _authHeaders, cancellationToken: _cts.Token);
+                    // Disposed on every path, so an upload that fails midway (a sealed file that shrank) cancels its RPC.
+                    using var call = _artifactClient.UploadArtifact(headers: _authHeaders, cancellationToken: _cts.Token);
                     await call.RequestStream.WriteAsync(new RunnerArtifactServiceUploadArtifactRequest { Metadata = metadata }).ConfigureAwait(false);
 
                     if (writer is not null)
