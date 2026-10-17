@@ -220,6 +220,63 @@ public class SealedHostLockdownLinuxTests
     }
 
     [Test]
+    public void Scan_CountsEntriesWritableThroughAReusableGroupAndUnreadableOnesAsUnchecked()
+    {
+        var groupWritable = Mode0755 | UnixFileMode.GroupWrite;
+        // /opt/cache is root:4242 0775, 4242 being a group id useradd may hand out again; /opt/team
+        // is the same for a live group. /opt/odd cannot be stat'ed although it is listed.
+        var entries = new Dictionary<string, (LinuxEntryStatus Status, string[] Children)>(StringComparer.Ordinal)
+        {
+            ["/"] = (new(true, false, 0, Mode0755), ["/opt"]),
+            ["/opt"] = (new(true, false, 0, Mode0755), ["/opt/cache", "/opt/team", "/opt/odd"]),
+            ["/opt/cache"] = (new(true, false, 0, groupWritable, GroupId: 4242), ["/opt/cache/item.bin"]),
+            ["/opt/cache/item.bin"] = (new(false, false, 0, Mode0755, IsRegularFile: true), []),
+            ["/opt/team"] = (new(true, false, 0, groupWritable, GroupId: 100), []),
+        };
+
+        var scan = SealedHostLockdown.Scan(
+            "/",
+            path => entries.TryGetValue(path, out var entry) ? entry.Status : null,
+            path => entries.ContainsKey(path) ? new LinuxFileIdentity(1, InodeOf(path), 0) : null,
+            path => entries[path].Children,
+            mounts: [],
+            isReusableOwner: static _ => false,
+            isReusableGroup: groupId => groupId == 4242);
+
+        Assert.That(scan.SharedWritable, Is.EqualTo(new[] { "/opt/cache" }));
+        // The fake /opt/odd does not exist on this machine, so it counts as gone, not unchecked.
+        Assert.That(scan.Unchecked, Is.Empty);
+    }
+
+    [Test]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public void Scan_CountsAnExistingEntryWithoutMetadataAsUnchecked()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+
+        var root = Path.Combine(Path.GetTempPath(), $"runner-unreadable-{Guid.NewGuid():N}");
+        try
+        {
+            var odd = Path.Combine(root, "odd");
+            Directory.CreateDirectory(odd);
+
+            var scan = SealedHostLockdown.Scan(
+                root,
+                path => path == odd ? null : SealedStorageProbe.ReadEntryStatus(path),
+                path => LinuxFileIdentityReader.TryRead(path, out var identity) ? identity : null,
+                Directory.GetFileSystemEntries,
+                mounts: [],
+                isReusableOwner: static _ => false);
+
+            Assert.That(scan.Unchecked, Is.EqualTo(new[] { odd }));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Test]
     public void HandToRoot_GivesEntriesToRootAndReportsWhatStaysWithTheOldOwner()
     {
         var owners = new Dictionary<string, uint>(StringComparer.Ordinal)

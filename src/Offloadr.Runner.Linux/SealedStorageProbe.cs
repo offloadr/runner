@@ -8,7 +8,7 @@ namespace Offloadr.Runner.Linux;
 public readonly record struct LinuxFileSystemStats(long Type, long BlockSize, long Blocks, long AvailableBlocks, bool ReadOnly = false);
 
 /// <summary>Type, owner and permission bits of an entry itself (links are not followed).</summary>
-public readonly record struct LinuxEntryStatus(bool IsDirectory, bool IsSymbolicLink, uint OwnerId, UnixFileMode Mode, bool IsRegularFile = false);
+public readonly record struct LinuxEntryStatus(bool IsDirectory, bool IsSymbolicLink, uint OwnerId, UnixFileMode Mode, bool IsRegularFile = false, uint GroupId = 0);
 
 /// <summary>
 /// Checks whether the sealed root can hold session data in memory: it must be on a tmpfs or
@@ -374,7 +374,7 @@ public sealed class SealedStorageProbe
     private const int StatFsBufferSize = 128;
     private const int AtFdcwd = -100;
     private const int AtSymlinkNofollow = 0x100;
-    private const uint StatxTypeModeUid = 0x0001 | 0x0002 | 0x0008;
+    private const uint StatxTypeModeUid = 0x0001 | 0x0002 | 0x0008 | 0x0010;
     private const int StatxBufferSize = 256;
     private const int FileTypeMask = 0xF000;
     private const int DirectoryType = 0x4000;
@@ -430,15 +430,17 @@ public sealed class SealedStorageProbe
                 return null;
             }
 
-            // struct statx: stx_uid at offset 20, stx_mode (u16) at offset 28.
+            // struct statx: stx_uid at offset 20, stx_gid at 24, stx_mode (u16) at 28.
             var ownerId = unchecked((uint)Marshal.ReadInt32(buffer, 20));
+            var groupId = unchecked((uint)Marshal.ReadInt32(buffer, 24));
             var mode = unchecked((ushort)Marshal.ReadInt16(buffer, 28));
             return new LinuxEntryStatus(
                 (mode & FileTypeMask) == DirectoryType,
                 (mode & FileTypeMask) == SymbolicLinkType,
                 ownerId,
                 (UnixFileMode)(mode & 0xFFF),
-                (mode & FileTypeMask) == RegularFileType);
+                (mode & FileTypeMask) == RegularFileType,
+                groupId);
         }
         finally
         {

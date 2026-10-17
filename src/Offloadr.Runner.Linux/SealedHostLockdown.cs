@@ -38,10 +38,12 @@ public static class SealedHostLockdown
     /// Scans as <see cref="FindSharedWritableDirectories(string)"/> describes. Inside a shared
     /// directory, a directory or regular file owned by a uid without an account, or by a session
     /// account, is reported too: useradd hands such a uid to the next session user, who could
-    /// then write there through its owner bits. An unreadable mount table is reported as
-    /// unchecked, since mounted filesystems would go unseen.
+    /// then write there through its owner bits. Anywhere, an entry its group may write counts as
+    /// shared when that group has no entry or is a session's (useradd -U hands its gid out again).
+    /// An unreadable mount table, or an entry whose metadata cannot be read, is reported as
+    /// unchecked, since what lies there would go unseen.
     /// </summary>
-    public static ScanResult Scan(string root = "/", string passwdPath = "/etc/passwd")
+    public static ScanResult Scan(string root = "/", string passwdPath = "/etc/passwd", string groupPath = "/etc/group")
     {
         var users = LinuxSessionResidue.ReadUsers(passwdPath);
         var liveUserIds = users.Select(static user => user.UserId).ToHashSet();
@@ -49,13 +51,46 @@ public static class SealedHostLockdown
             .Where(static user => user.UserName.StartsWith("sess_", StringComparison.Ordinal))
             .Select(static user => user.UserId)
             .ToHashSet();
+        var groups = ReadGroups(groupPath);
+        var liveGroupIds = groups.Select(static group => group.GroupId).ToHashSet();
+        var sessionGroupIds = groups
+            .Where(static group => group.Name.StartsWith("sess_", StringComparison.Ordinal))
+            .Select(static group => group.GroupId)
+            .ToHashSet();
         return Scan(
             root,
             SealedStorageProbe.ReadEntryStatus,
             static path => LinuxFileIdentityReader.TryRead(path, out var identity) ? identity : null,
             static path => Directory.GetFileSystemEntries(path),
             ReadMounts(),
-            userId => userId != 0 && (!liveUserIds.Contains(userId) || sessionUserIds.Contains(userId)));
+            userId => userId != 0 && (!liveUserIds.Contains(userId) || sessionUserIds.Contains(userId)),
+            groupId => groupId != 0 && (!liveGroupIds.Contains(groupId) || sessionGroupIds.Contains(groupId)));
+    }
+
+    /// <summary>Names and ids from a group database; empty when it cannot be read.</summary>
+    internal static IReadOnlyList<(string Name, uint GroupId)> ReadGroups(string groupPath)
+    {
+        string[] lines;
+        try
+        {
+            lines = File.ReadAllLines(groupPath);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return [];
+        }
+
+        var groups = new List<(string, uint)>();
+        foreach (var line in lines)
+        {
+            var fields = line.Split(':');
+            if (fields.Length >= 3 && uint.TryParse(fields[2], System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var groupId))
+            {
+                groups.Add((fields[0], groupId));
+            }
+        }
+
+        return groups;
     }
 
     internal static IReadOnlyList<string> FindSharedWritableDirectories(
@@ -81,8 +116,10 @@ public static class SealedHostLockdown
         Func<string, LinuxFileIdentity?> identityOf,
         Func<string, string[]> listChildren,
         IReadOnlyList<Mount>? mounts,
-        Func<uint, bool> isReusableOwner)
+        Func<uint, bool> isReusableOwner,
+        Func<uint, bool>? isReusableGroup = null)
     {
+        isReusableGroup ??= static _ => false;
         var found = new List<string>();
         var reusablyOwned = new List<string>();
         var unlisted = new List<string>();
@@ -157,8 +194,20 @@ public static class SealedHostLockdown
 
             foreach (var child in children)
             {
-                if (statEntry(child) is not { IsSymbolicLink: false } entry || identityOf(child) is not { } identity)
+                var status = statEntry(child);
+                if (status is { IsSymbolicLink: true })
                 {
+                    continue;
+                }
+
+                if (status is not { } entry || identityOf(child) is not { } identity)
+                {
+                    // Gone since the listing, or there but unreadable: then what is below is unknown.
+                    if (Path.Exists(child))
+                    {
+                        unlisted.Add(child);
+                    }
+
                     continue;
                 }
 
@@ -167,7 +216,9 @@ public static class SealedHostLockdown
                     reusablyOwned.Add(child);
                 }
 
-                var worldWritable = (entry.Mode & UnixFileMode.OtherWrite) != 0;
+                // Writable by every session user, or by one that gets a freed group id again.
+                var worldWritable = (entry.Mode & UnixFileMode.OtherWrite) != 0 ||
+                    ((entry.Mode & UnixFileMode.GroupWrite) != 0 && entry.GroupId != 0 && isReusableGroup(entry.GroupId));
                 if (!entry.IsDirectory)
                 {
                     // Anywhere: a session that knows the name can write it through any folder it can traverse.
