@@ -1,3 +1,5 @@
+using System.Runtime.InteropServices;
+
 namespace Offloadr.Runner.Linux;
 
 /// <summary>
@@ -22,14 +24,39 @@ public static class SealedHostLockdown
     /// directory that cannot be listed (a FUSE or network mount refusing root) goes to
     /// <paramref name="unlisted"/>: what a session can write below it is unknown.
     /// </summary>
-    public static IReadOnlyList<string> FindSharedWritableDirectories(string root = "/", ICollection<string>? unlisted = null)
-        => FindSharedWritableDirectories(
+    public static IReadOnlyList<string> FindSharedWritableDirectories(string root = "/")
+        => Scan(root).SharedWritable;
+
+    /// <summary>
+    /// What a lockdown must act on: world-writable places to close, entries inside shared
+    /// directories owned by a uid a session user may get again (to hand to root) and what could
+    /// not be checked.
+    /// </summary>
+    public sealed record ScanResult(IReadOnlyList<string> SharedWritable, IReadOnlyList<string> ReusablyOwned, IReadOnlyList<string> Unchecked);
+
+    /// <summary>
+    /// Scans as <see cref="FindSharedWritableDirectories(string)"/> describes. Inside a shared
+    /// directory, a directory or regular file owned by a uid without an account, or by a session
+    /// account, is reported too: useradd hands such a uid to the next session user, who could
+    /// then write there through its owner bits. An unreadable mount table is reported as
+    /// unchecked, since mounted filesystems would go unseen.
+    /// </summary>
+    public static ScanResult Scan(string root = "/", string passwdPath = "/etc/passwd")
+    {
+        var users = LinuxSessionResidue.ReadUsers(passwdPath);
+        var liveUserIds = users.Select(static user => user.UserId).ToHashSet();
+        var sessionUserIds = users
+            .Where(static user => user.UserName.StartsWith("sess_", StringComparison.Ordinal))
+            .Select(static user => user.UserId)
+            .ToHashSet();
+        return Scan(
             root,
             SealedStorageProbe.ReadEntryStatus,
             static path => LinuxFileIdentityReader.TryRead(path, out var identity) ? identity : null,
             static (path, everything) => everything ? Directory.GetFileSystemEntries(path) : Directory.GetDirectories(path),
             ReadMounts(),
-            unlisted);
+            userId => userId != 0 && (!liveUserIds.Contains(userId) || sessionUserIds.Contains(userId)));
+    }
 
     internal static IReadOnlyList<string> FindSharedWritableDirectories(
         string root,
@@ -39,12 +66,38 @@ public static class SealedHostLockdown
         IReadOnlyList<Mount> mounts,
         ICollection<string>? unlisted = null)
     {
+        var scan = Scan(root, statEntry, identityOf, listChildren, mounts, static _ => false);
+        foreach (var path in scan.Unchecked)
+        {
+            unlisted?.Add(path);
+        }
+
+        return scan.SharedWritable;
+    }
+
+    internal static ScanResult Scan(
+        string root,
+        Func<string, LinuxEntryStatus?> statEntry,
+        Func<string, LinuxFileIdentity?> identityOf,
+        Func<string, bool, string[]> listChildren,
+        IReadOnlyList<Mount>? mounts,
+        Func<uint, bool> isReusableOwner)
+    {
         var found = new List<string>();
+        var reusablyOwned = new List<string>();
+        var unlisted = new List<string>();
+        var result = new ScanResult(found, reusablyOwned, unlisted);
+        if (mounts is null)
+        {
+            unlisted.Add(MountTablePath);
+            mounts = [];
+        }
+
         var shared = new HashSet<string>(StringComparer.Ordinal);
         var visited = new HashSet<(ulong Device, ulong Inode)>();
         if (statEntry(root) is not { IsDirectory: true } || identityOf(root) is not { } rootIdentity)
         {
-            return found;
+            return result;
         }
 
         visited.Add((rootIdentity.DeviceId, rootIdentity.Inode));
@@ -69,7 +122,7 @@ public static class SealedHostLockdown
             Walk(mount.MountPoint, identity.DeviceId, insideShared: IsSharedOrBelowShared(mount.MountPoint));
         }
 
-        return found;
+        return result;
 
         bool IsSharedOrBelowShared(string path)
         {
@@ -98,7 +151,7 @@ public static class SealedHostLockdown
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
-                unlisted?.Add(directory);
+                unlisted.Add(directory);
                 return;
             }
 
@@ -107,6 +160,11 @@ public static class SealedHostLockdown
                 if (statEntry(child) is not { IsSymbolicLink: false } entry || identityOf(child) is not { } identity)
                 {
                     continue;
+                }
+
+                if (insideShared && entry.OwnerId != 0 && (entry.IsDirectory || entry.IsRegularFile) && isReusableOwner(entry.OwnerId))
+                {
+                    reusablyOwned.Add(child);
                 }
 
                 var worldWritable = (entry.Mode & UnixFileMode.OtherWrite) != 0;
@@ -147,7 +205,10 @@ public static class SealedHostLockdown
     /// <summary>One line of <c>/proc/self/mounts</c>.</summary>
     internal sealed record Mount(string MountPoint, string Type, bool ReadOnly);
 
-    internal static IReadOnlyList<Mount> ReadMounts(string path = "/proc/self/mounts")
+    private const string MountTablePath = "/proc/self/mounts";
+
+    /// <summary>The mount table, or null when it cannot be read (it always lists at least the root).</summary>
+    internal static IReadOnlyList<Mount>? ReadMounts(string path = MountTablePath)
     {
         string text;
         try
@@ -156,7 +217,7 @@ public static class SealedHostLockdown
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            return [];
+            return null;
         }
 
         var mounts = new List<Mount>();
@@ -176,6 +237,56 @@ public static class SealedHostLockdown
 
         return mounts;
     }
+
+    /// <summary>
+    /// Gives each directory or regular file to root (owner and group), so a session user that
+    /// gets its old uid again cannot write it, then checks the owner. Links are not followed.
+    /// </summary>
+    public static Result HandToRoot(IEnumerable<string> paths)
+        => HandToRoot(paths, SealedStorageProbe.ReadEntryStatus, static path =>
+        {
+            if (lchown(path, 0, 0) != 0)
+            {
+                throw new IOException($"lchown failed with errno {Marshal.GetLastPInvokeError()}.");
+            }
+        });
+
+    internal static Result HandToRoot(IEnumerable<string> paths, Func<string, LinuxEntryStatus?> statEntry, Action<string> chownToRoot)
+    {
+        ArgumentNullException.ThrowIfNull(paths);
+        var changed = new List<string>();
+        var stillOwned = new List<string>();
+        foreach (var path in paths)
+        {
+            if (statEntry(path) is not { IsSymbolicLink: false } entry || entry.OwnerId == 0)
+            {
+                continue;
+            }
+
+            try
+            {
+                chownToRoot(path);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                RunnerLog.Warning($"Sealed storage: could not give '{path}' to root: {ex.Message}");
+            }
+
+            if (statEntry(path) is { OwnerId: 0 })
+            {
+                changed.Add(path);
+            }
+            else
+            {
+                stillOwned.Add(path);
+            }
+        }
+
+        return new Result(changed, stillOwned);
+    }
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int lchown(string path, uint owner, uint group);
 
     /// <summary>What the lockdown closed, and what it could not close although others can still write it.</summary>
     public sealed record Result(IReadOnlyList<string> Closed, IReadOnlyList<string> StillWritable);

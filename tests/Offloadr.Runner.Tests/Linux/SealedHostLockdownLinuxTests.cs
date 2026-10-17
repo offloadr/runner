@@ -187,6 +187,93 @@ public class SealedHostLockdownLinuxTests
         Assert.That(unlisted, Is.EqualTo(new[] { "/tmp/fuse" }));
     }
 
+    [Test]
+    public void Scan_ReportsResidueOfReusableUidsAndAnUnreadableMountTable()
+    {
+        var shared = Mode0755 | UnixFileMode.OtherWrite;
+        const UnixFileMode Private = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
+        // Under /tmp: residue of a removed session user (uid 1001, any mode), a live service's
+        // folder (uid 999) and root's own. Outside shared directories ownership is not judged.
+        var entries = new Dictionary<string, (LinuxEntryStatus Status, string[] Children)>(StringComparer.Ordinal)
+        {
+            ["/"] = (new(true, false, 0, Mode0755), ["/tmp", "/home"]),
+            ["/tmp"] = (new(true, false, 0, shared), ["/tmp/old", "/tmp/service", "/tmp/agent"]),
+            ["/tmp/old"] = (new(true, false, 1001, Private), ["/tmp/old/notes.txt"]),
+            ["/tmp/old/notes.txt"] = (new(false, false, 1001, Private, IsRegularFile: true), []),
+            ["/tmp/service"] = (new(true, false, 999, Private), []),
+            ["/tmp/agent"] = (new(true, false, 0, Mode0755), []),
+            ["/home"] = (new(true, false, 0, Mode0755), ["/home/old"]),
+            ["/home/old"] = (new(true, false, 1001, Private), []),
+        };
+
+        var scan = SealedHostLockdown.Scan(
+            "/",
+            path => entries.TryGetValue(path, out var entry) ? entry.Status : null,
+            path => entries.ContainsKey(path) ? new LinuxFileIdentity(1, InodeOf(path), 0) : null,
+            (path, _) => entries[path].Children,
+            mounts: null,
+            isReusableOwner: userId => userId == 1001);
+
+        Assert.That(scan.ReusablyOwned, Is.EqualTo(new[] { "/tmp/old", "/tmp/old/notes.txt" }));
+        Assert.That(scan.SharedWritable, Is.EqualTo(new[] { "/tmp" }));
+        Assert.That(scan.Unchecked, Is.EqualTo(new[] { "/proc/self/mounts" }), "mounted filesystems would go unseen");
+    }
+
+    [Test]
+    public void HandToRoot_GivesEntriesToRootAndReportsWhatStaysWithTheOldOwner()
+    {
+        var owners = new Dictionary<string, uint>(StringComparer.Ordinal)
+        {
+            ["/tmp/old"] = 1001,
+            ["/tmp/refuses"] = 1001,
+            ["/tmp/root"] = 0,
+        };
+
+        var result = SealedHostLockdown.HandToRoot(
+            owners.Keys,
+            path => new LinuxEntryStatus(true, false, owners[path], Mode0755),
+            path =>
+            {
+                if (path == "/tmp/refuses")
+                {
+                    throw new UnauthorizedAccessException(path);
+                }
+
+                owners[path] = 0;
+            });
+
+        Assert.That(result.Closed, Is.EqualTo(new[] { "/tmp/old" }));
+        Assert.That(result.StillWritable, Is.EqualTo(new[] { "/tmp/refuses" }));
+    }
+
+    [Test]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public void HandToRoot_ChangesTheRealOwner()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        LinuxTestPrerequisites.RequireRoot();
+
+        var root = Path.Combine(Path.GetTempPath(), $"runner-handover-{Guid.NewGuid():N}");
+        try
+        {
+            var file = Path.Combine(root, "left.txt");
+            Directory.CreateDirectory(root);
+            File.WriteAllText(file, string.Empty);
+            var chown = Process.Start("/bin/chown", ["54321:54321", file])!;
+            chown.WaitForExit();
+
+            Assert.That(SealedStorageProbe.ReadEntryStatus(file)!.Value.OwnerId, Is.EqualTo(54321u));
+            var result = SealedHostLockdown.HandToRoot([file]);
+
+            Assert.That(result.Closed, Is.EqualTo(new[] { file }));
+            Assert.That(SealedStorageProbe.ReadEntryStatus(file)!.Value.OwnerId, Is.Zero);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
     private static ulong InodeOf(string path) => (ulong)(uint)StringComparer.Ordinal.GetHashCode(path);
 
     /// <summary>

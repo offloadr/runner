@@ -20,27 +20,34 @@ public sealed class SealedHostPreparation
                 return null;
             }
 
-            var unlisted = new List<string>();
+            var scan = SealedHostLockdown.Scan();
+            // Residue of an earlier session user first: its uid may come back.
+            var handed = SealedHostLockdown.HandToRoot(scan.ReusablyOwned);
             var lockdown = SealedHostLockdown.RemoveSharedWriteAccess(
                 SealedHostLockdown.SharedTemporaryDirectories
-                    .Concat(SealedHostLockdown.FindSharedWritableDirectories(unlisted: unlisted))
+                    .Concat(scan.SharedWritable)
                     .Distinct(StringComparer.Ordinal));
+            foreach (var path in handed.Closed)
+            {
+                RunnerLog.Info($"Sealed storage: '{path}', left by an earlier session user, now belongs to root.");
+            }
+
             foreach (var directory in lockdown.Closed)
             {
                 RunnerLog.Info($"Sealed storage: '{directory}' is no longer writable by session users.");
             }
 
-            if (lockdown.StillWritable.Count > 0)
+            var stillWritable = handed.StillWritable.Concat(lockdown.StillWritable).ToArray();
+            if (stillWritable.Length > 0)
             {
                 // Sessions could write their data to these disk-backed places.
-                return "these disk-backed paths stay writable by session users: " + string.Join(", ", lockdown.StillWritable);
+                return "these disk-backed paths stay writable by session users: " + string.Join(", ", stillWritable);
             }
 
-            if (unlisted.Count > 0)
+            if (scan.Unchecked.Count > 0)
             {
                 // A session may still reach a writable place below these, which the scan could not see.
-                return "these directories could not be listed to check what session users can write below them: " +
-                    string.Join(", ", unlisted);
+                return "these could not be read to check what session users can write: " + string.Join(", ", scan.Unchecked);
             }
 
             _applied = true;
