@@ -134,6 +134,8 @@ public static class SealedHostLockdown
         var visited = new HashSet<(ulong Device, ulong Inode)>();
         if (statEntry(root) is not { IsDirectory: true } || identityOf(root) is not { } rootIdentity)
         {
+            // Nothing below it was checked.
+            unlisted.Add(root);
             return result;
         }
 
@@ -148,10 +150,30 @@ public static class SealedHostLockdown
                      .Where(mount => mount.MountPoint.StartsWith(prefix, StringComparison.Ordinal))
                      .OrderBy(static mount => mount.MountPoint, StringComparer.Ordinal))
         {
-            if (mount.ReadOnly || NotDiskBackedTypes.Contains(mount.Type) ||
-                statEntry(mount.MountPoint) is not { IsDirectory: true, IsSymbolicLink: false } ||
-                identityOf(mount.MountPoint) is not { } identity ||
-                !visited.Add((identity.DeviceId, identity.Inode)))
+            if (mount.ReadOnly || NotDiskBackedTypes.Contains(mount.Type))
+            {
+                continue;
+            }
+
+            // A file bind-mounted over another (such as /etc/hosts) holds no directories.
+            var mountStatus = statEntry(mount.MountPoint);
+            if (mountStatus is { } known && (!known.IsDirectory || known.IsSymbolicLink))
+            {
+                continue;
+            }
+
+            if (mountStatus is null || identityOf(mount.MountPoint) is not { } identity)
+            {
+                // There but unreadable: what lies on it is unknown.
+                if (Path.Exists(mount.MountPoint))
+                {
+                    unlisted.Add(mount.MountPoint);
+                }
+
+                continue;
+            }
+
+            if (!visited.Add((identity.DeviceId, identity.Inode)))
             {
                 continue;
             }

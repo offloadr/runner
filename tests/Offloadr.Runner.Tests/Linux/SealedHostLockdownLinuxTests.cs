@@ -277,6 +277,21 @@ public class SealedHostLockdownLinuxTests
     }
 
     [Test]
+    public void Scan_CountsARootItCannotIdentifyAsUnchecked()
+    {
+        // statx blocked or unsupported: nothing could be checked, not "nothing found".
+        var scan = SealedHostLockdown.Scan(
+            "/",
+            _ => new LinuxEntryStatus(true, false, 0, Mode0755),
+            _ => null,
+            _ => [],
+            mounts: [],
+            isReusableOwner: static _ => false);
+
+        Assert.That(scan.Unchecked, Is.EqualTo(new[] { "/" }));
+    }
+
+    [Test]
     public void HandToRoot_GivesEntriesToRootAndReportsWhatStaysWithTheOldOwner()
     {
         var owners = new Dictionary<string, uint>(StringComparer.Ordinal)
