@@ -148,8 +148,23 @@ public sealed class SealedStorageProbe
         // cgroup v2 first, then v1; an unlimited cgroup is bounded by the machine's memory.
         var limit = ParseLimit(ReadCgroupValue("memory.max"))
             ?? ParseLimit(_readFile("/sys/fs/cgroup/memory/memory.limit_in_bytes")?.Trim());
-        var usage = ParseLong(ReadCgroupValue("memory.current"))
-            ?? ParseLong(_readFile("/sys/fs/cgroup/memory/memory.usage_in_bytes")?.Trim());
+        // Usage counts page cache, such as model files the VFS has read, which fills a limited
+        // cgroup but is reclaimed on demand: like docker and the kubelet, count the working set,
+        // usage without inactive file pages. A tmpfs file is not among them (it is swap-backed).
+        long? usage;
+        if (ParseLong(ReadCgroupValue("memory.current")) is { } current)
+        {
+            usage = current - ReadStatValue(_readFile("/sys/fs/cgroup/memory.stat"), "inactive_file");
+        }
+        else if (ParseLong(_readFile("/sys/fs/cgroup/memory/memory.usage_in_bytes")?.Trim()) is { } used)
+        {
+            usage = used - ReadStatValue(_readFile("/sys/fs/cgroup/memory/memory.stat"), "total_inactive_file");
+        }
+        else
+        {
+            usage = null;
+        }
+
         var total = ReadMemTotalBytes();
         if (limit is null || (total is { } t && limit > t))
         {
@@ -161,7 +176,22 @@ public sealed class SealedStorageProbe
             return null;
         }
 
-        return Math.Max(0, l - (usage ?? 0));
+        return Math.Max(0, l - Math.Max(0, usage ?? 0));
+    }
+
+    /// <summary>A counter from a cgroup <c>memory.stat</c> file, or 0 when it is missing.</summary>
+    private static long ReadStatValue(string? stat, string name)
+    {
+        foreach (var line in stat?.Split('\n') ?? [])
+        {
+            var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length == 2 && string.Equals(parts[0], name, StringComparison.Ordinal) && ParseLong(parts[1]) is { } value)
+            {
+                return value;
+            }
+        }
+
+        return 0;
     }
 
     private long? ReadMemTotalBytes()

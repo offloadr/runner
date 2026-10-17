@@ -1225,7 +1225,7 @@ internal sealed partial class SessionProcessManager : IDisposable
         ThrowIfSealedStorageUnavailable();
         var directory = ResolveSealedSessionDirectory(sessionId)
             ?? throw new InvalidOperationException($"Session id '{sessionId}' cannot name a sealed session directory.");
-        DeleteSealedSessionDirectory(sessionId);
+        _ = DeleteSealedSessionDirectory(sessionId);
         if (Path.Exists(directory))
         {
             throw new InvalidOperationException($"Sealed storage is unavailable: '{directory}' exists and is not a sealed session directory.");
@@ -1292,31 +1292,47 @@ internal sealed partial class SessionProcessManager : IDisposable
         return Path.Combine(_sealing.Root, sessionId);
     }
 
-    private void DeleteSealedSessionDirectory(string sessionId)
+    /// <summary>Removes the directory recursively; replaceable so tests can make it fail.</summary>
+    internal Action<string> DeleteDirectoryRecursively { get; set; } = static directory => Directory.Delete(directory, recursive: true);
+
+    /// <summary>
+    /// Removes the session's sealed directory. False while some of it stays: until a retry
+    /// succeeds the directory is closed to everyone but root, so a session user created later
+    /// with the same uid cannot read what is left.
+    /// </summary>
+    private bool DeleteSealedSessionDirectory(string sessionId)
     {
         if (ResolveSealedSessionDirectory(sessionId) is not { } directory)
         {
-            return;
+            return true;
         }
 
         if (!Path.Exists(directory))
         {
-            return;
+            return true;
         }
 
         if (!IsSealedSessionDirectory(directory, sessionId))
         {
             RunnerLog.Warning<SessionProcessManager>($"Leaving '{directory}' alone: it is not a sealed session directory of this runner.");
-            return;
+            return true;
         }
 
         try
         {
-            Directory.Delete(directory, recursive: true);
+            if (OperatingSystem.IsLinux())
+            {
+                File.SetUnixFileMode(directory, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            }
+
+            DeleteDirectoryRecursively(directory);
+            return true;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            RunnerLog.Error<SessionProcessManager>(ex, $"Failed to remove sealed session directory '{directory}': {ex.Message}");
+            // The message names the file that could not go, which is session data.
+            RunnerLog.Error<SessionProcessManager>($"Failed to remove sealed session directory '{directory}': {ex.GetType().Name}.");
+            return false;
         }
     }
 
@@ -1348,7 +1364,7 @@ internal sealed partial class SessionProcessManager : IDisposable
             }
 
             RunnerLog.Warning<SessionProcessManager>($"Removing sealed session data left by an earlier runner process: '{entry}'.");
-            DeleteSealedSessionDirectory(sessionId);
+            _ = DeleteSealedSessionDirectory(sessionId);
         }
     }
 
@@ -1697,9 +1713,16 @@ internal sealed partial class SessionProcessManager : IDisposable
             return;
         }
 
-        _pendingTeardowns.TryRemove(new KeyValuePair<string, PreparedSessionIdentity>(sessionId, identity));
         DeleteSessionHomeDirectory(identity.HomeDirectory);
-        DeleteSealedSessionDirectory(sessionId);
+        if (!DeleteSealedSessionDirectory(sessionId))
+        {
+            // Plaintext session data is still there: Stop stays pending until a retry removes it,
+            // and the reader key is kept until then.
+            _pendingTeardowns[sessionId] = identity;
+            return;
+        }
+
+        _pendingTeardowns.TryRemove(new KeyValuePair<string, PreparedSessionIdentity>(sessionId, identity));
         ReleaseTransferSealing(sessionId);
     }
 
@@ -1722,7 +1745,7 @@ internal sealed partial class SessionProcessManager : IDisposable
         if (_pendingTeardowns.ContainsKey(sessionId))
         {
             throw new InvalidOperationException(
-                $"Processes of session '{sessionId}' are still running after its teardown; the stop is not complete.");
+                $"The teardown of session '{sessionId}' is not complete (its processes still run or its sealed data is not removed); the stop is not complete.");
         }
     }
 
@@ -1762,7 +1785,7 @@ internal sealed partial class SessionProcessManager : IDisposable
             File.Delete(home);
         }
 
-        DeleteSealedSessionDirectory(sessionId);
+        _ = DeleteSealedSessionDirectory(sessionId);
     }
 
     private void DeleteSessionHomeDirectory(string homeDirectory)

@@ -102,6 +102,36 @@ public class SealedStorageProbeTests
         Assert.That(host.StatFsCalls, Is.EqualTo(new[] { "/dev/shm" }));
     }
 
+    [TestCase(false)]
+    [TestCase(true)]
+    public void Probe_LeavesReclaimableFileCacheOutOfTheHeadroom(bool cgroupV1)
+    {
+        var host = new FakeHost();
+        // A 16 GiB limit nearly full, mostly with inactive page cache of models read earlier.
+        var limit = (16 * GiB).ToString(System.Globalization.CultureInfo.InvariantCulture) + "\n";
+        var usage = (16 * GiB - 1024).ToString(System.Globalization.CultureInfo.InvariantCulture) + "\n";
+        var inactive = (12 * GiB).ToString(System.Globalization.CultureInfo.InvariantCulture);
+        host.Files.Remove("/sys/fs/cgroup/memory.max");
+        host.Files.Remove("/sys/fs/cgroup/memory.current");
+        if (cgroupV1)
+        {
+            host.Files["/sys/fs/cgroup/memory/memory.limit_in_bytes"] = limit;
+            host.Files["/sys/fs/cgroup/memory/memory.usage_in_bytes"] = usage;
+            host.Files["/sys/fs/cgroup/memory/memory.stat"] = $"cache 1\ninactive_file 5\ntotal_inactive_file {inactive}\n";
+        }
+        else
+        {
+            host.Files["/sys/fs/cgroup/memory.max"] = limit;
+            host.Files["/sys/fs/cgroup/memory.current"] = usage;
+            host.Files["/sys/fs/cgroup/memory.stat"] = $"anon 1\nfile 1\ninactive_anon 7\ninactive_file {inactive}\nactive_file 3\n";
+        }
+
+        var status = host.Probe().Probe(Required());
+
+        Assert.That(status.MemoryHeadroomBytes, Is.EqualTo(12 * GiB + 1024));
+        Assert.That(status.Available, Is.True, status.Reason);
+    }
+
     [Test]
     public void Probe_FallsBackToMemTotalWithoutCgroupFiles()
     {

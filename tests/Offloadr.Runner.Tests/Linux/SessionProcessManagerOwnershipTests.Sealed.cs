@@ -715,6 +715,53 @@ public partial class SessionProcessManagerOwnershipTests
 
     [Test]
     [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public async Task SealedTeardown_StaysPendingWhileItsDataCannotBeRemoved()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        LinuxTestPrerequisites.RequireRoot();
+
+        var (tempRoot, sealedRoot, options) = CreateSealedOptions("comfyui");
+        const string sessionId = "session-undeletable";
+        var homeDirectory = Path.Combine(options.SessionRoot, sessionId);
+        var sealedDirectory = Path.Combine(sealedRoot, sessionId);
+
+        try
+        {
+            using var manager = new SessionProcessManager(options, new RecordingIsolationStrategy("sess_undeletable", homeDirectory), SealedVfsBuilder(), new RecordingCommandRunner(string.Empty)) { PrepareSealedHost = HostLockedDown };
+            var deleteDirectory = manager.DeleteDirectoryRecursively;
+            manager.DeleteDirectoryRecursively = _ => throw new IOException("Directory not empty: 'output/my-secret-portrait.png'");
+
+            // The entry point does not exist, so the launch fails after provisioning and its
+            // cleanup cannot remove the sealed data.
+            Assert.CatchAsync(() => manager.StartSessionAsync(SealedStart(sessionId), CancellationToken.None));
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(Directory.Exists(sealedDirectory), Is.True);
+                Assert.That(File.GetUnixFileMode(sealedDirectory), Is.EqualTo(Mode0700), "closed to a later session user with the same uid");
+                Assert.That(manager.GetSessionSealingStatus(sessionId), Is.Not.Null, "the reader key outlives the data");
+            });
+            var pending = Assert.ThrowsAsync<InvalidOperationException>(() => manager.StopSessionAsync(sessionId, CancellationToken.None));
+            Assert.That(pending!.Message, Does.Contain("not complete"));
+
+            manager.DeleteDirectoryRecursively = deleteDirectory;
+            await manager.StopSessionAsync(sessionId, CancellationToken.None);
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(Directory.Exists(sealedDirectory), Is.False);
+                Assert.That(manager.GetSessionSealingStatus(sessionId), Is.Null);
+            });
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+            TryDelete(sealedRoot);
+        }
+    }
+
+    [Test]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
     public void SealedStart_IsRefusedUntilTheHostIsLockedDown()
     {
         LinuxTestPrerequisites.RequireLinux();
