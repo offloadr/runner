@@ -374,6 +374,56 @@ public class SealedHostLockdownLinuxTests
     }
 
     [Test]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public void IsGone_OnlyForAnEntryThatDoesNotExist()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+
+        var root = Path.Combine(Path.GetTempPath(), $"runner-gone-{Guid.NewGuid():N}");
+        try
+        {
+            Directory.CreateDirectory(root);
+            var file = Path.Combine(root, "file");
+            File.WriteAllText(file, string.Empty);
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(SealedHostLockdown.IsGone(Path.Combine(root, "missing")), Is.True);
+                Assert.That(SealedHostLockdown.IsGone(Path.Combine(file, "below")), Is.True, "below a file: ENOTDIR");
+                Assert.That(SealedHostLockdown.IsGone(file), Is.False);
+                Assert.That(SealedHostLockdown.IsGone(root), Is.False);
+            });
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [TestCase("")]
+    [TestCase("garbage\n")]
+    [TestCase("tmpfs /dev/shm tmpfs rw 0 0\n")]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public void ReadMounts_RejectsATableWithoutTheRoot(string content)
+    {
+        LinuxTestPrerequisites.RequireLinux();
+
+        var file = Path.Combine(Path.GetTempPath(), $"runner-mounts-{Guid.NewGuid():N}");
+        try
+        {
+            File.WriteAllText(file, content);
+            Assert.That(SealedHostLockdown.ReadMounts(file), Is.Null);
+
+            File.WriteAllText(file, "overlay / overlay rw 0 0\n" + content);
+            Assert.That(SealedHostLockdown.ReadMounts(file), Is.Not.Null);
+        }
+        finally
+        {
+            File.Delete(file);
+        }
+    }
+
+    [Test]
     public void Scan_CountsARootItCannotIdentifyAsUnchecked()
     {
         // statx blocked or unsupported: nothing could be checked, not "nothing found".

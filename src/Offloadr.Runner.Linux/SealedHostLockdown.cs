@@ -191,7 +191,7 @@ public static class SealedHostLockdown
             if (mountStatus is null || identityOf(mount.MountPoint) is not { } identity)
             {
                 // There but unreadable: what lies on it is unknown.
-                if (Path.Exists(mount.MountPoint))
+                if (!IsGone(mount.MountPoint))
                 {
                     unlisted.Add(mount.MountPoint);
                 }
@@ -252,7 +252,7 @@ public static class SealedHostLockdown
                 if (status is not { } entry || identityOf(child) is not { } identity)
                 {
                     // Gone since the listing, or there but unreadable: then what is below is unknown.
-                    if (Path.Exists(child))
+                    if (!IsGone(child))
                     {
                         unlisted.Add(child);
                     }
@@ -340,8 +340,40 @@ public static class SealedHostLockdown
                 parts[3].Split(',').Contains("ro", StringComparer.Ordinal)));
         }
 
-        return mounts;
+        // Every mount table lists the root; one that does not (empty, masked, garbled) shows nothing.
+        return mounts.Any(static mount => mount.MountPoint == "/") ? mounts : null;
     }
+
+    private const int NoSuchEntry = 2;
+    private const int NotADirectory = 20;
+    private const int AtFdcwd = -100;
+    private const int AtSymlinkNofollow = 0x100;
+
+    /// <summary>
+    /// True only when the entry is known to be gone (ENOENT or ENOTDIR from lstat). Any other
+    /// failure, such as EACCES or EIO on a FUSE or network mount, leaves it unknown, not absent.
+    /// </summary>
+    internal static bool IsGone(string path)
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            return false;
+        }
+
+        var buffer = Marshal.AllocHGlobal(256);
+        try
+        {
+            return statx(AtFdcwd, path, AtSymlinkNofollow, 0, buffer) != 0 &&
+                Marshal.GetLastPInvokeError() is NoSuchEntry or NotADirectory;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
+    }
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int statx(int directoryFileDescriptor, string path, int flags, uint mask, nint buffer);
 
     /// <summary>
     /// Gives each directory or regular file to root (owner and group), so a session user that
