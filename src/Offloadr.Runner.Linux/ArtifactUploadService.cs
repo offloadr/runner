@@ -1390,6 +1390,13 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                                     metadata.Envelope,
                                     _paths.TransferSealing,
                                     () => new SealedArtifactIdentity(_sessionId, state.EditorSid, state.Type, state.Subfolder, state.Filename)));
+                                // The envelope format caps this too; the artifact limit is checked
+                                // here so it never depends on that.
+                                if (sink.SealedPlaintextSize > MaxUploadBytes)
+                                {
+                                    throw new InvalidOperationException(
+                                        $"Artifact declares {sink.SealedPlaintextSize} bytes, above the {MaxUploadBytes} byte limit.");
+                                }
                                 // The catalog records the local file's size: the plaintext a sealed
                                 // header declares, not its ciphertext on the wire.
                                 state.UpdateMetadata(

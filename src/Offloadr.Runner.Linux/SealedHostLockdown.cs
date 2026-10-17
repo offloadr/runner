@@ -15,27 +15,76 @@ public static class SealedHostLockdown
     /// such as <c>/tmp</c>, <c>/var/tmp</c>, <c>/run/lock</c> or Ubuntu's <c>/var/crash</c>, and
     /// world-writable mount points there, such as a volume mounted into the container. Inside a
     /// world-writable directory every world-writable directory and regular file is reported, at
-    /// any depth, since closing only the top would leave them usable. Other filesystems are
-    /// reported but never entered, symlinks are not followed and sockets are left alone.
+    /// any depth, since closing only the top would leave them usable. That includes filesystems
+    /// mounted anywhere below one, which a session can still traverse into; read-only and
+    /// memory-backed ones are not entered. Other filesystems are not entered, symlinks are not
+    /// followed and sockets are left alone.
     /// </summary>
     public static IReadOnlyList<string> FindSharedWritableDirectories(string root = "/", int maxDepth = 3)
+        => FindSharedWritableDirectories(
+            root,
+            maxDepth,
+            SealedStorageProbe.ReadEntryStatus,
+            static path => LinuxFileIdentityReader.TryRead(path, out var identity) ? identity.DeviceId : null,
+            static (path, everything) => everything ? Directory.GetFileSystemEntries(path) : Directory.GetDirectories(path),
+            ReadMounts());
+
+    internal static IReadOnlyList<string> FindSharedWritableDirectories(
+        string root,
+        int maxDepth,
+        Func<string, LinuxEntryStatus?> statEntry,
+        Func<string, ulong?> deviceOf,
+        Func<string, bool, string[]> listChildren,
+        IReadOnlyList<Mount> mounts)
     {
         var found = new List<string>();
-        if (SealedStorageProbe.ReadEntryStatus(root) is not { IsDirectory: true } ||
-            !LinuxFileIdentityReader.TryRead(root, out var rootIdentity))
+        var shared = new HashSet<string>(StringComparer.Ordinal);
+        if (statEntry(root) is not { IsDirectory: true } || deviceOf(root) is not { } rootDevice)
         {
             return found;
         }
 
-        Walk(root, 0, insideShared: false);
+        Walk(root, rootDevice, 0, insideShared: false);
+
+        // A mount below a shared directory is reachable although the walk above stayed on its own
+        // filesystem. Parents sort before their children, so a mount nested in a walked mount is
+        // judged after what that walk found.
+        var prefix = root.EndsWith('/') ? root : root + "/";
+        foreach (var mount in mounts
+                     .Where(mount => mount.MountPoint.StartsWith(prefix, StringComparison.Ordinal))
+                     .OrderBy(static mount => mount.MountPoint, StringComparer.Ordinal))
+        {
+            if (mount.ReadOnly || mount.Type is "tmpfs" or "ramfs" || !IsSharedOrBelowShared(mount.MountPoint) ||
+                statEntry(mount.MountPoint) is not { IsDirectory: true, IsSymbolicLink: false } ||
+                deviceOf(mount.MountPoint) is not { } device)
+            {
+                continue;
+            }
+
+            Walk(mount.MountPoint, device, 0, insideShared: true);
+        }
+
         return found;
 
-        void Walk(string directory, int depth, bool insideShared)
+        bool IsSharedOrBelowShared(string path)
+        {
+            for (string? current = path; current is not null; current = Path.GetDirectoryName(current))
+            {
+                if (shared.Contains(current))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        void Walk(string directory, ulong walkDevice, int depth, bool insideShared)
         {
             string[] children;
             try
             {
-                children = insideShared ? Directory.GetFileSystemEntries(directory) : Directory.GetDirectories(directory);
+                children = listChildren(directory, insideShared);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
@@ -44,8 +93,7 @@ public static class SealedHostLockdown
 
             foreach (var child in children)
             {
-                if (SealedStorageProbe.ReadEntryStatus(child) is not { IsSymbolicLink: false } entry ||
-                    !LinuxFileIdentityReader.TryRead(child, out var identity))
+                if (statEntry(child) is not { IsSymbolicLink: false } entry || deviceOf(child) is not { } device)
                 {
                     continue;
                 }
@@ -53,7 +101,7 @@ public static class SealedHostLockdown
                 var worldWritable = (entry.Mode & UnixFileMode.OtherWrite) != 0;
                 if (!entry.IsDirectory)
                 {
-                    if (insideShared && entry.IsRegularFile && worldWritable)
+                    if (insideShared && entry.IsRegularFile && worldWritable && shared.Add(child))
                     {
                         found.Add(child);
                     }
@@ -61,26 +109,60 @@ public static class SealedHostLockdown
                     continue;
                 }
 
-                if (worldWritable)
+                if (worldWritable && shared.Add(child))
                 {
                     found.Add(child);
                 }
 
-                if (identity.DeviceId != rootIdentity.DeviceId)
+                // Another filesystem is walked from the mount table, if a session can reach it.
+                if (device != walkDevice)
                 {
                     continue;
                 }
 
                 if (worldWritable || insideShared)
                 {
-                    Walk(child, depth + 1, insideShared: true);
+                    Walk(child, walkDevice, depth + 1, insideShared: true);
                 }
                 else if (depth + 1 < maxDepth)
                 {
-                    Walk(child, depth + 1, insideShared: false);
+                    Walk(child, walkDevice, depth + 1, insideShared: false);
                 }
             }
         }
+    }
+
+    /// <summary>One line of <c>/proc/self/mounts</c>.</summary>
+    internal sealed record Mount(string MountPoint, string Type, bool ReadOnly);
+
+    internal static IReadOnlyList<Mount> ReadMounts(string path = "/proc/self/mounts")
+    {
+        string text;
+        try
+        {
+            text = File.ReadAllText(path);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return [];
+        }
+
+        var mounts = new List<Mount>();
+        foreach (var line in text.Split('\n'))
+        {
+            var parts = line.Split(' ');
+            if (parts.Length < 4)
+            {
+                continue;
+            }
+
+            mounts.Add(new Mount(
+                SealedStorageProbe.DecodeMountField(parts[1]),
+                parts[2],
+                parts[3].Split(',').Contains("ro", StringComparer.Ordinal)));
+        }
+
+        return mounts;
     }
 
     /// <summary>What the lockdown closed, and what it could not close although others can still write it.</summary>

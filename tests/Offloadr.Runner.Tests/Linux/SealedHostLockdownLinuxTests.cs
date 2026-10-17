@@ -48,6 +48,53 @@ public class SealedHostLockdownLinuxTests
         }
     }
 
+    [Test]
+    public void FindSharedWritableDirectories_FollowsMountsBelowSharedDirectories()
+    {
+        var shared = Mode0755 | UnixFileMode.OtherWrite;
+        // /workspace is a world-writable volume with a writable folder and a nested disk mount
+        // (not world-writable at its top) inside. /tmp/ram is memory-backed and /media read-only;
+        // /proc is another filesystem below nothing shared. None of those three is entered.
+        var entries = new Dictionary<string, (LinuxEntryStatus Status, ulong Device, string[] Children)>(StringComparer.Ordinal)
+        {
+            ["/"] = (new(true, false, 0, Mode0755), 1, ["/workspace", "/tmp", "/media", "/proc"]),
+            ["/workspace"] = (new(true, false, 0, shared), 2, ["/workspace/jobs", "/workspace/mnt"]),
+            ["/workspace/jobs"] = (new(true, false, 0, shared), 2, []),
+            ["/workspace/mnt"] = (new(true, false, 0, Mode0755), 3, ["/workspace/mnt/deep"]),
+            ["/workspace/mnt/deep"] = (new(true, false, 0, shared), 3, ["/workspace/mnt/deep/file"]),
+            ["/workspace/mnt/deep/file"] = (new(false, false, 0, shared, IsRegularFile: true), 3, []),
+            ["/tmp"] = (new(true, false, 0, shared), 1, ["/tmp/ram"]),
+            ["/tmp/ram"] = (new(true, false, 0, Mode0755), 5, ["/tmp/ram/open"]),
+            ["/tmp/ram/open"] = (new(true, false, 0, shared), 5, []),
+            ["/media"] = (new(true, false, 0, shared), 6, ["/media/open"]),
+            ["/media/open"] = (new(true, false, 0, shared), 6, []),
+            ["/proc"] = (new(true, false, 0, Mode0755), 4, ["/proc/open"]),
+            ["/proc/open"] = (new(true, false, 0, shared), 4, []),
+        };
+        var mounts = new SealedHostLockdown.Mount[]
+        {
+            new("/", "overlay", false),
+            new("/workspace/mnt", "ext4", false),
+            new("/workspace", "ext4", false),
+            new("/tmp/ram", "tmpfs", false),
+            new("/media", "ext4", true),
+            new("/proc", "proc", false),
+        };
+
+        var found = SealedHostLockdown.FindSharedWritableDirectories(
+            "/",
+            3,
+            path => entries.TryGetValue(path, out var entry) ? entry.Status : null,
+            path => entries.TryGetValue(path, out var entry) ? entry.Device : null,
+            (path, _) => entries[path].Children,
+            mounts);
+
+        Assert.That(found, Is.EquivalentTo(new[]
+        {
+            "/workspace", "/workspace/jobs", "/workspace/mnt/deep", "/workspace/mnt/deep/file", "/tmp", "/media",
+        }));
+    }
+
     /// <summary>
     /// Inventory of the disk-backed places a fresh session user can write on the root filesystem
     /// of this image: every one of them must be something the lockdown closes in required mode.
