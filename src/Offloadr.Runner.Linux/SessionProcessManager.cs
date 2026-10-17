@@ -248,7 +248,7 @@ internal sealed partial class SessionProcessManager : IDisposable
             identity = await _sessionIsolationStrategy.PrepareAsync(sessionId, _sessionRoot, cancellationToken).ConfigureAwait(false);
             prepared = true;
             _preparedIdentities[sessionId] = identity;
-            var paths = await PrepareSessionDirectoriesAsync(sessionId, identity.HomeDirectory, sealSession, cancellationToken).ConfigureAwait(false) with
+            var paths = await PrepareSessionDirectoriesAsync(sessionId, identity.HomeDirectory, sealSession, command.LifecycleGeneration, cancellationToken).ConfigureAwait(false) with
             {
                 TransferSealing = transferSealing
             };
@@ -1217,7 +1217,7 @@ internal sealed partial class SessionProcessManager : IDisposable
     /// Creates <c>root/sessionId</c> (root-owned 0755) with the session's data directories (0700,
     /// handed to the session user after provisioning) and a root-only staging directory.
     /// </summary>
-    private string PrepareSealedSessionDirectory(string sessionId)
+    private string PrepareSealedSessionDirectory(string sessionId, ulong lifecycleGeneration)
     {
         if (!OperatingSystem.IsLinux())
         {
@@ -1255,7 +1255,9 @@ internal sealed partial class SessionProcessManager : IDisposable
                    Path.Combine(directory, SealedSessionMarker),
                    new FileStreamOptions { Mode = FileMode.CreateNew, Access = FileAccess.Write, UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite }))
         {
-            marker.Write(System.Text.Encoding.UTF8.GetBytes(sessionId));
+            // The session id, then the lifecycle generation, so a later runner process knows
+            // whose Stop must hear about data it removes.
+            marker.Write(System.Text.Encoding.UTF8.GetBytes(FormattableString.Invariant($"{sessionId}\n{lifecycleGeneration}")));
         }
 
         foreach (var name in SealedSessionDirectoryNames)
@@ -1288,13 +1290,24 @@ internal sealed partial class SessionProcessManager : IDisposable
             return false;
         }
 
+        return ReadSealedSessionMarker(markerPath) is { } marker && string.Equals(marker.SessionId, sessionId, StringComparison.Ordinal);
+    }
+
+    /// <summary>The session id and lifecycle generation (0 when not recorded) a marker names.</summary>
+    private static (string SessionId, ulong LifecycleGeneration)? ReadSealedSessionMarker(string markerPath)
+    {
         try
         {
-            return string.Equals(File.ReadAllText(markerPath), sessionId, StringComparison.Ordinal);
+            var lines = File.ReadAllText(markerPath).Split('\n');
+            var generation = lines.Length > 1 &&
+                ulong.TryParse(lines[1], System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var parsed)
+                    ? parsed
+                    : 0;
+            return (lines[0], generation);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            return false;
+            return null;
         }
     }
 
@@ -1381,25 +1394,26 @@ internal sealed partial class SessionProcessManager : IDisposable
 
             RunnerLog.Warning<SessionProcessManager>($"Removing sealed session data left by an earlier runner process: '{entry}'.");
             // Whatever that run had not uploaded is gone, and nobody counted it.
-            _staleSealedSessions[sessionId] = 0;
+            _staleSealedSessions[sessionId] = ReadSealedSessionMarker(Path.Combine(entry, SealedSessionMarker))?.LifecycleGeneration ?? 0;
             _ = DeleteSealedSessionDirectory(sessionId);
         }
     }
 
-    private readonly ConcurrentDictionary<string, byte> _staleSealedSessions = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, ulong> _staleSealedSessions = new(StringComparer.Ordinal);
 
     /// <summary>
-    /// Takes the sessions whose sealed data an earlier runner process left and this one removed
-    /// at startup: their Stop cannot say how many artifacts were lost.
+    /// Takes the sessions, with the lifecycle generation that wrote it (0 when unknown), whose
+    /// sealed data an earlier runner process left and this one removed at startup: their Stop
+    /// cannot say how many artifacts were lost.
     /// </summary>
-    public IReadOnlyCollection<string> TakeStaleSealedSessions()
+    public IReadOnlyCollection<(string SessionId, ulong LifecycleGeneration)> TakeStaleSealedSessions()
     {
-        var taken = new List<string>();
+        var taken = new List<(string, ulong)>();
         foreach (var sessionId in _staleSealedSessions.Keys)
         {
-            if (_staleSealedSessions.TryRemove(sessionId, out _))
+            if (_staleSealedSessions.TryRemove(sessionId, out var generation))
             {
-                taken.Add(sessionId);
+                taken.Add((sessionId, generation));
             }
         }
 
@@ -1410,6 +1424,7 @@ internal sealed partial class SessionProcessManager : IDisposable
         string sessionId,
         string homeDirectory,
         bool sealSession,
+        ulong lifecycleGeneration,
         CancellationToken cancellationToken)
     {
         // Ensure home exists (useradd --create-home should have handled this)
@@ -1417,7 +1432,7 @@ internal sealed partial class SessionProcessManager : IDisposable
 
         // Sealed sessions keep user data on the memory-backed root; code, models, the virtualenv
         // and compiled caches stay in the disk-backed home (the sealed root is mounted noexec).
-        var sealedDirectory = sealSession ? PrepareSealedSessionDirectory(sessionId) : null;
+        var sealedDirectory = sealSession ? PrepareSealedSessionDirectory(sessionId, lifecycleGeneration) : null;
         var dataDirectory = sealedDirectory ?? homeDirectory;
         var paths = new SessionPaths
         {

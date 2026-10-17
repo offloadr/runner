@@ -321,7 +321,7 @@ public partial class SessionProcessManagerOwnershipTests
                 Directory.EnumerateFileSystemEntries(sealedRoot).Select(Path.GetFileName),
                 Is.EquivalentTo(new[] { "other-app", "shared.bin" }));
             // Its Stop must not say nothing was lost.
-            Assert.That(manager.TakeStaleSealedSessions(), Is.EqualTo(new[] { "old-session" }));
+            Assert.That(manager.TakeStaleSealedSessions(), Is.EqualTo(new[] { ("old-session", 9UL) }));
             Assert.That(manager.TakeStaleSealedSessions(), Is.Empty);
         }
         finally
@@ -711,7 +711,7 @@ public partial class SessionProcessManagerOwnershipTests
     private static void MarkAsSealedSession(string directory, string sessionId)
     {
         Directory.CreateDirectory(Path.Combine(directory, ".agent"));
-        File.WriteAllText(Path.Combine(directory, SessionProcessManager.SealedSessionMarker), sessionId);
+        File.WriteAllText(Path.Combine(directory, SessionProcessManager.SealedSessionMarker), sessionId + "\n9");
     }
 
     private static string? HostLockedDown() => null;

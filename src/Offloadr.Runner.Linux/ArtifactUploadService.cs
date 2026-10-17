@@ -166,22 +166,42 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         lock (_stopGate)
         {
             var taken = TakeRecordedUnsavedUploads(sessionId, lifecycleGeneration);
-            // The first Stop after a restart removed the session's data reports that nobody counted it.
-            return _lossUncounted.TryRemove(sessionId, out _) ? taken with { Incomplete = true } : taken;
+            if (!_lossUncounted.TryGetValue(sessionId, out var lostGeneration))
+            {
+                return taken;
+            }
+
+            // The Stop of the lifecycle whose data a restart removed reports that nobody counted
+            // it; so does an unfenced Stop, or any when the generation was not recorded. A newer
+            // lifecycle's Stop drops the mark unreported, as it does older counts; an older one's
+            // leaves it.
+            if (lifecycleGeneration == 0 || lostGeneration == 0 || lostGeneration == lifecycleGeneration)
+            {
+                _lossUncounted.TryRemove(sessionId, out _);
+                return taken with { Incomplete = true };
+            }
+
+            if (lifecycleGeneration > lostGeneration)
+            {
+                _lossUncounted.TryRemove(sessionId, out _);
+            }
+
+            return taken;
         }
     }
 
-    private readonly ConcurrentDictionary<string, byte> _lossUncounted = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, ulong> _lossUncounted = new(StringComparer.Ordinal);
 
     /// <summary>
-    /// Marks a session whose data was removed without counting what it lost, such as sealed data
-    /// an earlier runner process left: its next Stop reports the count as unknown.
+    /// Marks a session lifecycle (0 when unknown) whose data was removed without counting what it
+    /// lost, such as sealed data an earlier runner process left: that lifecycle's Stop reports
+    /// the count as unknown.
     /// </summary>
-    public void MarkLossUncounted(string sessionId)
+    public void MarkLossUncounted(string sessionId, ulong lifecycleGeneration = 0)
     {
         if (!string.IsNullOrWhiteSpace(sessionId))
         {
-            _lossUncounted[sessionId] = 0;
+            _lossUncounted[sessionId] = lifecycleGeneration;
         }
     }
 

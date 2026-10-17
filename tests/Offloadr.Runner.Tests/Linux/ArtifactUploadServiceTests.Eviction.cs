@@ -225,12 +225,19 @@ public partial class ArtifactUploadServiceTests
         var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse());
         await using var service = new ArtifactUploadService("runner-secret-value", artifactClient, NullLogger<ArtifactUploadService>.Instance);
 
-        // The earlier runner process held the session; this one only removed what it left.
-        service.MarkLossUncounted("session-1");
+        // The earlier runner process held lifecycle 7; this one only removed what it left.
+        service.MarkLossUncounted("session-1", 7);
 
+        Assert.That(service.TakeUnsavedUploads("session-1", 6), Is.EqualTo(default(UnsavedUploads)), "an older lifecycle's Stop leaves it");
         Assert.That(service.TakeUnsavedUploads("session-1", 7), Is.EqualTo(new UnsavedUploads(0, Incomplete: true)), "fenced Stop");
         Assert.That(service.TakeUnsavedUploads("session-1", 7), Is.EqualTo(default(UnsavedUploads)), "reported once");
-        service.MarkLossUncounted("session-2");
+
+        // Lifecycle 8 reused the session id before lifecycle 7's Stop came: not its loss.
+        service.MarkLossUncounted("session-1", 7);
+        Assert.That(service.TakeUnsavedUploads("session-1", 8), Is.EqualTo(default(UnsavedUploads)));
+        Assert.That(service.TakeUnsavedUploads("session-1", 7), Is.EqualTo(default(UnsavedUploads)), "and the mark is gone");
+
+        service.MarkLossUncounted("session-2", 3);
         Assert.That(service.TakeUnsavedUploads("session-2").Incomplete, Is.True, "unfenced Stop");
     }
 
