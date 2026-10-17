@@ -851,6 +851,9 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
                 throw CreateException($"setting published workspace file mode for '{_relativePath}'");
             }
 
+            // Taken before the exchange: once the placeholder is at the destination the editor can
+            // rewrite it in place, which only a version from before shows.
+            var placeholder = ReadVersion(_file, _relativePath);
             if (renameat2(GetDescriptor(_parent), _temporaryName, GetDescriptor(_parent), _destinationName, RenameExchange) != 0)
             {
                 // The destination went away or cannot be exchanged: nothing was replaced.
@@ -868,12 +871,13 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
                 return true;
             }
 
-            // Restore only while the destination still holds this publication's placeholder. A file
-            // the editor put there since is newer than the one displaced and stays; the displaced
-            // one, already superseded, is removed with the temporary name.
-            if (ReadVersion(_file, _relativePath) is { } placeholder &&
+            // Restore only while the destination still holds this publication's placeholder as it
+            // was written. A file the editor put there since, or a rewrite of the placeholder in
+            // place, is newer than the one displaced and stays; the displaced one, already
+            // superseded, is removed with the temporary name.
+            if (placeholder is { } written &&
                 ReadVersion(_parent, _destinationName, _relativePath) is { } current &&
-                current.Inode == placeholder.Inode &&
+                current.IsSameFileAs(written) &&
                 renameat2(GetDescriptor(_parent), _temporaryName, GetDescriptor(_parent), _destinationName, RenameExchange) != 0)
             {
                 throw CreateException($"restoring '{_relativePath}' after a replacement it did not expect");

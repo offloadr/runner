@@ -53,6 +53,8 @@ RunnerLog.Info(
     $"swap-devices={sealedStorageStatus.Swap.DevicesBytes} swap-cgroup={sealedStorageStatus.Swap.CgroupLimit ?? "unknown"} " +
     $"tmpfs-noswap={sealedStorageStatus.Swap.TmpfsNoswap}" +
     (sealedStorageStatus.Reason is null ? string.Empty : $" reason='{sealedStorageStatus.Reason}'"));
+// Auto mode applies it before its first sealed start.
+var sealedHostPreparation = new SealedHostPreparation();
 if (options.Session.Sealing.Mode == SealedStorageMode.Required)
 {
     try
@@ -64,21 +66,9 @@ if (options.Session.Sealing.Mode == SealedStorageMode.Required)
         RunnerLog.Error($"RUNNER_SEALED_STORAGE=required: {ex.Message}");
         return 1;
     }
-    var sharedWritable = SealedHostLockdown.SharedTemporaryDirectories
-        .Concat(SealedHostLockdown.FindSharedWritableDirectories())
-        .Distinct(StringComparer.Ordinal);
-    var lockdown = SealedHostLockdown.RemoveSharedWriteAccess(sharedWritable);
-    foreach (var directory in lockdown.Closed)
+    if (sealedHostPreparation.EnsureApplied() is { } failure)
     {
-        RunnerLog.Info($"Sealed storage: '{directory}' is no longer writable by session users.");
-    }
-
-    if (lockdown.StillWritable.Count > 0)
-    {
-        // Sessions could write their data to these disk-backed places: required mode cannot hold.
-        RunnerLog.Error(
-            "RUNNER_SEALED_STORAGE=required but these disk-backed paths stay writable by session users: " +
-            string.Join(", ", lockdown.StillWritable));
+        RunnerLog.Error($"RUNNER_SEALED_STORAGE=required but {failure}");
         return 1;
     }
 }
@@ -170,6 +160,7 @@ var runtimeTelemetryReporter = new ActiveSessionRuntimeTelemetryReporter(
     options.RuntimeTelemetryInterval,
     sessionId => runtimeIdentities.TryGet(sessionId, out var identity) ? identity : null);
 sessionManager.SessionOwnershipApplied = artifactUploadService.RefreshRecordedVersions;
+sessionManager.PrepareSealedHost = sealedHostPreparation.EnsureApplied;
 sessionManager.UnexpectedSessionExitCleanup = async (sessionId, exitedRuntime, exitCode, token) =>
 {
     var exitSummary = exitCode.HasValue ? $" code={exitCode.Value}" : string.Empty;

@@ -74,6 +74,12 @@ internal sealed partial class SessionProcessManager : IDisposable
     /// </summary>
     internal Action<string>? SessionOwnershipApplied { get; set; }
 
+    /// <summary>
+    /// Locks the host down for sealed data (<see cref="SealedHostPreparation.EnsureApplied"/>) and
+    /// returns why it cannot, or null. Without it no sealed start is admitted.
+    /// </summary>
+    internal Func<string?>? PrepareSealedHost { get; set; }
+
     internal int? TryGetTrackedProcessId(string sessionId)
         => _sessions.TryGetValue(sessionId, out var context) ? context.Process.Id : null;
 
@@ -1185,6 +1191,12 @@ internal sealed partial class SessionProcessManager : IDisposable
         if (!_vfsEnvironmentBuilder.CanDisableCoreDumps())
         {
             throw new InvalidOperationException("Sealed storage is unavailable: the VFS shim that makes session processes non-dumpable is missing or does not load.");
+        }
+
+        // Required mode did this at startup; in auto mode the first sealed start does it.
+        if ((PrepareSealedHost is null ? "the host was not locked down for sealed sessions" : PrepareSealedHost()) is { } failure)
+        {
+            throw new InvalidOperationException($"Sealed storage is unavailable: {failure}.");
         }
     }
 

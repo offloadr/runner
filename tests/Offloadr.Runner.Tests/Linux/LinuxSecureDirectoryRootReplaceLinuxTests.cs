@@ -93,6 +93,33 @@ public class LinuxSecureDirectoryRootReplaceLinuxTests
         }
     }
 
+    [Test]
+    public void CommitReplacing_KeepsAnInPlaceRewriteOfThePlaceholderDuringTheRestore()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = CreateRoot();
+        try
+        {
+            var path = Path.Combine(root, "a.png");
+            File.WriteAllText(path, "uploaded");
+            using var secureRoot = new LinuxSecureDirectoryRoot(root);
+            var version = secureRoot.GetVersion("a.png")!.Value;
+            using var placeholder = secureRoot.CreatePublication("a.png");
+
+            // A rewrite before the exchange, then the editor opens the placeholder now at the
+            // destination and saves into it in place (same inode): that save must survive.
+            ReplaceAtomically(root, path, "rewrite-1");
+            placeholder.AfterExchange = () => File.WriteAllText(path, "rewrite-2");
+
+            Assert.That(placeholder.CommitReplacing(version), Is.False);
+            Assert.That(File.ReadAllText(path), Is.EqualTo("rewrite-2"));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
     private static void ReplaceAtomically(string root, string path, string content)
     {
         var staged = Path.Combine(root, $"staged-{Guid.NewGuid():N}");
