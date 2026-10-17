@@ -291,6 +291,25 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
+    public async Task Stop_DropsTheLifecycleNoteOnlyAfterItsAcknowledgementGoesThrough()
+    {
+        var harness = RunningHarness(7, 3, InstanceA);
+        harness.Sink.FailNextAcknowledgements(2);
+
+        await ServiceClientManager.HandleStopSessionCommandAsync(Stop(7, 3, InstanceA), harness.Deps);
+        Assert.That(harness.ForgottenLifecycles, Is.Empty, "not before the control plane has the count");
+
+        await harness.Sink.WaitForAsync(harness.Sink.StopAcks, 1);
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        while (harness.ForgottenLifecycles.IsEmpty && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(20);
+        }
+
+        Assert.That(harness.ForgottenLifecycles, Is.EqualTo(new[] { CommandSessionId }));
+    }
+
+    [Test]
     public async Task Stop_ReportsAnIncompleteCountAsUnknown()
     {
         var harness = RunningHarness(7, 3, InstanceA);

@@ -484,6 +484,8 @@ internal static class ServiceClientManager
         public Func<StartSessionCommand, bool>? SealsStart { get; init; }
         /// <summary>Takes the artifacts the session lost when its runtimes' data was removed, for its stop acknowledgement.</summary>
         public Func<string, ulong, UnsavedUploads>? TakeUnsavedArtifacts { get; init; }
+        /// <summary>Drops the durable note of a sealed lifecycle once its Stop is acknowledged with the count.</summary>
+        public Action<string, ulong>? ForgetSealedLifecycle { get; init; }
     }
 
     internal sealed class RunnerCommandWorkState(CancellationToken shutdown)
@@ -537,6 +539,8 @@ internal static class ServiceClientManager
         public SemaphoreSlim Gate { get; } = new(1, 1);
         public AcknowledgeSessionStopRequest Acknowledgement { get; } = acknowledgement;
         public bool Completed { get; set; }
+        /// <summary>Whether this Stop took the session's count of lost artifacts.</summary>
+        public bool CountTaken { get; set; }
         public Task? AcknowledgementTask { get; set; }
 
         public bool Matches(AcknowledgeSessionStopRequest delivery)
@@ -1382,13 +1386,8 @@ internal static class ServiceClientManager
             Shutdown = shutdown,
             GetSessionSealing = sessionManager.GetSessionSealingStatus,
             SealsStart = start => start.Sealing?.Required != true && sessionManager.ShouldSeal(start),
-            TakeUnsavedArtifacts = (sessionId, generation) =>
-            {
-                var unsaved = artifactUploadService.TakeUnsavedUploads(sessionId, generation);
-                // Taken: a restart from here on no longer has to report this lifecycle as unknown.
-                sessionManager.ForgetSealedLifecycle(sessionId, generation);
-                return unsaved;
-            },
+            TakeUnsavedArtifacts = artifactUploadService.TakeUnsavedUploads,
+            ForgetSealedLifecycle = sessionManager.ForgetSealedLifecycle,
         };
 
         while (!shutdown.IsCancellationRequested)
@@ -2161,6 +2160,7 @@ internal static class ServiceClientManager
                     var unsaved = deps.TakeUnsavedArtifacts?.Invoke(command.SessionId, command.LifecycleGeneration) ?? default;
                     work.Acknowledgement.UnsavedArtifactCount = (uint)Math.Max(0, unsaved.Count);
                     work.Acknowledgement.UnsavedArtifactsUnknown = unsaved.Incomplete;
+                    work.CountTaken = true;
                 }
             }
 
@@ -2168,8 +2168,7 @@ internal static class ServiceClientManager
             {
                 // One retry loop per command; redelivery after a finished loop
                 // replays the same result without touching runtime state.
-                work.AcknowledgementTask = AcknowledgeRuntimeCommandWithRetryAsync(
-                    deps.Sink.AckStopSessionAsync, work.Acknowledgement, acknowledgementKey, deps.Shutdown);
+                work.AcknowledgementTask = AcknowledgeStopAsync(work, acknowledgementKey, command, deps);
             }
         }
         finally
@@ -3086,6 +3085,19 @@ internal static class ServiceClientManager
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// Acknowledges a Stop, then, once the control plane has its count of lost artifacts, drops
+    /// the lifecycle's durable note: until then a restart must still report the count unknown.
+    /// </summary>
+    private static async Task AcknowledgeStopAsync(StopCommandWork work, string acknowledgementKey, StopSessionCommand command, RuntimeCommandDependencies deps)
+    {
+        if (await AcknowledgeRuntimeCommandWithRetryAsync(deps.Sink.AckStopSessionAsync, work.Acknowledgement, acknowledgementKey, deps.Shutdown).ConfigureAwait(false) &&
+            work.CountTaken)
+        {
+            deps.ForgetSealedLifecycle?.Invoke(command.SessionId, command.LifecycleGeneration);
+        }
     }
 
     internal static async Task<bool> AcknowledgeRuntimeCommandWithRetryAsync<TRequest>(

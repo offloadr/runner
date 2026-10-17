@@ -1404,6 +1404,9 @@ public partial class ServiceClientManagerTests
 
         private int _unsavedArtifacts;
 
+        /// <summary>Sessions whose durable sealed-lifecycle note was dropped.</summary>
+        public ConcurrentQueue<string> ForgottenLifecycles { get; } = new();
+
         /// <summary>Whether the uploader could not count every lost artifact.</summary>
         public bool UnsavedArtifactsIncomplete { get; set; }
 
@@ -1488,6 +1491,7 @@ public partial class ServiceClientManagerTests
             GetSessionSealing = _ => SealingStatus,
             SealsStart = SealsStart,
             TakeUnsavedArtifacts = (_, _) => new UnsavedUploads(Interlocked.Exchange(ref _unsavedArtifacts, 0), UnsavedArtifactsIncomplete),
+            ForgetSealedLifecycle = (sessionId, _) => ForgottenLifecycles.Enqueue(sessionId),
         };
 
         private Task Record(string call)
