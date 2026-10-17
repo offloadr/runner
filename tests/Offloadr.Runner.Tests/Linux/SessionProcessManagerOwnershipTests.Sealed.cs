@@ -302,7 +302,13 @@ public partial class SessionProcessManagerOwnershipTests
         var (tempRoot, sealedRoot, options) = CreateSealedOptions("comfyui");
         Directory.CreateDirectory(Path.Combine(sealedRoot, "old-session", "output"));
         File.WriteAllText(Path.Combine(sealedRoot, "old-session", "output", "image.png"), "left behind");
+        MarkAsSealedSession(Path.Combine(sealedRoot, "old-session"), "old-session");
+        // Not the runner's: a root shared by mistake keeps everything else.
+        Directory.CreateDirectory(Path.Combine(sealedRoot, "other-app"));
+        File.WriteAllText(Path.Combine(sealedRoot, "shared.bin"), "someone else's");
         File.SetUnixFileMode(sealedRoot, Mode0711);
+        // Turning sealing off after a crash must not keep the earlier run's data.
+        options = WithSealing(options, new SealedStorageOptions { Mode = SealedStorageMode.Off, Root = sealedRoot });
 
         try
         {
@@ -311,7 +317,9 @@ public partial class SessionProcessManagerOwnershipTests
             await manager.CleanupStaleSessionsAsync(CancellationToken.None);
 
             Assert.That(Directory.Exists(sealedRoot), Is.True);
-            Assert.That(Directory.EnumerateFileSystemEntries(sealedRoot), Is.Empty);
+            Assert.That(
+                Directory.EnumerateFileSystemEntries(sealedRoot).Select(Path.GetFileName),
+                Is.EquivalentTo(new[] { "other-app", "shared.bin" }));
         }
         finally
         {
@@ -665,6 +673,42 @@ public partial class SessionProcessManagerOwnershipTests
             TryDelete(tempRoot);
             TryDelete(sealedRoot);
         }
+    }
+
+    [Test]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public void StartSessionAsync_SealedLeavesADirectoryItDidNotCreate()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        LinuxTestPrerequisites.RequireRoot();
+
+        var (tempRoot, sealedRoot, options) = CreateSealedOptions("comfyui");
+        const string sessionId = "session-taken";
+        var foreign = Path.Combine(sealedRoot, sessionId);
+        Directory.CreateDirectory(foreign);
+        File.SetUnixFileMode(sealedRoot, Mode0711);
+        File.WriteAllText(Path.Combine(foreign, "data.bin"), "not the runner's");
+
+        try
+        {
+            using var manager = new SessionProcessManager(options, new RecordingIsolationStrategy("sess_taken", Path.Combine(options.SessionRoot, sessionId)), SealedVfsBuilder(), new RecordingCommandRunner(string.Empty));
+
+            var ex = Assert.ThrowsAsync<InvalidOperationException>(() => manager.StartSessionAsync(SealedStart(sessionId), CancellationToken.None));
+
+            Assert.That(ex!.Message, Does.Contain("is not a sealed session directory"));
+            Assert.That(File.ReadAllText(Path.Combine(foreign, "data.bin")), Is.EqualTo("not the runner's"));
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+            TryDelete(sealedRoot);
+        }
+    }
+
+    private static void MarkAsSealedSession(string directory, string sessionId)
+    {
+        Directory.CreateDirectory(Path.Combine(directory, ".agent"));
+        File.WriteAllText(Path.Combine(directory, SessionProcessManager.SealedSessionMarker), sessionId);
     }
 
     /// <summary>A builder whose shim exists, as in the images; the file is not a real library.</summary>

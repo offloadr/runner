@@ -1214,14 +1214,60 @@ internal sealed partial class SessionProcessManager : IDisposable
         var directory = ResolveSealedSessionDirectory(sessionId)
             ?? throw new InvalidOperationException($"Session id '{sessionId}' cannot name a sealed session directory.");
         DeleteSealedSessionDirectory(sessionId);
+        if (Path.Exists(directory))
+        {
+            throw new InvalidOperationException($"Sealed storage is unavailable: '{directory}' exists and is not a sealed session directory.");
+        }
+
         Directory.CreateDirectory(directory, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
             UnixFileMode.GroupRead | UnixFileMode.GroupExecute | UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
-        foreach (var name in SealedSessionDirectoryNames.Append(".agent"))
+        // The marker is what lets cleanup tell this directory from anything else under the root.
+        Directory.CreateDirectory(Path.Combine(directory, ".agent"), UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        using (var marker = new FileStream(
+                   Path.Combine(directory, SealedSessionMarker),
+                   new FileStreamOptions { Mode = FileMode.CreateNew, Access = FileAccess.Write, UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite }))
+        {
+            marker.Write(System.Text.Encoding.UTF8.GetBytes(sessionId));
+        }
+
+        foreach (var name in SealedSessionDirectoryNames)
         {
             Directory.CreateDirectory(Path.Combine(directory, name), UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         }
 
         return directory;
+    }
+
+    /// <summary>A root-only file naming the session, inside the session directory's root-only staging directory.</summary>
+    internal const string SealedSessionMarker = ".agent/offloadr-sealed-session";
+
+    /// <summary>
+    /// True only for a directory this runner created for <paramref name="sessionId"/>: root-owned,
+    /// not a link, with the root-owned marker naming the session. Anything else under the sealed
+    /// root (a misconfigured root may be shared) is never removed.
+    /// </summary>
+    internal static bool IsSealedSessionDirectory(string directory, string sessionId)
+    {
+        if (SealedStorageProbe.ReadEntryStatus(directory) is not { IsDirectory: true, IsSymbolicLink: false, OwnerId: 0 } ||
+            SealedStorageProbe.ReadEntryStatus(Path.Combine(directory, ".agent")) is not { IsDirectory: true, IsSymbolicLink: false, OwnerId: 0 })
+        {
+            return false;
+        }
+
+        var markerPath = Path.Combine(directory, SealedSessionMarker);
+        if (SealedStorageProbe.ReadEntryStatus(markerPath) is not { IsRegularFile: true, OwnerId: 0 })
+        {
+            return false;
+        }
+
+        try
+        {
+            return string.Equals(File.ReadAllText(markerPath), sessionId, StringComparison.Ordinal);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
     }
 
     private string? ResolveSealedSessionDirectory(string sessionId)
@@ -1241,17 +1287,20 @@ internal sealed partial class SessionProcessManager : IDisposable
             return;
         }
 
+        if (!Path.Exists(directory))
+        {
+            return;
+        }
+
+        if (!IsSealedSessionDirectory(directory, sessionId))
+        {
+            RunnerLog.Warning<SessionProcessManager>($"Leaving '{directory}' alone: it is not a sealed session directory of this runner.");
+            return;
+        }
+
         try
         {
-            var info = new DirectoryInfo(directory);
-            if (info.LinkTarget is not null || File.Exists(directory))
-            {
-                File.Delete(directory);
-            }
-            else if (info.Exists)
-            {
-                Directory.Delete(directory, recursive: true);
-            }
+            Directory.Delete(directory, recursive: true);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
@@ -1261,8 +1310,8 @@ internal sealed partial class SessionProcessManager : IDisposable
 
     private void RemoveStaleSealedSessionDirectories()
     {
-        if (_sealing.Mode == SealedStorageMode.Off ||
-            SealedStorageProbe.ReadEntryStatus(_sealing.Root) is not { IsDirectory: true, IsSymbolicLink: false, OwnerId: 0 })
+        // Whatever the mode now: data a sealed run left behind must not outlive a mode change.
+        if (SealedStorageProbe.ReadEntryStatus(_sealing.Root) is not { IsDirectory: true, IsSymbolicLink: false, OwnerId: 0 })
         {
             return;
         }
@@ -1280,8 +1329,14 @@ internal sealed partial class SessionProcessManager : IDisposable
 
         foreach (var entry in entries)
         {
+            var sessionId = Path.GetFileName(entry);
+            if (!IsSealedSessionDirectory(entry, sessionId))
+            {
+                continue;
+            }
+
             RunnerLog.Warning<SessionProcessManager>($"Removing sealed session data left by an earlier runner process: '{entry}'.");
-            DeleteSealedSessionDirectory(Path.GetFileName(entry));
+            DeleteSealedSessionDirectory(sessionId);
         }
     }
 
