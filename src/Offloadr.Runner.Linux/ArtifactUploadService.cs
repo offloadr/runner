@@ -1,5 +1,6 @@
 using Offloadr.Runner.V1;
 using Offloadr.EditorRuntime.V1;
+using Offloadr.Runner.Core.Sealing;
 using Google.Protobuf.WellKnownTypes;
 using Grpc.Core;
 using Microsoft.Extensions.Logging;
@@ -16,6 +17,12 @@ using System.Threading.Tasks;
 
 namespace Offloadr.Runner.Linux;
 
+/// <summary>Artifacts a session lost; when <paramref name="Incomplete"/> the runner could not count them all.</summary>
+internal readonly record struct UnsavedUploads(int Count, bool Incomplete)
+{
+    public UnsavedUploads Add(UnsavedUploads other) => new(Count + other.Count, Incomplete || other.Incomplete);
+}
+
 internal sealed class ArtifactUploadService : IAsyncDisposable
 {
     /// <summary>Largest session file the uploader will send; larger files are skipped.</summary>
@@ -26,8 +33,27 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
     private static readonly TimeSpan DropWarningInterval = TimeSpan.FromMinutes(1);
 
+    /// <summary>
+    /// Every file below an artifact root, failing on a directory it cannot read rather than
+    /// skipping it; replaceable so tests can make it fail.
+    /// </summary>
+    internal static Func<string, IEnumerable<string>> EnumerateArtifactFiles { get; set; } = static root =>
+        Directory.EnumerateFiles(root, "*", new EnumerationOptions
+        {
+            RecurseSubdirectories = true,
+            IgnoreInaccessible = false,
+            AttributesToSkip = FileAttributes.ReparsePoint,
+        });
+
     /// <summary>How long Stop waits for cancelled upload and download work before moving on.</summary>
     internal static TimeSpan StopWaitTimeout { get; set; } = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    /// How long a session's stop may take before its lost artifacts are recorded without waiting
+    /// further. Under the caller's own bound, so the count is fixed before the session's data is
+    /// removed: a stop that finishes after that would count none.
+    /// </summary>
+    internal static TimeSpan StopRecordTimeout { get; set; } = TimeSpan.FromSeconds(25);
 
     private readonly string? _runnerSecret;
     private readonly RunnerArtifactService.RunnerArtifactServiceClient _artifactClient;
@@ -36,9 +62,27 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
     private readonly RuntimeIdentityRegistry? _runtimeIdentities;
     private readonly string _runnerId;
     private readonly ConcurrentDictionary<string, SessionUploader> _sessions = new(StringComparer.Ordinal);
+    // Unsaved artifacts per logical session, summed over its runtimes: a restart removes the old
+    // runtime's data too, and the session's Stop must still report what was lost then.
+    // Keyed by lifecycle generation too: a session id is reused by a newer lifecycle, whose Stop
+    // must not report an older one's losses.
+    private readonly ConcurrentDictionary<(string SessionId, ulong Generation), UnsavedUploads> _unsavedBySession = new();
+    private readonly object _stopGate = new();
+    private readonly Dictionary<string, StopInFlight> _stopping = new(StringComparer.Ordinal);
 
-    public ArtifactUploadService(string? runnerSecret, RunnerArtifactService.RunnerArtifactServiceClient artifactClient, ILogger<ArtifactUploadService> logger, RuntimeIdentityRegistry? runtimeIdentities = null, string? runnerId = null)
+    /// <summary>A session's stop that has not finished; its count is recorded once, by whichever comes first.</summary>
+    private sealed class StopInFlight(SessionUploader uploader)
     {
+        public SessionUploader Uploader { get; } = uploader;
+        public Task<int> Task { get; set; } = System.Threading.Tasks.Task.FromResult(0);
+        public int? RecordedCount { get; set; }
+    }
+
+    private readonly RunnerReadRequesterIdentity _requester;
+
+    public ArtifactUploadService(string? runnerSecret, RunnerArtifactService.RunnerArtifactServiceClient artifactClient, ILogger<ArtifactUploadService> logger, RuntimeIdentityRegistry? runtimeIdentities = null, string? runnerId = null, string? instanceId = null)
+    {
+        _requester = new RunnerReadRequesterIdentity(runnerId, instanceId, runtimeIdentities);
         _runnerSecret = string.IsNullOrWhiteSpace(runnerSecret) ? null : runnerSecret.Trim();
         _artifactClient = artifactClient ?? throw new ArgumentNullException(nameof(artifactClient));
         _authHeaders = BuildAuthHeaders(_runnerSecret);
@@ -65,12 +109,23 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
     public async Task StartSessionAsync(string sessionId, SessionProcessManager.SessionPaths paths, CancellationToken cancellationToken)
     {
-        if (_sessions.ContainsKey(sessionId))
+        if (_sessions.TryGetValue(sessionId, out var existing))
         {
-            return;
+            // A repeated start of the same runtime keeps its uploader. One left by an earlier
+            // runtime (it exited while a relaunch was already admitted, so nothing stopped it) is
+            // stopped, which records what it lost, and replaced: its reads name that runtime.
+            var current = CurrentRuntime(sessionId);
+            if (existing.CreatedFor is { } createdFor ? current is { } now && createdFor.SameRuntime(now) : current is null)
+            {
+                return;
+            }
+
+            await StopSessionAsync(sessionId).ConfigureAwait(false);
         }
 
-        var uploader = new SessionUploader(_runnerSecret, _artifactClient, _authHeaders, sessionId, paths, _logger, _runtimeIdentities, _runnerId);
+        // A sealed session's artifact names stay out of the console, which reaches the host's disk.
+        ILogger logger = paths.IsSealed ? new SealedSessionLogger(_logger) : _logger;
+        var uploader = new SessionUploader(_runnerSecret, _artifactClient, _authHeaders, sessionId, paths, logger, _runtimeIdentities, _runnerId, _requester);
         if (!_sessions.TryAdd(sessionId, uploader))
         {
             await uploader.DisposeAsync().ConfigureAwait(false);
@@ -94,8 +149,132 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Re-reads the file versions recorded for the session's artifacts after something other than
+    /// a rewrite moved their change time, such as the ownership pass before the editor starts.
+    /// </summary>
+    public void RefreshRecordedVersions(string sessionId)
+    {
+        if (_sessions.TryGetValue(sessionId, out var uploader))
+        {
+            uploader.RefreshRecordedVersions();
+        }
+    }
+
+    /// <summary>
+    /// Takes the artifacts the session's lifecycle <paramref name="lifecycleGeneration"/> lost
+    /// across all its runtimes, for its stop acknowledgement, and forgets them along with what
+    /// older lifecycles of the session left unreported.
+    /// </summary>
+    public int TakeUnsavedUploadCount(string sessionId, ulong lifecycleGeneration = 0)
+        => TakeUnsavedUploads(sessionId, lifecycleGeneration).Count;
+
+    /// <inheritdoc cref="TakeUnsavedUploadCount"/>
+    public UnsavedUploads TakeUnsavedUploads(string sessionId, ulong lifecycleGeneration = 0)
+    {
+        lock (_stopGate)
+        {
+            var taken = TakeRecordedUnsavedUploads(sessionId, lifecycleGeneration);
+            // The Stop of a lifecycle whose data a restart removed reports that nobody counted
+            // it; so does an unfenced Stop, or any when the generation was not recorded. A newer
+            // lifecycle's Stop drops older marks unreported, as it does older counts; marks of
+            // newer lifecycles stay.
+            var incomplete = false;
+            foreach (var mark in _lossUncounted.Keys.Where(mark => mark.SessionId == sessionId).ToArray())
+            {
+                var mine = lifecycleGeneration == 0 || mark.Generation == 0 || mark.Generation == lifecycleGeneration;
+                if (mine || mark.Generation < lifecycleGeneration)
+                {
+                    _lossUncounted.TryRemove(mark, out _);
+                    incomplete |= mine;
+                }
+            }
+
+            return incomplete ? taken with { Incomplete = true } : taken;
+        }
+    }
+
+    private readonly ConcurrentDictionary<(string SessionId, ulong Generation), byte> _lossUncounted = new();
+
+    /// <summary>
+    /// Marks a session lifecycle (0 when unknown) whose data was removed without counting what it
+    /// lost, such as sealed data an earlier runner process left: that lifecycle's Stop reports
+    /// the count as unknown.
+    /// </summary>
+    public void MarkLossUncounted(string sessionId, ulong lifecycleGeneration = 0)
+    {
+        if (!string.IsNullOrWhiteSpace(sessionId))
+        {
+            _lossUncounted[(sessionId, lifecycleGeneration)] = 0;
+        }
+    }
+
+    private UnsavedUploads TakeRecordedUnsavedUploads(string sessionId, ulong lifecycleGeneration)
+    {
+        lock (_stopGate)
+        {
+            // An unfenced Stop (no generation) is for whatever lifecycle the session has.
+            var unfenced = lifecycleGeneration == 0;
+
+            // A stop still running has not counted yet: what it would find is not known.
+            if (_stopping.TryGetValue(sessionId, out var inFlight) && !inFlight.Task.IsCompleted &&
+                (unfenced || inFlight.Uploader.LifecycleGeneration == lifecycleGeneration))
+            {
+                RecordWithoutWaiting(sessionId, inFlight);
+            }
+
+            if (unfenced)
+            {
+                UnsavedUploads all = default;
+                foreach (var key in _unsavedBySession.Keys.Where(key => key.SessionId == sessionId).ToArray())
+                {
+                    if (_unsavedBySession.TryRemove(key, out var lost))
+                    {
+                        all = all.Add(lost);
+                    }
+                }
+
+                return all;
+            }
+
+            foreach (var older in _unsavedBySession.Keys.Where(key => key.SessionId == sessionId && key.Generation < lifecycleGeneration))
+            {
+                _unsavedBySession.TryRemove(older, out _);
+            }
+
+            return _unsavedBySession.TryRemove((sessionId, lifecycleGeneration), out var unsaved) ? unsaved : default;
+        }
+    }
+
+    private RuntimeIdentity? CurrentRuntime(string sessionId)
+        => _runtimeIdentities?.TryGet(sessionId, out var identity) == true ? identity : null;
+
+    private void Record(string sessionId, ulong lifecycleGeneration, UnsavedUploads unsaved)
+        => _unsavedBySession.AddOrUpdate((sessionId, lifecycleGeneration), unsaved, (_, earlier) => earlier.Add(unsaved));
+
     internal int GetPendingUploadCount(string sessionId)
         => _sessions.TryGetValue(sessionId, out var uploader) ? uploader.PendingUploadCount : 0;
+
+    /// <summary>
+    /// Frees memory on a sealed session's root by turning uploaded artifacts back into empty
+    /// catalog placeholders, oldest upload first, until at least <paramref name="bytesToFree"/>
+    /// bytes are released. Only artifacts the control plane accepted, unchanged since, idle for
+    /// <paramref name="minimumIdle"/> and readable again through the VFS are evicted; opening one
+    /// later downloads it again. Returns the bytes released (0 for an unsealed session).
+    /// </summary>
+    /// <summary>Sets <see cref="SessionUploader.BeforeEvictionCandidate"/> for a session (tests only).</summary>
+    internal void SetBeforeEvictionCandidate(string sessionId, Action<string>? hook)
+    {
+        if (_sessions.TryGetValue(sessionId, out var uploader))
+        {
+            uploader.BeforeEvictionCandidate = hook;
+        }
+    }
+
+    public long EvictUploadedArtifacts(string sessionId, long bytesToFree, TimeSpan minimumIdle)
+        => _sessions.TryGetValue(sessionId, out var uploader) && uploader.IsSealed
+            ? uploader.EvictUploadedArtifacts(bytesToFree, minimumIdle, DateTimeOffset.UtcNow)
+            : 0;
 
     public void RegisterInputSeeds(string sessionId)
     {
@@ -163,12 +342,99 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         }
     }
 
-    public async Task StopSessionAsync(string sessionId)
+    /// <summary>
+    /// Stops the session's uploads after a short drain. Returns how many artifacts were not
+    /// uploaded: they failed or were still pending, and are lost once the session's data is removed.
+    /// </summary>
+    public Task<int> StopSessionAsync(string sessionId)
     {
-        if (_sessions.TryRemove(sessionId, out var uploader))
+        // A stop that overlaps another one for the session (an exit cleanup still draining when
+        // the Stop arrives) waits for it, so the lost artifacts are recorded before anyone takes them.
+        lock (_stopGate)
         {
-            await uploader.StopAsync().ConfigureAwait(false);
+            if (!_sessions.TryRemove(sessionId, out var uploader))
+            {
+                return _stopping.TryGetValue(sessionId, out var inFlight) ? inFlight.Task : Task.FromResult(0);
+            }
+
+            var stopping = new StopInFlight(uploader);
+            stopping.Task = StopAndRecordAsync(sessionId, stopping);
+            _stopping[sessionId] = stopping;
+            _ = stopping.Task.ContinueWith(
+                _ =>
+                {
+                    lock (_stopGate)
+                    {
+                        ((ICollection<KeyValuePair<string, StopInFlight>>)_stopping).Remove(new(sessionId, stopping));
+                    }
+                },
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+            return stopping.Task;
         }
+    }
+
+    private async Task<int> StopAndRecordAsync(string sessionId, StopInFlight stopping)
+    {
+        var stop = stopping.Uploader.StopAsync();
+        if (await Task.WhenAny(stop, Task.Delay(StopRecordTimeout)).ConfigureAwait(false) != stop)
+        {
+            _ = stop.ContinueWith(static failed => _ = failed.Exception, CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
+            lock (_stopGate)
+            {
+                return RecordWithoutWaiting(sessionId, stopping);
+            }
+        }
+
+        await stop.ConfigureAwait(false);
+        var unsaved = stopping.Uploader.UnsavedUploadCount;
+        lock (_stopGate)
+        {
+            if (stopping.RecordedCount is { } recorded)
+            {
+                // Counted already, without waiting; a count taken now may follow removed data.
+                return recorded;
+            }
+
+            stopping.RecordedCount = unsaved;
+            if (unsaved > 0 || stopping.Uploader.UnsavedCountIncomplete)
+            {
+                Record(sessionId, stopping.Uploader.LifecycleGeneration, new UnsavedUploads(unsaved, stopping.Uploader.UnsavedCountIncomplete));
+            }
+        }
+
+        if (unsaved > 0)
+        {
+            _logger.LogWarning(
+                "Session stopped with artifacts that were not uploaded session={SessionId} count={Count}",
+                sessionId,
+                unsaved);
+        }
+
+        return unsaved;
+    }
+
+    /// <summary>
+    /// Records a stop that has not finished as losing every pending upload, and at least one, and
+    /// marks the count incomplete: what the uploader would have found is not known, and the
+    /// session must not be reported as fully saved. Called under <see cref="_stopGate"/>.
+    /// </summary>
+    private int RecordWithoutWaiting(string sessionId, StopInFlight stopping)
+    {
+        if (stopping.RecordedCount is { } recorded)
+        {
+            return recorded;
+        }
+
+        var unsaved = Math.Max(1, stopping.Uploader.PendingUploadCount);
+        stopping.RecordedCount = unsaved;
+        Record(sessionId, stopping.Uploader.LifecycleGeneration, new UnsavedUploads(unsaved, Incomplete: true));
+        _logger.LogWarning(
+            "Artifact uploads of session={SessionId} did not stop in time; counting {Count} as not uploaded",
+            sessionId,
+            unsaved);
+        return unsaved;
     }
 
     public async ValueTask DisposeAsync()
@@ -237,8 +503,12 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         private int _rescanOwed;
         private long _lastDropWarningTicks = long.MinValue / 2;
 
-        public SessionUploader(string? runnerSecret, RunnerArtifactService.RunnerArtifactServiceClient artifactClient, Metadata? authHeaders, string sessionId, SessionProcessManager.SessionPaths paths, ILogger logger, RuntimeIdentityRegistry? runtimeIdentities = null, string? runnerId = null)
+        private readonly RunnerReadRequester _readRequester;
+
+        public SessionUploader(string? runnerSecret, RunnerArtifactService.RunnerArtifactServiceClient artifactClient, Metadata? authHeaders, string sessionId, SessionProcessManager.SessionPaths paths, ILogger logger, RuntimeIdentityRegistry? runtimeIdentities = null, string? runnerId = null, RunnerReadRequesterIdentity? requester = null)
         {
+            _readRequester = (requester ?? new RunnerReadRequesterIdentity(runnerId, null, runtimeIdentities)).For(sessionId);
+            CreatedFor = runtimeIdentities?.TryGet(sessionId, out var createdFor) == true ? createdFor : null;
             _runnerSecret = runnerSecret;
             _artifactClient = artifactClient;
             _authHeaders = authHeaders;
@@ -246,6 +516,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             _paths = paths;
             _logger = logger;
             _runtimeIdentities = runtimeIdentities;
+            LifecycleGeneration = runtimeIdentities?.TryGet(sessionId, out var identity) == true ? identity.LifecycleGeneration : 0;
             _runnerId = runnerId?.Trim() ?? string.Empty;
             _queue = Channel.CreateUnbounded<UploadRequest>(new UnboundedChannelOptions
             {
@@ -253,6 +524,16 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 SingleWriter = false
             });
         }
+
+        /// <summary>
+        /// The runtime registered for the session when this uploader was created, if any, as the
+        /// control plane spelled it. Every upload names it: a newer runtime registered later must
+        /// never be credited with this one's output.
+        /// </summary>
+        public RuntimeIdentity? CreatedFor { get; }
+
+        /// <summary>The lifecycle this uploader's runtime belongs to (0 without a registry).</summary>
+        public ulong LifecycleGeneration { get; }
 
         public Task InitializeAsync(CancellationToken cancellationToken)
         {
@@ -309,7 +590,8 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             _activated = true;
             RegisterArtifactWatcher(_paths.OutputDirectory, "output");
             RegisterArtifactWatcher(_paths.TempDirectory, "temp");
-            RegisterHomeWatcher(_paths.HomeDirectory);
+            // Watches the directory holding the output and temp roots, which a sealed session keeps outside its home.
+            RegisterHomeWatcher(Path.GetDirectoryName(_paths.OutputDirectory));
             EnqueueExistingFiles(_paths.OutputDirectory, "output");
             EnqueueExistingFiles(_paths.TempDirectory, "temp");
             _logger.LogInformation(
@@ -391,9 +673,15 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 }
             }
 
-            if (state.Downloaded && File.Exists(state.LocalPath))
+            // The shim opens the file itself once this returns: eviction must not replace it in
+            // between, so serving marks it as in use under the eviction gate.
+            lock (_evictionGate)
             {
-                return true;
+                if (state.Downloaded && File.Exists(state.LocalPath))
+                {
+                    state.MarkServed(DateTimeOffset.UtcNow);
+                    return true;
+                }
             }
 
             // The fetch is shared by every caller for this artifact and runs for the uploader's
@@ -883,25 +1171,30 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             }
 
             var createdUtc = ToDateTimeOffset(item.CreatedUtc);
-            _catalog.TryGetValue(normalized, out var previousState);
-            var state = new RemoteArtifactState(
-                activeEditorSid,
-                item.Type,
-                item.Subfolder,
-                item.Filename,
-                normalized,
-                item.SizeBytes,
-                item.Sha256,
-                createdUtc);
-            _catalog[normalized] = state;
+            // Under the eviction gate: a pass must not replace the file between this entry judging
+            // it downloaded and taking the place of the one the pass is evicting.
+            lock (_evictionGate)
+            {
+                _catalog.TryGetValue(normalized, out var previousState);
+                var state = new RemoteArtifactState(
+                    activeEditorSid,
+                    item.Type,
+                    item.Subfolder,
+                    item.Filename,
+                    normalized,
+                    item.SizeBytes,
+                    item.Sha256,
+                    createdUtc);
+                _catalog[normalized] = state;
 
-            try
-            {
-                EnsurePlaceholder(state, previousState);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogDebug(ex, "Failed to prepare placeholder for artifact {Path}", normalized);
+                try
+                {
+                    EnsurePlaceholder(state, previousState);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Failed to prepare placeholder for artifact {Path}", normalized);
+                }
             }
 
             return normalized;
@@ -909,11 +1202,16 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
         private void PruneCatalogEntries(HashSet<string> currentPaths)
         {
-            foreach (var (path, _) in _catalog)
+            // Under the eviction gate, as every catalog replacement: a pass must not empty a file
+            // whose entry, the only way to download it again, is being removed.
+            lock (_evictionGate)
             {
-                if (!currentPaths.Contains(path))
+                foreach (var (path, _) in _catalog)
                 {
-                    _catalog.TryRemove(path, out _);
+                    if (!currentPaths.Contains(path))
+                    {
+                        _catalog.TryRemove(path, out _);
+                    }
                 }
             }
         }
@@ -1152,6 +1450,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             {
                 case SecureEntryKind.Missing:
                     secureRoot.EnsurePlaceholder(relativePath, state.CreatedUtc.UtcDateTime);
+                    state.MarkPlaceholder(secureRoot.GetVersion(relativePath));
                     return;
                 case SecureEntryKind.Other:
                     throw new UnauthorizedAccessException($"Artifact path is not a regular file: '{state.LocalPath}'.");
@@ -1159,11 +1458,20 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
             if (status.Length > 0 && ShouldKeepExistingArtifactFile(state, previousState, status.Length, secureRoot, relativePath))
             {
-                state.MarkDownloaded();
+                // A kept output may hold newer bytes than the catalog's: only a file known to equal
+                // the remote artifact (the version this uploader sent or fetched, or the catalog's
+                // digest) counts as saved or may be evicted.
+                var version = secureRoot.GetVersion(relativePath);
+                var knownRemote = version is { } current &&
+                                  (previousState?.MatchesLocalFile(current) == true ||
+                                   (!string.IsNullOrWhiteSpace(state.Sha256) &&
+                                    ExistingFileMatchesCatalogMetadata(state, status.Length, secureRoot, relativePath)));
+                state.MarkDownloaded(knownRemote ? version : null);
                 return;
             }
 
             secureRoot.TruncateRegularFile(relativePath, state.CreatedUtc.UtcDateTime);
+            state.MarkPlaceholder(secureRoot.GetVersion(relativePath));
         }
 
         private static bool ShouldKeepExistingArtifactFile(
@@ -1230,13 +1538,19 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         EditorSid = state.EditorSid,
                         Filename = state.Filename,
                         Type = state.Type,
-                        Subfolder = state.Subfolder
+                        Subfolder = state.Subfolder,
+                        ReaderKey = _paths.TransferSealing?.ReaderKeyMessage,
+                        Requester = _readRequester.Clone(),
                     },
                     headers: _authHeaders,
                     cancellationToken: token);
 
-                await FetchToFileAsync(state, call.ResponseStream, token).ConfigureAwait(false);
-                state.MarkDownloaded();
+                var published = await FetchToFileAsync(state, call.ResponseStream, token).ConfigureAwait(false);
+                lock (_evictionGate)
+                {
+                    state.MarkDownloaded(published);
+                    state.MarkServed(DateTimeOffset.UtcNow);
+                }
             }
             catch (RpcException ex) when (!token.IsCancellationRequested)
             {
@@ -1244,7 +1558,8 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             }
         }
 
-        private async Task FetchToFileAsync(RemoteArtifactState state, IAsyncStreamReader<RunnerArtifactServiceReadArtifactResponse> responseStream, CancellationToken cancellationToken)
+        /// <summary>Downloads and publishes the artifact; returns the published file's version.</summary>
+        private async Task<SecureFileVersion?> FetchToFileAsync(RemoteArtifactState state, IAsyncStreamReader<RunnerArtifactServiceReadArtifactResponse> responseStream, CancellationToken cancellationToken)
         {
             if (!TryResolveSecureLocation(state.Type, state.LocalPath, out var root, out var relativePath))
             {
@@ -1254,11 +1569,16 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             // Write and publish relative to a pinned directory descriptor so that a
             // swapped symlink in the session tree cannot redirect the root-owned write.
             using var secureRoot = new LinuxSecureDirectoryRoot(root);
+            // The placeholder (or whatever) the download is to replace, as it is now: a write by
+            // the session while it runs is newer than the remote bytes and must stay.
+            var replacing = secureRoot.GetVersion(relativePath);
             using (var publication = secureRoot.CreatePublication(relativePath))
             {
+                CarryOwnership(publication, state.LocalPath);
                 long bytesWritten = 0;
                 long? expectedSizeBytes = null;
                 string? expectedSha256 = null;
+                using var sinkSlot = new SealedReadSinkSlot();
                 await using (var destination = publication.OpenWriteStream())
                 using (var hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA256))
                 {
@@ -1272,16 +1592,30 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                                 sawMetadata = true;
                                 var metadata = response.Metadata;
                                 expectedSizeBytes = metadata.SizeBytes;
-                                if (expectedSizeBytes > MaxUploadBytes)
+                                if (expectedSizeBytes > SealedReadSink.WireLimit(metadata.Envelope, MaxUploadBytes))
                                 {
                                     throw new InvalidOperationException(
                                         $"Artifact declares {expectedSizeBytes} bytes, above the {MaxUploadBytes} byte limit.");
                                 }
 
                                 expectedSha256 = string.IsNullOrWhiteSpace(metadata.Sha256) ? null : metadata.Sha256;
+                                var sink = sinkSlot.Begin(SealedReadSink.Open(
+                                    destination,
+                                    metadata.Envelope,
+                                    _paths.TransferSealing,
+                                    () => new SealedArtifactIdentity(_sessionId, state.EditorSid, state.Type, state.Subfolder, state.Filename)));
+                                // The envelope format caps this too; the artifact limit is checked
+                                // here so it never depends on that.
+                                if (sink.SealedPlaintextSize > MaxUploadBytes)
+                                {
+                                    throw new InvalidOperationException(
+                                        $"Artifact declares {sink.SealedPlaintextSize} bytes, above the {MaxUploadBytes} byte limit.");
+                                }
+                                // The catalog records the local file's size: the plaintext a sealed
+                                // header declares, not its ciphertext on the wire.
                                 state.UpdateMetadata(
-                                    expectedSizeBytes,
-                                    expectedSha256,
+                                    sink.SealedPlaintextSize ?? expectedSizeBytes,
+                                    sink.IsSealed ? null : expectedSha256,
                                     ToDateTimeOffset(metadata.ModifiedUtc));
                                 break;
                             case RunnerArtifactServiceReadArtifactResponse.PayloadOneofCase.Chunk:
@@ -1292,14 +1626,14 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
                                 // Bound the write as it happens, so a stream larger than declared
                                 // (or unbounded, when no size is declared) cannot fill the disk.
-                                var limit = expectedSizeBytes ?? MaxUploadBytes;
+                                var limit = expectedSizeBytes ?? sinkSlot.Current.SealedCiphertextSize ?? MaxUploadBytes;
                                 if (bytesWritten + response.Chunk.Length > limit)
                                 {
                                     throw new InvalidOperationException(
                                         $"Artifact stream exceeds its {(expectedSizeBytes.HasValue ? "declared size" : "size limit")} of {limit} bytes.");
                                 }
 
-                                await destination.WriteAsync(response.Chunk.Memory, cancellationToken).ConfigureAwait(false);
+                                await sinkSlot.Current.WriteAsync(response.Chunk.Memory, cancellationToken).ConfigureAwait(false);
                                 hasher.AppendData(response.Chunk.Memory.Span);
                                 bytesWritten += response.Chunk.Length;
                                 break;
@@ -1324,6 +1658,9 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                             throw new InvalidOperationException("Artifact stream SHA-256 mismatch.");
                         }
                     }
+
+                    // A sealed payload is usable only once its final chunk has verified.
+                    await sinkSlot.Current.CompleteAsync(cancellationToken).ConfigureAwait(false);
                 }
 
                 try
@@ -1336,8 +1673,14 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 }
 
                 // Disposing an uncommitted publication removes its temporary file.
-                publication.Commit();
+                if (!(replacing is { } expected ? publication.CommitReplacing(expected) : publication.CommitIfAbsent()))
+                {
+                    // The session wrote or created the file meanwhile: it stays, and its watcher uploads it.
+                    return null;
+                }
             }
+
+            return secureRoot.GetVersion(relativePath);
         }
 
         private void OnFileEvent(string type, string fullPath, string source)
@@ -1411,7 +1754,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     fullPath,
                     status.Length);
 
-                var request = new UploadRequest(type, fullPath, 0, CurrentRuntime());
+                var request = new UploadRequest(type, fullPath, 0, CreatedFor);
                 if (!_queue.Writer.TryWrite(request))
                 {
                     _pending.TryRemove(fullPath, out _);
@@ -1425,8 +1768,216 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
         internal int PendingUploadCount => _pending.Count;
 
-        private RuntimeIdentity? CurrentRuntime()
-            => _runtimeIdentities?.TryGet(_sessionId, out var identity) == true ? identity : null;
+        /// <summary>
+        /// Artifacts on disk that matched no uploaded version when the uploader stopped, whether their
+        /// upload failed, was still pending or never queued (a full queue drops files).
+        /// </summary>
+        public int UnsavedUploadCount { get; private set; }
+
+        /// <summary>Whether an artifact folder could not be read, so <see cref="UnsavedUploadCount"/> may be short.</summary>
+        public bool UnsavedCountIncomplete { get; private set; }
+
+        private int CountUnsavedArtifacts()
+        {
+            var unsaved = 0;
+            var unsendable = new HashSet<(ulong Device, ulong Inode)>();
+            foreach (var (type, root) in new[] { ("output", _paths.OutputDirectory), ("temp", _paths.TempDirectory) })
+            {
+                if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    using var secureRoot = new LinuxSecureDirectoryRoot(root);
+                    foreach (var file in EnumerateArtifactFiles(root))
+                    {
+                        if (!TryResolveSecureLocation(type, file, out _, out var relativePath))
+                        {
+                            continue;
+                        }
+
+                        if (secureRoot.GetVersion(relativePath) is not { } version)
+                        {
+                            // A regular file the uploader refuses (a second hard link, say) still
+                            // holds session data the control plane never got; once per inode.
+                            if (SealedStorageProbe.ReadEntryStatus(file) is { IsRegularFile: true, IsSymbolicLink: false } &&
+                                LinuxFileIdentityReader.TryRead(file, out var identity) &&
+                                unsendable.Add((identity.DeviceId, identity.Inode)))
+                            {
+                                unsaved++;
+                            }
+
+                            continue;
+                        }
+
+                        // Saved means the control plane holds this exact file, or it is the empty
+                        // placeholder the agent left for a remote artifact. An empty rewrite by the
+                        // editor is neither.
+                        if (!_catalog.TryGetValue(NormalizePath(file), out var state) || !state.AccountsFor(version))
+                        {
+                            unsaved++;
+                        }
+                    }
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    // Files past this point went uncounted: the session must not be reported as
+                    // fully saved on a partial count.
+                    unsaved++;
+                    UnsavedCountIncomplete = true;
+                    _logger.LogWarning(ex, "Could not count unsaved artifacts session={SessionId} type={Type}", _sessionId, type);
+                }
+            }
+
+            return unsaved;
+        }
+
+        public bool IsSealed => _paths.IsSealed;
+
+        internal void RefreshRecordedVersions()
+        {
+            lock (_evictionGate)
+            {
+                foreach (var state in _catalog.Values)
+                {
+                    if ((state.LocalVersion is null && state.PlaceholderVersion is null) ||
+                        !TryResolveSecureLocation(state.Type, state.LocalPath, out var root, out var relativePath))
+                    {
+                        continue;
+                    }
+
+                    try
+                    {
+                        using var secureRoot = new LinuxSecureDirectoryRoot(root);
+                        state.RefreshVersion(secureRoot.GetVersion(relativePath));
+                    }
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                    {
+                        state.RefreshVersion(null);
+                    }
+                }
+            }
+        }
+
+        private readonly object _evictionGate = new();
+
+        private readonly struct EvictionGateScope : IDisposable
+        {
+            private readonly object _gate;
+
+            public EvictionGateScope(object gate)
+            {
+                _gate = gate;
+                Monitor.Enter(gate);
+            }
+
+            public void Dispose() => Monitor.Exit(_gate);
+        }
+
+        /// <summary>
+        /// Gives a publication the owner of the file it replaces when that is not root: the
+        /// session's own output stays writable to it after an eviction or a download again, since
+        /// the shim does not intercept opens for writing.
+        /// </summary>
+        private static void CarryOwnership(LinuxSecureDirectoryRoot.PendingPublication publication, string path)
+        {
+            if (SealedStorageProbe.ReadEntryStatus(path) is { IsRegularFile: true, IsSymbolicLink: false, OwnerId: not 0 } current)
+            {
+                publication.SetOwner(current.OwnerId, current.GroupId);
+            }
+        }
+
+        /// <summary>Runs before each eviction candidate takes the gate; lets tests change the catalog then.</summary>
+        internal Action<string>? BeforeEvictionCandidate { get; set; }
+
+        internal long EvictUploadedArtifacts(long bytesToFree, TimeSpan minimumIdle, DateTimeOffset now)
+        {
+            long released = 0;
+            // An artifact still open or mapped keeps its memory until it closes: the pass stops
+            // on the space that actually came back, not on the lengths it replaced.
+            var freeBefore = ReadSealedFreeBytes();
+            var candidates = _catalog.Values
+                .Where(state => state.LocalVersion is { Status.Length: > 0 } &&
+                                state.IdleSince(now) >= minimumIdle &&
+                                RunnerVfsEnvironmentBuilder.IsArtifactReadbackPath(state.LocalPath))
+                .OrderBy(static state => state.CreatedUtc)
+                .ToArray();
+            foreach (var state in candidates)
+            {
+                if (_cts.IsCancellationRequested)
+                {
+                    break;
+                }
+
+                if (_pending.ContainsKey(state.LocalPath) ||
+                    !TryResolveSecureLocation(state.Type, state.LocalPath, out var root, out var relativePath))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    BeforeEvictionCandidate?.Invoke(state.LocalPath);
+                    // Excludes the VFS serving this file, and catalog updates, while it is checked
+                    // and replaced.
+                    using var gate = new EvictionGateScope(_evictionGate);
+                    // A refresh or upload may have replaced this entry since the pass began: the
+                    // current one then decides, and judged the file itself.
+                    if (!_catalog.TryGetValue(state.LocalPath, out var current) || !ReferenceEquals(current, state) ||
+                        state.IdleSince(DateTimeOffset.UtcNow) < minimumIdle)
+                    {
+                        continue;
+                    }
+
+                    using var secureRoot = new LinuxSecureDirectoryRoot(root);
+                    // A rewrite of the same length is a different version: only the one the control
+                    // plane holds may be replaced, since opening the placeholder downloads that one.
+                    if (secureRoot.GetVersion(relativePath) is not { } version || !state.MatchesLocalFile(version))
+                    {
+                        continue;
+                    }
+
+                    var status = version.Status;
+
+                    // Replace rather than truncate: a reader or mapping that still has the file
+                    // open keeps the uploaded bytes until it closes, and memory is released then.
+                    using var placeholder = secureRoot.CreatePublication(relativePath);
+                    placeholder.SetModifiedUtc(status.LastWriteTimeUtc);
+                    CarryOwnership(placeholder, state.LocalPath);
+                    // Swapped in atomically and kept only if it displaced exactly that version.
+                    if (!placeholder.CommitReplacing(version))
+                    {
+                        continue;
+                    }
+
+                    state.MarkEvicted(secureRoot.GetVersion(relativePath));
+                    released += status.Length;
+                    var freed = freeBefore is { } before && ReadSealedFreeBytes() is { } after ? after - before : released;
+                    if (freed >= bytesToFree)
+                    {
+                        break;
+                    }
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    _logger.LogDebug(ex, "Could not evict artifact session={SessionId} type={Type}", _sessionId, state.Type);
+                }
+            }
+
+            if (released > 0)
+            {
+                _logger.LogInformation("Evicted uploaded artifacts session={SessionId} bytes={Bytes}", _sessionId, released);
+            }
+
+            return released;
+        }
+
+        private long? ReadSealedFreeBytes()
+            => _paths.SealedDirectory is { } directory && SealedStorageProbe.ReadFileSystemStats(directory) is { } stats
+                ? stats.AvailableBlocks * stats.BlockSize
+                : null;
 
         /// <summary>
         /// Rescans the artifact folders once the queue has drained to half its cap after
@@ -1593,6 +2144,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     await using var stream = opened;
                     var sizeBytes = stream.Length;
                     var snapshotWriteUtc = LinuxSecureDirectoryRoot.GetOpenFileStatus(stream.SafeFileHandle, relPath).LastWriteTimeUtc;
+                    var snapshotVersion = LinuxSecureDirectoryRoot.GetOpenFileVersion(stream.SafeFileHandle, relPath);
                     if (sizeBytes > MaxUploadBytes)
                     {
                         _logger.LogWarning(
@@ -1617,6 +2169,18 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         ContentType = string.IsNullOrWhiteSpace(contentType) ? null : contentType,
                         SizeBytes = sizeBytes
                     };
+
+                    // Every attempt seals afresh: a new data key and encapsulation, never a resend.
+                    using var writer = _paths.TransferSealing?.OutputRecipient is { } recipient
+                        ? SealedEnvelopeWriter.Create(
+                            recipient,
+                            new SealedArtifactIdentity(_sessionId, _editorSid, type, subfolder, fileName),
+                            sizeBytes)
+                        : null;
+                    if (writer is not null)
+                    {
+                        metadata.Envelope = SessionTransferSealing.ToMessage(writer.Envelope);
+                    }
 
                     if (!string.IsNullOrWhiteSpace(_owner))
                     {
@@ -1643,14 +2207,28 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         relPath,
                         sizeBytes);
 
-                    var call = _artifactClient.UploadArtifact(headers: _authHeaders, cancellationToken: _cts.Token);
+                    // Disposed on every path, so an upload that fails midway (a sealed file that shrank) cancels its RPC.
+                    using var call = _artifactClient.UploadArtifact(headers: _authHeaders, cancellationToken: _cts.Token);
                     await call.RequestStream.WriteAsync(new RunnerArtifactServiceUploadArtifactRequest { Metadata = metadata }).ConfigureAwait(false);
+
+                    if (writer is not null)
+                    {
+                        // Seal exactly the size declared in the header, even if the file grows.
+                        await using var limited = new LengthLimitedReadStream(stream, sizeBytes);
+                        await foreach (var sealedChunk in writer.EncryptChunksAsync(limited, _cts.Token).ConfigureAwait(false))
+                        {
+                            await call.RequestStream.WriteAsync(new RunnerArtifactServiceUploadArtifactRequest
+                            {
+                                Chunk = Google.Protobuf.ByteString.CopyFrom(sealedChunk.Span)
+                            }).ConfigureAwait(false);
+                        }
+                    }
 
                     var buffer = ArrayPool<byte>.Shared.Rent(128 * 1024);
                     try
                     {
                         // Send at most the size declared in the metadata, even if the file grows.
-                        var remaining = sizeBytes;
+                        var remaining = writer is null ? sizeBytes : 0;
                         int read;
                         while (remaining > 0 &&
                                (read = await stream.ReadAsync(buffer.AsMemory(0, (int)Math.Min(buffer.Length, remaining)), _cts.Token).ConfigureAwait(false)) > 0)
@@ -1678,14 +2256,18 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     // A rewrite during the upload is dropped by the pending set, so compare the
                     // file with the snapshot that was sent before recording it as uploaded.
                     SecureFileStatus after;
+                    SecureFileVersion? afterVersion;
                     using (var secureRoot = new LinuxSecureDirectoryRoot(root))
                     {
                         after = secureRoot.GetStatus(relPath);
+                        afterVersion = secureRoot.GetVersion(relPath);
                     }
 
                     var changedDuringUpload = !after.IsRegularFile ||
                                               after.Length != sizeBytes ||
-                                              after.LastWriteTimeUtc != snapshotWriteUtc;
+                                              after.LastWriteTimeUtc != snapshotWriteUtc ||
+                                              afterVersion is null ||
+                                              afterVersion != snapshotVersion;
 
                     // When it changed, record the snapshot's time so a later scan sees a newer file.
                     var createdUtc = changedDuringUpload
@@ -1693,8 +2275,12 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         : DateTimeOffset.UtcNow;
                     var localPath = NormalizePath(fullPath);
                     var remote = new RemoteArtifactState(_editorSid, type, subfolder, fileName, localPath, sizeBytes, null, createdUtc);
-                    _catalog[remote.LocalPath] = remote;
-                    remote.MarkDownloaded();
+                    lock (_evictionGate)
+                    {
+                        _catalog[remote.LocalPath] = remote;
+                        // A file that changed while it was sent matches no uploaded version yet.
+                        remote.MarkDownloaded(changedDuringUpload ? null : afterVersion);
+                    }
 
                     _logger.LogInformation("Uploaded artifact session={SessionId} type={Type} path={Relative}", _sessionId, type, relPath);
                     if (changedDuringUpload && after.IsRegularFile && request.Attempt < 3)
@@ -1811,7 +2397,67 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 CreatedUtc = createdUtc;
             }
 
-            public void MarkDownloaded() => Downloaded = true;
+            /// <summary>The local file that equals the remote artifact, when there is one.</summary>
+            public SecureFileVersion? LocalVersion { get; private set; }
+
+            /// <summary>The empty placeholder the agent left for the remote artifact, when there is one.</summary>
+            public SecureFileVersion? PlaceholderVersion { get; private set; }
+
+            public void MarkDownloaded(SecureFileVersion? localVersion = null)
+            {
+                Downloaded = true;
+                LocalVersion = localVersion;
+                PlaceholderVersion = null;
+            }
+
+            public void MarkPlaceholder(SecureFileVersion? placeholder)
+            {
+                LocalVersion = null;
+                PlaceholderVersion = placeholder is { Status.Length: 0 } ? placeholder : null;
+            }
+
+            public void MarkEvicted(SecureFileVersion? placeholder)
+            {
+                Downloaded = false;
+                MarkPlaceholder(placeholder);
+            }
+
+            /// <summary>
+            /// Takes on <paramref name="current"/> when it is the recorded file with only its change
+            /// time moved; a record whose file changed in any other way no longer stands for it.
+            /// </summary>
+            public void RefreshVersion(SecureFileVersion? current)
+            {
+                if (LocalVersion is { } local)
+                {
+                    LocalVersion = current is { } now && now.IsSameFileAs(local) ? now : null;
+                }
+
+                if (PlaceholderVersion is { } placeholder)
+                {
+                    PlaceholderVersion = current is { } now && now.IsSameFileAs(placeholder) ? now : null;
+                }
+            }
+
+            /// <summary>
+            /// True when the control plane holds what <paramref name="version"/> stands for: the file
+            /// itself, or the remote artifact behind the agent's own empty placeholder.
+            /// </summary>
+            public bool AccountsFor(SecureFileVersion version)
+                => MatchesLocalFile(version) || PlaceholderVersion == version;
+
+            /// <summary>When the VFS last told a reader the local file is ready.</summary>
+            public DateTimeOffset LastServedUtc { get; private set; }
+
+            public void MarkServed(DateTimeOffset when) => LastServedUtc = when;
+
+            /// <summary>How long since the artifact was last uploaded, downloaded or served.</summary>
+            public TimeSpan IdleSince(DateTimeOffset now)
+                => now - (LastServedUtc > CreatedUtc ? LastServedUtc : CreatedUtc);
+
+            /// <summary>True when <paramref name="version"/> is exactly the file the control plane holds.</summary>
+            public bool MatchesLocalFile(SecureFileVersion version)
+                => Downloaded && LocalVersion == version;
 
             public bool HasSameCatalogGeneration(RemoteArtifactState other)
                 => SizeBytes == other.SizeBytes
@@ -1856,6 +2502,9 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             {
                 await WaitAfterCancellationAsync(Task.WhenAll(downloadTasks), "artifact downloads").ConfigureAwait(false);
             }
+
+            // Uploads have stopped: whatever is not on the control plane now is lost with the session's data.
+            UnsavedUploadCount = CountUnsavedArtifacts();
         }
 
         private async Task WaitAfterCancellationAsync(Task task, string description)

@@ -19,6 +19,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/ioctl.h>
 #include <sys/sendfile.h>
 #include <sys/socket.h>
@@ -237,6 +238,26 @@ static pending_release_t *pending_releases = NULL;
 static int pending_release_worker_started = 0;
 static __thread int reentry = 0;
 static int log_state = -1;
+
+/* Sealed sessions set VFS_NO_DUMP=1: every process that loads the shim becomes non-dumpable,
+ * so no core dump writes session memory to the host's disk. execve resets dumpability, which
+ * is why this runs in each new program rather than once in the editor. */
+__attribute__((constructor)) static void apply_no_dump(void) {
+    const char *value = getenv("VFS_NO_DUMP");
+    if (value && strcmp(value, "1") == 0) {
+        prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+        /* The agent's probe: proof that the shim loaded and the flag took, which the loader's
+         * silent skip of an unloadable LD_PRELOAD entry would not give. */
+        const char *report = getenv("VFS_NO_DUMP_REPORT");
+        if (report && strcmp(report, "1") == 0) {
+            char line[48];
+            int length = snprintf(line, sizeof line, "offloadr-vfs-no-dump=%d\n", prctl(PR_GET_DUMPABLE, 0, 0, 0, 0));
+            if (length > 0 && (size_t)length < sizeof line && write(STDERR_FILENO, line, (size_t)length) < 0) {
+                /* Nothing to do: the probe then fails closed. */
+            }
+        }
+    }
+}
 
 static void init_syms(void) {
     if (!real_openat_fn) real_openat_fn = dlsym(RTLD_NEXT, "openat");

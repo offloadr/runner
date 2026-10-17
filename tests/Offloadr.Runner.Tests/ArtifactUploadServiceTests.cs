@@ -216,10 +216,15 @@ public partial class ArtifactUploadServiceTests
             const string filename = "ComfyUI_00006_.png";
             var outputPath = Path.Combine(outputDirectory, filename);
             var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse());
+            var identities = new RuntimeIdentityRegistry();
+            identities.Set("session-1", 5, 2, "instance-a");
             await using var service = new ArtifactUploadService(
                 runnerSecret: "runner-secret-value",
                 artifactClient,
-                NullLogger<ArtifactUploadService>.Instance);
+                NullLogger<ArtifactUploadService>.Instance,
+                identities,
+                "runner-1",
+                "process-1");
 
             var paths = new SessionProcessManager.SessionPaths
             {
@@ -250,12 +255,234 @@ public partial class ArtifactUploadServiceTests
                 ],
                 CancellationToken.None);
 
+            // A newer start for the session is admitted while this runtime still reads.
+            identities.Set("session-1", 6, 1, "instance-b");
             var available = await service.TryEnsureArtifactAvailableAsync(outputPath, highPriority: false, CancellationToken.None);
 
             Assert.That(available, Is.True);
             Assert.That(artifactClient.LastReadArtifactRequest, Is.Not.Null);
             Assert.That(artifactClient.LastReadArtifactRequest!.EditorSid, Is.EqualTo("editor-current"));
+            Assert.That(artifactClient.LastReadArtifactRequest.Requester, Is.EqualTo(new RunnerReadRequester
+            {
+                RunnerId = "runner-1",
+                InstanceId = "process-1",
+                SessionId = "session-1",
+                LifecycleGeneration = 5,
+                RuntimeEpoch = 2,
+                RuntimeInstanceId = "instance-a",
+            }));
             Assert.That(new FileInfo(outputPath).Length, Is.EqualTo(4));
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
+    public async Task Upload_NamesTheRuntimeItsUploaderStartedFor()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var outputDirectory = Path.Combine(root, "output");
+            Directory.CreateDirectory(outputDirectory);
+            var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse());
+            var identities = new RuntimeIdentityRegistry();
+            identities.Set("session-1", 5, 2, "instance-a");
+            await using var service = new ArtifactUploadService("runner-secret-value", artifactClient, NullLogger<ArtifactUploadService>.Instance, identities, "runner-1", "process-1");
+            var paths = new SessionProcessManager.SessionPaths
+            {
+                HomeDirectory = root,
+                UserDirectory = root,
+                OutputDirectory = outputDirectory,
+                InputDirectory = root,
+                TempDirectory = Path.Combine(root, "temp"),
+                CacheDirectory = root,
+                LogsDirectory = root
+            };
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+
+            // A replacement runtime is registered while this one still writes output.
+            identities.Set("session-1", 5, 3, "instance-b");
+            await File.WriteAllBytesAsync(Path.Combine(outputDirectory, "late.png"), [1, 2, 3]);
+            var upload = await artifactClient.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+
+            Assert.That(upload.Metadata!.RuntimeEpoch, Is.EqualTo(2));
+            Assert.That(upload.Metadata.RuntimeInstanceId, Is.EqualTo("instance-a"));
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
+    public async Task StartSessionAsync_ForANewerRuntimeReplacesAnUploaderLeftByAnEarlierOne()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var outputDirectory = Path.Combine(root, "output");
+            Directory.CreateDirectory(outputDirectory);
+            const string filename = "ComfyUI_00008_.png";
+            var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse());
+            var identities = new RuntimeIdentityRegistry();
+            identities.Set("session-1", 5, 2, "instance-a");
+            await using var service = new ArtifactUploadService("runner-secret-value", artifactClient, NullLogger<ArtifactUploadService>.Instance, identities, "runner-1", "process-1");
+            var paths = new SessionProcessManager.SessionPaths
+            {
+                HomeDirectory = root,
+                UserDirectory = root,
+                OutputDirectory = outputDirectory,
+                InputDirectory = root,
+                TempDirectory = Path.Combine(root, "temp"),
+                CacheDirectory = root,
+                LogsDirectory = root
+            };
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+
+            // A relaunch at epoch 3 was admitted, then the epoch-2 child exited on its own: nothing
+            // stopped its uploader before the new runtime starts.
+            identities.Set("session-1", 5, 3, "instance-b");
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.SeedSessionAsync(
+                "session-1",
+                "editor-1",
+                "owner-1",
+                [new EditorArtifactMetadata { EditorSid = "editor-1", Filename = filename, Type = "output", Subfolder = string.Empty, SizeBytes = 4 }],
+                CancellationToken.None);
+
+            Assert.That(await service.TryEnsureArtifactAvailableAsync(Path.Combine(outputDirectory, filename), highPriority: false, CancellationToken.None), Is.True);
+            Assert.That(artifactClient.LastReadArtifactRequest!.Requester.RuntimeEpoch, Is.EqualTo(3), "reads name the runtime that now runs");
+            Assert.That(artifactClient.LastReadArtifactRequest.Requester.RuntimeInstanceId, Is.EqualTo("instance-b"));
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
+    public async Task Readback_KeepsAWriteTheSessionMadeWhileItDownloaded()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var outputDirectory = Path.Combine(root, "output");
+            Directory.CreateDirectory(outputDirectory);
+            const string filename = "ComfyUI_00009_.png";
+            var outputPath = Path.Combine(outputDirectory, filename);
+            // The workflow writes its new output into the placeholder while the old one downloads.
+            var reader = new CallbackReadArtifactStreamReader(
+                [
+                    new() { Metadata = new RunnerReadStreamMetadata { SizeBytes = 6, ModifiedUtc = Timestamp.FromDateTime(DateTime.UtcNow) } },
+                    new() { Chunk = Google.Protobuf.ByteString.CopyFrom("remote"u8.ToArray()) },
+                ],
+                afterFirst: () => File.WriteAllText(outputPath, "newer!"));
+            var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse()) { BlockingReadArtifactReader = reader };
+            await using var service = new ArtifactUploadService("runner-secret-value", artifactClient, NullLogger<ArtifactUploadService>.Instance);
+            var paths = new SessionProcessManager.SessionPaths
+            {
+                HomeDirectory = root,
+                UserDirectory = root,
+                OutputDirectory = outputDirectory,
+                InputDirectory = root,
+                TempDirectory = Path.Combine(root, "temp"),
+                CacheDirectory = root,
+                LogsDirectory = root
+            };
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.SeedSessionAsync(
+                "session-1",
+                "editor-1",
+                "owner-1",
+                [new EditorArtifactMetadata { EditorSid = "editor-1", Filename = filename, Type = "output", Subfolder = string.Empty, SizeBytes = 6 }],
+                CancellationToken.None);
+
+            await service.TryEnsureArtifactAvailableAsync(outputPath, highPriority: false, CancellationToken.None);
+
+            Assert.That(File.ReadAllText(outputPath), Is.EqualTo("newer!"), "the older remote bytes do not replace it");
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    /// <summary>Answers a read with fixed frames, running an action after the first.</summary>
+    private sealed class CallbackReadArtifactStreamReader(RunnerArtifactServiceReadArtifactResponse[] frames, Action afterFirst)
+        : IAsyncStreamReader<RunnerArtifactServiceReadArtifactResponse>
+    {
+        private int _index = -1;
+
+        public RunnerArtifactServiceReadArtifactResponse Current => frames[_index];
+
+        public Task<bool> MoveNext(CancellationToken cancellationToken)
+        {
+            if (_index == 0)
+            {
+                afterFirst();
+            }
+
+            _index++;
+            return Task.FromResult(_index < frames.Length);
+        }
+    }
+
+    [Test]
+    public async Task Readback_ThatSendsMetadataTwicePublishesNothing()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var outputDirectory = Path.Combine(root, "output");
+            Directory.CreateDirectory(outputDirectory);
+            const string filename = "ComfyUI_00007_.png";
+            var outputPath = Path.Combine(outputDirectory, filename);
+            var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse())
+            {
+                // A first payload's prefix, then a second stream claiming the whole wire size.
+                ReadArtifactFrames =
+                [
+                    new() { Metadata = new RunnerReadStreamMetadata { SizeBytes = 6, ModifiedUtc = Timestamp.FromDateTime(DateTime.UtcNow) } },
+                    new() { Chunk = Google.Protobuf.ByteString.CopyFrom([1, 2, 3]) },
+                    new() { Metadata = new RunnerReadStreamMetadata { SizeBytes = 6, ModifiedUtc = Timestamp.FromDateTime(DateTime.UtcNow) } },
+                    new() { Chunk = Google.Protobuf.ByteString.CopyFrom([4, 5, 6]) },
+                ],
+            };
+            await using var service = new ArtifactUploadService("runner-secret-value", artifactClient, NullLogger<ArtifactUploadService>.Instance);
+            var paths = new SessionProcessManager.SessionPaths
+            {
+                HomeDirectory = root,
+                UserDirectory = root,
+                OutputDirectory = outputDirectory,
+                InputDirectory = root,
+                TempDirectory = Path.Combine(root, "temp"),
+                CacheDirectory = root,
+                LogsDirectory = root
+            };
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.SeedSessionAsync(
+                "session-1",
+                "editor-1",
+                "owner-1",
+                [new EditorArtifactMetadata { EditorSid = "editor-1", Filename = filename, Type = "output", Subfolder = string.Empty, SizeBytes = 6 }],
+                CancellationToken.None);
+
+            bool available;
+            try
+            {
+                available = await service.TryEnsureArtifactAvailableAsync(outputPath, highPriority: false, CancellationToken.None);
+            }
+            catch (Exception)
+            {
+                available = false;
+            }
+
+            Assert.That(available, Is.False);
+            Assert.That(File.Exists(outputPath) ? File.ReadAllBytes(outputPath) : [], Is.Empty, "nothing of either payload is published");
         }
         finally
         {
@@ -1593,6 +1820,8 @@ public partial class ArtifactUploadServiceTests
         public Metadata? LastListHeaders { get; private set; }
         public Metadata? LastUploadHeaders { get; private set; }
         public byte[] ReadArtifactContent { get; set; } = [1, 2, 3, 4];
+        /// <summary>Sent with the read metadata; ReadArtifactContent then holds the ciphertext.</summary>
+        public SealedEnvelope? ReadArtifactEnvelope { get; set; }
         public DateTime ReadArtifactModifiedUtc { get; set; } = DateTime.UtcNow;
         public long? ReadArtifactMetadataSizeBytes { get; set; }
         public string? ReadArtifactSha256 { get; set; }
@@ -1601,6 +1830,18 @@ public partial class ArtifactUploadServiceTests
         public IAsyncStreamReader<RunnerArtifactServiceReadArtifactResponse>? BlockingReadArtifactReader { get; init; }
         /// <summary>When set, upload responses wait for this task, as on a stalled artifact API.</summary>
         public Task? UploadGate { get; init; }
+        /// <summary>Answers every upload with success=false, as a control plane refusing it would.</summary>
+        public bool RejectUploads { get; set; }
+
+        /// <summary>Runs when an upload's metadata frame is written, before any chunk.</summary>
+        public Action? AfterUploadMetadata { get; set; }
+
+        public int UploadCallsStarted => Volatile.Read(ref _uploadCallsStarted);
+
+        public int UploadCallsDisposed => Volatile.Read(ref _uploadCallsDisposed);
+
+        private int _uploadCallsStarted;
+        private int _uploadCallsDisposed;
 
         private static async Task<RunnerArtifactServiceUploadArtifactResponse> WaitForGateAsync(
             Task gate,
@@ -1612,6 +1853,9 @@ public partial class ArtifactUploadServiceTests
         public RunnerArtifactServiceReadArtifactRequest? LastReadArtifactRequest { get; private set; }
         public int ListCallCount { get; private set; }
         public int ReadArtifactCallCount { get; private set; }
+
+        /// <summary>When set, the frames every read answers with, in place of one metadata frame and one chunk.</summary>
+        public RunnerArtifactServiceReadArtifactResponse[]? ReadArtifactFrames { get; set; }
 
         public override AsyncUnaryCall<RunnerArtifactServiceListArtifactsResponse> ListArtifactsAsync(RunnerArtifactServiceListArtifactsRequest request, CallOptions options)
         {
@@ -1631,12 +1875,13 @@ public partial class ArtifactUploadServiceTests
         public override AsyncClientStreamingCall<RunnerArtifactServiceUploadArtifactRequest, RunnerArtifactServiceUploadArtifactResponse> UploadArtifact(CallOptions options)
         {
             LastUploadHeaders = options.Headers;
+            Interlocked.Increment(ref _uploadCallsStarted);
             var response = new TaskCompletionSource<RunnerArtifactServiceUploadArtifactResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
-            var writer = new CaptureUploadStreamWriter(captured =>
+            var writer = new CaptureUploadStreamWriter(AfterUploadMetadata, captured =>
             {
                 _uploads.Enqueue(captured);
                 _uploadSignals.Writer.TryWrite(captured);
-                response.TrySetResult(new RunnerArtifactServiceUploadArtifactResponse { Success = true });
+                response.TrySetResult(new RunnerArtifactServiceUploadArtifactResponse { Success = !RejectUploads, Message = RejectUploads ? "rejected" : string.Empty });
             });
             var gate = UploadGate;
 
@@ -1646,7 +1891,7 @@ public partial class ArtifactUploadServiceTests
                 Task.FromResult(new Metadata()),
                 () => Status.DefaultSuccess,
                 () => new Metadata(),
-                () => { });
+                () => Interlocked.Increment(ref _uploadCallsDisposed));
         }
 
         public override AsyncServerStreamingCall<RunnerArtifactServiceReadArtifactResponse> ReadArtifact(RunnerArtifactServiceReadArtifactRequest request, CallOptions options)
@@ -1660,6 +1905,8 @@ public partial class ArtifactUploadServiceTests
 
             IAsyncStreamReader<RunnerArtifactServiceReadArtifactResponse> responseStream = BlockingReadArtifactReader is not null
                 ? BlockingReadArtifactReader
+                : ReadArtifactFrames is not null
+                ? new SequenceAsyncStreamReader<RunnerArtifactServiceReadArtifactResponse>(ReadArtifactFrames)
                 : new SequenceAsyncStreamReader<RunnerArtifactServiceReadArtifactResponse>(
                     [
                         new RunnerArtifactServiceReadArtifactResponse
@@ -1668,7 +1915,8 @@ public partial class ArtifactUploadServiceTests
                             {
                                 SizeBytes = ReadArtifactMetadataSizeBytes ?? ReadArtifactContent.LongLength,
                                 Sha256 = string.IsNullOrWhiteSpace(ReadArtifactSha256) ? null : ReadArtifactSha256,
-                                ModifiedUtc = Timestamp.FromDateTime(ReadArtifactModifiedUtc)
+                                ModifiedUtc = Timestamp.FromDateTime(ReadArtifactModifiedUtc),
+                                Envelope = ReadArtifactEnvelope
                             }
                         },
                         new RunnerArtifactServiceReadArtifactResponse
@@ -1683,6 +1931,8 @@ public partial class ArtifactUploadServiceTests
                 () => new Metadata(),
                 () => { });
         }
+
+        public int UploadCount => _uploads.Count;
 
         public async Task<CapturedUpload> WaitForUploadAsync(TimeSpan timeout)
         {
@@ -1699,7 +1949,7 @@ public partial class ArtifactUploadServiceTests
         }
     }
 
-    private sealed class CaptureUploadStreamWriter(Action<CapturedUpload> onComplete) : IClientStreamWriter<RunnerArtifactServiceUploadArtifactRequest>
+    private sealed class CaptureUploadStreamWriter(Action? afterMetadata, Action<CapturedUpload> onComplete) : IClientStreamWriter<RunnerArtifactServiceUploadArtifactRequest>
     {
         private readonly Action<CapturedUpload> _onComplete = onComplete;
         private readonly object _gate = new();
@@ -1714,6 +1964,11 @@ public partial class ArtifactUploadServiceTests
                 _messages.Add(message.Clone());
             }
 
+            if (message.PayloadCase == RunnerArtifactServiceUploadArtifactRequest.PayloadOneofCase.Metadata)
+            {
+                afterMetadata?.Invoke();
+            }
+
             return Task.CompletedTask;
         }
 
@@ -1726,16 +1981,18 @@ public partial class ArtifactUploadServiceTests
             }
 
             var metadata = snapshot.FirstOrDefault(m => m.PayloadCase == RunnerArtifactServiceUploadArtifactRequest.PayloadOneofCase.Metadata)?.Metadata;
-            var chunkBytes = snapshot
+            var chunks = snapshot
                 .Where(m => m.PayloadCase == RunnerArtifactServiceUploadArtifactRequest.PayloadOneofCase.Chunk)
-                .Sum(m => (long)m.Chunk.Length);
+                .ToArray();
+            var chunkBytes = chunks.Sum(m => (long)m.Chunk.Length);
+            var payload = chunks.SelectMany(m => m.Chunk.ToByteArray()).ToArray();
 
-            _onComplete(new CapturedUpload(metadata, chunkBytes));
+            _onComplete(new CapturedUpload(metadata, chunkBytes, payload));
             return Task.CompletedTask;
         }
     }
 
-    private sealed record CapturedUpload(RunnerArtifactUploadMetadata? Metadata, long ChunkBytes);
+    private sealed record CapturedUpload(RunnerArtifactUploadMetadata? Metadata, long ChunkBytes, byte[] Payload);
 
     private sealed class SequenceAsyncStreamReader<T>(IReadOnlyList<T> messages) : IAsyncStreamReader<T>
     {

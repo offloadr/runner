@@ -1,6 +1,7 @@
 using Offloadr.Common.V1;
 using Offloadr.EditorRuntime.V1;
 using Offloadr.Runner.V1;
+using SealedStorageMode = Offloadr.Runner.Core.SealedStorageMode;
 using System.Buffers;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -59,8 +60,30 @@ internal sealed partial class SessionProcessManager : IDisposable
     private readonly RunnerVfsEnvironmentBuilder _vfsEnvironmentBuilder;
     private readonly ILinuxCommandRunner _signalCommandRunner;
     private readonly SessionProcessLogRelay? _processLogRelay;
+    private readonly SealedStorageOptions _sealing;
+    private readonly SealedStorageProbe _sealedStorageProbe;
+    // The transfer sealing of each session's current runtime; its reader key is released only
+    // after that runtime's data has been removed.
+    private readonly ConcurrentDictionary<string, SessionTransferSealing> _transferSealings = new(StringComparer.Ordinal);
 
     internal Func<string, RuntimeIdentity, int?, CancellationToken, Task>? UnexpectedSessionExitCleanup { get; set; }
+
+    /// <summary>
+    /// Runs once the session's files have been handed to its user, before the editor starts. The
+    /// ownership pass moves every file's change time, so recorded file versions are re-read here.
+    /// </summary>
+    internal Action<string>? SessionOwnershipApplied { get; set; }
+
+    /// <summary>
+    /// Locks the host down for sealed data (<see cref="SealedHostPreparation.EnsureApplied"/>) and
+    /// returns why it cannot, or null. Without it no sealed start is admitted.
+    /// </summary>
+    internal Func<string?>? PrepareSealedHost { get; set; }
+
+    // Why the last lockdown attempt failed. Registration offers no sealed sessions while it is
+    // set: each sealed start would be refused the same way. A sealed start that locks the host
+    // down clears it.
+    private volatile string? _sealedHostFailure;
 
     internal int? TryGetTrackedProcessId(string sessionId)
         => _sessions.TryGetValue(sessionId, out var context) ? context.Process.Id : null;
@@ -83,7 +106,8 @@ internal sealed partial class SessionProcessManager : IDisposable
         RunnerVfsEnvironmentBuilder vfsEnvironmentBuilder,
         ILinuxCommandRunner signalCommandRunner,
         SessionProcessLogRelay? processLogRelay = null,
-        HttpMessageHandler? httpMessageHandler = null)
+        HttpMessageHandler? httpMessageHandler = null,
+        SealedStorageProbe? sealedStorageProbe = null)
     {
         ArgumentNullException.ThrowIfNull(options);
         _sessionIsolationStrategy = sessionIsolationStrategy ?? throw new ArgumentNullException(nameof(sessionIsolationStrategy));
@@ -103,6 +127,8 @@ internal sealed partial class SessionProcessManager : IDisposable
         _shutdownGracePeriod = options.ShutdownGracePeriod;
         _readyTimeout = options.ReadyTimeout;
         _readyHost = options.ReadyHost;
+        _sealing = options.Sealing;
+        _sealedStorageProbe = sealedStorageProbe ?? new SealedStorageProbe();
 
         var handler = httpMessageHandler ?? new SocketsHttpHandler
         {
@@ -199,6 +225,18 @@ internal sealed partial class SessionProcessManager : IDisposable
             throw new InvalidOperationException("Concurrent sessions are not supported yet on this runner.");
         }
 
+        // A session that must be sealed never falls back to disk: refuse it before anything is
+        // provisioned when the memory-backed root cannot take it.
+        var sealSession = ShouldSeal(command);
+        if (sealSession)
+        {
+            ThrowIfSealedStorageUnavailable();
+        }
+
+        // Validates the output recipient before anything is provisioned, too.
+        var transferSealing = SessionTransferSealing.Create(sessionId, command.Sealing, sealSession);
+        ReplaceTransferSealing(sessionId, transferSealing);
+
         PreparedSessionIdentity identity = default;
         SessionContext? launchedContext = null;
         var prepared = false;
@@ -210,7 +248,10 @@ internal sealed partial class SessionProcessManager : IDisposable
             identity = await _sessionIsolationStrategy.PrepareAsync(sessionId, _sessionRoot, cancellationToken).ConfigureAwait(false);
             prepared = true;
             _preparedIdentities[sessionId] = identity;
-            var paths = await PrepareSessionDirectoriesAsync(sessionId, identity.HomeDirectory, cancellationToken).ConfigureAwait(false);
+            var paths = await PrepareSessionDirectoriesAsync(sessionId, identity.HomeDirectory, sealSession, command.LifecycleGeneration, cancellationToken).ConfigureAwait(false) with
+            {
+                TransferSealing = transferSealing
+            };
 
             // Copy bundled input seeds before the initializer can create input catalog placeholders.
             PrepareBundledInputSeeds(paths);
@@ -239,7 +280,17 @@ internal sealed partial class SessionProcessManager : IDisposable
                 await _signalCommandRunner
                     .RunAsync(LinuxCommandFactory.ChownRecursive(identity.UserName, identity.HomeDirectory), cancellationToken)
                     .ConfigureAwait(false);
+                // The sealed session directory itself stays root's, so the session cannot remove
+                // and recreate a data root as an ordinary directory; only its children are handed over.
+                foreach (var directory in paths.SealedSessionOwnedDirectories)
+                {
+                    await _signalCommandRunner
+                        .RunAsync(LinuxCommandFactory.ChownRecursive(identity.UserName, directory), cancellationToken)
+                        .ConfigureAwait(false);
+                }
             }
+
+            SessionOwnershipApplied?.Invoke(sessionId);
 
             if (string.Equals(_runtimeKind, "comfyui", StringComparison.OrdinalIgnoreCase))
             {
@@ -264,6 +315,10 @@ internal sealed partial class SessionProcessManager : IDisposable
             else if (prepared)
             {
                 await CleanupPreparedStartupAsync(identity, sessionId).ConfigureAwait(false);
+            }
+            else
+            {
+                ReleaseTransferSealing(sessionId, transferSealing);
             }
             throw;
         }
@@ -367,6 +422,7 @@ internal sealed partial class SessionProcessManager : IDisposable
 
         context.Cancellation.Cancel();
         var beforeCleanupCompleted = false;
+        var cleanedUp = false;
         try
         {
             await TerminateProcessAsync(context, cancellationToken).ConfigureAwait(false);
@@ -377,6 +433,7 @@ internal sealed partial class SessionProcessManager : IDisposable
             }
 
             await CleanupTrackedContextAsync(context, cancellationToken).ConfigureAwait(false);
+            cleanedUp = true;
             ThrowIfTeardownPending(sessionId);
             stopCompletion.TrySetResult();
             return true;
@@ -387,7 +444,9 @@ internal sealed partial class SessionProcessManager : IDisposable
 
             try
             {
-                if (context.Process.HasExited)
+                // After its cleanup the process handle is disposed; what is left is retried as a
+                // pending teardown by the next Stop.
+                if (!cleanedUp && context.Process.HasExited)
                 {
                     if (!beforeCleanupCompleted)
                     {
@@ -473,6 +532,122 @@ internal sealed partial class SessionProcessManager : IDisposable
         catch (Exception ex)
         {
             RunnerLog.Error<SessionProcessManager>(ex, $"Failed to remove stale session state: {ex.Message}");
+        }
+
+        // Sealed data of a crashed run cannot be uploaded or used again; it only costs memory.
+        RemoveStaleSealedSessionDirectories();
+        ReadRecordedSealedLifecycles();
+    }
+
+    private string SealedLifecycleRecords => Path.Combine(_sessionRoot, ".offloadr-sealed-lifecycles");
+
+    /// <summary>
+    /// Notes on disk that <paramref name="sessionId"/>'s lifecycle has sealed data, until its Stop
+    /// takes the count of what it lost. The note outlives a restart of the agent, which loses the
+    /// counts and, with the container, the memory-backed data itself. Throws when it cannot be
+    /// written: the sealed start is then refused.
+    /// </summary>
+    private void RecordSealedLifecycle(string sessionId, ulong lifecycleGeneration)
+    {
+        try
+        {
+            Directory.CreateDirectory(_sessionRoot);
+            var rootOnly = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
+            var sessionRecords = Path.Combine(SealedLifecycleRecords, sessionId);
+            foreach (var directory in new[] { SealedLifecycleRecords, sessionRecords })
+            {
+                _ = LinuxSecureDirectoryRoot.CreateDirectoryNoFollow(directory, rootOnly);
+                if (SealedStorageProbe.ReadEntryStatus(directory) is not { IsDirectory: true, IsSymbolicLink: false, OwnerId: 0 })
+                {
+                    throw new IOException("The sealed lifecycle notes' folder is not a directory owned by root.");
+                }
+            }
+
+            // One note per lifecycle: a newer one never replaces an older one still awaiting its Stop.
+            File.WriteAllText(Path.Combine(sessionRecords, lifecycleGeneration.ToString(System.Globalization.CultureInfo.InvariantCulture)), string.Empty);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            throw new InvalidOperationException(
+                $"Sealed storage is unavailable: the session's lifecycle cannot be noted under '{SealedLifecycleRecords}' ({ex.GetType().Name}).",
+                ex);
+        }
+    }
+
+    /// <summary>
+    /// At startup: every sealed lifecycle still noted on disk had no Stop take its count, so what
+    /// it lost is unknown, whether or not its data was found.
+    /// </summary>
+    private void ReadRecordedSealedLifecycles()
+    {
+        if (SealedStorageProbe.ReadEntryStatus(SealedLifecycleRecords) is not { IsDirectory: true, IsSymbolicLink: false, OwnerId: 0 })
+        {
+            return;
+        }
+
+        try
+        {
+            foreach (var sessionRecords in Directory.GetDirectories(SealedLifecycleRecords))
+            {
+                var sessionId = Path.GetFileName(sessionRecords);
+                foreach (var generation in ReadRecordedGenerations(sessionRecords))
+                {
+                    _staleSealedSessions[(sessionId, generation)] = 0;
+                }
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            RunnerLog.Warning<SessionProcessManager>($"Could not read the sealed lifecycle notes: {ex.GetType().Name}");
+        }
+    }
+
+    private static IEnumerable<ulong> ReadRecordedGenerations(string sessionRecords)
+        => Directory.GetFiles(sessionRecords)
+            .Select(static record => ulong.TryParse(Path.GetFileName(record), System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var generation)
+                ? generation
+                : 0)
+            .ToArray();
+
+    /// <summary>
+    /// Drops the note for <paramref name="sessionId"/> once a Stop of its lifecycle (or an
+    /// unfenced one) has taken the count of what it lost. A newer lifecycle's note stays.
+    /// </summary>
+    public void ForgetSealedLifecycle(string sessionId, ulong lifecycleGeneration)
+    {
+        if (ResolveSealedSessionDirectory(sessionId) is null)
+        {
+            return;
+        }
+
+        var sessionRecords = Path.Combine(SealedLifecycleRecords, sessionId);
+        if (!Directory.Exists(sessionRecords))
+        {
+            return;
+        }
+
+        try
+        {
+            // That lifecycle's note and older ones, whose Stops a newer one superseded; an
+            // unfenced Stop takes them all.
+            foreach (var record in Directory.GetFiles(sessionRecords))
+            {
+                if (lifecycleGeneration == 0 ||
+                    !ulong.TryParse(Path.GetFileName(record), System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var recorded) ||
+                    recorded <= lifecycleGeneration)
+                {
+                    File.Delete(record);
+                }
+            }
+
+            if (!Directory.EnumerateFileSystemEntries(sessionRecords).Any())
+            {
+                Directory.Delete(sessionRecords);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            RunnerLog.Warning<SessionProcessManager>($"Could not drop the note for sealed session '{sessionId}': {ex.GetType().Name}");
         }
     }
 
@@ -1045,31 +1220,407 @@ internal sealed partial class SessionProcessManager : IDisposable
         }
     }
 
+    /// <summary>
+    /// Whether <paramref name="command"/> keeps its data on the memory-backed root: always in
+    /// required mode, and when the start requires the sealed-session profile. Throws when it
+    /// requires the profile and sealing is off.
+    /// </summary>
+    internal bool ShouldSeal(StartSessionCommand command)
+    {
+        if (command.Sealing?.Required == true)
+        {
+            if (_sealing.Mode == SealedStorageMode.Off)
+            {
+                throw new InvalidOperationException("This runner does not offer sealed sessions (RUNNER_SEALED_STORAGE=off).");
+            }
+
+            return true;
+        }
+
+        return _sealing.Mode == SealedStorageMode.Required;
+    }
+
+    /// <summary>Whether the session's current runtime keeps its data on the memory-backed root.</summary>
+    public bool IsSessionSealed(string sessionId)
+        => _transferSealings.TryGetValue(sessionId, out var sealing) && sealing.MemoryWorkspace;
+
+    /// <summary>Whether any session currently keeps its data on the memory-backed root.</summary>
+    public bool HasSealedSession()
+        => _transferSealings.Values.Any(static sealing => sealing.MemoryWorkspace);
+
+    /// <summary>What the session's current runtime got, or null when none was started.</summary>
+    public SessionSealingStatus? GetSessionSealingStatus(string sessionId)
+        => _transferSealings.TryGetValue(sessionId, out var sealing) ? sealing.ToStatus() : null;
+
+    /// <summary>What this runner can offer sealed sessions, for registration.</summary>
+    public RunnerSealedStorage DescribeSealedStorage()
+    {
+        var status = _sealedStorageProbe.Probe(_sealing);
+        var described = new RunnerSealedStorage
+        {
+            Mode = _sealing.Mode switch
+            {
+                SealedStorageMode.Off => Offloadr.Runner.V1.SealedStorageMode.Off,
+                SealedStorageMode.Auto => Offloadr.Runner.V1.SealedStorageMode.Auto,
+                _ => Offloadr.Runner.V1.SealedStorageMode.Required,
+            },
+            MemoryWorkspaceAvailable = status.Available && _vfsEnvironmentBuilder.CanDisableCoreDumps() &&
+                PrepareSealedHost is not null && _sealedHostFailure is null,
+            BudgetBytes = status.BudgetBytes is > 0 and var budget ? (ulong)budget : 0,
+        };
+        if (_sealing.Mode != SealedStorageMode.Off)
+        {
+            described.Algorithms.Add(Offloadr.Runner.Core.Sealing.SealedEnvelopeFormat.AlgorithmId);
+        }
+
+        return described;
+    }
+
+    private void ReplaceTransferSealing(string sessionId, SessionTransferSealing sealing)
+    {
+        if (_transferSealings.TryGetValue(sessionId, out var previous) && !ReferenceEquals(previous, sealing))
+        {
+            ReleaseTransferSealing(sessionId, previous);
+        }
+
+        _transferSealings[sessionId] = sealing;
+    }
+
+    private void ReleaseTransferSealing(string sessionId, SessionTransferSealing? expected = null)
+    {
+        if (expected is null)
+        {
+            if (_transferSealings.TryRemove(sessionId, out var removed))
+            {
+                removed.Dispose();
+            }
+
+            return;
+        }
+
+        ((ICollection<KeyValuePair<string, SessionTransferSealing>>)_transferSealings).Remove(new(sessionId, expected));
+        expected.Dispose();
+    }
+
+    private void ThrowIfSealedStorageUnavailable()
+    {
+        var status = _sealedStorageProbe.Probe(_sealing);
+        if (!status.Available)
+        {
+            throw new InvalidOperationException($"Sealed storage is unavailable: {status.Reason}.");
+        }
+
+        // Without the shim, session processes would stay dumpable.
+        if (!_vfsEnvironmentBuilder.CanDisableCoreDumps())
+        {
+            throw new InvalidOperationException("Sealed storage is unavailable: the VFS shim that makes session processes non-dumpable is missing or does not load.");
+        }
+
+        // Required mode did this at startup; in auto mode the first sealed start does it.
+        if (PrepareSealedHost is null)
+        {
+            throw new InvalidOperationException("Sealed storage is unavailable: the host was not locked down for sealed sessions.");
+        }
+
+        var failure = PrepareSealedHost();
+        _sealedHostFailure = failure;
+        if (failure is not null)
+        {
+            throw new InvalidOperationException($"Sealed storage is unavailable: {failure}.");
+        }
+    }
+
+    /// <summary>
+    /// Creates <c>root/sessionId</c> (root-owned 0755) with the session's data directories (0700,
+    /// handed to the session user after provisioning) and a root-only staging directory.
+    /// </summary>
+    private string PrepareSealedSessionDirectory(string sessionId, ulong lifecycleGeneration)
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            throw new PlatformNotSupportedException("Sealed storage needs Linux.");
+        }
+
+        // The agent holds sealed data in its buffers too.
+        LinuxProcessHardening.RequireCoreDumpsDisabled();
+        // Under a world-writable parent such as /dev/shm another process may race a link into the
+        // root's place: created without following one, and whatever is there is checked below.
+        _ = LinuxSecureDirectoryRoot.CreateDirectoryNoFollow(_sealing.Root, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
+            UnixFileMode.GroupExecute | UnixFileMode.OtherExecute);
+
+        // Created under a world-writable parent such as /dev/shm: re-check what is there now.
+        ThrowIfSealedStorageUnavailable();
+        var directory = ResolveSealedSessionDirectory(sessionId)
+            ?? throw new InvalidOperationException($"Session id '{sessionId}' cannot name a sealed session directory.");
+        _ = DeleteSealedSessionDirectory(sessionId);
+        if (Path.Exists(directory))
+        {
+            throw new InvalidOperationException($"Sealed storage is unavailable: '{directory}' exists and is not a sealed session directory.");
+        }
+
+        // Before any data exists: without the note a restart could not report its loss as unknown.
+        RecordSealedLifecycle(sessionId, lifecycleGeneration);
+        var traversable = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
+            UnixFileMode.GroupRead | UnixFileMode.GroupExecute | UnixFileMode.OtherRead | UnixFileMode.OtherExecute;
+        Directory.CreateDirectory(directory, traversable);
+        // The umask may have taken bits away; the session user must traverse this directory.
+        File.SetUnixFileMode(directory, traversable);
+        // The marker is what lets cleanup tell this directory from anything else under the root.
+        Directory.CreateDirectory(Path.Combine(directory, ".agent"), UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        using (var marker = new FileStream(
+                   Path.Combine(directory, SealedSessionMarker),
+                   new FileStreamOptions { Mode = FileMode.CreateNew, Access = FileAccess.Write, UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite }))
+        {
+            // The session id, then the lifecycle generation, so a later runner process knows
+            // whose Stop must hear about data it removes.
+            marker.Write(System.Text.Encoding.UTF8.GetBytes(FormattableString.Invariant($"{sessionId}\n{lifecycleGeneration}")));
+        }
+
+
+        foreach (var name in SealedSessionDirectoryNames)
+        {
+            Directory.CreateDirectory(Path.Combine(directory, name), UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+
+        return directory;
+    }
+
+    /// <summary>A root-only file naming the session, inside the session directory's root-only staging directory.</summary>
+    internal const string SealedSessionMarker = ".agent/offloadr-sealed-session";
+
+    /// <summary>
+    /// True only for a directory this runner created for <paramref name="sessionId"/>: root-owned,
+    /// not a link, with the root-owned marker naming the session. Anything else under the sealed
+    /// root (a misconfigured root may be shared) is never removed.
+    /// </summary>
+    internal static bool IsSealedSessionDirectory(string directory, string sessionId)
+    {
+        if (SealedStorageProbe.ReadEntryStatus(directory) is not { IsDirectory: true, IsSymbolicLink: false, OwnerId: 0 } ||
+            SealedStorageProbe.ReadEntryStatus(Path.Combine(directory, ".agent")) is not { IsDirectory: true, IsSymbolicLink: false, OwnerId: 0 })
+        {
+            return false;
+        }
+
+        var markerPath = Path.Combine(directory, SealedSessionMarker);
+        if (SealedStorageProbe.ReadEntryStatus(markerPath) is not { IsRegularFile: true, OwnerId: 0 })
+        {
+            return false;
+        }
+
+        return ReadSealedSessionMarker(markerPath) is { } marker && string.Equals(marker.SessionId, sessionId, StringComparison.Ordinal);
+    }
+
+    /// <summary>The session id and lifecycle generation (0 when not recorded) a marker names.</summary>
+    private static (string SessionId, ulong LifecycleGeneration)? ReadSealedSessionMarker(string markerPath)
+    {
+        try
+        {
+            var lines = File.ReadAllText(markerPath).Split('\n');
+            var generation = lines.Length > 1 &&
+                ulong.TryParse(lines[1], System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var parsed)
+                    ? parsed
+                    : 0;
+            return (lines[0], generation);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
+    private string? ResolveSealedSessionDirectory(string sessionId)
+    {
+        // No control characters either: the marker names the session on its first line, and a
+        // line break in the id would make it name another, so cleanup would not recognise it.
+        if (string.IsNullOrEmpty(sessionId) || sessionId is "." or ".." || sessionId.IndexOfAny(['/', '\\', '\0']) >= 0 ||
+            sessionId.Any(char.IsControl))
+        {
+            return null;
+        }
+
+        return Path.Combine(_sealing.Root, sessionId);
+    }
+
+    /// <summary>Removes the directory recursively; replaceable so tests can make it fail.</summary>
+    internal Action<string> DeleteDirectoryRecursively { get; set; } = static directory => Directory.Delete(directory, recursive: true);
+
+    /// <summary>
+    /// Removes the session's sealed directory. False while some of it stays: until a retry
+    /// succeeds the directory is closed to everyone but root, so a session user created later
+    /// with the same uid cannot read what is left.
+    /// </summary>
+    private bool DeleteSealedSessionDirectory(string sessionId)
+    {
+        if (ResolveSealedSessionDirectory(sessionId) is not { } directory)
+        {
+            return true;
+        }
+
+        if (!Path.Exists(directory))
+        {
+            return true;
+        }
+
+        if (!IsSealedSessionDirectory(directory, sessionId))
+        {
+            RunnerLog.Warning<SessionProcessManager>($"Leaving '{directory}' alone: it is not a sealed session directory of this runner.");
+            return true;
+        }
+
+        try
+        {
+            if (OperatingSystem.IsLinux())
+            {
+                File.SetUnixFileMode(directory, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            }
+
+            // The marker goes last: while anything else is left, a retry must still recognise
+            // the directory as this session's, or it would take it for someone else's and stop.
+            var agentDirectory = Path.Combine(directory, ".agent");
+            var markerPath = Path.Combine(directory, SealedSessionMarker);
+            DeleteEntriesExcept(directory, agentDirectory);
+            DeleteEntriesExcept(agentDirectory, markerPath);
+            File.Delete(markerPath);
+            Directory.Delete(agentDirectory);
+            Directory.Delete(directory);
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // The message names the file that could not go, which is session data.
+            RunnerLog.Error<SessionProcessManager>($"Failed to remove sealed session directory '{directory}': {ex.GetType().Name}.");
+            return false;
+        }
+    }
+
+    /// <summary>Removes every entry of <paramref name="directory"/> but <paramref name="kept"/>, without following links.</summary>
+    private void DeleteEntriesExcept(string directory, string kept)
+    {
+        foreach (var entry in Directory.GetFileSystemEntries(directory))
+        {
+            if (string.Equals(entry, kept, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            if (SealedStorageProbe.ReadEntryStatus(entry) is { IsDirectory: true, IsSymbolicLink: false })
+            {
+                DeleteDirectoryRecursively(entry);
+            }
+            else
+            {
+                File.Delete(entry);
+            }
+        }
+    }
+
+    private void RemoveStaleSealedSessionDirectories()
+    {
+        // Whatever the mode now: data a sealed run left behind must not outlive a mode change.
+        if (SealedStorageProbe.ReadEntryStatus(_sealing.Root) is not { IsDirectory: true, IsSymbolicLink: false, OwnerId: 0 })
+        {
+            return;
+        }
+
+        string[] entries;
+        try
+        {
+            entries = Directory.GetFileSystemEntries(_sealing.Root);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            RunnerLog.Error<SessionProcessManager>(ex, $"Failed to list sealed root '{_sealing.Root}': {ex.Message}");
+            return;
+        }
+
+        foreach (var entry in entries)
+        {
+            var sessionId = Path.GetFileName(entry);
+            if (!IsSealedSessionDirectory(entry, sessionId))
+            {
+                continue;
+            }
+
+            RunnerLog.Warning<SessionProcessManager>($"Removing sealed session data left by an earlier runner process: '{entry}'.");
+            // Whatever that run had not uploaded is gone, and nobody counted it.
+            _staleSealedSessions[(sessionId, ReadSealedSessionMarker(Path.Combine(entry, SealedSessionMarker))?.LifecycleGeneration ?? 0)] = 0;
+            if (!DeleteSealedSessionDirectory(sessionId))
+            {
+                // Closed to everyone but root meanwhile; the session's Stop retries and stays
+                // pending until the plaintext is gone.
+                _pendingSealedDeletes[sessionId] = 0;
+            }
+        }
+    }
+
+    private readonly ConcurrentDictionary<(string SessionId, ulong LifecycleGeneration), byte> _staleSealedSessions = new();
+    // Sessions whose sealed directory is still to be removed; their Stop retries only that.
+    private readonly ConcurrentDictionary<string, byte> _pendingSealedDeletes = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Takes the sessions, with the lifecycle generation that wrote it (0 when unknown), whose
+    /// sealed data an earlier runner process left and this one removed at startup: their Stop
+    /// cannot say how many artifacts were lost.
+    /// </summary>
+    public IReadOnlyCollection<(string SessionId, ulong LifecycleGeneration)> TakeStaleSealedSessions()
+    {
+        var taken = new List<(string, ulong)>();
+        foreach (var lifecycle in _staleSealedSessions.Keys)
+        {
+            if (_staleSealedSessions.TryRemove(lifecycle, out _))
+            {
+                taken.Add(lifecycle);
+            }
+        }
+
+        return taken;
+    }
+
     private async Task<SessionPaths> PrepareSessionDirectoriesAsync(
         string sessionId,
         string homeDirectory,
+        bool sealSession,
+        ulong lifecycleGeneration,
         CancellationToken cancellationToken)
     {
         // Ensure home exists (useradd --create-home should have handled this)
         Directory.CreateDirectory(homeDirectory);
 
+        // Sealed sessions keep user data on the memory-backed root; code, models, the virtualenv
+        // and compiled caches stay in the disk-backed home (the sealed root is mounted noexec).
+        var sealedDirectory = sealSession ? PrepareSealedSessionDirectory(sessionId, lifecycleGeneration) : null;
+        var dataDirectory = sealedDirectory ?? homeDirectory;
         var paths = new SessionPaths
         {
             HomeDirectory = homeDirectory,
-            UserDirectory = Path.Combine(homeDirectory, "user"),
+            SealedDirectory = sealedDirectory,
+            UserDirectory = Path.Combine(dataDirectory, "user"),
             CustomNodesDirectory = Path.Combine(homeDirectory, "custom_nodes"),
             ModelsDirectory = Path.Combine(homeDirectory, "models"),
             VirtualEnvDirectory = Path.Combine(homeDirectory, ".venv"),
-            OutputDirectory = Path.Combine(homeDirectory, "output"),
-            InputDirectory = Path.Combine(homeDirectory, "input"),
-            TempDirectory = Path.Combine(homeDirectory, "temp"),
-            ScratchDirectory = Path.Combine(homeDirectory, "tmp"),
+            OutputDirectory = Path.Combine(dataDirectory, "output"),
+            InputDirectory = Path.Combine(dataDirectory, "input"),
+            TempDirectory = Path.Combine(dataDirectory, "temp"),
+            ScratchDirectory = Path.Combine(dataDirectory, "tmp"),
             CacheDirectory = Path.Combine(homeDirectory, ".cache"),
             WebDirectory = Path.Combine(homeDirectory, "web"),
             UvCacheDirectory = Path.Combine(homeDirectory, ".cache", "uv"),
-            TorchInductorCacheDirectory = Path.Combine(homeDirectory, "tmp", "torchinductor"),
+            TorchInductorCacheDirectory = sealedDirectory is null
+                ? Path.Combine(homeDirectory, "tmp", "torchinductor")
+                : Path.Combine(homeDirectory, ".cache", "torchinductor"),
             LogsDirectory = Path.Combine(homeDirectory, "logs")
         };
+
+        if (paths.IsSealed)
+        {
+            Directory.CreateDirectory(paths.BuildScratchDirectory);
+            if (string.Equals(_runtimeKind, "forge-neo", StringComparison.OrdinalIgnoreCase))
+            {
+                // Forge derives its extensions and default output directories from --data-dir.
+                Directory.CreateSymbolicLink(Path.Combine(paths.ForgeDataDirectory, "extensions"), paths.CustomNodesDirectory);
+                Directory.CreateSymbolicLink(Path.Combine(paths.ForgeDataDirectory, "output"), paths.OutputDirectory);
+            }
+        }
 
         Directory.CreateDirectory(paths.UserDirectory);
         Directory.CreateDirectory(paths.CustomNodesDirectory);
@@ -1103,6 +1654,10 @@ internal sealed partial class SessionProcessManager : IDisposable
         try
         {
             var sessionCategory = SessionLogCategory(sessionId);
+            // Editor output carries prompts, filenames and node values. A sealed session keeps it
+            // off the console (which the container engine writes to the host's disk) and only
+            // relays it to the control plane.
+            var logToConsole = !paths.IsSealed;
             var psi = BuildEditorStartInfo(sessionId, identity, paths);
 
             process = new Process { StartInfo = psi, EnableRaisingEvents = true };
@@ -1121,7 +1676,11 @@ internal sealed partial class SessionProcessManager : IDisposable
             {
                 if (!string.IsNullOrWhiteSpace(line))
                 {
-                    RunnerLog.Info(sessionCategory, line);
+                    if (logToConsole)
+                    {
+                        RunnerLog.Info(sessionCategory, line);
+                    }
+
                     _processLogRelay?.Enqueue(sessionId, SessionProcessLogStream.Stdout, line, runtimeIdentity);
                 }
             });
@@ -1129,7 +1688,11 @@ internal sealed partial class SessionProcessManager : IDisposable
             {
                 if (!string.IsNullOrWhiteSpace(line))
                 {
-                    RunnerLog.Info(sessionCategory, line);
+                    if (logToConsole)
+                    {
+                        RunnerLog.Info(sessionCategory, line);
+                    }
+
                     _processLogRelay?.Enqueue(sessionId, SessionProcessLogStream.Stderr, line, runtimeIdentity);
                 }
             });
@@ -1167,7 +1730,7 @@ internal sealed partial class SessionProcessManager : IDisposable
         {
             args.Add("--api");
             args.Add("--data-dir");
-            args.Add(paths.HomeDirectory);
+            args.Add(paths.ForgeDataDirectory);
             args.Add("--model-ref");
             args.Add(projectedModelsRoot);
             return args;
@@ -1176,6 +1739,19 @@ internal sealed partial class SessionProcessManager : IDisposable
         args.Add("--disable-auto-launch");
         args.Add("--base-directory");
         args.Add(paths.HomeDirectory);
+        if (paths.SealedDirectory is { } sealedDirectory)
+        {
+            args.Add("--input-directory");
+            args.Add(paths.InputDirectory);
+            args.Add("--output-directory");
+            args.Add(paths.OutputDirectory);
+            // ComfyUI appends "temp" to the temp directory it is given.
+            args.Add("--temp-directory");
+            args.Add(sealedDirectory);
+            args.Add("--user-directory");
+            args.Add(paths.UserDirectory);
+        }
+
         return args;
     }
 
@@ -1346,8 +1922,19 @@ internal sealed partial class SessionProcessManager : IDisposable
             return;
         }
 
+        // The account is gone, and its uid may be handed out again: a retry must never act on
+        // that uid, only on what is left of this session.
         _pendingTeardowns.TryRemove(new KeyValuePair<string, PreparedSessionIdentity>(sessionId, identity));
         DeleteSessionHomeDirectory(identity.HomeDirectory);
+        if (!DeleteSealedSessionDirectory(sessionId))
+        {
+            // Plaintext session data is still there: Stop stays pending until a retry removes it,
+            // and the reader key is kept until then.
+            _pendingSealedDeletes[sessionId] = 0;
+            return;
+        }
+
+        ReleaseTransferSealing(sessionId);
     }
 
     /// <summary>
@@ -1361,15 +1948,28 @@ internal sealed partial class SessionProcessManager : IDisposable
             await CleanupPreparedStartupAsync(identity, sessionId).ConfigureAwait(false);
         }
 
+        // Sealed data a teardown, or startup for an earlier runner process, could not remove.
+        if (_pendingSealedDeletes.ContainsKey(sessionId))
+        {
+            if (!DeleteSealedSessionDirectory(sessionId))
+            {
+                throw new InvalidOperationException(
+                    $"Sealed data of session '{sessionId}' could not be removed; the stop is not complete.");
+            }
+
+            _pendingSealedDeletes.TryRemove(sessionId, out _);
+            ReleaseTransferSealing(sessionId);
+        }
+
         ThrowIfTeardownPending(sessionId);
     }
 
     private void ThrowIfTeardownPending(string sessionId)
     {
-        if (_pendingTeardowns.ContainsKey(sessionId))
+        if (_pendingTeardowns.ContainsKey(sessionId) || _pendingSealedDeletes.ContainsKey(sessionId))
         {
             throw new InvalidOperationException(
-                $"Processes of session '{sessionId}' are still running after its teardown; the stop is not complete.");
+                $"The teardown of session '{sessionId}' is not complete (its processes still run or its sealed data is not removed); the stop is not complete.");
         }
     }
 
@@ -1408,6 +2008,8 @@ internal sealed partial class SessionProcessManager : IDisposable
         {
             File.Delete(home);
         }
+
+        _ = DeleteSealedSessionDirectory(sessionId);
     }
 
     private void DeleteSessionHomeDirectory(string homeDirectory)
@@ -1479,9 +2081,9 @@ internal sealed partial class SessionProcessManager : IDisposable
         PreparedSessionIdentity identity,
         SessionPaths paths)
     {
-        return new Dictionary<string, string>(StringComparer.Ordinal)
+        var environment = new Dictionary<string, string>(StringComparer.Ordinal)
         {
-            ["HOME"] = paths.HomeDirectory,
+            ["HOME"] = paths.ProfileDirectory,
             ["VIRTUAL_ENV"] = paths.VirtualEnvDirectory,
             ["USER"] = identity.UserName,
             ["LOGNAME"] = identity.UserName,
@@ -1494,6 +2096,16 @@ internal sealed partial class SessionProcessManager : IDisposable
             ["TMPDIR"] = paths.ScratchDirectory,
             ["COMFYUI_SESSION_ID"] = sessionId
         };
+
+        if (paths.IsSealed)
+        {
+            // HOME is memory-backed and noexec, so caches of compiled code must be named explicitly.
+            environment["TRITON_CACHE_DIR"] = Path.Combine(paths.CacheDirectory, "triton");
+            environment["CUDA_CACHE_PATH"] = Path.Combine(paths.CacheDirectory, "nv");
+            environment["GRADIO_TEMP_DIR"] = Path.Combine(paths.ScratchDirectory, "gradio");
+        }
+
+        return environment;
     }
 
     private static string BuildSessionProcessPath(string virtualEnvDirectory)
@@ -1575,7 +2187,11 @@ internal sealed partial class SessionProcessManager : IDisposable
         {
             if (!string.IsNullOrWhiteSpace(line))
             {
-                RunnerLog.Info(SessionLogCategory(sessionId), line);
+                if (!paths.IsSealed)
+                {
+                    RunnerLog.Info(SessionLogCategory(sessionId), line);
+                }
+
                 CaptureProcessOutput(output, outputLock, line);
             }
         }
@@ -1672,7 +2288,8 @@ internal sealed partial class SessionProcessManager : IDisposable
                 paths.OutputDirectory,
                 paths.InputDirectory,
                 paths.TempDirectory),
-            sessionId: sessionId);
+            sessionId: sessionId,
+            sealedSession: paths.IsSealed);
         foreach (var kvp in vfsEnvironment)
         {
             psi.Environment[kvp.Key] = kvp.Value;
@@ -1711,6 +2328,17 @@ internal sealed partial class SessionProcessManager : IDisposable
         }
 
         psi.Environment["COMFYUI_PATH"] = _workingDirectory;
+        if (paths.IsSealed)
+        {
+            // Dependency builds may compile and run helpers, which the noexec sealed TMPDIR forbids.
+            psi.Environment["TMPDIR"] = paths.BuildScratchDirectory;
+            // It reads the memory-backed user workspace, so it must not dump core either.
+            foreach (var kvp in _vfsEnvironmentBuilder.BuildCoreDumpHardening())
+            {
+                psi.Environment[kvp.Key] = kvp.Value;
+            }
+        }
+
         return psi;
     }
 
@@ -2965,7 +3593,41 @@ internal sealed partial class SessionProcessManager : IDisposable
         public string UvCacheDirectory { get; init; }
         public string TorchInductorCacheDirectory { get; init; }
         public string LogsDirectory { get; init; }
+
+        /// <summary>The session's directory on the memory-backed root, or null for an unsealed session.</summary>
+        public string? SealedDirectory { get; init; }
+
+        /// <summary>How the runtime seals its transfers; null outside a managed session (tests).</summary>
+        public SessionTransferSealing? TransferSealing { get; init; }
+
+        public bool IsSealed => SealedDirectory is not null;
+
+        /// <summary><c>HOME</c> for session processes.</summary>
+        public string ProfileDirectory => SealedDirectory is null ? HomeDirectory : Path.Combine(SealedDirectory, "home");
+
+        /// <summary>Forge's <c>--data-dir</c>: settings, styles and the last prompt's parameters.</summary>
+        public string ForgeDataDirectory => SealedDirectory is null ? HomeDirectory : Path.Combine(SealedDirectory, "forge");
+
+        /// <summary>Root-only staging space for the agent on the memory-backed root.</summary>
+        public string? SealedAgentDirectory => SealedDirectory is null ? null : Path.Combine(SealedDirectory, ".agent");
+
+        /// <summary>Disk-backed temporary space for dependency builds, which must be able to execute what they build.</summary>
+        public string BuildScratchDirectory => Path.Combine(HomeDirectory, "tmp");
+
+        public IEnumerable<string> SealedSessionOwnedDirectories
+        {
+            get
+            {
+                var sealedDirectory = SealedDirectory;
+                return sealedDirectory is null
+                    ? []
+                    : SealedSessionDirectoryNames.Select(name => Path.Combine(sealedDirectory, name));
+            }
+        }
     }
+
+    /// <summary>Children of a sealed session directory that belong to the session user.</summary>
+    internal static readonly string[] SealedSessionDirectoryNames = ["home", "input", "output", "temp", "user", "tmp", "forge"];
 
     internal sealed record ForgeQueueDataArityAdjustment(int FnIndex, int ReceivedCount, int ExpectedCount);
 

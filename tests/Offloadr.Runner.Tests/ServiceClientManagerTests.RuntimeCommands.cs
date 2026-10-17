@@ -1389,7 +1389,26 @@ public partial class ServiceClientManagerTests
         public RuntimeIdentityRegistry Identities { get; } = new();
         public ServiceClientManager.TransientCancellationRegistry TransientCancellation { get; }
         public ConcurrentQueue<string> Calls { get; } = new();
+        public ConcurrentQueue<StartSessionCommand> Starts { get; } = new();
         public string InstanceId { get; set; } = "process-1";
+        public SessionSealingStatus? SealingStatus { get; set; }
+
+        public Func<StartSessionCommand, bool>? SealsStart { get; set; }
+
+        /// <summary>Lost artifacts the next completed Stop takes, as the uploader keeps them.</summary>
+        public int UnsavedArtifacts
+        {
+            get => Volatile.Read(ref _unsavedArtifacts);
+            set => Volatile.Write(ref _unsavedArtifacts, value);
+        }
+
+        private int _unsavedArtifacts;
+
+        /// <summary>Sessions whose durable sealed-lifecycle note was dropped.</summary>
+        public ConcurrentQueue<string> ForgottenLifecycles { get; } = new();
+
+        /// <summary>Whether the uploader could not count every lost artifact.</summary>
+        public bool UnsavedArtifactsIncomplete { get; set; }
 
         /// <summary>Runs before a start registers its runtime; may block or throw.</summary>
         public Func<StartSessionCommand, CancellationToken, Task> BeforeStart { get; set; } = (_, _) => Task.CompletedTask;
@@ -1469,6 +1488,10 @@ public partial class ServiceClientManagerTests
                 return Task.CompletedTask;
             },
             Shutdown = Shutdown.Token,
+            GetSessionSealing = _ => SealingStatus,
+            SealsStart = SealsStart,
+            TakeUnsavedArtifacts = (_, _) => new UnsavedUploads(Interlocked.Exchange(ref _unsavedArtifacts, 0), UnsavedArtifactsIncomplete),
+            ForgetSealedLifecycle = (sessionId, _) => ForgottenLifecycles.Enqueue(sessionId),
         };
 
         private Task Record(string call)
@@ -1480,6 +1503,7 @@ public partial class ServiceClientManagerTests
         private async Task StartAsync(StartSessionCommand command, CancellationToken token)
         {
             Calls.Enqueue($"start:{command.RuntimeEpoch}");
+            Starts.Enqueue(command.Clone());
             var identity = new RuntimeIdentity(command.LifecycleGeneration, command.RuntimeEpoch, command.RuntimeInstanceId);
             if (_tracked.TryGetValue(command.SessionId, out var existing) && existing != identity)
             {

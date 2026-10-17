@@ -1,6 +1,8 @@
 using Offloadr.Runner.V1;
+using SealedStorageMode = Offloadr.Runner.Core.SealedStorageMode;
 using Grpc.Net.Client;
 using Microsoft.Extensions.Logging;
+using System.Globalization;
 using System.Reflection;
 using System.Runtime.InteropServices;
 
@@ -21,7 +23,8 @@ using var loggerFactory = LoggerFactory.Create(builder =>
 
 RunnerLog.Configure(loggerFactory);
 var sessionIsolationStrategy = new LinuxUserIsolationStrategy(new LinuxCommandRunner());
-var startupValidator = new RunnerStartupValidator(sessionIsolationStrategy);
+var sealedStorageProbe = new SealedStorageProbe();
+var startupValidator = new RunnerStartupValidator(sessionIsolationStrategy, sealedStorageProbe: sealedStorageProbe);
 
 try
 {
@@ -43,6 +46,27 @@ RunnerLog.Info(
     $"Runner starting id={options.RunnerId} version={version} offloadr-api={GrpcChannelManager.RedactForLog(options.OffloadrApiUrl)} " +
     $"instance={instanceId} mode=grpc grpc-trace={(options.TraceGrpcHttp ? "on" : "off")}");
 RunnerLog.Info("Offloadr runner is free software under AGPL-3.0-only; source: https://github.com/offloadr/runner");
+var sealedStorageStatus = sealedStorageProbe.Probe(options.Session.Sealing);
+RunnerLog.Info(
+    $"Sealed storage mode={sealedStorageStatus.Mode} root='{sealedStorageStatus.Root}' available={sealedStorageStatus.Available} " +
+    $"budget={sealedStorageStatus.BudgetBytes?.ToString(CultureInfo.InvariantCulture) ?? "unknown"} " +
+    $"swap-devices={sealedStorageStatus.Swap.DevicesBytes} swap-cgroup={sealedStorageStatus.Swap.CgroupLimit ?? "unknown"} " +
+    $"tmpfs-noswap={sealedStorageStatus.Swap.TmpfsNoswap}" +
+    (sealedStorageStatus.Reason is null ? string.Empty : $" reason='{sealedStorageStatus.Reason}'"));
+// Auto mode applies it before its first sealed start.
+var sealedHostPreparation = new SealedHostPreparation();
+if (options.Session.Sealing.Mode == SealedStorageMode.Required)
+{
+    try
+    {
+        LinuxProcessHardening.RequireCoreDumpsDisabled();
+    }
+    catch (InvalidOperationException ex)
+    {
+        RunnerLog.Error($"RUNNER_SEALED_STORAGE=required: {ex.Message}");
+        return 1;
+    }
+}
 
 using var shutdown = new CancellationTokenSource();
 var runtimeIdentities = new RuntimeIdentityRegistry();
@@ -72,6 +96,14 @@ try
 catch (OperationCanceledException) when (shutdown.IsCancellationRequested)
 {
     return 0;
+}
+
+// After that cleanup: it finds the homes of removed session users by their unknown owners, which
+// the lockdown hands to root.
+if (options.Session.Sealing.Mode == SealedStorageMode.Required && sealedHostPreparation.EnsureApplied() is { } lockdownFailure)
+{
+    RunnerLog.Error($"RUNNER_SEALED_STORAGE=required but {lockdownFailure}");
+    return 1;
 }
 var logicalSessionState = new ServiceClientManager.LogicalSessionState(sessionManager.GetActiveSessionId());
 var hydrationCapabilities = ModelHydrationRuntimeCapabilities.FromEnvironment(
@@ -105,11 +137,21 @@ await using var artifactUploadService = new ArtifactUploadService(
     artifactCatalogClient,
     loggerFactory.CreateLogger<ArtifactUploadService>(),
     runtimeIdentities,
-    options.RunnerId);
+    options.RunnerId,
+    instanceId);
+// Sealed data the stale cleanup above removed: what it had not uploaded was never counted.
+foreach (var (staleSessionId, staleGeneration) in sessionManager.TakeStaleSealedSessions())
+{
+    artifactUploadService.MarkLossUncounted(staleSessionId, staleGeneration);
+}
+
 await using var workspaceMirrorService = new WorkspaceMirrorService(
     workspaceCatalogClient,
     options.RunnerSecret,
-    loggerFactory.CreateLogger<WorkspaceMirrorService>());
+    loggerFactory.CreateLogger<WorkspaceMirrorService>(),
+    runtimeIdentities: runtimeIdentities,
+    runnerId: options.RunnerId,
+    instanceId: instanceId);
 await using var downloadService = new ModelDownloadService(
     downloadBackend,
     options.Aria2,
@@ -130,6 +172,8 @@ var runtimeTelemetryReporter = new ActiveSessionRuntimeTelemetryReporter(
     sessionRuntimeTelemetryRelay.Enqueue,
     options.RuntimeTelemetryInterval,
     sessionId => runtimeIdentities.TryGet(sessionId, out var identity) ? identity : null);
+sessionManager.SessionOwnershipApplied = artifactUploadService.RefreshRecordedVersions;
+sessionManager.PrepareSealedHost = sealedHostPreparation.EnsureApplied;
 sessionManager.UnexpectedSessionExitCleanup = async (sessionId, exitedRuntime, exitCode, token) =>
 {
     var exitSummary = exitCode.HasValue ? $" code={exitCode.Value}" : string.Empty;
@@ -156,7 +200,8 @@ await using var downloadIpcServer = new ModelDownloadIpcServer(
     downloadService,
     artifactUploadService,
     workspaceMirrorService,
-    sessionManager.GetSessionUserId);
+    sessionManager.GetSessionUserId,
+    sessionManager.HasSealedSession);
 
 try
 {
@@ -229,6 +274,12 @@ var commandTask = ServiceClientManager.CommandListenerLoopAsync(
     shutdown.Token);
 
 var runtimeTelemetryTask = runtimeTelemetryReporter.RunAsync(shutdown.Token);
+var sealedStorageEvictionTask = new SealedStorageEvictor(
+    options.Session.Sealing,
+    sealedStorageProbe,
+    logicalSessionState.GetActiveSessionId,
+    artifactUploadService.EvictUploadedArtifacts,
+    isSessionSealed: sessionManager.IsSessionSealed).RunAsync(shutdown.Token);
 
 var statusFilePath = RunnerStatusFileWriter.ResolvePath(Environment.GetEnvironmentVariable);
 var statusFileTask = statusFilePath is null
@@ -239,11 +290,12 @@ var statusFileTask = statusFilePath is null
         instanceId,
         version,
         options.SupportedEditorTemplates,
-        logicalSessionState.GetActiveSessionId).RunAsync(shutdown.Token);
+        logicalSessionState.GetActiveSessionId,
+        sealedStorage: () => sealedStorageProbe.Probe(options.Session.Sealing)).RunAsync(shutdown.Token);
 
 try
 {
-    await Task.WhenAll(commandTask, runtimeTelemetryTask, statusFileTask);
+    await Task.WhenAll(commandTask, runtimeTelemetryTask, statusFileTask, sealedStorageEvictionTask);
 }
 finally
 {

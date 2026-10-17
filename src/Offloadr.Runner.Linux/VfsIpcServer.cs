@@ -47,6 +47,19 @@ public sealed class VfsIpcServer : IAsyncDisposable
     {
     }
 
+    /// <summary>
+    /// True while a sealed session runs: request paths name its files, and exception messages carry
+    /// them, so log lines then show neither. The console reaches the host's disk.
+    /// </summary>
+    public Func<bool> RedactPaths { get; init; } = static () => false;
+
+    private const string RedactedText = "[sealed]";
+
+    private string LogPath(string? path) => RedactPaths() ? RedactedText : VfsIpcLogText.Sanitize(path);
+
+    private string LogExceptionMessage(Exception exception)
+        => RedactPaths() ? RedactedText : VfsIpcLogText.Sanitize(exception.Message, 512);
+
     /// <param name="authorizePeer">
     /// Decides, from the kernel-reported peer credentials, whether a connection may issue
     /// requests. When omitted only root and this process's own uid are accepted.
@@ -330,7 +343,7 @@ public sealed class VfsIpcServer : IAsyncDisposable
                     if (_logEnabled)
                     {
                         RunnerLog.Info<VfsIpcServer>(
-                            $"[vfs-ipc] operation={parsed.Request.Operation} path='{VfsIpcLogText.Sanitize(parsed.Request.Path)}'");
+                            $"[vfs-ipc] operation={parsed.Request.Operation} path='{LogPath(parsed.Request.Path)}'");
                     }
 
                     var response = await DispatchUntilHangupAsync(client, parsed.Request, peer, cancellationToken)
@@ -353,7 +366,7 @@ public sealed class VfsIpcServer : IAsyncDisposable
                     if (_logEnabled && response.Status == VfsIpcStatus.Success)
                     {
                         RunnerLog.Info<VfsIpcServer>(
-                            $"[vfs-ipc] ready operation={parsed.Request.Operation} path='{VfsIpcLogText.Sanitize(parsed.Request.Path)}' disposition={response.OpenDisposition}");
+                            $"[vfs-ipc] ready operation={parsed.Request.Operation} path='{LogPath(parsed.Request.Path)}' disposition={response.OpenDisposition}");
                     }
                 }
                 catch (ClientHungUpException)
@@ -450,12 +463,12 @@ public sealed class VfsIpcServer : IAsyncDisposable
         }
 
         // The path and messages that embed it come from the client; never log them raw.
-        var path = VfsIpcLogText.Sanitize(request.Path);
+        var path = LogPath(request.Path);
         if (exception is ModelHydrationIOException or IOException)
         {
             RunnerLog.Warning<VfsIpcServer>(
                 $"[vfs-ipc] Operation {request.Operation} failed for '{path}'{SuppressedSuffix(suppressed)}: " +
-                $"{exception.GetType().Name}: {VfsIpcLogText.Sanitize(exception.Message, 512)}");
+                $"{exception.GetType().Name}: {LogExceptionMessage(exception)}");
             return;
         }
 
@@ -465,8 +478,8 @@ public sealed class VfsIpcServer : IAsyncDisposable
     }
 
     /// <summary>Type, bounded message and stack of an unexpected exception, on one line.</summary>
-    private static string DescribeUnexpected(Exception exception)
-        => $"{exception.GetType().FullName}: {VfsIpcLogText.Sanitize(exception.Message, 512)} " +
+    private string DescribeUnexpected(Exception exception)
+        => $"{exception.GetType().FullName}: {LogExceptionMessage(exception)} " +
            $"at {VfsIpcLogText.Sanitize(exception.StackTrace, 2048)}";
 
     private static string SuppressedSuffix(int suppressed)

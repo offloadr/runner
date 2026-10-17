@@ -15,7 +15,7 @@ MSYS_NO_PATHCONV=1 docker run --rm \
   bash -c '
 set -euo pipefail
 apt-get update -qq >/dev/null
-apt-get install -y -qq --no-install-recommends gcc libc6-dev aria2 >/dev/null
+apt-get install -y -qq --no-install-recommends gcc libc6-dev aria2 nodejs >/dev/null
 mkdir /work
 tar -C /repo --exclude=./.git --exclude="*/bin" --exclude="*/obj" -cf - . | tar -xf - -C /work
 cd /work

@@ -32,6 +32,7 @@ public sealed class SessionProcessOptions
     public required TimeSpan ShutdownGracePeriod { get; init; }
     public required TimeSpan ReadyTimeout { get; init; }
     public required string ReadyHost { get; init; }
+    public SealedStorageOptions Sealing { get; init; } = new();
 
     public static SessionProcessOptions FromEnvironment(Func<string, string?>? env = null)
     {
@@ -54,7 +55,8 @@ public sealed class SessionProcessOptions
             ComfyPort = ParseInt(env, "COMFY_PORT", DefaultPort, 1, 65535),
             ShutdownGracePeriod = TimeSpan.FromSeconds(shutdownSeconds),
             ReadyTimeout = TimeSpan.FromSeconds(readySeconds),
-            ReadyHost = GetTrimmedOrDefault(env("COMFY_READY_HOST"), "127.0.0.1")
+            ReadyHost = GetTrimmedOrDefault(env("COMFY_READY_HOST"), "127.0.0.1"),
+            Sealing = SealedStorageOptions.FromEnvironment(env)
         };
     }
 
