@@ -280,6 +280,45 @@ public partial class ArtifactUploadServiceTests
     }
 
     [Test]
+    public async Task Upload_NamesTheRuntimeItsUploaderStartedFor()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var outputDirectory = Path.Combine(root, "output");
+            Directory.CreateDirectory(outputDirectory);
+            var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse());
+            var identities = new RuntimeIdentityRegistry();
+            identities.Set("session-1", 5, 2, "instance-a");
+            await using var service = new ArtifactUploadService("runner-secret-value", artifactClient, NullLogger<ArtifactUploadService>.Instance, identities, "runner-1", "process-1");
+            var paths = new SessionProcessManager.SessionPaths
+            {
+                HomeDirectory = root,
+                UserDirectory = root,
+                OutputDirectory = outputDirectory,
+                InputDirectory = root,
+                TempDirectory = Path.Combine(root, "temp"),
+                CacheDirectory = root,
+                LogsDirectory = root
+            };
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+
+            // A replacement runtime is registered while this one still writes output.
+            identities.Set("session-1", 5, 3, "instance-b");
+            await File.WriteAllBytesAsync(Path.Combine(outputDirectory, "late.png"), [1, 2, 3]);
+            var upload = await artifactClient.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+
+            Assert.That(upload.Metadata!.RuntimeEpoch, Is.EqualTo(2));
+            Assert.That(upload.Metadata.RuntimeInstanceId, Is.EqualTo("instance-a"));
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
     public async Task StartSessionAsync_ForANewerRuntimeReplacesAnUploaderLeftByAnEarlierOne()
     {
         var root = CreateTempDirectory();

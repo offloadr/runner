@@ -114,7 +114,8 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             // A repeated start of the same runtime keeps its uploader. One left by an earlier
             // runtime (it exited while a relaunch was already admitted, so nothing stopped it) is
             // stopped, which records what it lost, and replaced: its reads name that runtime.
-            if (existing.CreatedFor == CurrentRuntime(sessionId))
+            var current = CurrentRuntime(sessionId);
+            if (existing.CreatedFor is { } createdFor ? current is { } now && createdFor.SameRuntime(now) : current is null)
             {
                 return;
             }
@@ -251,7 +252,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
     }
 
     private RuntimeIdentity? CurrentRuntime(string sessionId)
-        => _runtimeIdentities?.TryGet(sessionId, out var identity) == true ? identity.Normalized() : null;
+        => _runtimeIdentities?.TryGet(sessionId, out var identity) == true ? identity : null;
 
     private void Record(string sessionId, ulong lifecycleGeneration, UnsavedUploads unsaved)
         => _unsavedBySession.AddOrUpdate((sessionId, lifecycleGeneration), unsaved, (_, earlier) => earlier.Add(unsaved));
@@ -512,7 +513,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         public SessionUploader(string? runnerSecret, RunnerArtifactService.RunnerArtifactServiceClient artifactClient, Metadata? authHeaders, string sessionId, SessionProcessManager.SessionPaths paths, ILogger logger, RuntimeIdentityRegistry? runtimeIdentities = null, string? runnerId = null, RunnerReadRequesterIdentity? requester = null)
         {
             _readRequester = (requester ?? new RunnerReadRequesterIdentity(runnerId, null, runtimeIdentities)).For(sessionId);
-            CreatedFor = runtimeIdentities?.TryGet(sessionId, out var createdFor) == true ? createdFor.Normalized() : null;
+            CreatedFor = runtimeIdentities?.TryGet(sessionId, out var createdFor) == true ? createdFor : null;
             _runnerSecret = runnerSecret;
             _artifactClient = artifactClient;
             _authHeaders = authHeaders;
@@ -529,7 +530,11 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             });
         }
 
-        /// <summary>The runtime registered for the session when this uploader was created, if any.</summary>
+        /// <summary>
+        /// The runtime registered for the session when this uploader was created, if any, as the
+        /// control plane spelled it. Every upload names it: a newer runtime registered later must
+        /// never be credited with this one's output.
+        /// </summary>
         public RuntimeIdentity? CreatedFor { get; }
 
         /// <summary>The lifecycle this uploader's runtime belongs to (0 without a registry).</summary>
@@ -1761,7 +1766,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     fullPath,
                     status.Length);
 
-                var request = new UploadRequest(type, fullPath, 0, CurrentRuntime());
+                var request = new UploadRequest(type, fullPath, 0, CreatedFor);
                 if (!_queue.Writer.TryWrite(request))
                 {
                     _pending.TryRemove(fullPath, out _);
@@ -1985,9 +1990,6 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             => _paths.SealedDirectory is { } directory && SealedStorageProbe.ReadFileSystemStats(directory) is { } stats
                 ? stats.AvailableBlocks * stats.BlockSize
                 : null;
-
-        private RuntimeIdentity? CurrentRuntime()
-            => _runtimeIdentities?.TryGet(_sessionId, out var identity) == true ? identity : null;
 
         /// <summary>
         /// Rescans the artifact folders once the queue has drained to half its cap after
