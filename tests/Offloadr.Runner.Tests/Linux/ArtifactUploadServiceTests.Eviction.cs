@@ -125,6 +125,49 @@ public partial class ArtifactUploadServiceTests
     }
 
     [Test]
+    public async Task StopSessionAsync_ThatOverrunsCountsConservativelyAndOnlyOnce()
+    {
+        var root = CreateTempDirectory();
+        var originalTimeout = ArtifactUploadService.StopRecordTimeout;
+        var originalWait = ArtifactUploadService.StopWaitTimeout;
+        ArtifactUploadService.StopRecordTimeout = TimeSpan.FromMilliseconds(100);
+        ArtifactUploadService.StopWaitTimeout = TimeSpan.FromMilliseconds(200);
+        try
+        {
+            var paths = CreateEvictionPaths(root, sealedSession: true);
+            var neverAccepted = new TaskCompletionSource();
+            var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse())
+            {
+                UploadGate = neverAccepted.Task,
+            };
+            await using var service = new ArtifactUploadService("runner-secret-value", artifactClient, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            await File.WriteAllBytesAsync(Path.Combine(paths.OutputDirectory, "late.png"), [1, 2, 3]);
+            await artifactClient.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+
+            // The uploader is still draining when the stop's time is up.
+            var stopped = service.StopSessionAsync("session-1");
+            var finished = await Task.WhenAny(stopped, Task.Delay(TimeSpan.FromSeconds(3)));
+
+            Assert.That(finished, Is.SameAs(stopped), "the stop does not wait for the drain");
+            Assert.That(await stopped, Is.GreaterThanOrEqualTo(1));
+            Assert.That(service.TakeUnsavedUploadCount("session-1"), Is.EqualTo(await stopped));
+
+            // The uploader finishes later (after its 5 s drain and the wait for its worker); what it
+            // counts then is not added again.
+            await Task.Delay(TimeSpan.FromSeconds(6.5));
+            Assert.That(service.TakeUnsavedUploadCount("session-1"), Is.Zero);
+        }
+        finally
+        {
+            ArtifactUploadService.StopRecordTimeout = originalTimeout;
+            ArtifactUploadService.StopWaitTimeout = originalWait;
+            TryDelete(root);
+        }
+    }
+
+    [Test]
     public async Task SameLengthRewrite_IsNeitherEvictedNorCountedAsSaved()
     {
         var root = CreateTempDirectory();

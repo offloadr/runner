@@ -30,6 +30,13 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
     /// <summary>How long Stop waits for cancelled upload and download work before moving on.</summary>
     internal static TimeSpan StopWaitTimeout { get; set; } = TimeSpan.FromSeconds(10);
 
+    /// <summary>
+    /// How long a session's stop may take before its lost artifacts are recorded without waiting
+    /// further. Under the caller's own bound, so the count is fixed before the session's data is
+    /// removed: a stop that finishes after that would count none.
+    /// </summary>
+    internal static TimeSpan StopRecordTimeout { get; set; } = TimeSpan.FromSeconds(25);
+
     private readonly string? _runnerSecret;
     private readonly RunnerArtifactService.RunnerArtifactServiceClient _artifactClient;
     private readonly Metadata? _authHeaders;
@@ -41,7 +48,15 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
     // runtime's data too, and the session's Stop must still report what was lost then.
     private readonly ConcurrentDictionary<string, int> _unsavedBySession = new(StringComparer.Ordinal);
     private readonly object _stopGate = new();
-    private readonly Dictionary<string, Task<int>> _stopping = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, StopInFlight> _stopping = new(StringComparer.Ordinal);
+
+    /// <summary>A session's stop that has not finished; its count is recorded once, by whichever comes first.</summary>
+    private sealed class StopInFlight(SessionUploader uploader)
+    {
+        public SessionUploader Uploader { get; } = uploader;
+        public Task<int> Task { get; set; } = System.Threading.Tasks.Task.FromResult(0);
+        public int? RecordedCount { get; set; }
+    }
 
     public ArtifactUploadService(string? runnerSecret, RunnerArtifactService.RunnerArtifactServiceClient artifactClient, ILogger<ArtifactUploadService> logger, RuntimeIdentityRegistry? runtimeIdentities = null, string? runnerId = null)
     {
@@ -119,7 +134,18 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
     /// and forgets them.
     /// </summary>
     public int TakeUnsavedUploadCount(string sessionId)
-        => _unsavedBySession.TryRemove(sessionId, out var count) ? count : 0;
+    {
+        lock (_stopGate)
+        {
+            // A stop still running has not counted yet: what it would find is not known.
+            if (_stopping.TryGetValue(sessionId, out var inFlight) && !inFlight.Task.IsCompleted)
+            {
+                RecordWithoutWaiting(sessionId, inFlight);
+            }
+
+            return _unsavedBySession.TryRemove(sessionId, out var count) ? count : 0;
+        }
+    }
 
     internal int GetPendingUploadCount(string sessionId)
         => _sessions.TryGetValue(sessionId, out var uploader) ? uploader.PendingUploadCount : 0;
@@ -214,43 +240,87 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         {
             if (!_sessions.TryRemove(sessionId, out var uploader))
             {
-                return _stopping.TryGetValue(sessionId, out var inFlight) ? inFlight : Task.FromResult(0);
+                return _stopping.TryGetValue(sessionId, out var inFlight) ? inFlight.Task : Task.FromResult(0);
             }
 
-            var stopping = StopAndRecordAsync(sessionId, uploader);
+            var stopping = new StopInFlight(uploader);
+            stopping.Task = StopAndRecordAsync(sessionId, stopping);
             _stopping[sessionId] = stopping;
-            _ = stopping.ContinueWith(
-                completed =>
+            _ = stopping.Task.ContinueWith(
+                _ =>
                 {
                     lock (_stopGate)
                     {
-                        ((ICollection<KeyValuePair<string, Task<int>>>)_stopping).Remove(new(sessionId, completed));
+                        ((ICollection<KeyValuePair<string, StopInFlight>>)_stopping).Remove(new(sessionId, stopping));
                     }
                 },
                 CancellationToken.None,
                 TaskContinuationOptions.ExecuteSynchronously,
                 TaskScheduler.Default);
-            return stopping;
+            return stopping.Task;
         }
     }
 
-    private async Task<int> StopAndRecordAsync(string sessionId, SessionUploader uploader)
+    private async Task<int> StopAndRecordAsync(string sessionId, StopInFlight stopping)
     {
-        await uploader.StopAsync().ConfigureAwait(false);
-        if (uploader.UnsavedUploadCount > 0)
+        var stop = stopping.Uploader.StopAsync();
+        if (await Task.WhenAny(stop, Task.Delay(StopRecordTimeout)).ConfigureAwait(false) != stop)
         {
-            _unsavedBySession.AddOrUpdate(sessionId, uploader.UnsavedUploadCount, (_, earlier) => earlier + uploader.UnsavedUploadCount);
+            _ = stop.ContinueWith(static failed => _ = failed.Exception, CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
+            lock (_stopGate)
+            {
+                return RecordWithoutWaiting(sessionId, stopping);
+            }
         }
 
-        if (uploader.UnsavedUploadCount > 0)
+        await stop.ConfigureAwait(false);
+        var unsaved = stopping.Uploader.UnsavedUploadCount;
+        lock (_stopGate)
+        {
+            if (stopping.RecordedCount is { } recorded)
+            {
+                // Counted already, without waiting; a count taken now may follow removed data.
+                return recorded;
+            }
+
+            stopping.RecordedCount = unsaved;
+            if (unsaved > 0)
+            {
+                _unsavedBySession.AddOrUpdate(sessionId, unsaved, (_, earlier) => earlier + unsaved);
+            }
+        }
+
+        if (unsaved > 0)
         {
             _logger.LogWarning(
                 "Session stopped with artifacts that were not uploaded session={SessionId} count={Count}",
                 sessionId,
-                uploader.UnsavedUploadCount);
+                unsaved);
         }
 
-        return uploader.UnsavedUploadCount;
+        return unsaved;
+    }
+
+    /// <summary>
+    /// Records a stop that has not finished as losing every pending upload, and at least one: the
+    /// session must not be reported as fully saved on a count that does not exist yet. Called
+    /// under <see cref="_stopGate"/>.
+    /// </summary>
+    private int RecordWithoutWaiting(string sessionId, StopInFlight stopping)
+    {
+        if (stopping.RecordedCount is { } recorded)
+        {
+            return recorded;
+        }
+
+        var unsaved = Math.Max(1, stopping.Uploader.PendingUploadCount);
+        stopping.RecordedCount = unsaved;
+        _unsavedBySession.AddOrUpdate(sessionId, unsaved, (_, earlier) => earlier + unsaved);
+        _logger.LogWarning(
+            "Artifact uploads of session={SessionId} did not stop in time; counting {Count} as not uploaded",
+            sessionId,
+            unsaved);
+        return unsaved;
     }
 
     public async ValueTask DisposeAsync()
