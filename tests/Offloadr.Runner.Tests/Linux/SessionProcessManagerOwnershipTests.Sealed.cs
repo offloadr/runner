@@ -720,7 +720,7 @@ public partial class SessionProcessManagerOwnershipTests
             File.WriteAllText(shim, string.Empty);
         }
 
-        return new RunnerVfsEnvironmentBuilder { DefaultVfsLibraryPath = shim };
+        return new RunnerVfsEnvironmentBuilder { DefaultVfsLibraryPath = shim, CoreDumpHardeningProbe = _ => true };
     }
 
     [Test]

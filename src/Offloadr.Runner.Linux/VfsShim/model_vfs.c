@@ -246,6 +246,16 @@ __attribute__((constructor)) static void apply_no_dump(void) {
     const char *value = getenv("VFS_NO_DUMP");
     if (value && strcmp(value, "1") == 0) {
         prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+        /* The agent's probe: proof that the shim loaded and the flag took, which the loader's
+         * silent skip of an unloadable LD_PRELOAD entry would not give. */
+        const char *report = getenv("VFS_NO_DUMP_REPORT");
+        if (report && strcmp(report, "1") == 0) {
+            char line[48];
+            int length = snprintf(line, sizeof line, "offloadr-vfs-no-dump=%d\n", prctl(PR_GET_DUMPABLE, 0, 0, 0, 0));
+            if (length > 0 && (size_t)length < sizeof line && write(STDERR_FILENO, line, (size_t)length) < 0) {
+                /* Nothing to do: the probe then fails closed. */
+            }
+        }
     }
 }
 

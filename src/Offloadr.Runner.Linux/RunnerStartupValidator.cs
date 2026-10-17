@@ -8,15 +8,18 @@ public sealed class RunnerStartupValidator
     private readonly ISessionIsolationStrategy _sessionIsolationStrategy;
     private readonly string _passwdPath;
     private readonly SealedStorageProbe _sealedStorageProbe;
+    private readonly RunnerVfsEnvironmentBuilder _vfsEnvironmentBuilder;
 
     public RunnerStartupValidator(
         ISessionIsolationStrategy sessionIsolationStrategy,
         string passwdPath = "/etc/passwd",
-        SealedStorageProbe? sealedStorageProbe = null)
+        SealedStorageProbe? sealedStorageProbe = null,
+        RunnerVfsEnvironmentBuilder? vfsEnvironmentBuilder = null)
     {
         _sessionIsolationStrategy = sessionIsolationStrategy ?? throw new ArgumentNullException(nameof(sessionIsolationStrategy));
         _passwdPath = passwdPath;
         _sealedStorageProbe = sealedStorageProbe ?? new SealedStorageProbe();
+        _vfsEnvironmentBuilder = vfsEnvironmentBuilder ?? new RunnerVfsEnvironmentBuilder();
     }
 
     public void ValidateOrThrow(RunnerAgentOptions options)
@@ -110,10 +113,10 @@ public sealed class RunnerStartupValidator
         }
 
         // Session processes are made non-dumpable by the VFS shim.
-        var vfsLibrary = Environment.GetEnvironmentVariable("RUNNER_VFS_LIB") ?? new RunnerVfsEnvironmentBuilder().DefaultVfsLibraryPath;
-        if (!File.Exists(vfsLibrary))
+        if (!_vfsEnvironmentBuilder.CanDisableCoreDumps())
         {
-            errors.Add($"RUNNER_SEALED_STORAGE=required needs the VFS shim at '{vfsLibrary}' (RUNNER_VFS_LIB).");
+            var vfsLibrary = Environment.GetEnvironmentVariable("RUNNER_VFS_LIB") ?? _vfsEnvironmentBuilder.DefaultVfsLibraryPath;
+            errors.Add($"RUNNER_SEALED_STORAGE=required needs the VFS shim at '{vfsLibrary}' (RUNNER_VFS_LIB) to load and make session processes non-dumpable.");
         }
     }
 

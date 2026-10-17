@@ -1184,7 +1184,7 @@ internal sealed partial class SessionProcessManager : IDisposable
         // Without the shim, session processes would stay dumpable.
         if (!_vfsEnvironmentBuilder.CanDisableCoreDumps())
         {
-            throw new InvalidOperationException("Sealed storage is unavailable: the VFS shim that makes session processes non-dumpable is missing.");
+            throw new InvalidOperationException("Sealed storage is unavailable: the VFS shim that makes session processes non-dumpable is missing or does not load.");
         }
     }
 
@@ -2030,7 +2030,7 @@ internal sealed partial class SessionProcessManager : IDisposable
                 paths.InputDirectory,
                 paths.TempDirectory),
             sessionId: sessionId,
-            disableCoreDumps: paths.IsSealed);
+            sealedSession: paths.IsSealed);
         foreach (var kvp in vfsEnvironment)
         {
             psi.Environment[kvp.Key] = kvp.Value;

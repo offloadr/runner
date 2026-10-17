@@ -180,6 +180,7 @@ public class SessionTransferSealingTests
         {
             ["LD_PRELOAD"] = "/opt/shim.so:/other.so",
             ["VFS_ROOTS"] = string.Empty,
+            ["VFS_LOG"] = "0",
             ["VFS_NO_DUMP"] = "1",
         }));
         Assert.That(missing, Is.Empty);
