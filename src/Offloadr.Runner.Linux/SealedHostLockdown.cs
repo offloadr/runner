@@ -16,8 +16,8 @@ public static class SealedHostLockdown
     /// Directories anyone may write, at any depth, on <paramref name="root"/>'s filesystem and on
     /// every writable disk mounted below it (a volume a session can traverse into), such as
     /// <c>/tmp</c>, <c>/var/tmp</c>, <c>/run/lock</c>, Ubuntu's <c>/var/crash</c> or a scratch
-    /// folder on a volume. Inside a world-writable directory every world-writable directory and
-    /// regular file is reported too, since closing only the top would leave them usable.
+    /// folder on a volume, and every world-writable regular file there. Inside a world-writable
+    /// directory everything below is walked too, since closing only the top would leave it usable.
     /// Read-only, memory-backed and kernel filesystems are not entered, symlinks are not
     /// followed, each directory is visited once (bind mounts can repeat one) and sockets are left
     /// alone. A
@@ -53,7 +53,7 @@ public static class SealedHostLockdown
             root,
             SealedStorageProbe.ReadEntryStatus,
             static path => LinuxFileIdentityReader.TryRead(path, out var identity) ? identity : null,
-            static (path, everything) => everything ? Directory.GetFileSystemEntries(path) : Directory.GetDirectories(path),
+            static path => Directory.GetFileSystemEntries(path),
             ReadMounts(),
             userId => userId != 0 && (!liveUserIds.Contains(userId) || sessionUserIds.Contains(userId)));
     }
@@ -62,7 +62,7 @@ public static class SealedHostLockdown
         string root,
         Func<string, LinuxEntryStatus?> statEntry,
         Func<string, LinuxFileIdentity?> identityOf,
-        Func<string, bool, string[]> listChildren,
+        Func<string, string[]> listChildren,
         IReadOnlyList<Mount> mounts,
         ICollection<string>? unlisted = null)
     {
@@ -79,7 +79,7 @@ public static class SealedHostLockdown
         string root,
         Func<string, LinuxEntryStatus?> statEntry,
         Func<string, LinuxFileIdentity?> identityOf,
-        Func<string, bool, string[]> listChildren,
+        Func<string, string[]> listChildren,
         IReadOnlyList<Mount>? mounts,
         Func<uint, bool> isReusableOwner)
     {
@@ -142,7 +142,7 @@ public static class SealedHostLockdown
             string[] children;
             try
             {
-                children = listChildren(directory, insideShared);
+                children = listChildren(directory);
             }
             catch (DirectoryNotFoundException)
             {
@@ -170,7 +170,8 @@ public static class SealedHostLockdown
                 var worldWritable = (entry.Mode & UnixFileMode.OtherWrite) != 0;
                 if (!entry.IsDirectory)
                 {
-                    if (insideShared && entry.IsRegularFile && worldWritable && shared.Add(child))
+                    // Anywhere: a session that knows the name can write it through any folder it can traverse.
+                    if (entry.IsRegularFile && worldWritable && shared.Add(child))
                     {
                         found.Add(child);
                     }

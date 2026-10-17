@@ -91,6 +91,28 @@ public class SealedStorageProbeTests
         });
     }
 
+    [TestCase("/dev/shm", 1000u, "755", TestName = "Probe_RefusesARootUnderAUserOwnedParent")]
+    [TestCase("/dev/shm", 0u, "777", TestName = "Probe_RefusesARootUnderAParentOthersCanRenameIn")]
+    [TestCase("/dev", 1000u, "755", TestName = "Probe_RefusesARootUnderAReplaceableAncestor")]
+    public void Probe_RefusesARootOthersCouldReplace(string ancestor, uint owner, string mode)
+    {
+        var host = new FakeHost();
+        host.Entries[ancestor] = new LinuxEntryStatus(true, false, owner, (UnixFileMode)Convert.ToInt32(mode, 8));
+
+        // Whether the root exists yet or not.
+        var missing = host.Probe().Probe(Required());
+        host.Entries["/dev/shm/offloadr"] = new LinuxEntryStatus(true, false, 0, (UnixFileMode)Convert.ToInt32("711", 8));
+        var existing = host.Probe().Probe(Required());
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(missing.Available, Is.False);
+            Assert.That(missing.Reason, Does.Contain($"'{ancestor}'"));
+            Assert.That(existing.Available, Is.False);
+            Assert.That(existing.Reason, Does.Contain($"'{ancestor}'"));
+        });
+    }
+
     [Test]
     public void Probe_UsesTheParentWhenTheRootDoesNotExistYet()
     {
@@ -296,6 +318,8 @@ public class SealedStorageProbeTests
 
         public Dictionary<string, LinuxEntryStatus> Entries { get; } = new(StringComparer.Ordinal)
         {
+            ["/"] = new LinuxEntryStatus(true, false, 0, (UnixFileMode)Convert.ToInt32("755", 8)),
+            ["/dev"] = new LinuxEntryStatus(true, false, 0, (UnixFileMode)Convert.ToInt32("755", 8)),
             ["/dev/shm"] = new LinuxEntryStatus(true, false, 0, (UnixFileMode)Convert.ToInt32("1777", 8)),
         };
 

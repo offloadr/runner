@@ -85,7 +85,7 @@ public class SealedHostLockdownLinuxTests
             "/",
             path => entries.TryGetValue(path, out var entry) ? entry.Status : null,
             path => entries.TryGetValue(path, out var entry) ? new LinuxFileIdentity(entry.Device, InodeOf(path), 0) : null,
-            (path, _) => entries[path].Children,
+            path => entries[path].Children,
             mounts);
 
         Assert.That(found, Is.EquivalentTo(new[]
@@ -98,8 +98,8 @@ public class SealedHostLockdownLinuxTests
     public void FindSharedWritableDirectories_WalksEveryWritableDiskMount()
     {
         var shared = Mode0755 | UnixFileMode.OtherWrite;
-        // /data is a 0755 volume, below nothing shared, with a scratch folder anyone may write;
-        // a world-writable file outside it is not usable (its folder is closed to writes).
+        // /data is a 0755 volume, below nothing shared, with a scratch folder anyone may write
+        // and a file anyone may write, which a session can reach by name.
         // /sys/fs/cgroup is a kernel filesystem and is not entered.
         var entries = new Dictionary<string, (LinuxEntryStatus Status, ulong Device, string[] Children)>(StringComparer.Ordinal)
         {
@@ -127,10 +127,10 @@ public class SealedHostLockdownLinuxTests
             "/",
             path => entries.TryGetValue(path, out var entry) ? entry.Status : null,
             path => entries.TryGetValue(path, out var entry) ? new LinuxFileIdentity(entry.Device, InodeOf(path), 0) : null,
-            (path, _) => entries[path].Children,
+            path => entries[path].Children,
             mounts);
 
-        Assert.That(found, Is.EquivalentTo(new[] { "/data/scratch", "/data/scratch/cache.bin", "/data/models/deep" }));
+        Assert.That(found, Is.EquivalentTo(new[] { "/data/scratch", "/data/scratch/cache.bin", "/data/models/deep", "/data/open.log" }));
     }
 
     [Test]
@@ -152,7 +152,7 @@ public class SealedHostLockdownLinuxTests
             "/",
             path => entries.TryGetValue(path, out var entry) ? entry.Status : null,
             path => entries.TryGetValue(path, out var entry) ? new LinuxFileIdentity(1, entry.Inode, 0) : null,
-            (path, _) => entries[path].Children,
+            path => entries[path].Children,
             []);
 
         Assert.That(found, Is.EqualTo(new[] { "/data/open" }));
@@ -177,7 +177,7 @@ public class SealedHostLockdownLinuxTests
             "/",
             path => entries.TryGetValue(path, out var entry) ? entry.Status : null,
             path => entries.ContainsKey(path) ? new LinuxFileIdentity(1, InodeOf(path), 0) : null,
-            (path, _) => entries[path].Children ?? throw (path == "/tmp/gone"
+            path => entries[path].Children ?? throw (path == "/tmp/gone"
                 ? new DirectoryNotFoundException(path)
                 : new UnauthorizedAccessException(path)),
             [],
@@ -210,7 +210,7 @@ public class SealedHostLockdownLinuxTests
             "/",
             path => entries.TryGetValue(path, out var entry) ? entry.Status : null,
             path => entries.ContainsKey(path) ? new LinuxFileIdentity(1, InodeOf(path), 0) : null,
-            (path, _) => entries[path].Children,
+            path => entries[path].Children,
             mounts: null,
             isReusableOwner: userId => userId == 1001);
 

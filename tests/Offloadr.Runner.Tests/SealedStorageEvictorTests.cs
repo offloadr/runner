@@ -33,7 +33,7 @@ public class SealedStorageEvictorTests
                 _ => null,
             },
             _ => new LinuxFileSystemStats(0x01021994, 4096, 10 * GiB / 4096, free / 4096),
-            path => path == "/dev/shm" ? new LinuxEntryStatus(true, false, 0, UnixFileMode.UserRead) : null,
+            path => path is "/" or "/dev" or "/dev/shm" ? new LinuxEntryStatus(true, false, 0, UnixFileMode.UserRead) : null,
             path => path);
         var evictor = new SealedStorageEvictor(
             new SealedStorageOptions { Mode = SealedStorageMode.Required },

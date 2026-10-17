@@ -87,6 +87,15 @@ public sealed class SealedStorageProbe
             target = parent;
         }
 
+        // Whoever may rename an ancestor could swap the root for another tree between the checks
+        // and the session's use of it.
+        if (FindReplaceableAncestor(options.Root) is { } ancestor)
+        {
+            return Unavailable(
+                $"sealed root's ancestor '{ancestor}' must be a directory owned by root that others cannot rename entries in",
+                new SealedStorageSwapStatus(swapDevices, swapLimit, false));
+        }
+
         var noswap = MountHasOption(_resolvePath(target), "noswap");
         var swap = new SealedStorageSwapStatus(swapDevices, swapLimit, noswap);
         if (_statFileSystem(target) is not { } stats)
@@ -128,6 +137,28 @@ public sealed class SealedStorageProbe
 
         SealedStorageStatus Unavailable(string why, SealedStorageSwapStatus swapStatus)
             => new(mode, false, why, options.Root, null, null, null, null, swapStatus);
+    }
+
+    /// <summary>
+    /// The first ancestor of <paramref name="path"/> through which someone other than root could
+    /// rename or replace it: not a real directory, not owned by root, or writable by others
+    /// without the sticky bit (as <c>/dev/shm</c> has). Null when there is none.
+    /// </summary>
+    private string? FindReplaceableAncestor(string path)
+    {
+        var current = path;
+        while (current != "/")
+        {
+            var separator = current.LastIndexOf('/');
+            current = separator == 0 ? "/" : current[..separator];
+            if (_statEntry(current) is not { IsDirectory: true, IsSymbolicLink: false, OwnerId: 0 } entry ||
+                ((entry.Mode & (UnixFileMode.GroupWrite | UnixFileMode.OtherWrite)) != 0 && (entry.Mode & UnixFileMode.StickyBit) == 0))
+            {
+                return current;
+            }
+        }
+
+        return null;
     }
 
     /// <summary>
