@@ -208,6 +208,15 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
     /// <paramref name="minimumIdle"/> and readable again through the VFS are evicted; opening one
     /// later downloads it again. Returns the bytes released (0 for an unsealed session).
     /// </summary>
+    /// <summary>Sets <see cref="SessionUploader.BeforeEvictionCandidate"/> for a session (tests only).</summary>
+    internal void SetBeforeEvictionCandidate(string sessionId, Action<string>? hook)
+    {
+        if (_sessions.TryGetValue(sessionId, out var uploader))
+        {
+            uploader.BeforeEvictionCandidate = hook;
+        }
+    }
+
     public long EvictUploadedArtifacts(string sessionId, long bytesToFree, TimeSpan minimumIdle)
         => _sessions.TryGetValue(sessionId, out var uploader) && uploader.IsSealed
             ? uploader.EvictUploadedArtifacts(bytesToFree, minimumIdle, DateTimeOffset.UtcNow)
@@ -1097,25 +1106,30 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             }
 
             var createdUtc = ToDateTimeOffset(item.CreatedUtc);
-            _catalog.TryGetValue(normalized, out var previousState);
-            var state = new RemoteArtifactState(
-                activeEditorSid,
-                item.Type,
-                item.Subfolder,
-                item.Filename,
-                normalized,
-                item.SizeBytes,
-                item.Sha256,
-                createdUtc);
-            _catalog[normalized] = state;
+            // Under the eviction gate: a pass must not replace the file between this entry judging
+            // it downloaded and taking the place of the one the pass is evicting.
+            lock (_evictionGate)
+            {
+                _catalog.TryGetValue(normalized, out var previousState);
+                var state = new RemoteArtifactState(
+                    activeEditorSid,
+                    item.Type,
+                    item.Subfolder,
+                    item.Filename,
+                    normalized,
+                    item.SizeBytes,
+                    item.Sha256,
+                    createdUtc);
+                _catalog[normalized] = state;
 
-            try
-            {
-                EnsurePlaceholder(state, previousState);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogDebug(ex, "Failed to prepare placeholder for artifact {Path}", normalized);
+                try
+                {
+                    EnsurePlaceholder(state, previousState);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Failed to prepare placeholder for artifact {Path}", normalized);
+                }
             }
 
             return normalized;
@@ -1783,6 +1797,9 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             public void Dispose() => Monitor.Exit(_gate);
         }
 
+        /// <summary>Runs before each eviction candidate takes the gate; lets tests change the catalog then.</summary>
+        internal Action<string>? BeforeEvictionCandidate { get; set; }
+
         internal long EvictUploadedArtifacts(long bytesToFree, TimeSpan minimumIdle, DateTimeOffset now)
         {
             long released = 0;
@@ -1810,9 +1827,14 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
                 try
                 {
-                    // Excludes the VFS serving this file while it is checked and replaced.
+                    BeforeEvictionCandidate?.Invoke(state.LocalPath);
+                    // Excludes the VFS serving this file, and catalog updates, while it is checked
+                    // and replaced.
                     using var gate = new EvictionGateScope(_evictionGate);
-                    if (state.IdleSince(DateTimeOffset.UtcNow) < minimumIdle)
+                    // A refresh or upload may have replaced this entry since the pass began: the
+                    // current one then decides, and judged the file itself.
+                    if (!_catalog.TryGetValue(state.LocalPath, out var current) || !ReferenceEquals(current, state) ||
+                        state.IdleSince(DateTimeOffset.UtcNow) < minimumIdle)
                     {
                         continue;
                     }
@@ -2163,9 +2185,12 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         : DateTimeOffset.UtcNow;
                     var localPath = NormalizePath(fullPath);
                     var remote = new RemoteArtifactState(_editorSid, type, subfolder, fileName, localPath, sizeBytes, null, createdUtc);
-                    _catalog[remote.LocalPath] = remote;
-                    // A file that changed while it was sent matches no uploaded version yet.
-                    remote.MarkDownloaded(changedDuringUpload ? null : afterVersion);
+                    lock (_evictionGate)
+                    {
+                        _catalog[remote.LocalPath] = remote;
+                        // A file that changed while it was sent matches no uploaded version yet.
+                        remote.MarkDownloaded(changedDuringUpload ? null : afterVersion);
+                    }
 
                     _logger.LogInformation("Uploaded artifact session={SessionId} type={Type} path={Relative}", _sessionId, type, relPath);
                     if (changedDuringUpload && after.IsRegularFile && request.Attempt < 3)
