@@ -555,6 +555,7 @@ internal static class ServiceClientManager
             // Filled in from the completed stop, never by a delivery.
             delivery.UnsavedArtifactCount = Acknowledgement.UnsavedArtifactCount;
             delivery.UnsavedArtifactsUnknown = Acknowledgement.UnsavedArtifactsUnknown;
+            delivery.CleanupDisposition = Acknowledgement.CleanupDisposition;
             return Acknowledgement.Equals(delivery);
         }
     }
@@ -2160,13 +2161,24 @@ internal static class ServiceClientManager
                 // does an older lifecycle's Stop that came after a newer lifecycle began: the
                 // counts are kept by lifecycle, so it takes none of the current one's. A Stop
                 // for an older runtime of the current lifecycle leaves the count for that
-                // lifecycle's own Stop.
+                // lifecycle's own Stop. Only the Stop that tore the session down performed its
+                // cleanup; any other is superseded, and its saving evidence stays unknown.
+                if (outcome is StopOutcome.Superseded or StopOutcome.SupersededLifecycle)
+                {
+                    work.Acknowledgement.CleanupDisposition = RunnerCleanupDisposition.Superseded;
+                    work.Acknowledgement.UnsavedArtifactsUnknown = true;
+                }
+
                 if (outcome is StopOutcome.Stopped or StopOutcome.SupersededLifecycle)
                 {
-                    var unsaved = deps.TakeUnsavedArtifacts?.Invoke(command.SessionId, command.LifecycleGeneration) ?? default;
+                    var unsaved = deps.TakeUnsavedArtifacts?.Invoke(command.SessionId, command.LifecycleGeneration) ?? new UnsavedUploads(0, true);
                     work.Acknowledgement.UnsavedArtifactCount = (uint)Math.Max(0, unsaved.Count);
-                    work.Acknowledgement.UnsavedArtifactsUnknown = unsaved.Incomplete;
+                    work.Acknowledgement.UnsavedArtifactsUnknown |= unsaved.Incomplete;
                     work.CountTaken = true;
+                    if (outcome == StopOutcome.Stopped)
+                    {
+                        work.Acknowledgement.CleanupDisposition = RunnerCleanupDisposition.Performed;
+                    }
                 }
             }
 
@@ -2300,6 +2312,7 @@ internal static class ServiceClientManager
         var runtimeIdentity = new RuntimeIdentity(command.LifecycleGeneration, command.RuntimeEpoch, command.RuntimeInstanceId.Trim());
         var ack = new AcknowledgeSessionStartRequest
         {
+            InstanceId = deps.InstanceId.Trim(),
             SessionId = command.SessionId,
             User = command.User,
             LifecycleGeneration = command.LifecycleGeneration,
@@ -2566,6 +2579,7 @@ internal static class ServiceClientManager
         var runtimeIdentity = new RuntimeIdentity(command.LifecycleGeneration, command.RuntimeEpoch, command.RuntimeInstanceId.Trim());
         var ack = new AcknowledgeEditorRuntimeLaunchRequest
         {
+            InstanceId = deps.InstanceId.Trim(),
             CommandId = command.CommandId,
             RestartId = command.RestartId,
             RunnerId = deps.RunnerId,

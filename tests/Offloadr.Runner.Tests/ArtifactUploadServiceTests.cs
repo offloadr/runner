@@ -272,6 +272,14 @@ public partial class ArtifactUploadServiceTests
                 RuntimeInstanceId = "instance-a",
             }));
             Assert.That(new FileInfo(outputPath).Length, Is.EqualTo(4));
+            var queuedAfterReplacement = Path.Combine(outputDirectory, "queued-after-replacement.png");
+            await File.WriteAllBytesAsync(queuedAfterReplacement, [9, 8, 7]);
+            var captured = await artifactClient.WaitForUploadAsync(TimeSpan.FromSeconds(10));
+            Assert.That(captured.Metadata!.LifecycleGeneration, Is.EqualTo(5));
+            Assert.That(captured.Metadata.RuntimeEpoch, Is.EqualTo(2));
+            Assert.That(captured.Metadata.RuntimeInstanceId, Is.EqualTo("instance-a"));
+            Assert.That(captured.Metadata.InstanceId, Is.EqualTo("process-1"));
+
         }
         finally
         {
@@ -1881,7 +1889,19 @@ public partial class ArtifactUploadServiceTests
             {
                 _uploads.Enqueue(captured);
                 _uploadSignals.Writer.TryWrite(captured);
-                response.TrySetResult(new RunnerArtifactServiceUploadArtifactResponse { Success = !RejectUploads, Message = RejectUploads ? "rejected" : string.Empty });
+                response.TrySetResult(new RunnerArtifactServiceUploadArtifactResponse
+                {
+                    Outcome = RejectUploads ? RunnerArtifactUploadOutcome.Unspecified : RunnerArtifactUploadOutcome.Committed,
+                    Artifact = RejectUploads ? null : new()
+                    {
+                        EditorSid = captured.Metadata!.EditorSid,
+                        Filename = captured.Metadata.Filename,
+                        Type = captured.Metadata.Type,
+                        Subfolder = captured.Metadata.Subfolder,
+                        SizeBytes = captured.Metadata.SizeBytes
+                    },
+                    Message = RejectUploads ? "rejected" : string.Empty
+                });
             });
             var gate = UploadGate;
 

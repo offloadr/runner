@@ -413,6 +413,9 @@ public partial class ServiceClientManagerTests
         Assert.Multiple(() =>
         {
             Assert.That(stale.UnsavedArtifactCount, Is.Zero);
+            Assert.That(stale.UnsavedArtifactsUnknown, Is.True);
+            Assert.That(stale.CleanupDisposition, Is.EqualTo(RunnerCleanupDisposition.Superseded));
+            Assert.That(current.CleanupDisposition, Is.EqualTo(RunnerCleanupDisposition.Performed));
             Assert.That(current.UnsavedArtifactCount, Is.EqualTo(2));
         });
     }

@@ -518,7 +518,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             _paths = paths;
             _logger = logger;
             _runtimeIdentities = runtimeIdentities;
-            LifecycleGeneration = runtimeIdentities?.TryGet(sessionId, out var identity) == true ? identity.LifecycleGeneration : 0;
+            LifecycleGeneration = _readRequester.LifecycleGeneration;
             _runnerId = runnerId?.Trim() ?? string.Empty;
             _queue = Channel.CreateUnbounded<UploadRequest>(new UnboundedChannelOptions
             {
@@ -2199,7 +2199,8 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
                     var metadata = new RunnerArtifactUploadMetadata
                     {
-                        RunnerId = _runnerId,
+                        RunnerId = _readRequester.RunnerId,
+                        InstanceId = _readRequester.InstanceId,
                         EditorSid = _editorSid,
                         Filename = fileName,
                         Type = type,
@@ -2286,7 +2287,15 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     await call.RequestStream.CompleteAsync().ConfigureAwait(false);
                     var response = await call.ResponseAsync.ConfigureAwait(false);
 
-                    if (!response.Success)
+                    if (response.Outcome == RunnerArtifactUploadOutcome.RejectedStaleRuntime)
+                    {
+                        // Rejection never proves that these bytes reached durable storage.
+                        return null;
+                    }
+                    if (response.Outcome != RunnerArtifactUploadOutcome.Committed || response.Artifact is null
+                        || response.Artifact.EditorSid != _editorSid || response.Artifact.Type != type
+                        || response.Artifact.Subfolder != subfolder || response.Artifact.Filename != fileName
+                        || response.Artifact.SizeBytes != sizeBytes)
                     {
                         throw new InvalidOperationException(string.IsNullOrWhiteSpace(response.Message) ? "upload failed" : response.Message);
                     }
