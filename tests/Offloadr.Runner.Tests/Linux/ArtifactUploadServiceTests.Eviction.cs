@@ -220,6 +220,21 @@ public partial class ArtifactUploadServiceTests
     }
 
     [Test]
+    public async Task UnsavedCount_IsUnknownForASessionWhoseDataARestartRemoved()
+    {
+        var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse());
+        await using var service = new ArtifactUploadService("runner-secret-value", artifactClient, NullLogger<ArtifactUploadService>.Instance);
+
+        // The earlier runner process held the session; this one only removed what it left.
+        service.MarkLossUncounted("session-1");
+
+        Assert.That(service.TakeUnsavedUploads("session-1", 7), Is.EqualTo(new UnsavedUploads(0, Incomplete: true)), "fenced Stop");
+        Assert.That(service.TakeUnsavedUploads("session-1", 7), Is.EqualTo(default(UnsavedUploads)), "reported once");
+        service.MarkLossUncounted("session-2");
+        Assert.That(service.TakeUnsavedUploads("session-2").Incomplete, Is.True, "unfenced Stop");
+    }
+
+    [Test]
     public async Task UnsavedCount_BelongsToTheLifecycleThatLostTheArtifacts()
     {
         var root = CreateTempDirectory();

@@ -139,6 +139,12 @@ await using var artifactUploadService = new ArtifactUploadService(
     runtimeIdentities,
     options.RunnerId,
     instanceId);
+// Sealed data the stale cleanup above removed: what it had not uploaded was never counted.
+foreach (var staleSessionId in sessionManager.TakeStaleSealedSessions())
+{
+    artifactUploadService.MarkLossUncounted(staleSessionId);
+}
+
 await using var workspaceMirrorService = new WorkspaceMirrorService(
     workspaceCatalogClient,
     options.RunnerSecret,

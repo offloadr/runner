@@ -165,6 +165,30 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
     {
         lock (_stopGate)
         {
+            var taken = TakeRecordedUnsavedUploads(sessionId, lifecycleGeneration);
+            // The first Stop after a restart removed the session's data reports that nobody counted it.
+            return _lossUncounted.TryRemove(sessionId, out _) ? taken with { Incomplete = true } : taken;
+        }
+    }
+
+    private readonly ConcurrentDictionary<string, byte> _lossUncounted = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Marks a session whose data was removed without counting what it lost, such as sealed data
+    /// an earlier runner process left: its next Stop reports the count as unknown.
+    /// </summary>
+    public void MarkLossUncounted(string sessionId)
+    {
+        if (!string.IsNullOrWhiteSpace(sessionId))
+        {
+            _lossUncounted[sessionId] = 0;
+        }
+    }
+
+    private UnsavedUploads TakeRecordedUnsavedUploads(string sessionId, ulong lifecycleGeneration)
+    {
+        lock (_stopGate)
+        {
             // An unfenced Stop (no generation) is for whatever lifecycle the session has.
             var unfenced = lifecycleGeneration == 0;
 

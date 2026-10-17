@@ -320,6 +320,9 @@ public partial class SessionProcessManagerOwnershipTests
             Assert.That(
                 Directory.EnumerateFileSystemEntries(sealedRoot).Select(Path.GetFileName),
                 Is.EquivalentTo(new[] { "other-app", "shared.bin" }));
+            // Its Stop must not say nothing was lost.
+            Assert.That(manager.TakeStaleSealedSessions(), Is.EqualTo(new[] { "old-session" }));
+            Assert.That(manager.TakeStaleSealedSessions(), Is.Empty);
         }
         finally
         {

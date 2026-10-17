@@ -1380,8 +1380,30 @@ internal sealed partial class SessionProcessManager : IDisposable
             }
 
             RunnerLog.Warning<SessionProcessManager>($"Removing sealed session data left by an earlier runner process: '{entry}'.");
+            // Whatever that run had not uploaded is gone, and nobody counted it.
+            _staleSealedSessions[sessionId] = 0;
             _ = DeleteSealedSessionDirectory(sessionId);
         }
+    }
+
+    private readonly ConcurrentDictionary<string, byte> _staleSealedSessions = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Takes the sessions whose sealed data an earlier runner process left and this one removed
+    /// at startup: their Stop cannot say how many artifacts were lost.
+    /// </summary>
+    public IReadOnlyCollection<string> TakeStaleSealedSessions()
+    {
+        var taken = new List<string>();
+        foreach (var sessionId in _staleSealedSessions.Keys)
+        {
+            if (_staleSealedSessions.TryRemove(sessionId, out _))
+            {
+                taken.Add(sessionId);
+            }
+        }
+
+        return taken;
     }
 
     private async Task<SessionPaths> PrepareSessionDirectoriesAsync(
