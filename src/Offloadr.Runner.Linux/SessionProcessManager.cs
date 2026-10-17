@@ -551,11 +551,12 @@ internal sealed partial class SessionProcessManager : IDisposable
         try
         {
             Directory.CreateDirectory(_sessionRoot);
-            _ = LinuxSecureDirectoryRoot.CreateDirectoryNoFollow(SealedLifecycleRecords, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
-            var record = Path.Combine(SealedLifecycleRecords, sessionId);
-            var staged = record + ".new";
-            File.WriteAllText(staged, lifecycleGeneration.ToString(System.Globalization.CultureInfo.InvariantCulture));
-            File.Move(staged, record, overwrite: true);
+            var rootOnly = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
+            _ = LinuxSecureDirectoryRoot.CreateDirectoryNoFollow(SealedLifecycleRecords, rootOnly);
+            var sessionRecords = Path.Combine(SealedLifecycleRecords, sessionId);
+            _ = LinuxSecureDirectoryRoot.CreateDirectoryNoFollow(sessionRecords, rootOnly);
+            // One note per lifecycle: a newer one never replaces an older one still awaiting its Stop.
+            File.WriteAllText(Path.Combine(sessionRecords, lifecycleGeneration.ToString(System.Globalization.CultureInfo.InvariantCulture)), string.Empty);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
@@ -574,37 +575,29 @@ internal sealed partial class SessionProcessManager : IDisposable
             return;
         }
 
-        string[] records;
         try
         {
-            records = Directory.GetFiles(SealedLifecycleRecords);
+            foreach (var sessionRecords in Directory.GetDirectories(SealedLifecycleRecords))
+            {
+                var sessionId = Path.GetFileName(sessionRecords);
+                foreach (var generation in ReadRecordedGenerations(sessionRecords))
+                {
+                    _staleSealedSessions[(sessionId, generation)] = 0;
+                }
+            }
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            return;
-        }
-
-        foreach (var record in records.Where(static record => !record.EndsWith(".new", StringComparison.Ordinal)))
-        {
-            var sessionId = Path.GetFileName(record);
-            var generation = ReadRecordedGeneration(record);
-            _staleSealedSessions.AddOrUpdate(sessionId, generation, (_, known) => Math.Max(known, generation));
+            RunnerLog.Warning<SessionProcessManager>($"Could not read the sealed lifecycle notes: {ex.GetType().Name}");
         }
     }
 
-    private static ulong ReadRecordedGeneration(string record)
-    {
-        try
-        {
-            return ulong.TryParse(File.ReadAllText(record).Trim(), System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var generation)
+    private static IEnumerable<ulong> ReadRecordedGenerations(string sessionRecords)
+        => Directory.GetFiles(sessionRecords)
+            .Select(static record => ulong.TryParse(Path.GetFileName(record), System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var generation)
                 ? generation
-                : 0;
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            return 0;
-        }
-    }
+                : 0)
+            .ToArray();
 
     /// <summary>
     /// Drops the note for <paramref name="sessionId"/> once a Stop of its lifecycle (or an
@@ -617,21 +610,30 @@ internal sealed partial class SessionProcessManager : IDisposable
             return;
         }
 
-        var record = Path.Combine(SealedLifecycleRecords, sessionId);
-        if (!File.Exists(record))
-        {
-            return;
-        }
-
-        var recorded = ReadRecordedGeneration(record);
-        if (lifecycleGeneration != 0 && recorded > lifecycleGeneration)
+        var sessionRecords = Path.Combine(SealedLifecycleRecords, sessionId);
+        if (!Directory.Exists(sessionRecords))
         {
             return;
         }
 
         try
         {
-            File.Delete(record);
+            // That lifecycle's note and older ones, whose Stops a newer one superseded; an
+            // unfenced Stop takes them all.
+            foreach (var record in Directory.GetFiles(sessionRecords))
+            {
+                if (lifecycleGeneration == 0 ||
+                    !ulong.TryParse(Path.GetFileName(record), System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var recorded) ||
+                    recorded <= lifecycleGeneration)
+                {
+                    File.Delete(record);
+                }
+            }
+
+            if (!Directory.EnumerateFileSystemEntries(sessionRecords).Any())
+            {
+                Directory.Delete(sessionRecords);
+            }
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
@@ -1530,7 +1532,7 @@ internal sealed partial class SessionProcessManager : IDisposable
 
             RunnerLog.Warning<SessionProcessManager>($"Removing sealed session data left by an earlier runner process: '{entry}'.");
             // Whatever that run had not uploaded is gone, and nobody counted it.
-            _staleSealedSessions[sessionId] = ReadSealedSessionMarker(Path.Combine(entry, SealedSessionMarker))?.LifecycleGeneration ?? 0;
+            _staleSealedSessions[(sessionId, ReadSealedSessionMarker(Path.Combine(entry, SealedSessionMarker))?.LifecycleGeneration ?? 0)] = 0;
             if (!DeleteSealedSessionDirectory(sessionId))
             {
                 // Closed to everyone but root meanwhile; the session's Stop retries and stays
@@ -1540,7 +1542,7 @@ internal sealed partial class SessionProcessManager : IDisposable
         }
     }
 
-    private readonly ConcurrentDictionary<string, ulong> _staleSealedSessions = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<(string SessionId, ulong LifecycleGeneration), byte> _staleSealedSessions = new();
     // Sessions whose sealed directory is still to be removed; their Stop retries only that.
     private readonly ConcurrentDictionary<string, byte> _pendingSealedDeletes = new(StringComparer.Ordinal);
 
@@ -1552,11 +1554,11 @@ internal sealed partial class SessionProcessManager : IDisposable
     public IReadOnlyCollection<(string SessionId, ulong LifecycleGeneration)> TakeStaleSealedSessions()
     {
         var taken = new List<(string, ulong)>();
-        foreach (var sessionId in _staleSealedSessions.Keys)
+        foreach (var lifecycle in _staleSealedSessions.Keys)
         {
-            if (_staleSealedSessions.TryRemove(sessionId, out var generation))
+            if (_staleSealedSessions.TryRemove(lifecycle, out _))
             {
-                taken.Add((sessionId, generation));
+                taken.Add(lifecycle);
             }
         }
 

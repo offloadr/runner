@@ -769,7 +769,8 @@ public partial class SessionProcessManagerOwnershipTests
 
         var (tempRoot, sealedRoot, options) = CreateSealedOptions("comfyui");
         const string sessionId = "session-noted";
-        var note = Path.Combine(options.SessionRoot, ".offloadr-sealed-lifecycles", sessionId);
+        var notes = Path.Combine(options.SessionRoot, ".offloadr-sealed-lifecycles", sessionId);
+        bool Noted() => Directory.Exists(notes) && Directory.EnumerateFiles(notes).Any();
         bool? notedDuringStart = null;
 
         try
@@ -781,22 +782,30 @@ public partial class SessionProcessManagerOwnershipTests
                     SealedStart(sessionId),
                     (_, _) =>
                     {
-                        notedDuringStart = File.Exists(note);
+                        notedDuringStart = Noted();
                         return Task.CompletedTask;
                     },
                     CancellationToken.None));
             }
 
             Assert.That(notedDuringStart, Is.True);
-            Assert.That(File.Exists(note), Is.True, "no Stop has taken the count yet");
+            Assert.That(Noted(), Is.True, "no Stop has taken the count yet");
+            // A newer lifecycle of the session keeps its own note beside the older one.
+            File.WriteAllText(Path.Combine(notes, "99"), string.Empty);
 
             // The agent restarts before that Stop: the new process knows the count is unknown.
             using var restarted = new SessionProcessManager(options, new RecordingIsolationStrategy("unused", Path.Combine(options.SessionRoot, "unused")), SealedVfsBuilder(), new RecordingCommandRunner(string.Empty)) { PrepareSealedHost = HostLockedDown };
             await restarted.CleanupStaleSessionsAsync(CancellationToken.None);
-            Assert.That(restarted.TakeStaleSealedSessions().Select(static stale => stale.SessionId), Does.Contain(sessionId));
+            var stale = restarted.TakeStaleSealedSessions();
+            var noted = stale.Where(lifecycle => lifecycle.SessionId == sessionId).Select(static lifecycle => lifecycle.LifecycleGeneration).ToArray();
+            Assert.That(noted, Has.Member(99UL).And.Length.EqualTo(2));
 
+            // The older lifecycle's Stop drops only its own note.
+            var older = stale.Where(lifecycle => lifecycle.SessionId == sessionId).Min(static lifecycle => lifecycle.LifecycleGeneration);
+            restarted.ForgetSealedLifecycle(sessionId, older);
+            Assert.That(Directory.EnumerateFiles(notes).Select(Path.GetFileName), Is.EqualTo(new[] { "99" }));
             restarted.ForgetSealedLifecycle(sessionId, 0);
-            Assert.That(File.Exists(note), Is.False);
+            Assert.That(Noted(), Is.False);
         }
         finally
         {

@@ -124,6 +124,7 @@ public class LinuxSessionResidueLinuxTests
                 Assert.That(File.Exists(sessionFile), Is.False);
                 Assert.That(File.Exists(serviceFile), Is.True, "someone else's file stays");
                 Assert.That(SealedStorageProbe.ReadEntryStatus(folder)!.Value.OwnerId, Is.Zero, "the folder is root's now");
+                Assert.That(File.GetUnixFileMode(folder) & (UnixFileMode.GroupRead | UnixFileMode.GroupExecute | UnixFileMode.OtherRead | UnixFileMode.OtherWrite | UnixFileMode.OtherExecute), Is.EqualTo((UnixFileMode)0), "and closed to later sessions");
             });
         }
         finally

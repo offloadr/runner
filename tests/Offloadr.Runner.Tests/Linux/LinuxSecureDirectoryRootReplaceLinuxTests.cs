@@ -194,6 +194,40 @@ public class LinuxSecureDirectoryRootReplaceLinuxTests
         }
     }
 
+    [Test]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public void CommitIfAbsent_LeavesAFileThatAppearedMeanwhile()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = CreateRoot();
+        try
+        {
+            var path = Path.Combine(root, "dynamic.png");
+            using var secureRoot = new LinuxSecureDirectoryRoot(root);
+            using (var download = secureRoot.CreatePublication("dynamic.png"))
+            {
+                // The workflow writes the input while the download is in flight.
+                File.WriteAllText(path, "written meanwhile");
+                Assert.That(download.CommitIfAbsent(), Is.False);
+            }
+
+            Assert.That(File.ReadAllText(path), Is.EqualTo("written meanwhile"));
+
+            var absent = Path.Combine(root, "absent.png");
+            using (var download = secureRoot.CreatePublication("absent.png"))
+            {
+                Assert.That(download.CommitIfAbsent(), Is.True);
+            }
+
+            Assert.That(File.Exists(absent), Is.True);
+            Assert.That(Directory.GetFiles(root), Has.Length.EqualTo(2), "no temporary file is left");
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
     private static void ReplaceAtomically(string root, string path, string content)
     {
         var staged = Path.Combine(root, $"staged-{Guid.NewGuid():N}");

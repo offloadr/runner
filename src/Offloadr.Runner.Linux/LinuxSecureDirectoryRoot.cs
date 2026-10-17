@@ -42,6 +42,7 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
     private const int StatxCtimeSecondsOffset = 96;
     private const int StatxCtimeNanosecondsOffset = 104;
     private const uint RenameExchange = 2;
+    private const uint RenameNoReplace = 1;
     private const int StatxBufferSize = 256;
     private const int StatxNlinkOffset = 16;
     private const int StatxModeOffset = 28;
@@ -916,6 +917,31 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
             }
 
             _committed = true;
+        }
+
+        /// <summary>
+        /// Publishes only while nothing is at the destination: an entry that appeared since (a
+        /// file the session wrote) is never replaced. Returns whether the publication went in.
+        /// </summary>
+        public bool CommitIfAbsent()
+        {
+            if (fchmod(GetDescriptor(_file), Convert.ToUInt32("644", 8)) != 0)
+            {
+                throw CreateException($"setting published workspace file mode for '{_relativePath}'");
+            }
+
+            if (renameat2(GetDescriptor(_parent), _temporaryName, GetDescriptor(_parent), _destinationName, RenameNoReplace) != 0)
+            {
+                if (Marshal.GetLastPInvokeError() == AlreadyExists)
+                {
+                    return false;
+                }
+
+                throw CreateException($"publishing workspace file '{_relativePath}'");
+            }
+
+            _committed = true;
+            return true;
         }
 
         /// <summary>

@@ -751,15 +751,8 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                 }
             }
 
-            if (replacing is { } expected)
-            {
-                // False when the session wrote the file meanwhile: its newer bytes stay.
-                _ = publication.CommitReplacing(expected);
-            }
-            else
-            {
-                publication.Commit();
-            }
+            // False when the session wrote or created the file meanwhile: its newer bytes stay.
+            _ = replacing is { } expected ? publication.CommitReplacing(expected) : publication.CommitIfAbsent();
         }
 
         private static DateTime? ToDateTime(Timestamp? timestamp)

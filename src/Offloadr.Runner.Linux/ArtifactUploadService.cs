@@ -175,31 +175,26 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         lock (_stopGate)
         {
             var taken = TakeRecordedUnsavedUploads(sessionId, lifecycleGeneration);
-            if (!_lossUncounted.TryGetValue(sessionId, out var lostGeneration))
-            {
-                return taken;
-            }
-
-            // The Stop of the lifecycle whose data a restart removed reports that nobody counted
+            // The Stop of a lifecycle whose data a restart removed reports that nobody counted
             // it; so does an unfenced Stop, or any when the generation was not recorded. A newer
-            // lifecycle's Stop drops the mark unreported, as it does older counts; an older one's
-            // leaves it.
-            if (lifecycleGeneration == 0 || lostGeneration == 0 || lostGeneration == lifecycleGeneration)
+            // lifecycle's Stop drops older marks unreported, as it does older counts; marks of
+            // newer lifecycles stay.
+            var incomplete = false;
+            foreach (var mark in _lossUncounted.Keys.Where(mark => mark.SessionId == sessionId).ToArray())
             {
-                _lossUncounted.TryRemove(sessionId, out _);
-                return taken with { Incomplete = true };
+                var mine = lifecycleGeneration == 0 || mark.Generation == 0 || mark.Generation == lifecycleGeneration;
+                if (mine || mark.Generation < lifecycleGeneration)
+                {
+                    _lossUncounted.TryRemove(mark, out _);
+                    incomplete |= mine;
+                }
             }
 
-            if (lifecycleGeneration > lostGeneration)
-            {
-                _lossUncounted.TryRemove(sessionId, out _);
-            }
-
-            return taken;
+            return incomplete ? taken with { Incomplete = true } : taken;
         }
     }
 
-    private readonly ConcurrentDictionary<string, ulong> _lossUncounted = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<(string SessionId, ulong Generation), byte> _lossUncounted = new();
 
     /// <summary>
     /// Marks a session lifecycle (0 when unknown) whose data was removed without counting what it
@@ -210,7 +205,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
     {
         if (!string.IsNullOrWhiteSpace(sessionId))
         {
-            _lossUncounted[sessionId] = lifecycleGeneration;
+            _lossUncounted[(sessionId, lifecycleGeneration)] = 0;
         }
     }
 
@@ -1678,17 +1673,10 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 }
 
                 // Disposing an uncommitted publication removes its temporary file.
-                if (replacing is { } expected)
+                if (!(replacing is { } expected ? publication.CommitReplacing(expected) : publication.CommitIfAbsent()))
                 {
-                    if (!publication.CommitReplacing(expected))
-                    {
-                        // The session wrote the file meanwhile: it stays, and its watcher uploads it.
-                        return null;
-                    }
-                }
-                else
-                {
-                    publication.Commit();
+                    // The session wrote or created the file meanwhile: it stays, and its watcher uploads it.
+                    return null;
                 }
             }
 
