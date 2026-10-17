@@ -476,11 +476,11 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         private int _rescanOwed;
         private long _lastDropWarningTicks = long.MinValue / 2;
 
-        private readonly RunnerReadRequesterIdentity _requester;
+        private readonly RunnerReadRequester _readRequester;
 
         public SessionUploader(string? runnerSecret, RunnerArtifactService.RunnerArtifactServiceClient artifactClient, Metadata? authHeaders, string sessionId, SessionProcessManager.SessionPaths paths, ILogger logger, RuntimeIdentityRegistry? runtimeIdentities = null, string? runnerId = null, RunnerReadRequesterIdentity? requester = null)
         {
-            _requester = requester ?? new RunnerReadRequesterIdentity(runnerId, null, runtimeIdentities);
+            _readRequester = (requester ?? new RunnerReadRequesterIdentity(runnerId, null, runtimeIdentities)).For(sessionId);
             _runnerSecret = runnerSecret;
             _artifactClient = artifactClient;
             _authHeaders = authHeaders;
@@ -1500,7 +1500,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         Type = state.Type,
                         Subfolder = state.Subfolder,
                         ReaderKey = _paths.TransferSealing?.ReaderKeyMessage,
-                        Requester = _requester.For(_sessionId),
+                        Requester = _readRequester.Clone(),
                     },
                     headers: _authHeaders,
                     cancellationToken: token);

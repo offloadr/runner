@@ -171,7 +171,7 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
         private string? _editorSid;
         private int _dynamicInputCount;
 
-        private readonly RunnerReadRequesterIdentity _requester;
+        private readonly RunnerReadRequester _readRequester;
 
         public SessionMirror(
             RunnerWorkspaceService.RunnerWorkspaceServiceClient workspaceClient,
@@ -182,7 +182,7 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
             int maxDynamicInputEntries,
             RunnerReadRequesterIdentity requester)
         {
-            _requester = requester;
+            _readRequester = requester.For(sessionId);
             _workspaceClient = workspaceClient;
             _authHeaders = authHeaders;
             _sessionId = sessionId;
@@ -390,7 +390,7 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                     Root = state.Root,
                     RelativePath = state.RelativePath,
                     ReaderKey = _paths.TransferSealing?.ReaderKeyMessage,
-                    Requester = _requester.For(_sessionId),
+                    Requester = _readRequester.Clone(),
                 },
                 headers: _authHeaders,
                 cancellationToken: linkedCancellationToken);
@@ -407,7 +407,7 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                     EditorSid = _editorSid!,
                     Root = root,
                     ReaderKey = _paths.TransferSealing?.ReaderKeyMessage,
-                    Requester = _requester.For(_sessionId),
+                    Requester = _readRequester.Clone(),
                 },
                 headers: _authHeaders,
                 cancellationToken: cancellationToken);

@@ -255,6 +255,8 @@ public partial class ArtifactUploadServiceTests
                 ],
                 CancellationToken.None);
 
+            // A newer start for the session is admitted while this runtime still reads.
+            identities.Set("session-1", 6, 1, "instance-b");
             var available = await service.TryEnsureArtifactAvailableAsync(outputPath, highPriority: false, CancellationToken.None);
 
             Assert.That(available, Is.True);

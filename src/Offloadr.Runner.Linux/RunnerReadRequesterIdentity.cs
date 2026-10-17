@@ -12,7 +12,11 @@ internal sealed class RunnerReadRequesterIdentity(string? runnerId, string? inst
     private readonly string _runnerId = runnerId?.Trim() ?? string.Empty;
     private readonly string _instanceId = instanceId?.Trim() ?? string.Empty;
 
-    /// <summary>The requester for a read of <paramref name="sessionId"/>, with its current runtime.</summary>
+    /// <summary>
+    /// The requester for reads of <paramref name="sessionId"/>, with the runtime it has now.
+    /// Taken once, when the session's uploader or mirror is created for that runtime, and kept:
+    /// a newer runtime registered later must never lend its identity to an older one's reads.
+    /// </summary>
     public RunnerReadRequester For(string sessionId)
     {
         var requester = new RunnerReadRequester

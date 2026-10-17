@@ -384,6 +384,8 @@ public class WorkspaceMirrorServiceTests
                 instanceId: "process-1");
 
             await service.PrepareSessionAsync(sessionId, paths, "editor-1", "comfyui", [], CancellationToken.None);
+            // A newer start for the session is admitted while this runtime still reads.
+            identities.Set(sessionId, 8, 1, "instance-b");
             Assert.That(
                 await service.TryEnsureWorkspaceFileAvailableAsync(Path.Combine(paths.InputDirectory, "late", "audio.wav"), highPriority: false, CancellationToken.None),
                 Is.True);
