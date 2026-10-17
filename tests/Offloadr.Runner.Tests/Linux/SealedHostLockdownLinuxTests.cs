@@ -448,11 +448,12 @@ public class SealedHostLockdownLinuxTests
             ["/tmp/refuses"] = 1001,
             ["/tmp/root"] = 0,
         };
+        var modes = owners.Keys.ToDictionary(static path => path, static _ => Mode0755, StringComparer.Ordinal);
 
         var result = SealedHostLockdown.HandToRoot(
             owners.Keys,
-            path => new LinuxEntryStatus(true, false, owners[path], Mode0755),
-            path =>
+            path => new LinuxEntryStatus(true, false, owners[path], modes[path]),
+            (path, entry) =>
             {
                 if (path == "/tmp/refuses")
                 {
@@ -460,10 +461,12 @@ public class SealedHostLockdownLinuxTests
                 }
 
                 owners[path] = 0;
+                modes[path] = entry.Mode & (UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
             });
 
         Assert.That(result.Closed, Is.EqualTo(new[] { "/tmp/old" }));
         Assert.That(result.StillWritable, Is.EqualTo(new[] { "/tmp/refuses" }));
+        Assert.That(modes["/tmp/old"] & (UnixFileMode.OtherRead | UnixFileMode.GroupRead), Is.EqualTo((UnixFileMode)0), "not even readable by a later session");
     }
 
     [Test]
@@ -487,6 +490,7 @@ public class SealedHostLockdownLinuxTests
 
             Assert.That(result.Closed, Is.EqualTo(new[] { file }));
             Assert.That(SealedStorageProbe.ReadEntryStatus(file)!.Value.OwnerId, Is.Zero);
+            Assert.That(File.GetUnixFileMode(file) & (UnixFileMode.GroupRead | UnixFileMode.OtherRead), Is.EqualTo((UnixFileMode)0));
         }
         finally
         {

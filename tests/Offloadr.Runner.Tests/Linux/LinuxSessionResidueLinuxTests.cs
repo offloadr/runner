@@ -98,6 +98,42 @@ public class LinuxSessionResidueLinuxTests
 
     [Test]
     [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public async Task RemoveEntriesOwnedBy_KeepsSomeoneElsesFilesInTheUsersDirectory()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        LinuxTestPrerequisites.RequireRoot();
+        LinuxTestPrerequisites.RequireCommand("/bin/chown");
+
+        var root = Path.Combine(Path.GetTempPath(), $"runner-foreign-{Guid.NewGuid():N}");
+        try
+        {
+            // The session made the folder and a file in it; a root service added its own file.
+            var folder = Path.Combine(root, "shared-cache");
+            Directory.CreateDirectory(folder);
+            var sessionFile = Path.Combine(folder, "session.bin");
+            var serviceFile = Path.Combine(folder, "service.bin");
+            await File.WriteAllTextAsync(sessionFile, "session data");
+            await File.WriteAllTextAsync(serviceFile, "service data");
+            await VfsShimLinuxTests.RunProcessAsync("/bin/chown", ["54321:54321", folder, sessionFile], root);
+
+            LinuxSessionResidue.RemoveEntriesOwnedBy(54321, [root], out var remaining);
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(remaining, Is.Zero);
+                Assert.That(File.Exists(sessionFile), Is.False);
+                Assert.That(File.Exists(serviceFile), Is.True, "someone else's file stays");
+                Assert.That(SealedStorageProbe.ReadEntryStatus(folder)!.Value.OwnerId, Is.Zero, "the folder is root's now");
+            });
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Test]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
     public void RemoveEntriesOwnedBy_SkipsOnlyARootThatDoesNotExist()
     {
         LinuxTestPrerequisites.RequireLinux();

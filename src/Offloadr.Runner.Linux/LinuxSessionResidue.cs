@@ -199,13 +199,18 @@ public static class LinuxSessionResidue
 
     /// <summary>
     /// Walks <paramref name="root"/> at any depth, without recursion, and visits each directory
-    /// once (a bind mount can show one again), so no subtree is skipped by a depth cutoff.
+    /// once (a bind mount can show one again), so no subtree is skipped by a depth cutoff. Only
+    /// the user's own entries go: a directory of the user's that holds someone else's files
+    /// (root's, or another service's) is emptied of the user's entries and given to root, and
+    /// those files stay.
     /// </summary>
     private static int RemoveOwnedEntries(string root, uint userId, ref int remaining)
     {
         var removed = 0;
         var visited = new HashSet<(ulong Device, ulong Inode)>();
         var pending = new Stack<string>();
+        // The user's own directories, in the order found: children come after their parents.
+        var ownedDirectories = new List<string>();
         pending.Push(root);
         while (pending.TryPop(out var directory))
         {
@@ -234,9 +239,18 @@ public static class LinuxSessionResidue
                     continue;
                 }
 
-                if (ownerId == userId)
+                if (isDirectory)
                 {
-                    if (TryRemove(entry, isDirectory))
+                    if (ownerId == userId)
+                    {
+                        ownedDirectories.Add(entry);
+                    }
+
+                    pending.Push(entry);
+                }
+                else if (ownerId == userId)
+                {
+                    if (TryRemove(entry, isDirectory: false))
                     {
                         removed++;
                     }
@@ -245,15 +259,37 @@ public static class LinuxSessionResidue
                         remaining++;
                     }
                 }
-                else if (isDirectory)
+            }
+        }
+
+        // Deepest first: a directory is empty of the user's entries by the time it is reached.
+        for (var index = ownedDirectories.Count - 1; index >= 0; index--)
+        {
+            var directory = ownedDirectories[index];
+            try
+            {
+                Directory.Delete(directory, recursive: false);
+                removed++;
+            }
+            catch (IOException) when (Directory.Exists(directory) && Directory.EnumerateFileSystemEntries(directory).Any())
+            {
+                // Someone else's files are in it: it becomes root's, and they stay.
+                if (lchown(directory, 0, 0) != 0)
                 {
-                    pending.Push(entry);
+                    remaining++;
                 }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                remaining++;
             }
         }
 
         return removed;
     }
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int lchown(string path, uint owner, uint group);
 
     private static bool TryEnumerateEntries(string directory, out string[] entries)
     {

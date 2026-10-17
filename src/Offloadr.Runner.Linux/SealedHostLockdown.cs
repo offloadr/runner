@@ -378,19 +378,28 @@ public static class SealedHostLockdown
     private static extern int statx(int directoryFileDescriptor, string path, int flags, uint mask, nint buffer);
 
     /// <summary>
-    /// Gives each directory or regular file to root (owner and group), so a session user that
-    /// gets its old uid again cannot write it, then checks the owner. Links are not followed.
+    /// Gives each directory or regular file to root (owner and group) and closes it to everyone
+    /// else, so a session user that gets its old uid again can neither write nor read it, then
+    /// checks both. Links are not followed.
     /// </summary>
     public static Result HandToRoot(IEnumerable<string> paths)
-        => HandToRoot(paths, SealedStorageProbe.ReadEntryStatus, static path =>
+        => HandToRoot(paths, SealedStorageProbe.ReadEntryStatus, static (path, entry) =>
         {
             if (lchown(path, 0, 0) != 0)
             {
                 throw new IOException($"lchown failed with errno {Marshal.GetLastPInvokeError()}.");
             }
+
+            // Root's alone: a later session must not even read what the earlier one left. With an
+            // ACL the group bits are its mask, so clearing them shuts out every named entry too.
+            LinuxSecureDirectoryRoot.SetModeNoFollow(path, entry.Mode & OwnerOnly);
         });
 
-    internal static Result HandToRoot(IEnumerable<string> paths, Func<string, LinuxEntryStatus?> statEntry, Action<string> chownToRoot)
+    private const UnixFileMode OwnerOnly = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
+    private const UnixFileMode GroupOrOther = UnixFileMode.GroupRead | UnixFileMode.GroupWrite | UnixFileMode.GroupExecute |
+        UnixFileMode.OtherRead | UnixFileMode.OtherWrite | UnixFileMode.OtherExecute;
+
+    internal static Result HandToRoot(IEnumerable<string> paths, Func<string, LinuxEntryStatus?> statEntry, Action<string, LinuxEntryStatus> closeToRoot)
     {
         ArgumentNullException.ThrowIfNull(paths);
         var changed = new List<string>();
@@ -404,7 +413,7 @@ public static class SealedHostLockdown
 
             try
             {
-                chownToRoot(path);
+                closeToRoot(path, entry);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
@@ -412,7 +421,7 @@ public static class SealedHostLockdown
                 RunnerLog.Warning($"Sealed storage: could not give an entry to root: {ex.GetType().Name}");
             }
 
-            if (statEntry(path) is { OwnerId: 0 })
+            if (statEntry(path) is { OwnerId: 0 } after && (after.Mode & GroupOrOther) == 0)
             {
                 changed.Add(path);
             }
