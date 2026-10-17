@@ -21,6 +21,39 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
+    public async Task RefusedLaunch_KeepsTheSealingForTheNextLaunch()
+    {
+        var harness = new RuntimeCommandHarness();
+        var start = SealedStart(7, 3, InstanceA);
+        await ServiceClientManager.HandleStartSessionCommand(start, harness.Deps);
+        await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
+
+        // Refused as weakening, then a launch that carries no sealing of its own.
+        var weakening = Launch(7, 4, InstanceB, revision: 1);
+        weakening.Sealing = new SessionSealing { Required = false };
+        await ServiceClientManager.HandleLaunchRuntimeCommand(weakening, harness.Deps);
+        await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 1);
+        await ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 5, InstanceA, revision: 2), harness.Deps);
+        await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 2);
+
+        Assert.That(harness.Starts.Last().Sealing, Is.EqualTo(start.Sealing), "still sealed as it started");
+    }
+
+    [Test]
+    public async Task LaunchOfANewerLifecycle_DoesNotInheritAnOlderLifecyclesSealing()
+    {
+        var harness = new RuntimeCommandHarness();
+        await ServiceClientManager.HandleStartSessionCommand(SealedStart(7, 3, InstanceA), harness.Deps);
+        await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
+
+        // Generation 8 began without this runner seeing generation 7 stop.
+        await ServiceClientManager.HandleLaunchRuntimeCommand(Launch(8, 1, InstanceB, revision: 1), harness.Deps);
+        await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 1);
+
+        Assert.That(harness.Starts.Last().Sealing, Is.Null);
+    }
+
+    [Test]
     public async Task FailedStart_DoesNotLeaveItsSealingForALaterLaunch()
     {
         var harness = new RuntimeCommandHarness
