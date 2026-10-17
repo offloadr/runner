@@ -781,6 +781,7 @@ public partial class SessionProcessManagerOwnershipTests
             start.Sealing = new SessionSealing { Required = true, OutputRecipient = SessionTransferSealingTests.ToMessage(recipient.PublicKey) };
 
             // No lockdown at all, then one that cannot close everything.
+            var offeredUnwired = manager.DescribeSealedStorage().MemoryWorkspaceAvailable;
             var unprepared = Assert.ThrowsAsync<InvalidOperationException>(() => manager.StartSessionAsync(start, CancellationToken.None));
             var calls = 0;
             manager.PrepareSealedHost = () =>
@@ -788,10 +789,20 @@ public partial class SessionProcessManagerOwnershipTests
                 calls++;
                 return "these disk-backed paths stay writable by session users: /workspace";
             };
+            var offeredBeforeTrying = manager.DescribeSealedStorage().MemoryWorkspaceAvailable;
             var failed = Assert.ThrowsAsync<InvalidOperationException>(() => manager.StartSessionAsync(start, CancellationToken.None));
+            // Registration after the failure no longer offers sealed sessions, even once the
+            // lockdown would hold, until a sealed start gets it to hold.
+            var offeredAfterFailure = manager.DescribeSealedStorage().MemoryWorkspaceAvailable;
+            manager.PrepareSealedHost = HostLockedDown;
+            var offeredBeforeRetry = manager.DescribeSealedStorage().MemoryWorkspaceAvailable;
 
             Assert.Multiple(() =>
             {
+                Assert.That(offeredUnwired, Is.False);
+                Assert.That(offeredBeforeTrying, Is.True);
+                Assert.That(offeredAfterFailure, Is.False);
+                Assert.That(offeredBeforeRetry, Is.False);
                 Assert.That(unprepared!.Message, Does.Contain("not locked down"));
                 Assert.That(failed!.Message, Does.Contain("/workspace"));
                 Assert.That(calls, Is.EqualTo(1));
@@ -800,6 +811,10 @@ public partial class SessionProcessManagerOwnershipTests
                 Assert.That(Directory.Exists(Path.Combine(sealedRoot, sessionId)), Is.False);
                 Assert.That(isolation.CleanupCallCount, Is.Zero);
             });
+
+            // The entry point does not exist, so this start fails after the lockdown held.
+            Assert.CatchAsync(() => manager.StartSessionAsync(start, CancellationToken.None));
+            Assert.That(manager.DescribeSealedStorage().MemoryWorkspaceAvailable, Is.True);
         }
         finally
         {

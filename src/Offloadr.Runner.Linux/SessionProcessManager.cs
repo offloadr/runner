@@ -80,6 +80,11 @@ internal sealed partial class SessionProcessManager : IDisposable
     /// </summary>
     internal Func<string?>? PrepareSealedHost { get; set; }
 
+    // Why the last lockdown attempt failed. Registration offers no sealed sessions while it is
+    // set: each sealed start would be refused the same way. A sealed start that locks the host
+    // down clears it.
+    private volatile string? _sealedHostFailure;
+
     internal int? TryGetTrackedProcessId(string sessionId)
         => _sessions.TryGetValue(sessionId, out var context) ? context.Process.Id : null;
 
@@ -1142,7 +1147,8 @@ internal sealed partial class SessionProcessManager : IDisposable
                 SealedStorageMode.Auto => Offloadr.Runner.V1.SealedStorageMode.Auto,
                 _ => Offloadr.Runner.V1.SealedStorageMode.Required,
             },
-            MemoryWorkspaceAvailable = status.Available && _vfsEnvironmentBuilder.CanDisableCoreDumps(),
+            MemoryWorkspaceAvailable = status.Available && _vfsEnvironmentBuilder.CanDisableCoreDumps() &&
+                PrepareSealedHost is not null && _sealedHostFailure is null,
             BudgetBytes = status.BudgetBytes is > 0 and var budget ? (ulong)budget : 0,
         };
         if (_sealing.Mode != SealedStorageMode.Off)
@@ -1194,7 +1200,14 @@ internal sealed partial class SessionProcessManager : IDisposable
         }
 
         // Required mode did this at startup; in auto mode the first sealed start does it.
-        if ((PrepareSealedHost is null ? "the host was not locked down for sealed sessions" : PrepareSealedHost()) is { } failure)
+        if (PrepareSealedHost is null)
+        {
+            throw new InvalidOperationException("Sealed storage is unavailable: the host was not locked down for sealed sessions.");
+        }
+
+        var failure = PrepareSealedHost();
+        _sealedHostFailure = failure;
+        if (failure is not null)
         {
             throw new InvalidOperationException($"Sealed storage is unavailable: {failure}.");
         }
