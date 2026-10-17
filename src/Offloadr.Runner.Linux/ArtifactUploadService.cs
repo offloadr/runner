@@ -1687,6 +1687,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         private int CountUnsavedArtifacts()
         {
             var unsaved = 0;
+            var unsendable = new HashSet<(ulong Device, ulong Inode)>();
             foreach (var (type, root) in new[] { ("output", _paths.OutputDirectory), ("temp", _paths.TempDirectory) })
             {
                 if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root))
@@ -1706,6 +1707,15 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
                         if (secureRoot.GetVersion(relativePath) is not { } version)
                         {
+                            // A regular file the uploader refuses (a second hard link, say) still
+                            // holds session data the control plane never got; once per inode.
+                            if (SealedStorageProbe.ReadEntryStatus(file) is { IsRegularFile: true, IsSymbolicLink: false } &&
+                                LinuxFileIdentityReader.TryRead(file, out var identity) &&
+                                unsendable.Add((identity.DeviceId, identity.Inode)))
+                            {
+                                unsaved++;
+                            }
+
                             continue;
                         }
 

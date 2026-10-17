@@ -125,6 +125,34 @@ public partial class ArtifactUploadServiceTests
     }
 
     [Test]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public async Task StopSessionAsync_CountsAHardLinkedOutputOnceAsUnsaved()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        LinuxTestPrerequisites.RequireCommand("/bin/ln");
+
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = CreateEvictionPaths(root, sealedSession: true);
+            var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse());
+            await using var service = new ArtifactUploadService("runner-secret-value", artifactClient, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+
+            // Two names for one inode: the uploader refuses it, so the control plane has no copy.
+            var original = Path.Combine(paths.OutputDirectory, "linked.png");
+            await File.WriteAllBytesAsync(original, [1, 2, 3]);
+            await VfsShimLinuxTests.RunProcessAsync("/bin/ln", [original, Path.Combine(paths.OutputDirectory, "alias.png")], root);
+
+            Assert.That(await service.StopSessionAsync("session-1"), Is.EqualTo(1));
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
     public async Task StopSessionAsync_CountsALossWhenItCannotListEveryArtifact()
     {
         var root = CreateTempDirectory();
