@@ -270,6 +270,51 @@ public partial class ArtifactUploadServiceTests
     }
 
     [Test]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public async Task EvictUploadedArtifacts_KeepsGoingWhileAnOpenArtifactHoldsItsMemory()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        // On a real tmpfs, where replacing an open file frees nothing until it closes.
+        if (SealedStorageProbe.ReadFileSystemStats("/dev/shm") is not { Type: SealedStorageProbe.TmpfsMagic })
+        {
+            Assert.Ignore("/dev/shm is not a tmpfs here.");
+        }
+
+        var root = Path.Combine("/dev/shm", $"runner-evict-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        try
+        {
+            var paths = CreateEvictionPaths(root, sealedSession: true);
+            var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse());
+            await using var service = new ArtifactUploadService("runner-secret-value", artifactClient, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            const int Size = 1 << 20;
+            var older = Path.Combine(paths.OutputDirectory, "older.png");
+            var newer = Path.Combine(paths.OutputDirectory, "newer.png");
+            await File.WriteAllBytesAsync(older, new byte[Size]);
+            await artifactClient.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            await Task.Delay(50);
+            await File.WriteAllBytesAsync(newer, new byte[Size]);
+            await artifactClient.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            await Task.Delay(200);
+
+            // The editor still reads the older one: evicting it alone gives nothing back yet.
+            using (var reader = new FileStream(older, FileMode.Open, FileAccess.Read))
+            {
+                service.EvictUploadedArtifacts("session-1", Size, TimeSpan.Zero);
+            }
+
+            Assert.That(new FileInfo(older).Length, Is.Zero);
+            Assert.That(new FileInfo(newer).Length, Is.Zero, "the pass went on to an artifact whose memory it could free");
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
     public async Task EvictUploadedArtifacts_LeavesAnArtifactTheVfsJustServed()
     {
         var root = CreateTempDirectory();

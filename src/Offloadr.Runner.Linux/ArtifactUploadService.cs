@@ -1776,6 +1776,9 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         internal long EvictUploadedArtifacts(long bytesToFree, TimeSpan minimumIdle, DateTimeOffset now)
         {
             long released = 0;
+            // An artifact still open or mapped keeps its memory until it closes: the pass stops
+            // on the space that actually came back, not on the lengths it replaced.
+            var freeBefore = ReadSealedFreeBytes();
             var candidates = _catalog.Values
                 .Where(state => state.LocalVersion is { Status.Length: > 0 } &&
                                 state.IdleSince(now) >= minimumIdle &&
@@ -1784,7 +1787,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 .ToArray();
             foreach (var state in candidates)
             {
-                if (released >= bytesToFree || _cts.IsCancellationRequested)
+                if (_cts.IsCancellationRequested)
                 {
                     break;
                 }
@@ -1826,6 +1829,11 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
                     state.MarkEvicted(secureRoot.GetVersion(relativePath));
                     released += status.Length;
+                    var freed = freeBefore is { } before && ReadSealedFreeBytes() is { } after ? after - before : released;
+                    if (freed >= bytesToFree)
+                    {
+                        break;
+                    }
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
                 {
@@ -1840,6 +1848,11 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
             return released;
         }
+
+        private long? ReadSealedFreeBytes()
+            => _paths.SealedDirectory is { } directory && SealedStorageProbe.ReadFileSystemStats(directory) is { } stats
+                ? stats.AvailableBlocks * stats.BlockSize
+                : null;
 
         private RuntimeIdentity? CurrentRuntime()
             => _runtimeIdentities?.TryGet(_sessionId, out var identity) == true ? identity : null;
