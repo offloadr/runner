@@ -819,6 +819,15 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
         public void SetModifiedUtc(DateTime modifiedUtc)
             => LinuxSecureDirectoryRoot.SetModifiedUtc(_file, modifiedUtc);
 
+        /// <summary>Gives the publication to an owner and group before it is published.</summary>
+        public void SetOwner(uint ownerId, uint groupId)
+        {
+            if (fchown(GetDescriptor(_file), ownerId, groupId) != 0)
+            {
+                throw CreateException($"setting the owner of workspace file '{_relativePath}'");
+            }
+        }
+
         public void Commit()
         {
             if (fchmod(GetDescriptor(_file), Convert.ToUInt32("644", 8)) != 0)
@@ -937,6 +946,9 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
 
     [DllImport("libc", SetLastError = true)]
     private static extern int fchmod(int fileDescriptor, uint mode);
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int fchown(int fileDescriptor, uint owner, uint group);
 
     [DllImport("libc", SetLastError = true)]
     private static extern int fcntl(int fileDescriptor, int command, int argument);

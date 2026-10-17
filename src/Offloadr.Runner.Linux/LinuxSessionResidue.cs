@@ -73,7 +73,8 @@ public static class LinuxSessionResidue
         }
 
         var removed = 0;
-        foreach (var entry in EnumerateEntries(directory))
+        _ = TryEnumerateEntries(directory, out var entries);
+        foreach (var entry in entries)
         {
             if (TryReadOwner(entry, out var ownerId, out var entryIsDirectory) &&
                 ownerId != 0 &&
@@ -118,10 +119,23 @@ public static class LinuxSessionResidue
     private static int RemoveOwnedEntries(string directory, uint userId, int depth, ref int remaining)
     {
         var removed = 0;
-        foreach (var entry in EnumerateEntries(directory))
+        if (!TryEnumerateEntries(directory, out var entries))
+        {
+            // What lies below is unknown; some of it may be the user's.
+            remaining++;
+            return removed;
+        }
+
+        foreach (var entry in entries)
         {
             if (!TryReadOwner(entry, out var ownerId, out var isDirectory))
             {
+                // Gone since the listing is fine; there but unreadable may still be the user's.
+                if (!SealedHostLockdown.IsGone(entry))
+                {
+                    remaining++;
+                }
+
                 continue;
             }
 
@@ -145,15 +159,22 @@ public static class LinuxSessionResidue
         return removed;
     }
 
-    private static string[] EnumerateEntries(string directory)
+    private static bool TryEnumerateEntries(string directory, out string[] entries)
     {
         try
         {
-            return Directory.GetFileSystemEntries(directory);
+            entries = Directory.GetFileSystemEntries(directory);
+            return true;
+        }
+        catch (DirectoryNotFoundException)
+        {
+            entries = [];
+            return true;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            return [];
+            entries = [];
+            return false;
         }
     }
 

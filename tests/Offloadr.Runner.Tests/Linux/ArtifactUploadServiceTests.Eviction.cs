@@ -49,6 +49,49 @@ public partial class ArtifactUploadServiceTests
     }
 
     [Test]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public async Task EvictionAndDownload_KeepTheSessionUsersOwnershipOfItsOutput()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        LinuxTestPrerequisites.RequireRoot();
+        LinuxTestPrerequisites.RequireCommand("/bin/chown");
+
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = CreateEvictionPaths(root, sealedSession: true);
+            var content = "session-owned-output"u8.ToArray();
+            var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse())
+            {
+                ReadArtifactContent = content,
+            };
+            await using var service = new ArtifactUploadService("runner-secret-value", artifactClient, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+
+            // The editor's output belongs to the session user; it arrives whole, as by a rename.
+            var staged = Path.Combine(root, "staged.png");
+            await File.WriteAllBytesAsync(staged, content);
+            await VfsShimLinuxTests.RunProcessAsync("/bin/chown", ["54321:54322", staged], root);
+            var outputPath = Path.Combine(paths.OutputDirectory, "ComfyUI_00002_.png");
+            File.Move(staged, outputPath);
+            await artifactClient.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+
+            Assert.That(await EvictWhenRecordedAsync(service, "session-1"), Is.EqualTo(content.Length));
+            var placeholder = SealedStorageProbe.ReadEntryStatus(outputPath)!.Value;
+            Assert.That((placeholder.OwnerId, placeholder.GroupId), Is.EqualTo((54321u, 54322u)), "the placeholder stays the session user's");
+
+            Assert.That(await service.TryEnsureArtifactAvailableAsync(outputPath, highPriority: true, CancellationToken.None), Is.True);
+            var downloaded = SealedStorageProbe.ReadEntryStatus(outputPath)!.Value;
+            Assert.That((downloaded.OwnerId, downloaded.GroupId), Is.EqualTo((54321u, 54322u)), "and so does the download");
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
     public async Task EvictUploadedArtifacts_LeavesUnsealedChangedAndRecentArtifacts()
     {
         var root = CreateTempDirectory();

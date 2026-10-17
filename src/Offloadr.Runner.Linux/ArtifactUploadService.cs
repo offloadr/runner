@@ -1507,6 +1507,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             using var secureRoot = new LinuxSecureDirectoryRoot(root);
             using (var publication = secureRoot.CreatePublication(relativePath))
             {
+                CarryOwnership(publication, state.LocalPath);
                 long bytesWritten = 0;
                 long? expectedSizeBytes = null;
                 string? expectedSha256 = null;
@@ -1804,6 +1805,19 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             public void Dispose() => Monitor.Exit(_gate);
         }
 
+        /// <summary>
+        /// Gives a publication the owner of the file it replaces when that is not root: the
+        /// session's own output stays writable to it after an eviction or a download again, since
+        /// the shim does not intercept opens for writing.
+        /// </summary>
+        private static void CarryOwnership(LinuxSecureDirectoryRoot.PendingPublication publication, string path)
+        {
+            if (SealedStorageProbe.ReadEntryStatus(path) is { IsRegularFile: true, IsSymbolicLink: false, OwnerId: not 0 } current)
+            {
+                publication.SetOwner(current.OwnerId, current.GroupId);
+            }
+        }
+
         /// <summary>Runs before each eviction candidate takes the gate; lets tests change the catalog then.</summary>
         internal Action<string>? BeforeEvictionCandidate { get; set; }
 
@@ -1860,6 +1874,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     // open keeps the uploaded bytes until it closes, and memory is released then.
                     using var placeholder = secureRoot.CreatePublication(relativePath);
                     placeholder.SetModifiedUtc(status.LastWriteTimeUtc);
+                    CarryOwnership(placeholder, state.LocalPath);
                     // Swapped in atomically and kept only if it displaced exactly that version.
                     if (!placeholder.CommitReplacing(version))
                     {
