@@ -36,10 +36,11 @@ public static class SealedHostLockdown
     public sealed record ScanResult(IReadOnlyList<string> SharedWritable, IReadOnlyList<string> ReusablyOwned, IReadOnlyList<string> Unchecked);
 
     /// <summary>
-    /// Scans as <see cref="FindSharedWritableDirectories(string)"/> describes. Inside a shared
-    /// directory, a directory or regular file owned by a uid without an account, or by a session
-    /// account, is reported too: useradd hands such a uid to the next session user, who could
-    /// then write there through its owner bits. Anywhere, an entry its group may write counts as
+    /// Scans as <see cref="FindSharedWritableDirectories(string)"/> describes. A directory or
+    /// regular file owned by a uid without an account, or by a session account, is reported too:
+    /// useradd hands such a uid to the next session user, who could then write there through its
+    /// owner bits. The stale-session cleanup must run first, or it would no longer recognise the
+    /// homes of removed session users it deletes. Anywhere, an entry its group may write counts as
     /// shared when that group has no entry or is a session's (useradd -U hands its gid out again).
     /// An unreadable mount table, or an entry whose metadata cannot be read, is reported as
     /// unchecked, since what lies there would go unseen.
@@ -260,7 +261,8 @@ public static class SealedHostLockdown
                     continue;
                 }
 
-                if (insideShared && entry.OwnerId != 0 && (entry.IsDirectory || entry.IsRegularFile) && isReusableOwner(entry.OwnerId))
+                // Anywhere a session can reach: its owner bits would serve the next user of that uid.
+                if (entry.OwnerId != 0 && (entry.IsDirectory || entry.IsRegularFile) && isReusableOwner(entry.OwnerId))
                 {
                     reusablyOwned.Add(child);
                 }

@@ -2583,10 +2583,10 @@ internal static class ServiceClientManager
             Sealing = command.Sealing?.Clone() ?? startSealing?.Clone(),
         };
         // A restart keeps the logical session: it never runs it with less sealing than it started
-        // with, neither unsealed nor without the output recipient that encrypts its uploads.
+        // with, neither unsealed nor encrypting its uploads to another recipient, or to none.
         var weakensSealing = command.Sealing is { } launchSealing && startSealing is not null &&
             ((startSealing.Required && !launchSealing.Required) ||
-             (startSealing.OutputRecipient is not null && launchSealing.OutputRecipient is null));
+             (startSealing.OutputRecipient is not null && !startSealing.OutputRecipient.Equals(launchSealing.OutputRecipient)));
         start.InitialModels.AddRange(command.InitialModels);
         start.InitialArtifacts.AddRange(command.InitialArtifacts);
         start.InitialWorkspaceFiles.AddRange(command.InitialWorkspaceFiles);

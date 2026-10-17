@@ -193,7 +193,7 @@ public class SealedHostLockdownLinuxTests
         var shared = Mode0755 | UnixFileMode.OtherWrite;
         const UnixFileMode Private = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
         // Under /tmp: residue of a removed session user (uid 1001, any mode), a live service's
-        // folder (uid 999) and root's own. Outside shared directories ownership is not judged.
+        // folder (uid 999) and root's own. Ownership counts outside shared directories too.
         var entries = new Dictionary<string, (LinuxEntryStatus Status, string[] Children)>(StringComparer.Ordinal)
         {
             ["/"] = (new(true, false, 0, Mode0755), ["/tmp", "/home"]),
@@ -214,7 +214,7 @@ public class SealedHostLockdownLinuxTests
             mounts: null,
             isReusableOwner: userId => userId == 1001);
 
-        Assert.That(scan.ReusablyOwned, Is.EqualTo(new[] { "/tmp/old", "/tmp/old/notes.txt" }));
+        Assert.That(scan.ReusablyOwned, Is.EquivalentTo(new[] { "/tmp/old", "/tmp/old/notes.txt", "/home/old" }));
         Assert.That(scan.SharedWritable, Is.EqualTo(new[] { "/tmp" }));
         Assert.That(scan.Unchecked, Is.EqualTo(new[] { "/proc/self/mounts" }), "mounted filesystems would go unseen");
     }
@@ -302,7 +302,8 @@ public class SealedHostLockdownLinuxTests
             mounts: [],
             isReusableOwner: userId => userId == 1001);
 
-        Assert.That(scan.ReusablyOwned, Is.EqualTo(new[] { "/tmp/cache/old" }));
+        // Through either path; below /tmp it is also walked as shared.
+        Assert.That(scan.ReusablyOwned, Is.EquivalentTo(new[] { "/srv/cache/old", "/tmp/cache/old" }));
     }
 
     [Test]

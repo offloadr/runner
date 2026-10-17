@@ -66,11 +66,6 @@ if (options.Session.Sealing.Mode == SealedStorageMode.Required)
         RunnerLog.Error($"RUNNER_SEALED_STORAGE=required: {ex.Message}");
         return 1;
     }
-    if (sealedHostPreparation.EnsureApplied() is { } failure)
-    {
-        RunnerLog.Error($"RUNNER_SEALED_STORAGE=required but {failure}");
-        return 1;
-    }
 }
 
 using var shutdown = new CancellationTokenSource();
@@ -101,6 +96,14 @@ try
 catch (OperationCanceledException) when (shutdown.IsCancellationRequested)
 {
     return 0;
+}
+
+// After that cleanup: it finds the homes of removed session users by their unknown owners, which
+// the lockdown hands to root.
+if (options.Session.Sealing.Mode == SealedStorageMode.Required && sealedHostPreparation.EnsureApplied() is { } lockdownFailure)
+{
+    RunnerLog.Error($"RUNNER_SEALED_STORAGE=required but {lockdownFailure}");
+    return 1;
 }
 var logicalSessionState = new ServiceClientManager.LogicalSessionState(sessionManager.GetActiveSessionId());
 var hydrationCapabilities = ModelHydrationRuntimeCapabilities.FromEnvironment(

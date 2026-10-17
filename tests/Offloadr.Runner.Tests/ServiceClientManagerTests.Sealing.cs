@@ -116,6 +116,24 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
+    public async Task LaunchRuntime_ThatWouldSwapTheOutputRecipientIsRefused()
+    {
+        var harness = new RuntimeCommandHarness();
+        await ServiceClientManager.HandleStartSessionCommand(SealedStart(7, 3, InstanceA), harness.Deps);
+        await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
+        var startsBefore = harness.Starts.Count;
+
+        var launch = Launch(7, 4, InstanceB, revision: 1);
+        launch.Sealing = SealedStart(7, 4, InstanceB).Sealing;
+        launch.Sealing.OutputRecipient.KeyId = "output-2";
+        await ServiceClientManager.HandleLaunchRuntimeCommand(launch, harness.Deps);
+
+        var ack = await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 1);
+        Assert.That(ack.Ready, Is.False);
+        Assert.That(harness.Starts, Has.Count.EqualTo(startsBefore));
+    }
+
+    [Test]
     public async Task LaunchRuntime_ThatWouldDropTheOutputRecipientIsRefused()
     {
         var harness = new RuntimeCommandHarness();
