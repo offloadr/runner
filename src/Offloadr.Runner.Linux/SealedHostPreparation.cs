@@ -27,31 +27,50 @@ public sealed class SealedHostPreparation
                 SealedHostLockdown.SharedTemporaryDirectories
                     .Concat(scan.SharedWritable)
                     .Distinct(StringComparer.Ordinal));
-            foreach (var path in handed.Closed)
+            if (handed.Closed.Count > 0)
             {
-                RunnerLog.Info($"Sealed storage: '{path}', left by an earlier session user, now belongs to root.");
+                RunnerLog.Info($"Sealed storage: entries left by earlier session users now belong to root: {Summarize(handed.Closed)}.");
             }
 
-            foreach (var directory in lockdown.Closed)
+            if (lockdown.Closed.Count > 0)
             {
-                RunnerLog.Info($"Sealed storage: '{directory}' is no longer writable by session users.");
+                RunnerLog.Info($"Sealed storage: no longer writable by session users: {Summarize(lockdown.Closed)}.");
             }
 
             var stillWritable = handed.StillWritable.Concat(lockdown.StillWritable).ToArray();
             if (stillWritable.Length > 0)
             {
                 // Sessions could write their data to these disk-backed places.
-                return "these disk-backed paths stay writable by session users: " + string.Join(", ", stillWritable);
+                return "disk-backed paths stay writable by session users: " + Summarize(stillWritable);
             }
 
             if (scan.Unchecked.Count > 0)
             {
                 // A session may still reach a writable place below these, which the scan could not see.
-                return "these could not be read to check what session users can write: " + string.Join(", ", scan.Unchecked);
+                return "paths could not be read to check what session users can write: " + Summarize(scan.Unchecked);
             }
 
             _applied = true;
             return null;
         }
+    }
+
+    /// <summary>
+    /// Counts paths by their top-level directory, such as "3 under /tmp, 1 under /workspace".
+    /// Names below it may have been chosen by an earlier session and carry its data, and these
+    /// lines reach the host's disk; the top level is the image's or a mount's.
+    /// </summary>
+    internal static string Summarize(IEnumerable<string> paths)
+        => string.Join(
+            ", ",
+            paths
+                .GroupBy(static path => TopLevel(path), StringComparer.Ordinal)
+                .OrderBy(static group => group.Key, StringComparer.Ordinal)
+                .Select(static group => $"{group.Count()} under {group.Key}"));
+
+    private static string TopLevel(string path)
+    {
+        var separator = path.IndexOf('/', 1);
+        return separator < 0 ? path : path[..separator];
     }
 }

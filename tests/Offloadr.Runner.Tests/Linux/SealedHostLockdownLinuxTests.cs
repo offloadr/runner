@@ -331,6 +331,21 @@ public class SealedHostLockdownLinuxTests
         }
     }
 
+    [Test]
+    public void Summarize_NamesOnlyTopLevelDirectories()
+    {
+        var summary = SealedHostPreparation.Summarize(
+        [
+            "/tmp/portrait of alice.png",
+            "/tmp/old/notes.txt",
+            "/workspace/scratch",
+            "/tmp",
+            "/proc/self/mounts",
+        ]);
+
+        Assert.That(summary, Is.EqualTo("1 under /proc, 3 under /tmp, 1 under /workspace"));
+    }
+
     private static ulong InodeOf(string path) => (ulong)(uint)StringComparer.Ordinal.GetHashCode(path);
 
     /// <summary>

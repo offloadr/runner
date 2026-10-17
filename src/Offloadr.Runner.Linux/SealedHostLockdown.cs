@@ -321,7 +321,8 @@ public static class SealedHostLockdown
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
-                RunnerLog.Warning($"Sealed storage: could not give '{path}' to root: {ex.Message}");
+                // The path, and the message naming it, may carry an earlier session's data.
+                RunnerLog.Warning($"Sealed storage: could not give an entry to root: {ex.GetType().Name}");
             }
 
             if (statEntry(path) is { OwnerId: 0 })
@@ -393,7 +394,8 @@ public static class SealedHostLockdown
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
-                RunnerLog.Warning($"Sealed storage: could not close '{directory}' to session users: {ex.Message}");
+                // The path, and the message naming it, may carry an earlier session's data.
+                RunnerLog.Warning($"Sealed storage: could not close an entry to session users: {ex.GetType().Name}");
             }
 
             // Some filesystems accept chmod and ignore it; only the mode read back counts.
