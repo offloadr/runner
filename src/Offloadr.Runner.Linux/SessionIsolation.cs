@@ -32,12 +32,18 @@ public sealed class LinuxUserIsolationStrategy : ISessionIsolationStrategy
     {
     }
 
+    internal delegate int RemoveOwnedEntries(uint userId, IEnumerable<string> roots, out int remaining);
+
+    private readonly RemoveOwnedEntries _removeOwnedEntries;
+
     internal LinuxUserIsolationStrategy(
         ILinuxCommandRunner commandRunner,
         Func<uint, CancellationToken, Task<bool>> killUserProcesses,
         IReadOnlyList<string>? residueRoots = null,
-        string passwdPath = "/etc/passwd")
+        string passwdPath = "/etc/passwd",
+        RemoveOwnedEntries? removeOwnedEntries = null)
     {
+        _removeOwnedEntries = removeOwnedEntries ?? LinuxSessionResidue.RemoveEntriesOwnedBy;
         _commandRunner = commandRunner ?? throw new ArgumentNullException(nameof(commandRunner));
         _killUserProcesses = killUserProcesses ?? throw new ArgumentNullException(nameof(killUserProcesses));
         _residueRoots = residueRoots ?? LinuxSessionResidue.SharedTemporaryRoots;
@@ -271,17 +277,30 @@ public sealed class LinuxUserIsolationStrategy : ISessionIsolationStrategy
                string.Equals(LinuxSessionIdentity.BuildUserName(sessionId), userName, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// Removes what the user left in the shared temporary directories (including the
+    /// memory-backed <c>/dev/shm</c>). Throws while any of it stays: the account, and so its uid,
+    /// is then kept, since the next session user to get that uid would own what is left.
+    /// </summary>
     private void RemoveSharedResidue(string userName, uint userId)
     {
+        int remaining;
         try
         {
-            LinuxSessionResidue.RemoveEntriesOwnedBy(userId, _residueRoots);
+            _removeOwnedEntries(userId, _residueRoots, out remaining);
         }
         catch (Exception ex)
         {
+            // The message would name the session's files.
             RunnerLog.Error<LinuxUserIsolationStrategy>(
-                ex,
-                $"Failed removing temporary files of session user '{userName}' (uid {userId}): {ex.Message}");
+                $"Failed removing temporary files of session user '{userName}' (uid {userId}): {ex.GetType().Name}");
+            remaining = 1;
+        }
+
+        if (remaining > 0)
+        {
+            throw new InvalidOperationException(
+                $"{remaining} temporary file(s) of session user '{userName}' (uid {userId}) could not be removed; the account is kept so its uid is not reused.");
         }
     }
 

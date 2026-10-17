@@ -28,7 +28,13 @@ public static class LinuxSessionResidue
     /// </summary>
     /// <returns>How many entries were removed.</returns>
     public static int RemoveEntriesOwnedBy(uint userId, IEnumerable<string> roots)
+        => RemoveEntriesOwnedBy(userId, roots, out _);
+
+    /// <inheritdoc cref="RemoveEntriesOwnedBy(uint, IEnumerable{string})"/>
+    /// <param name="remaining">Entries of the user that could not be removed.</param>
+    public static int RemoveEntriesOwnedBy(uint userId, IEnumerable<string> roots, out int remaining)
     {
+        remaining = 0;
         if (userId == 0)
         {
             throw new ArgumentOutOfRangeException(nameof(userId), "Refusing to remove files owned by root.");
@@ -45,7 +51,7 @@ public static class LinuxSessionResidue
             // Never act through a link at the root itself.
             if (TryReadOwner(root, out _, out var isDirectory) && isDirectory)
             {
-                removed += RemoveOwnedEntries(root, userId, depth: 0);
+                removed += RemoveOwnedEntries(root, userId, depth: 0, ref remaining);
             }
         }
 
@@ -109,7 +115,7 @@ public static class LinuxSessionResidue
         return users;
     }
 
-    private static int RemoveOwnedEntries(string directory, uint userId, int depth)
+    private static int RemoveOwnedEntries(string directory, uint userId, int depth, ref int remaining)
     {
         var removed = 0;
         foreach (var entry in EnumerateEntries(directory))
@@ -125,10 +131,14 @@ public static class LinuxSessionResidue
                 {
                     removed++;
                 }
+                else
+                {
+                    remaining++;
+                }
             }
             else if (isDirectory && depth < MaxDepth)
             {
-                removed += RemoveOwnedEntries(entry, userId, depth + 1);
+                removed += RemoveOwnedEntries(entry, userId, depth + 1, ref remaining);
             }
         }
 
