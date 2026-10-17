@@ -108,10 +108,11 @@ public sealed class SealedStorageProbe
         long? capacity = stats.Type == RamfsMagic ? null : SafeMultiply(stats.Blocks, stats.BlockSize);
         long? free = stats.Type == RamfsMagic ? null : SafeMultiply(stats.AvailableBlocks, stats.BlockSize);
         var headroom = ReadMemoryHeadroomBytes();
+        // Without a memory figure the budget is unknown: the tmpfs size alone may promise memory
+        // the machine does not have.
         long? budget = (free, headroom) switch
         {
-            (null, null) => null,
-            ({ } f, null) => f,
+            (_, null) => null,
             (null, { } h) => h,
             ({ } f, { } h) => Math.Min(f, h),
         };
@@ -165,18 +166,24 @@ public sealed class SealedStorageProbe
             usage = null;
         }
 
-        var total = ReadMemTotalBytes();
+        var total = ReadMeminfoBytes("MemTotal");
         if (limit is null || (total is { } t && limit > t))
         {
             limit = total;
         }
 
-        if (limit is not { } l)
+        // What the kernel can still hand out, which other tenants of the machine also draw on.
+        // Without a usage figure it is the only measure: the limit alone would count memory that
+        // is already in use as free.
+        var available = ReadMeminfoBytes("MemAvailable");
+        long? headroom = limit is { } l && usage is { } u ? Math.Max(0, l - Math.Max(0, u)) : null;
+        return (headroom, available) switch
         {
-            return null;
-        }
-
-        return Math.Max(0, l - Math.Max(0, usage ?? 0));
+            ({ } h, { } a) => Math.Min(h, a),
+            ({ } h, null) => h,
+            (null, { } a) => limit is { } bound ? Math.Min(bound, a) : a,
+            _ => null,
+        };
     }
 
     /// <summary>A counter from a cgroup <c>memory.stat</c> file, or 0 when it is missing.</summary>
@@ -194,7 +201,7 @@ public sealed class SealedStorageProbe
         return 0;
     }
 
-    private long? ReadMemTotalBytes()
+    private long? ReadMeminfoBytes(string field)
     {
         var meminfo = _readFile("/proc/meminfo");
         if (meminfo is null)
@@ -202,14 +209,15 @@ public sealed class SealedStorageProbe
             return null;
         }
 
+        var prefix = field + ":";
         foreach (var line in meminfo.Split('\n'))
         {
-            if (!line.StartsWith("MemTotal:", StringComparison.Ordinal))
+            if (!line.StartsWith(prefix, StringComparison.Ordinal))
             {
                 continue;
             }
 
-            var parts = line["MemTotal:".Length..].Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            var parts = line[prefix.Length..].Split(' ', StringSplitOptions.RemoveEmptyEntries);
             return parts.Length > 0 && ParseLong(parts[0]) is { } kib ? SafeMultiply(kib, 1024) : null;
         }
 

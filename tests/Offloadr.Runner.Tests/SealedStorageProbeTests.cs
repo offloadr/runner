@@ -133,7 +133,21 @@ public class SealedStorageProbeTests
     }
 
     [Test]
-    public void Probe_FallsBackToMemTotalWithoutCgroupFiles()
+    public void Probe_UsesAvailableMemoryWithoutCgroupFiles()
+    {
+        var host = new FakeHost();
+        host.Files.Remove("/sys/fs/cgroup/memory.max");
+        host.Files.Remove("/sys/fs/cgroup/memory.current");
+        // Most of the machine is in use: its total is not headroom.
+        host.Files["/proc/meminfo"] = "MemTotal:       32784444 kB\nMemFree:  1 kB\nMemAvailable:    6291456 kB\n";
+
+        var status = host.Probe().Probe(Required());
+
+        Assert.That(status.MemoryHeadroomBytes, Is.EqualTo(6 * GiB));
+    }
+
+    [Test]
+    public void Probe_ReportsNoHeadroomWithoutAnyUsageFigure()
     {
         var host = new FakeHost();
         host.Files.Remove("/sys/fs/cgroup/memory.max");
@@ -142,7 +156,22 @@ public class SealedStorageProbeTests
 
         var status = host.Probe().Probe(Required());
 
-        Assert.That(status.MemoryHeadroomBytes, Is.EqualTo(32784444L * 1024));
+        Assert.That(status.MemoryHeadroomBytes, Is.Null);
+        Assert.That(status.Available, Is.False);
+    }
+
+    [Test]
+    public void Probe_CapsTheCgroupHeadroomAtTheMachinesAvailableMemory()
+    {
+        var host = new FakeHost();
+        host.Files["/sys/fs/cgroup/memory.max"] = "max\n";
+        host.Files["/sys/fs/cgroup/memory.current"] = "1073741824\n";
+        // Other tenants use most of the machine.
+        host.Files["/proc/meminfo"] = "MemTotal: 8388608 kB\nMemAvailable: 2097152 kB\n";
+
+        var status = host.Probe().Probe(Required());
+
+        Assert.That(status.MemoryHeadroomBytes, Is.EqualTo(2 * GiB));
     }
 
     [Test]

@@ -258,7 +258,7 @@ The image sets `RUNNER_STATUS_FILE=/run/offloadr/status.json`. The agent rewrite
 }
 ```
 
-`sealed_storage.budget_bytes` is the smaller of the sealed root's free space and the container's memory headroom: its memory limit minus its working set (usage without reclaimable page cache, as `docker stats` counts it). A supervisor can read it with `docker exec <container> cat /run/offloadr/status.json`. An empty `active_session_id` means restarting the container will not interrupt a session. The file never leaves the container; unset `RUNNER_STATUS_FILE` to disable it.
+`sealed_storage.budget_bytes` is the smaller of the sealed root's free space and the container's memory headroom: its memory limit minus its working set (usage without reclaimable page cache, as `docker stats` counts it), and never more than the machine's `MemAvailable`. Without a usage figure only `MemAvailable` counts; without either the budget is unknown and sealed storage unavailable. A supervisor can read it with `docker exec <container> cat /run/offloadr/status.json`. An empty `active_session_id` means restarting the container will not interrupt a session. The file never leaves the container; unset `RUNNER_STATUS_FILE` to disable it.
 
 ## Building the Images
 
