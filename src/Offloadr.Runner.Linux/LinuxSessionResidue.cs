@@ -20,6 +20,13 @@ public static class LinuxSessionResidue
     /// </summary>
     public static int? CountIpcObjectsOwnedBy(uint userId, string sysvipcDirectory = "/proc/sysvipc")
     {
+        // A kernel without System V IPC has no such directory; with one, every table is there,
+        // and one that is missing (masked, say) hides what it would list.
+        if (!Directory.Exists(sysvipcDirectory))
+        {
+            return 0;
+        }
+
         var owned = 0;
         foreach (var table in new[] { "shm", "msg", "sem" })
         {
@@ -27,11 +34,6 @@ public static class LinuxSessionResidue
             try
             {
                 lines = File.ReadAllLines(Path.Combine(sysvipcDirectory, table));
-            }
-            catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
-            {
-                // No System V IPC in this kernel: nothing to leave behind.
-                continue;
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {

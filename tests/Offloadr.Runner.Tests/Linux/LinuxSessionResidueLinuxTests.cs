@@ -61,6 +61,29 @@ public class LinuxSessionResidueLinuxTests
     }
 
     [Test]
+    public void CountIpcObjectsOwnedBy_IsUnknownWhenATableIsMissing()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), $"runner-sysvipc-{Guid.NewGuid():N}");
+        try
+        {
+            Directory.CreateDirectory(directory);
+            File.WriteAllText(Path.Combine(directory, "shm"), "key shmid perms size cpid lpid nattch uid gid\n0 7 600 4096 1 1 0 54321 54321\n");
+            File.WriteAllText(Path.Combine(directory, "msg"), "key msqid perms cbytes qnum lspid lrpid uid gid\n");
+
+            // The semaphore table is masked: what it would list is unknown.
+            Assert.That(LinuxSessionResidue.CountIpcObjectsOwnedBy(54321, directory), Is.Null);
+
+            File.WriteAllText(Path.Combine(directory, "sem"), "key semid perms nsems uid gid\n");
+            Assert.That(LinuxSessionResidue.CountIpcObjectsOwnedBy(54321, directory), Is.EqualTo(1));
+            Assert.That(LinuxSessionResidue.CountIpcObjectsOwnedBy(54321, Path.Combine(directory, "absent")), Is.Zero, "a kernel without System V IPC");
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Test]
     [System.Runtime.Versioning.SupportedOSPlatform("linux")]
     public void RemoveEntriesOwnedBy_SkipsOnlyARootThatDoesNotExist()
     {
