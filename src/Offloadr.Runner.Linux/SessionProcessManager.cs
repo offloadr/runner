@@ -1112,6 +1112,14 @@ internal sealed partial class SessionProcessManager : IDisposable
         return _sealing.Mode == SealedStorageMode.Required;
     }
 
+    /// <summary>Whether the session's current runtime keeps its data on the memory-backed root.</summary>
+    public bool IsSessionSealed(string sessionId)
+        => _transferSealings.TryGetValue(sessionId, out var sealing) && sealing.MemoryWorkspace;
+
+    /// <summary>Whether any session currently keeps its data on the memory-backed root.</summary>
+    public bool HasSealedSession()
+        => _transferSealings.Values.Any(static sealing => sealing.MemoryWorkspace);
+
     /// <summary>What the session's current runtime got, or null when none was started.</summary>
     public SessionSealingStatus? GetSessionSealingStatus(string sessionId)
         => _transferSealings.TryGetValue(sessionId, out var sealing) ? sealing.ToStatus() : null;

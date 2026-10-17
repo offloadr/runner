@@ -57,6 +57,31 @@ public class SealedStorageEvictorTests
         Assert.That(calls, Has.Count.EqualTo(1));
     }
 
+    [Test]
+    public void RunOnce_LeavesAnUnsealedSessionAlone()
+    {
+        var calls = 0;
+        var probe = new SealedStorageProbe(
+            _ => null,
+            _ => new LinuxFileSystemStats(0x01021994, 4096, 16384, 16384),
+            path => path == "/dev/shm" ? new LinuxEntryStatus(true, false, 0, UnixFileMode.UserRead) : null,
+            path => path);
+        var evictor = new SealedStorageEvictor(
+            new SealedStorageOptions { Mode = SealedStorageMode.Auto },
+            probe,
+            () => "session-1",
+            (_, _, _) =>
+            {
+                calls++;
+                return 0;
+            },
+            isSessionSealed: _ => false);
+
+        // Docker's default 64 MiB /dev/shm is far below the budget, but the session is on disk.
+        Assert.That(evictor.RunOnce(), Is.Zero);
+        Assert.That(calls, Is.Zero);
+    }
+
     private static SealedStorageStatus Status(long? budget)
         => new("required", false, null, "/dev/shm/offloadr", null, null, null, budget, new SealedStorageSwapStatus(0, "0", false));
 }

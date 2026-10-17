@@ -410,6 +410,50 @@ public class VfsIpcServerLinuxTests
         }
     }
 
+    [Test]
+    public async Task FailedRequests_LogNoPathWhileASealedSessionRuns()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        LinuxTestPrerequisites.RequireUnixDomainSockets();
+
+        var logs = new List<string>();
+        using var loggerFactory = LoggerFactory.Create(builder =>
+        {
+            builder.AddProvider(new RecordingLoggerProvider(logs));
+            builder.SetMinimumLevel(LogLevel.Information);
+        });
+        RunnerLog.Configure(loggerFactory);
+        try
+        {
+            var socketPath = CreateSocketPath();
+            await using var server = new VfsIpcServer(
+                socketPath,
+                (request, _) => throw new IOException($"A sealed transfer did not open: '{request.Path}'"),
+                logEnabled: true)
+            {
+                RedactPaths = static () => true,
+            };
+            server.Start();
+
+            using var client = await ConnectAsync(socketPath);
+            await VfsIpcProtocol.WriteRequestAsync(client, VfsIpcRequest.Open("/dev/shm/offloadr/s/output/alice_portrait.png", "session-1"), CancellationToken.None);
+            await VfsIpcProtocol.ReadResponseAsync(client, CancellationToken.None);
+
+            string[] lines;
+            lock (logs)
+            {
+                lines = [.. logs];
+            }
+
+            Assert.That(lines.Where(static line => line.Contains("[vfs-ipc]", StringComparison.Ordinal)), Is.Not.Empty);
+            Assert.That(lines.Where(static line => line.Contains("alice_portrait", StringComparison.Ordinal)), Is.Empty);
+        }
+        finally
+        {
+            RunnerLog.Configure(null);
+        }
+    }
+
     private sealed class RecordingLoggerProvider(List<string> lines) : ILoggerProvider
     {
         public ILogger CreateLogger(string categoryName) => new RecordingLogger(lines);

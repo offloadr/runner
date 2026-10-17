@@ -12,8 +12,10 @@ public sealed class SealedStorageEvictor(
     Func<string> activeSessionId,
     Func<string, long, TimeSpan, long> evictUploadedArtifacts,
     TimeSpan? interval = null,
-    TimeSpan? minimumIdle = null)
+    TimeSpan? minimumIdle = null,
+    Func<string, bool>? isSessionSealed = null)
 {
+    private readonly Func<string, bool> _isSessionSealed = isSessionSealed ?? (static _ => true);
     private readonly TimeSpan _interval = interval ?? TimeSpan.FromSeconds(15);
     private readonly TimeSpan _minimumIdle = minimumIdle ?? TimeSpan.FromMinutes(2);
 
@@ -46,8 +48,9 @@ public sealed class SealedStorageEvictor(
 
     internal long RunOnce()
     {
+        // An unsealed session keeps its data on disk: there is no budget to keep, and nothing to say.
         var sessionId = activeSessionId();
-        if (string.IsNullOrEmpty(sessionId))
+        if (string.IsNullOrEmpty(sessionId) || !_isSessionSealed(sessionId))
         {
             return 0;
         }

@@ -196,7 +196,8 @@ await using var downloadIpcServer = new ModelDownloadIpcServer(
     downloadService,
     artifactUploadService,
     workspaceMirrorService,
-    sessionManager.GetSessionUserId);
+    sessionManager.GetSessionUserId,
+    sessionManager.HasSealedSession);
 
 try
 {
@@ -273,7 +274,8 @@ var sealedStorageEvictionTask = new SealedStorageEvictor(
     options.Session.Sealing,
     sealedStorageProbe,
     logicalSessionState.GetActiveSessionId,
-    artifactUploadService.EvictUploadedArtifacts).RunAsync(shutdown.Token);
+    artifactUploadService.EvictUploadedArtifacts,
+    isSessionSealed: sessionManager.IsSessionSealed).RunAsync(shutdown.Token);
 
 var statusFilePath = RunnerStatusFileWriter.ResolvePath(Environment.GetEnvironmentVariable);
 var statusFileTask = statusFilePath is null
