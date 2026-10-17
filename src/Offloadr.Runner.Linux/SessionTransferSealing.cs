@@ -244,9 +244,18 @@ internal sealed class SealedReadSinkSlot : IDisposable
     public SealedReadSink Current
         => Sink ?? throw new InvalidOperationException("A transfer chunk arrived before its metadata.");
 
-    public SealedReadSink Replace(SealedReadSink sink)
+    /// <summary>
+    /// Takes the sink for the stream's one metadata frame. A second one fails the read: its
+    /// chunks would follow what the first already wrote, and the file would mix two payloads.
+    /// </summary>
+    public SealedReadSink Begin(SealedReadSink sink)
     {
-        Sink?.Dispose();
+        if (Sink is not null)
+        {
+            sink.Dispose();
+            throw new InvalidOperationException("A transfer sent its metadata twice.");
+        }
+
         Sink = sink;
         return sink;
     }

@@ -483,7 +483,7 @@ internal static class ServiceClientManager
         /// <summary>Whether this runner seals a start that does not ask for it (required mode).</summary>
         public Func<StartSessionCommand, bool>? SealsStart { get; init; }
         /// <summary>Takes the artifacts the session lost when its runtimes' data was removed, for its stop acknowledgement.</summary>
-        public Func<string, int>? TakeUnsavedArtifactCount { get; init; }
+        public Func<string, ulong, int>? TakeUnsavedArtifactCount { get; init; }
     }
 
     internal sealed class RunnerCommandWorkState(CancellationToken shutdown)
@@ -2139,7 +2139,7 @@ internal static class ServiceClientManager
                 if (outcome == StopOutcome.Stopped)
                 {
                     work.Acknowledgement.UnsavedArtifactCount =
-                        (uint)Math.Max(0, deps.TakeUnsavedArtifactCount?.Invoke(command.SessionId) ?? 0);
+                        (uint)Math.Max(0, deps.TakeUnsavedArtifactCount?.Invoke(command.SessionId, command.LifecycleGeneration) ?? 0);
                 }
             }
 
@@ -2322,12 +2322,14 @@ internal static class ServiceClientManager
                         deps.RuntimeIdentities.Set(command.SessionId, command.LifecycleGeneration,
                             command.RuntimeEpoch, command.RuntimeInstanceId);
                         // Retained for relaunches only by the start that was admitted, never by a
-                        // delivery that joined it.
-                        if (command.Sealing is { } sealing)
+                        // delivery that joined it, nor by a duplicate of a runtime already running.
+                        var duplicateOfRunning = deps.GetTrackedRuntime(command.SessionId) is { } tracked &&
+                            tracked.SameRuntime(runtimeIdentity);
+                        if (!duplicateOfRunning && command.Sealing is { } sealing)
                         {
                             deps.WorkState.SessionSealing[command.SessionId] = sealing.Clone();
                         }
-                        else
+                        else if (!duplicateOfRunning)
                         {
                             deps.WorkState.SessionSealing.TryRemove(command.SessionId, out _);
                         }

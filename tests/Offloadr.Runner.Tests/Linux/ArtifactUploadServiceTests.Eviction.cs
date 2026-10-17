@@ -125,6 +125,42 @@ public partial class ArtifactUploadServiceTests
     }
 
     [Test]
+    public async Task UnsavedCount_BelongsToTheLifecycleThatLostTheArtifacts()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var identities = new RuntimeIdentityRegistry();
+            identities.Set("session-1", 1, 1, "instance-1");
+            var paths = CreateEvictionPaths(root, sealedSession: true);
+            var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse())
+            {
+                UploadGate = new TaskCompletionSource().Task,
+            };
+            await using var service = new ArtifactUploadService("runner-secret-value", artifactClient, NullLogger<ArtifactUploadService>.Instance, identities);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            await File.WriteAllBytesAsync(Path.Combine(paths.OutputDirectory, "late.png"), [1, 2, 3]);
+            await artifactClient.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            // Lifecycle 1 exits with one artifact lost; its Stop never comes.
+            Assert.That(await service.StopSessionAsync("session-1"), Is.EqualTo(1));
+
+            // A newer lifecycle of the same session id loses nothing.
+            identities.Set("session-1", 2, 1, "instance-2");
+            var relaunched = CreateEvictionPaths(Path.Combine(root, "next"), sealedSession: true);
+            await service.StartSessionAsync("session-1", relaunched, CancellationToken.None);
+            Assert.That(await service.StopSessionAsync("session-1"), Is.Zero);
+
+            Assert.That(service.TakeUnsavedUploadCount("session-1", 2), Is.Zero, "the older lifecycle's loss is not this one's");
+            Assert.That(service.TakeUnsavedUploadCount("session-1", 1), Is.Zero, "and is dropped once a newer lifecycle reported");
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
     public async Task StopSessionAsync_ThatOverrunsCountsConservativelyAndOnlyOnce()
     {
         var root = CreateTempDirectory();

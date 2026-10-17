@@ -97,6 +97,25 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
+    public async Task DuplicateStartOfARunningRuntime_KeepsTheAdmittedSealing()
+    {
+        var harness = new RuntimeCommandHarness();
+        var start = SealedStart(7, 3, InstanceA);
+        await ServiceClientManager.HandleStartSessionCommand(start, harness.Deps);
+        await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
+        harness.Track(start.SessionId, new RuntimeIdentity(7, 3, InstanceA));
+
+        // The same runtime's Start, delivered again without sealing.
+        var duplicate = Start(7, 3, InstanceA);
+        await ServiceClientManager.HandleStartSessionCommand(duplicate, harness.Deps);
+        await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 2);
+        await ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 4, InstanceB, revision: 1), harness.Deps);
+        await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 1);
+
+        Assert.That(harness.Starts.Last().Sealing, Is.EqualTo(start.Sealing));
+    }
+
+    [Test]
     public async Task LaunchRuntime_ThatWouldWeakenTheSessionsSealingIsRefused()
     {
         var harness = new RuntimeCommandHarness();

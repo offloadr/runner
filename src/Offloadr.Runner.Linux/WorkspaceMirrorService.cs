@@ -448,7 +448,7 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                                 expectedSha256 = response.Metadata.Sha256.Trim();
                             }
 
-                            var archiveSink = sinkSlot.Replace(SealedReadSink.Open(
+                            var archiveSink = sinkSlot.Begin(SealedReadSink.Open(
                                 destination,
                                 response.Metadata.Envelope,
                                 _paths.TransferSealing,
@@ -672,7 +672,7 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                                 expectedSha256 = response.Metadata.Sha256.Trim();
                             }
 
-                            var sink = sinkSlot.Replace(SealedReadSink.Open(
+                            var sink = sinkSlot.Begin(SealedReadSink.Open(
                                 destination,
                                 response.Metadata.Envelope,
                                 _paths.TransferSealing,

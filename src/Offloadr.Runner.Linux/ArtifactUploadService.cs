@@ -46,7 +46,9 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
     private readonly ConcurrentDictionary<string, SessionUploader> _sessions = new(StringComparer.Ordinal);
     // Unsaved artifacts per logical session, summed over its runtimes: a restart removes the old
     // runtime's data too, and the session's Stop must still report what was lost then.
-    private readonly ConcurrentDictionary<string, int> _unsavedBySession = new(StringComparer.Ordinal);
+    // Keyed by lifecycle generation too: a session id is reused by a newer lifecycle, whose Stop
+    // must not report an older one's losses.
+    private readonly ConcurrentDictionary<(string SessionId, ulong Generation), int> _unsavedBySession = new();
     private readonly object _stopGate = new();
     private readonly Dictionary<string, StopInFlight> _stopping = new(StringComparer.Ordinal);
 
@@ -130,20 +132,27 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
     }
 
     /// <summary>
-    /// Takes the artifacts the session lost across all its runtimes, for its stop acknowledgement,
-    /// and forgets them.
+    /// Takes the artifacts the session's lifecycle <paramref name="lifecycleGeneration"/> lost
+    /// across all its runtimes, for its stop acknowledgement, and forgets them along with what
+    /// older lifecycles of the session left unreported.
     /// </summary>
-    public int TakeUnsavedUploadCount(string sessionId)
+    public int TakeUnsavedUploadCount(string sessionId, ulong lifecycleGeneration = 0)
     {
         lock (_stopGate)
         {
             // A stop still running has not counted yet: what it would find is not known.
-            if (_stopping.TryGetValue(sessionId, out var inFlight) && !inFlight.Task.IsCompleted)
+            if (_stopping.TryGetValue(sessionId, out var inFlight) && !inFlight.Task.IsCompleted &&
+                inFlight.Uploader.LifecycleGeneration == lifecycleGeneration)
             {
                 RecordWithoutWaiting(sessionId, inFlight);
             }
 
-            return _unsavedBySession.TryRemove(sessionId, out var count) ? count : 0;
+            foreach (var older in _unsavedBySession.Keys.Where(key => key.SessionId == sessionId && key.Generation < lifecycleGeneration))
+            {
+                _unsavedBySession.TryRemove(older, out _);
+            }
+
+            return _unsavedBySession.TryRemove((sessionId, lifecycleGeneration), out var count) ? count : 0;
         }
     }
 
@@ -286,7 +295,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             stopping.RecordedCount = unsaved;
             if (unsaved > 0)
             {
-                _unsavedBySession.AddOrUpdate(sessionId, unsaved, (_, earlier) => earlier + unsaved);
+                _unsavedBySession.AddOrUpdate((sessionId, stopping.Uploader.LifecycleGeneration), unsaved, (_, earlier) => earlier + unsaved);
             }
         }
 
@@ -315,7 +324,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
         var unsaved = Math.Max(1, stopping.Uploader.PendingUploadCount);
         stopping.RecordedCount = unsaved;
-        _unsavedBySession.AddOrUpdate(sessionId, unsaved, (_, earlier) => earlier + unsaved);
+        _unsavedBySession.AddOrUpdate((sessionId, stopping.Uploader.LifecycleGeneration), unsaved, (_, earlier) => earlier + unsaved);
         _logger.LogWarning(
             "Artifact uploads of session={SessionId} did not stop in time; counting {Count} as not uploaded",
             sessionId,
@@ -398,6 +407,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             _paths = paths;
             _logger = logger;
             _runtimeIdentities = runtimeIdentities;
+            LifecycleGeneration = runtimeIdentities?.TryGet(sessionId, out var identity) == true ? identity.LifecycleGeneration : 0;
             _runnerId = runnerId?.Trim() ?? string.Empty;
             _queue = Channel.CreateUnbounded<UploadRequest>(new UnboundedChannelOptions
             {
@@ -405,6 +415,9 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 SingleWriter = false
             });
         }
+
+        /// <summary>The lifecycle this uploader's runtime belongs to (0 without a registry).</summary>
+        public ulong LifecycleGeneration { get; }
 
         public Task InitializeAsync(CancellationToken cancellationToken)
         {
@@ -1455,7 +1468,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                                 }
 
                                 expectedSha256 = string.IsNullOrWhiteSpace(metadata.Sha256) ? null : metadata.Sha256;
-                                var sink = sinkSlot.Replace(SealedReadSink.Open(
+                                var sink = sinkSlot.Begin(SealedReadSink.Open(
                                     destination,
                                     metadata.Envelope,
                                     _paths.TransferSealing,

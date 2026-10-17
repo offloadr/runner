@@ -264,6 +264,65 @@ public partial class ArtifactUploadServiceTests
     }
 
     [Test]
+    public async Task Readback_ThatSendsMetadataTwicePublishesNothing()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var outputDirectory = Path.Combine(root, "output");
+            Directory.CreateDirectory(outputDirectory);
+            const string filename = "ComfyUI_00007_.png";
+            var outputPath = Path.Combine(outputDirectory, filename);
+            var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse())
+            {
+                // A first payload's prefix, then a second stream claiming the whole wire size.
+                ReadArtifactFrames =
+                [
+                    new() { Metadata = new RunnerReadStreamMetadata { SizeBytes = 6, ModifiedUtc = Timestamp.FromDateTime(DateTime.UtcNow) } },
+                    new() { Chunk = Google.Protobuf.ByteString.CopyFrom([1, 2, 3]) },
+                    new() { Metadata = new RunnerReadStreamMetadata { SizeBytes = 6, ModifiedUtc = Timestamp.FromDateTime(DateTime.UtcNow) } },
+                    new() { Chunk = Google.Protobuf.ByteString.CopyFrom([4, 5, 6]) },
+                ],
+            };
+            await using var service = new ArtifactUploadService("runner-secret-value", artifactClient, NullLogger<ArtifactUploadService>.Instance);
+            var paths = new SessionProcessManager.SessionPaths
+            {
+                HomeDirectory = root,
+                UserDirectory = root,
+                OutputDirectory = outputDirectory,
+                InputDirectory = root,
+                TempDirectory = Path.Combine(root, "temp"),
+                CacheDirectory = root,
+                LogsDirectory = root
+            };
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.SeedSessionAsync(
+                "session-1",
+                "editor-1",
+                "owner-1",
+                [new EditorArtifactMetadata { EditorSid = "editor-1", Filename = filename, Type = "output", Subfolder = string.Empty, SizeBytes = 6 }],
+                CancellationToken.None);
+
+            bool available;
+            try
+            {
+                available = await service.TryEnsureArtifactAvailableAsync(outputPath, highPriority: false, CancellationToken.None);
+            }
+            catch (Exception)
+            {
+                available = false;
+            }
+
+            Assert.That(available, Is.False);
+            Assert.That(File.Exists(outputPath) ? File.ReadAllBytes(outputPath) : [], Is.Empty, "nothing of either payload is published");
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
     public async Task SeedSessionAsync_WithInitialInputArtifact_CreatesPlaceholderAndLazyFetchesFromInputRoot()
     {
         var root = CreateTempDirectory();
@@ -1627,6 +1686,9 @@ public partial class ArtifactUploadServiceTests
         public int ListCallCount { get; private set; }
         public int ReadArtifactCallCount { get; private set; }
 
+        /// <summary>When set, the frames every read answers with, in place of one metadata frame and one chunk.</summary>
+        public RunnerArtifactServiceReadArtifactResponse[]? ReadArtifactFrames { get; set; }
+
         public override AsyncUnaryCall<RunnerArtifactServiceListArtifactsResponse> ListArtifactsAsync(RunnerArtifactServiceListArtifactsRequest request, CallOptions options)
         {
             ListCallCount++;
@@ -1675,6 +1737,8 @@ public partial class ArtifactUploadServiceTests
 
             IAsyncStreamReader<RunnerArtifactServiceReadArtifactResponse> responseStream = BlockingReadArtifactReader is not null
                 ? BlockingReadArtifactReader
+                : ReadArtifactFrames is not null
+                ? new SequenceAsyncStreamReader<RunnerArtifactServiceReadArtifactResponse>(ReadArtifactFrames)
                 : new SequenceAsyncStreamReader<RunnerArtifactServiceReadArtifactResponse>(
                     [
                         new RunnerArtifactServiceReadArtifactResponse

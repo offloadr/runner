@@ -1484,7 +1484,7 @@ public partial class ServiceClientManagerTests
             Shutdown = Shutdown.Token,
             GetSessionSealing = _ => SealingStatus,
             SealsStart = SealsStart,
-            TakeUnsavedArtifactCount = _ => Interlocked.Exchange(ref _unsavedArtifacts, 0),
+            TakeUnsavedArtifactCount = (_, _) => Interlocked.Exchange(ref _unsavedArtifacts, 0),
         };
 
         private Task Record(string call)
