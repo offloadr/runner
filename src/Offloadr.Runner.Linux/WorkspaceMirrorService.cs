@@ -23,12 +23,18 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
     private readonly int _maxDynamicInputEntries;
     private readonly ConcurrentDictionary<string, SessionMirror> _sessions = new(StringComparer.Ordinal);
 
+    private readonly RunnerReadRequesterIdentity _requester;
+
     public WorkspaceMirrorService(
         RunnerWorkspaceService.RunnerWorkspaceServiceClient workspaceClient,
         string? runnerSecret,
         ILogger<WorkspaceMirrorService> logger,
-        int maxDynamicInputEntries = DefaultMaxDynamicInputEntries)
+        int maxDynamicInputEntries = DefaultMaxDynamicInputEntries,
+        RuntimeIdentityRegistry? runtimeIdentities = null,
+        string? runnerId = null,
+        string? instanceId = null)
     {
+        _requester = new RunnerReadRequesterIdentity(runnerId, instanceId, runtimeIdentities);
         _workspaceClient = workspaceClient ?? throw new ArgumentNullException(nameof(workspaceClient));
         _authHeaders = BuildAuthHeaders(runnerSecret);
         _logger = logger;
@@ -48,7 +54,7 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
         await StopSessionAsync(sessionId).ConfigureAwait(false);
 
         ILogger logger = paths.IsSealed ? new SealedSessionLogger(_logger) : _logger;
-        var mirror = new SessionMirror(_workspaceClient, _authHeaders, sessionId, paths, logger, _maxDynamicInputEntries);
+        var mirror = new SessionMirror(_workspaceClient, _authHeaders, sessionId, paths, logger, _maxDynamicInputEntries, _requester);
         if (!_sessions.TryAdd(sessionId, mirror))
         {
             await mirror.DisposeAsync().ConfigureAwait(false);
@@ -165,14 +171,18 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
         private string? _editorSid;
         private int _dynamicInputCount;
 
+        private readonly RunnerReadRequesterIdentity _requester;
+
         public SessionMirror(
             RunnerWorkspaceService.RunnerWorkspaceServiceClient workspaceClient,
             Metadata? authHeaders,
             string sessionId,
             SessionProcessManager.SessionPaths paths,
             ILogger logger,
-            int maxDynamicInputEntries)
+            int maxDynamicInputEntries,
+            RunnerReadRequesterIdentity requester)
         {
+            _requester = requester;
             _workspaceClient = workspaceClient;
             _authHeaders = authHeaders;
             _sessionId = sessionId;
@@ -379,7 +389,8 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                     EditorSid = state.EditorSid,
                     Root = state.Root,
                     RelativePath = state.RelativePath,
-                    ReaderKey = _paths.TransferSealing?.ReaderKeyMessage
+                    ReaderKey = _paths.TransferSealing?.ReaderKeyMessage,
+                    Requester = _requester.For(_sessionId),
                 },
                 headers: _authHeaders,
                 cancellationToken: linkedCancellationToken);
@@ -395,7 +406,8 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                 {
                     EditorSid = _editorSid!,
                     Root = root,
-                    ReaderKey = _paths.TransferSealing?.ReaderKeyMessage
+                    ReaderKey = _paths.TransferSealing?.ReaderKeyMessage,
+                    Requester = _requester.For(_sessionId),
                 },
                 headers: _authHeaders,
                 cancellationToken: cancellationToken);

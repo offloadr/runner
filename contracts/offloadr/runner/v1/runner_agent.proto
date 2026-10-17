@@ -584,6 +584,19 @@ message RunnerReadStreamMetadata {
     SealedEnvelope envelope = 5; // Set when the chunks carry a payload sealed to the request's reader_key.
 }
 
+// Who reads, and for which session runtime. The control plane authorizes a read against exactly
+// this identity and the runner's current assignment (a runtime that is starting or relaunching
+// reads before it is ready) and refuses one for a retired process or runtime. A sealed response's
+// envelope identity takes session_id from here.
+message RunnerReadRequester {
+    string runner_id = 1;
+    string instance_id = 2;           // The registered runner process (RegisterRunnerRequest.instance_id).
+    string session_id = 3;
+    uint64 lifecycle_generation = 4;  // The session runtime the read is for; unset when unknown.
+    uint64 runtime_epoch = 5;
+    string runtime_instance_id = 6;
+}
+
 message RunnerArtifactServiceReadArtifactRequest {
     string editor_sid = 1;
     string filename = 2;
@@ -592,6 +605,7 @@ message RunnerArtifactServiceReadArtifactRequest {
     // The session's reader key. An encryption destination only: the read is authorized exactly
     // as without it, and the response is then sealed to it.
     SealingPublicKey reader_key = 5;
+    RunnerReadRequester requester = 6;
 }
 
 message RunnerArtifactServiceReadArtifactResponse {
@@ -648,6 +662,7 @@ message RunnerWorkspaceServiceReadWorkspaceFileRequest {
     WorkspaceRoot root = 2;
     string relative_path = 3;
     SealingPublicKey reader_key = 4; // As on RunnerArtifactServiceReadArtifactRequest.
+    RunnerReadRequester requester = 5;
 }
 
 message RunnerWorkspaceServiceReadWorkspaceFileResponse {
@@ -673,6 +688,7 @@ message RunnerWorkspaceServiceReadWorkspaceSeedArchiveRequest {
     string editor_sid = 1;
     WorkspaceRoot root = 2;
     SealingPublicKey reader_key = 3; // As on RunnerArtifactServiceReadArtifactRequest.
+    RunnerReadRequester requester = 4;
 }
 
 message RunnerWorkspaceServiceReadWorkspaceSeedArchiveResponse {

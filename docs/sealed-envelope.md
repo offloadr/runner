@@ -71,7 +71,7 @@ Object identity is a tagged union. Every field below is a string. Limits are in 
 | `0x02` | workspace file | `session_id` (128), `root` (64), `relative_path` (4096) |
 | `0x03` | seed archive | `session_id` (128), `root` (64) |
 
-`root` is the workspace root's lower-case name without the enum prefix: `user`, `custom_nodes` or `input`. Field values are exactly those of the transfer request they belong to. Senders MUST NOT normalize or rewrite them.
+`root` is the workspace root's lower-case name without the enum prefix: `user`, `custom_nodes` or `input`. Field values are exactly those of the transfer request they belong to; for a read, `session_id` is the request's `requester.session_id`. Senders MUST NOT normalize or rewrite them.
 
 A parser MUST reject a header that is longer than 8192 bytes or truncated, has the wrong magic, version, suite ids, payload id or chunk size, declares a plaintext size over 4 GiB, has a string over its limit, an empty string where one is not allowed, malformed UTF-8 or an unknown identity kind, or has bytes after the last identity field. With those rules there is exactly one encoding of any header, so the received bytes are the canonical bytes.
 

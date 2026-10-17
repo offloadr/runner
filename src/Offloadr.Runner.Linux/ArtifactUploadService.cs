@@ -78,8 +78,11 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         public int? RecordedCount { get; set; }
     }
 
-    public ArtifactUploadService(string? runnerSecret, RunnerArtifactService.RunnerArtifactServiceClient artifactClient, ILogger<ArtifactUploadService> logger, RuntimeIdentityRegistry? runtimeIdentities = null, string? runnerId = null)
+    private readonly RunnerReadRequesterIdentity _requester;
+
+    public ArtifactUploadService(string? runnerSecret, RunnerArtifactService.RunnerArtifactServiceClient artifactClient, ILogger<ArtifactUploadService> logger, RuntimeIdentityRegistry? runtimeIdentities = null, string? runnerId = null, string? instanceId = null)
     {
+        _requester = new RunnerReadRequesterIdentity(runnerId, instanceId, runtimeIdentities);
         _runnerSecret = string.IsNullOrWhiteSpace(runnerSecret) ? null : runnerSecret.Trim();
         _artifactClient = artifactClient ?? throw new ArgumentNullException(nameof(artifactClient));
         _authHeaders = BuildAuthHeaders(_runnerSecret);
@@ -113,7 +116,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
         // A sealed session's artifact names stay out of the console, which reaches the host's disk.
         ILogger logger = paths.IsSealed ? new SealedSessionLogger(_logger) : _logger;
-        var uploader = new SessionUploader(_runnerSecret, _artifactClient, _authHeaders, sessionId, paths, logger, _runtimeIdentities, _runnerId);
+        var uploader = new SessionUploader(_runnerSecret, _artifactClient, _authHeaders, sessionId, paths, logger, _runtimeIdentities, _runnerId, _requester);
         if (!_sessions.TryAdd(sessionId, uploader))
         {
             await uploader.DisposeAsync().ConfigureAwait(false);
@@ -449,8 +452,11 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         private int _rescanOwed;
         private long _lastDropWarningTicks = long.MinValue / 2;
 
-        public SessionUploader(string? runnerSecret, RunnerArtifactService.RunnerArtifactServiceClient artifactClient, Metadata? authHeaders, string sessionId, SessionProcessManager.SessionPaths paths, ILogger logger, RuntimeIdentityRegistry? runtimeIdentities = null, string? runnerId = null)
+        private readonly RunnerReadRequesterIdentity _requester;
+
+        public SessionUploader(string? runnerSecret, RunnerArtifactService.RunnerArtifactServiceClient artifactClient, Metadata? authHeaders, string sessionId, SessionProcessManager.SessionPaths paths, ILogger logger, RuntimeIdentityRegistry? runtimeIdentities = null, string? runnerId = null, RunnerReadRequesterIdentity? requester = null)
         {
+            _requester = requester ?? new RunnerReadRequesterIdentity(runnerId, null, runtimeIdentities);
             _runnerSecret = runnerSecret;
             _artifactClient = artifactClient;
             _authHeaders = authHeaders;
@@ -1469,7 +1475,8 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         Filename = state.Filename,
                         Type = state.Type,
                         Subfolder = state.Subfolder,
-                        ReaderKey = _paths.TransferSealing?.ReaderKeyMessage
+                        ReaderKey = _paths.TransferSealing?.ReaderKeyMessage,
+                        Requester = _requester.For(_sessionId),
                     },
                     headers: _authHeaders,
                     cancellationToken: token);

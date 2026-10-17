@@ -216,10 +216,15 @@ public partial class ArtifactUploadServiceTests
             const string filename = "ComfyUI_00006_.png";
             var outputPath = Path.Combine(outputDirectory, filename);
             var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse());
+            var identities = new RuntimeIdentityRegistry();
+            identities.Set("session-1", 5, 2, "instance-a");
             await using var service = new ArtifactUploadService(
                 runnerSecret: "runner-secret-value",
                 artifactClient,
-                NullLogger<ArtifactUploadService>.Instance);
+                NullLogger<ArtifactUploadService>.Instance,
+                identities,
+                "runner-1",
+                "process-1");
 
             var paths = new SessionProcessManager.SessionPaths
             {
@@ -255,6 +260,15 @@ public partial class ArtifactUploadServiceTests
             Assert.That(available, Is.True);
             Assert.That(artifactClient.LastReadArtifactRequest, Is.Not.Null);
             Assert.That(artifactClient.LastReadArtifactRequest!.EditorSid, Is.EqualTo("editor-current"));
+            Assert.That(artifactClient.LastReadArtifactRequest.Requester, Is.EqualTo(new RunnerReadRequester
+            {
+                RunnerId = "runner-1",
+                InstanceId = "process-1",
+                SessionId = "session-1",
+                LifecycleGeneration = 5,
+                RuntimeEpoch = 2,
+                RuntimeInstanceId = "instance-a",
+            }));
             Assert.That(new FileInfo(outputPath).Length, Is.EqualTo(4));
         }
         finally

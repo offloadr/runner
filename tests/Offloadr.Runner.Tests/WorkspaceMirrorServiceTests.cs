@@ -358,6 +358,56 @@ public class WorkspaceMirrorServiceTests
     }
 
     [Test]
+    public async Task Reads_NameTheRunnerProcessAndTheSessionRuntime()
+    {
+        const string sessionId = "session-requester";
+        var tempRoot = CreateTempDirectory();
+
+        try
+        {
+            var paths = CreateSessionPaths(tempRoot);
+            var workspaceClient = new FakeRunnerWorkspaceClient
+            {
+                FileContentsByRelativePath = new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["late/audio.wav"] = "live-audio"
+                }
+            };
+            var identities = new RuntimeIdentityRegistry();
+            identities.Set(sessionId, 7, 3, "instance-a");
+            await using var service = new WorkspaceMirrorService(
+                workspaceClient,
+                "runner-secret-value",
+                NullLogger<WorkspaceMirrorService>.Instance,
+                runtimeIdentities: identities,
+                runnerId: "runner-1",
+                instanceId: "process-1");
+
+            await service.PrepareSessionAsync(sessionId, paths, "editor-1", "comfyui", [], CancellationToken.None);
+            Assert.That(
+                await service.TryEnsureWorkspaceFileAvailableAsync(Path.Combine(paths.InputDirectory, "late", "audio.wav"), highPriority: false, CancellationToken.None),
+                Is.True);
+
+            var expected = new RunnerReadRequester
+            {
+                RunnerId = "runner-1",
+                InstanceId = "process-1",
+                SessionId = sessionId,
+                LifecycleGeneration = 7,
+                RuntimeEpoch = 3,
+                RuntimeInstanceId = "instance-a",
+            };
+            Assert.That(workspaceClient.SeedArchiveRequestMessages, Is.Not.Empty);
+            Assert.That(workspaceClient.SeedArchiveRequestMessages.Select(static request => request.Requester), Has.All.EqualTo(expected));
+            Assert.That(workspaceClient.DownloadRequests.Single().Requester, Is.EqualTo(expected));
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+        }
+    }
+
+    [Test]
     public async Task TryEnsureWorkspaceFileAvailableAsync_DownloadsInputFilesAddedAfterStartup()
     {
         const string sessionId = "session-live-input";
@@ -943,11 +993,13 @@ public class WorkspaceMirrorServiceTests
         public Action? AfterSeedArchiveStream { get; init; }
         public BlockingResponseStreamReader? BlockingInputReader { get; init; }
         public List<WorkspaceRoot> SeedArchiveRequests { get; } = [];
+        public List<RunnerWorkspaceServiceReadWorkspaceSeedArchiveRequest> SeedArchiveRequestMessages { get; } = [];
         public List<RunnerWorkspaceServiceReadWorkspaceFileRequest> DownloadRequests { get; } = [];
 
         public override AsyncServerStreamingCall<RunnerWorkspaceServiceReadWorkspaceSeedArchiveResponse> ReadWorkspaceSeedArchive(RunnerWorkspaceServiceReadWorkspaceSeedArchiveRequest request, CallOptions options)
         {
             SeedArchiveRequests.Add(request.Root);
+            SeedArchiveRequestMessages.Add(request);
             IAsyncStreamReader<RunnerWorkspaceServiceReadWorkspaceSeedArchiveResponse> responseStream = ThrowArchiveRead
                 ? new ThrowingArchiveResponseStreamReader()
                 : new SequenceAsyncStreamReader<RunnerWorkspaceServiceReadWorkspaceSeedArchiveResponse>(

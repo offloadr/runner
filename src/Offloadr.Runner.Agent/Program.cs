@@ -137,11 +137,15 @@ await using var artifactUploadService = new ArtifactUploadService(
     artifactCatalogClient,
     loggerFactory.CreateLogger<ArtifactUploadService>(),
     runtimeIdentities,
-    options.RunnerId);
+    options.RunnerId,
+    instanceId);
 await using var workspaceMirrorService = new WorkspaceMirrorService(
     workspaceCatalogClient,
     options.RunnerSecret,
-    loggerFactory.CreateLogger<WorkspaceMirrorService>());
+    loggerFactory.CreateLogger<WorkspaceMirrorService>(),
+    runtimeIdentities: runtimeIdentities,
+    runnerId: options.RunnerId,
+    instanceId: instanceId);
 await using var downloadService = new ModelDownloadService(
     downloadBackend,
     options.Aria2,
