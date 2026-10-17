@@ -2564,6 +2564,7 @@ internal static class ServiceClientManager
             command.LifecycleGeneration,
             command.RuntimeEpoch,
             command.RuntimeInstanceId);
+        var startSealing = deps.WorkState.SessionSealing.TryGetValue(command.SessionId, out var retained) ? retained : null;
         var start = new StartSessionCommand
         {
             SessionId = command.SessionId,
@@ -2575,9 +2576,10 @@ internal static class ServiceClientManager
             RuntimeEpoch = command.RuntimeEpoch,
             RuntimeInstanceId = command.RuntimeInstanceId,
             // The launch's own sealing wins; the start's covers a control plane that omits it.
-            Sealing = command.Sealing?.Clone() ??
-                (deps.WorkState.SessionSealing.TryGetValue(command.SessionId, out var sealing) ? sealing.Clone() : null),
+            Sealing = command.Sealing?.Clone() ?? startSealing?.Clone(),
         };
+        // A restart keeps the logical session: it never runs it with less sealing than it started with.
+        var weakensSealing = startSealing?.Required == true && command.Sealing is { Required: false };
         start.InitialModels.AddRange(command.InitialModels);
         start.InitialArtifacts.AddRange(command.InitialArtifacts);
         start.InitialWorkspaceFiles.AddRange(command.InitialWorkspaceFiles);
@@ -2590,6 +2592,11 @@ internal static class ServiceClientManager
             {
                 try
                 {
+                    if (weakensSealing)
+                    {
+                        throw new InvalidOperationException("The session started sealed; a runtime launch cannot run it unsealed.");
+                    }
+
                     await deps.StartRuntimeAndWaitForReady(start, cancellationToken).ConfigureAwait(false);
                     return new StartupOutcome(
                         true,

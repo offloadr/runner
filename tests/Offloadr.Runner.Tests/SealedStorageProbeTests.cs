@@ -109,6 +109,19 @@ public class SealedStorageProbeTests
         }
     }
 
+    [TestCase("/dev/shm", "1770")]
+    [TestCase("/dev", "750")]
+    public void Probe_NeedsAncestorsSessionUsersCanTraverse(string ancestor, string mode)
+    {
+        var host = new FakeHost();
+        host.Entries[ancestor] = new LinuxEntryStatus(true, false, 0, (UnixFileMode)Convert.ToInt32(mode, 8));
+
+        var status = host.Probe().Probe(Required());
+
+        Assert.That(status.Available, Is.False);
+        Assert.That(status.Reason, Does.Contain($"'{ancestor}' must let session users traverse it"));
+    }
+
     [TestCase("/dev/shm", 1000u, "755", TestName = "Probe_RefusesARootUnderAUserOwnedParent")]
     [TestCase("/dev/shm", 0u, "777", TestName = "Probe_RefusesARootUnderAParentOthersCanRenameIn")]
     [TestCase("/dev", 1000u, "755", TestName = "Probe_RefusesARootUnderAReplaceableAncestor")]

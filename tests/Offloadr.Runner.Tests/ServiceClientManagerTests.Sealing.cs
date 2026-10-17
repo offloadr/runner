@@ -97,6 +97,24 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
+    public async Task LaunchRuntime_ThatWouldWeakenTheSessionsSealingIsRefused()
+    {
+        var harness = new RuntimeCommandHarness();
+        await ServiceClientManager.HandleStartSessionCommand(SealedStart(7, 3, InstanceA), harness.Deps);
+        await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
+        var startsBefore = harness.Starts.Count;
+
+        var launch = Launch(7, 4, InstanceB, revision: 1);
+        launch.Sealing = new SessionSealing { Required = false };
+        await ServiceClientManager.HandleLaunchRuntimeCommand(launch, harness.Deps);
+
+        var ack = await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 1);
+        Assert.That(ack.Ready, Is.False);
+        Assert.That(ack.Message, Does.Contain("cannot run it unsealed"));
+        Assert.That(harness.Starts, Has.Count.EqualTo(startsBefore), "no runtime was started");
+    }
+
+    [Test]
     public async Task DuplicateStartDelivery_DoesNotReplaceTheAdmittedStartsSealing()
     {
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);

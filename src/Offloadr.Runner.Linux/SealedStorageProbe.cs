@@ -102,6 +102,14 @@ public sealed class SealedStorageProbe
                 new SealedStorageSwapStatus(swapDevices, swapLimit, false));
         }
 
+        // Session users reach their directories through every ancestor.
+        if (FindUntraversableAncestor(options.Root) is { } closed)
+        {
+            return Unavailable(
+                $"sealed root's ancestor '{closed}' must let session users traverse it (execute for others)",
+                new SealedStorageSwapStatus(swapDevices, swapLimit, false));
+        }
+
         var noswap = MountHasOption(_resolvePath(target), "noswap");
         var swap = new SealedStorageSwapStatus(swapDevices, swapLimit, noswap);
         if (_statFileSystem(target) is not { } stats)
@@ -159,6 +167,23 @@ public sealed class SealedStorageProbe
             current = separator == 0 ? "/" : current[..separator];
             if (_statEntry(current) is not { IsDirectory: true, IsSymbolicLink: false, OwnerId: 0 } entry ||
                 ((entry.Mode & (UnixFileMode.GroupWrite | UnixFileMode.OtherWrite)) != 0 && (entry.Mode & UnixFileMode.StickyBit) == 0))
+            {
+                return current;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>The first ancestor of <paramref name="path"/> others may not traverse, or null.</summary>
+    private string? FindUntraversableAncestor(string path)
+    {
+        var current = path;
+        while (current != "/")
+        {
+            var separator = current.LastIndexOf('/');
+            current = separator == 0 ? "/" : current[..separator];
+            if (_statEntry(current) is not { } entry || (entry.Mode & UnixFileMode.OtherExecute) == 0)
             {
                 return current;
             }
