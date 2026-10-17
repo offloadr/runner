@@ -493,8 +493,9 @@ internal static class ServiceClientManager
         // Retain successful Stops for the process lifetime, including reconnects.
         // Evicting a nonce would allow a delayed retry to stop a replacement runtime.
         public ConcurrentDictionary<Guid, StopCommandWork> Stops { get; } = new();
-        // The sealing each logical session was started with; a relaunch of its runtime keeps it.
-        public ConcurrentDictionary<string, SessionSealing> SessionSealing { get; } = new(StringComparer.Ordinal);
+        // The sealing each logical session was started with, by the lifecycle that started it; a
+        // relaunch of its runtime keeps it.
+        public ConcurrentDictionary<string, RetainedSealing> SessionSealing { get; } = new(StringComparer.Ordinal);
         private TrackedCommandWork? _activeStartup;
 
         public TrackedCommandWork? GetActiveStartup()
@@ -2052,6 +2053,9 @@ internal static class ServiceClientManager
     /// remains the session's identity; a cleanup that could not stop the child keeps
     /// the state until the process exits.
     /// </summary>
+    /// <summary>A session's start sealing and the lifecycle generation of the start that set it.</summary>
+    internal sealed record RetainedSealing(ulong LifecycleGeneration, SessionSealing Sealing);
+
     private static async Task CleanUpFailedStartupAsync(
         string sessionId,
         RuntimeIdentity failedRuntime,
@@ -2077,6 +2081,14 @@ internal static class ServiceClientManager
                 failedRuntime.LifecycleGeneration,
                 failedRuntime.RuntimeEpoch,
                 failedRuntime.RuntimeInstanceId);
+            // The failed lifecycle's sealing goes with it: a later launch that omits its own must
+            // not inherit this one's recipient. A newer start's is left alone.
+            if (deps.WorkState.SessionSealing.TryGetValue(sessionId, out var retained) &&
+                retained.LifecycleGeneration == failedRuntime.LifecycleGeneration)
+            {
+                ((ICollection<KeyValuePair<string, RetainedSealing>>)deps.WorkState.SessionSealing).Remove(new(sessionId, retained));
+            }
+
             return;
         }
 
@@ -2329,7 +2341,7 @@ internal static class ServiceClientManager
                             tracked.SameRuntime(runtimeIdentity);
                         if (!duplicateOfRunning && command.Sealing is { } sealing)
                         {
-                            deps.WorkState.SessionSealing[command.SessionId] = sealing.Clone();
+                            deps.WorkState.SessionSealing[command.SessionId] = new RetainedSealing(command.LifecycleGeneration, sealing.Clone());
                         }
                         else if (!duplicateOfRunning)
                         {
@@ -2568,7 +2580,7 @@ internal static class ServiceClientManager
             command.LifecycleGeneration,
             command.RuntimeEpoch,
             command.RuntimeInstanceId);
-        var startSealing = deps.WorkState.SessionSealing.TryGetValue(command.SessionId, out var retained) ? retained : null;
+        var startSealing = deps.WorkState.SessionSealing.TryGetValue(command.SessionId, out var retained) ? retained.Sealing : null;
         var start = new StartSessionCommand
         {
             SessionId = command.SessionId,

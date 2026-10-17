@@ -21,6 +21,26 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
+    public async Task FailedStart_DoesNotLeaveItsSealingForALaterLaunch()
+    {
+        var harness = new RuntimeCommandHarness
+        {
+            BeforeStart = (start, _) => start.RuntimeEpoch == 3
+                ? throw new InvalidOperationException("Sealed storage is unavailable: low.")
+                : Task.CompletedTask,
+        };
+        await ServiceClientManager.HandleStartSessionCommand(SealedStart(7, 3, InstanceA), harness.Deps);
+        var ack = await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
+        Assert.That(ack.Ready, Is.False);
+
+        // A launch whose Start this runner did not see, without sealing of its own.
+        await ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 4, InstanceB, revision: 1), harness.Deps);
+        await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 1);
+
+        Assert.That(harness.Starts.Last().Sealing, Is.Null, "the failed start's recipient is not inherited");
+    }
+
+    [Test]
     public async Task StartSession_ThatFailsAcknowledgesNoSealing()
     {
         var harness = new RuntimeCommandHarness
