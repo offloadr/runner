@@ -92,8 +92,19 @@ public static class LinuxSessionResidue
         var removed = 0;
         foreach (var root in roots)
         {
+            if (!TryReadOwner(root, out _, out var isDirectory))
+            {
+                // A root that does not exist holds nothing; one that cannot be read may.
+                if (!SealedHostLockdown.IsGone(root))
+                {
+                    remaining++;
+                }
+
+                continue;
+            }
+
             // Never act through a link at the root itself.
-            if (TryReadOwner(root, out _, out var isDirectory) && isDirectory)
+            if (isDirectory)
             {
                 removed += RemoveOwnedEntries(root, userId, ref remaining);
             }

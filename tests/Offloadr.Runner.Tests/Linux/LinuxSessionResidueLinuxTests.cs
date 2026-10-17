@@ -62,6 +62,18 @@ public class LinuxSessionResidueLinuxTests
 
     [Test]
     [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public void RemoveEntriesOwnedBy_SkipsOnlyARootThatDoesNotExist()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+
+        var missing = Path.Combine(Path.GetTempPath(), $"runner-missing-{Guid.NewGuid():N}");
+        LinuxSessionResidue.RemoveEntriesOwnedBy(54321, [missing], out var remaining);
+
+        Assert.That(remaining, Is.Zero);
+    }
+
+    [Test]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
     public async Task RemoveEntriesOwnedBy_ReachesAFileAnyDepthDown()
     {
         LinuxTestPrerequisites.RequireLinux();
