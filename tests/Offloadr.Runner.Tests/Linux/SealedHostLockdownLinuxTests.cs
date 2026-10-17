@@ -95,6 +95,45 @@ public class SealedHostLockdownLinuxTests
     }
 
     [Test]
+    public void FindSharedWritableDirectories_WalksEveryWritableDiskMount()
+    {
+        var shared = Mode0755 | UnixFileMode.OtherWrite;
+        // /data is a 0755 volume, below nothing shared, with a scratch folder anyone may write;
+        // a world-writable file outside it is not usable (its folder is closed to writes).
+        // /sys/fs/cgroup is a kernel filesystem and is not entered.
+        var entries = new Dictionary<string, (LinuxEntryStatus Status, ulong Device, string[] Children)>(StringComparer.Ordinal)
+        {
+            ["/"] = (new(true, false, 0, Mode0755), 1, ["/data", "/sys"]),
+            ["/data"] = (new(true, false, 0, Mode0755), 7, ["/data/scratch", "/data/models", "/data/open.log"]),
+            ["/data/scratch"] = (new(true, false, 0, shared), 7, ["/data/scratch/cache.bin"]),
+            ["/data/scratch/cache.bin"] = (new(false, false, 0, shared, IsRegularFile: true), 7, []),
+            ["/data/models"] = (new(true, false, 0, Mode0755), 7, ["/data/models/deep"]),
+            ["/data/models/deep"] = (new(true, false, 0, shared), 7, []),
+            ["/data/open.log"] = (new(false, false, 0, shared, IsRegularFile: true), 7, []),
+            ["/sys"] = (new(true, false, 0, Mode0755), 8, ["/sys/fs"]),
+            ["/sys/fs"] = (new(true, false, 0, Mode0755), 8, ["/sys/fs/cgroup"]),
+            ["/sys/fs/cgroup"] = (new(true, false, 0, Mode0755), 9, ["/sys/fs/cgroup/open"]),
+            ["/sys/fs/cgroup/open"] = (new(true, false, 0, shared), 9, []),
+        };
+        var mounts = new SealedHostLockdown.Mount[]
+        {
+            new("/", "overlay", false),
+            new("/data", "ext4", false),
+            new("/sys", "sysfs", false),
+            new("/sys/fs/cgroup", "cgroup2", false),
+        };
+
+        var found = SealedHostLockdown.FindSharedWritableDirectories(
+            "/",
+            path => entries.TryGetValue(path, out var entry) ? entry.Status : null,
+            path => entries.TryGetValue(path, out var entry) ? new LinuxFileIdentity(entry.Device, InodeOf(path), 0) : null,
+            (path, _) => entries[path].Children,
+            mounts);
+
+        Assert.That(found, Is.EquivalentTo(new[] { "/data/scratch", "/data/scratch/cache.bin", "/data/models/deep" }));
+    }
+
+    [Test]
     public void FindSharedWritableDirectories_VisitsADirectoryOnceThroughABindMountLoop()
     {
         var shared = Mode0755 | UnixFileMode.OtherWrite;

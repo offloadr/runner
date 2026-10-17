@@ -11,14 +11,14 @@ public static class SealedHostLockdown
     public static readonly IReadOnlyList<string> SharedTemporaryDirectories = ["/tmp", "/var/tmp"];
 
     /// <summary>
-    /// Directories on <paramref name="root"/>'s filesystem that anyone may write, at any depth,
-    /// such as <c>/tmp</c>, <c>/var/tmp</c>, <c>/run/lock</c> or Ubuntu's <c>/var/crash</c>, and
-    /// world-writable mount points there, such as a volume mounted into the container. Inside a
-    /// world-writable directory every world-writable directory and regular file is reported too,
-    /// since closing only the top would leave them usable. That includes filesystems mounted
-    /// anywhere below one, which a session can still traverse into; read-only and memory-backed
-    /// ones are not entered. Other filesystems are not entered, symlinks are not followed, each
-    /// directory is visited once (bind mounts can repeat one) and sockets are left alone. A
+    /// Directories anyone may write, at any depth, on <paramref name="root"/>'s filesystem and on
+    /// every writable disk mounted below it (a volume a session can traverse into), such as
+    /// <c>/tmp</c>, <c>/var/tmp</c>, <c>/run/lock</c>, Ubuntu's <c>/var/crash</c> or a scratch
+    /// folder on a volume. Inside a world-writable directory every world-writable directory and
+    /// regular file is reported too, since closing only the top would leave them usable.
+    /// Read-only, memory-backed and kernel filesystems are not entered, symlinks are not
+    /// followed, each directory is visited once (bind mounts can repeat one) and sockets are left
+    /// alone. A
     /// directory that cannot be listed (a FUSE or network mount refusing root) goes to
     /// <paramref name="unlisted"/>: what a session can write below it is unknown.
     /// </summary>
@@ -50,15 +50,15 @@ public static class SealedHostLockdown
         visited.Add((rootIdentity.DeviceId, rootIdentity.Inode));
         Walk(root, rootIdentity.DeviceId, insideShared: false);
 
-        // A mount below a shared directory is reachable although the walk above stayed on its own
-        // filesystem. Parents sort before their children, so a mount nested in a walked mount is
-        // judged after what that walk found.
+        // Each other filesystem a session can traverse into is walked on its own: inside, as a
+        // shared directory, when it lies below one. Parents sort before their children, so a mount
+        // nested in a walked mount is judged after what that walk found.
         var prefix = root.EndsWith('/') ? root : root + "/";
         foreach (var mount in mounts
                      .Where(mount => mount.MountPoint.StartsWith(prefix, StringComparison.Ordinal))
                      .OrderBy(static mount => mount.MountPoint, StringComparer.Ordinal))
         {
-            if (mount.ReadOnly || mount.Type is "tmpfs" or "ramfs" || !IsSharedOrBelowShared(mount.MountPoint) ||
+            if (mount.ReadOnly || NotDiskBackedTypes.Contains(mount.Type) ||
                 statEntry(mount.MountPoint) is not { IsDirectory: true, IsSymbolicLink: false } ||
                 identityOf(mount.MountPoint) is not { } identity ||
                 !visited.Add((identity.DeviceId, identity.Inode)))
@@ -66,7 +66,7 @@ public static class SealedHostLockdown
                 continue;
             }
 
-            Walk(mount.MountPoint, identity.DeviceId, insideShared: true);
+            Walk(mount.MountPoint, identity.DeviceId, insideShared: IsSharedOrBelowShared(mount.MountPoint));
         }
 
         return found;
@@ -135,6 +135,14 @@ public static class SealedHostLockdown
             }
         }
     }
+
+    /// <summary>Memory-backed and kernel filesystems: nothing written there reaches a disk.</summary>
+    private static readonly HashSet<string> NotDiskBackedTypes = new(StringComparer.Ordinal)
+    {
+        "tmpfs", "ramfs", "proc", "sysfs", "devtmpfs", "devpts", "mqueue", "cgroup", "cgroup2",
+        "debugfs", "tracefs", "securityfs", "pstore", "bpf", "hugetlbfs", "configfs", "fusectl",
+        "binfmt_misc", "autofs", "nsfs", "efivarfs", "rpc_pipefs", "nfsd",
+    };
 
     /// <summary>One line of <c>/proc/self/mounts</c>.</summary>
     internal sealed record Mount(string MountPoint, string Type, bool ReadOnly);
