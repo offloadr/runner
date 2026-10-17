@@ -426,6 +426,50 @@ public partial class SessionProcessManagerOwnershipTests
 
     [Test]
     [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public async Task StopOfARunningSealedSession_StaysPendingWhileItsDataCannotBeRemoved()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        LinuxTestPrerequisites.RequireRoot();
+
+        var (tempRoot, sealedRoot, options) = CreateSealedOptions("comfyui");
+        var entryPoint = Path.Combine(tempRoot, "editor.sh");
+        File.WriteAllText(entryPoint, "#!/bin/sh\nexec /bin/sleep 600\n");
+        File.SetUnixFileMode(entryPoint, Mode0755);
+        options = WithEntryPoint(options, entryPoint);
+        const string sessionId = "session-busy";
+        var homeDirectory = Path.Combine(options.SessionRoot, sessionId);
+        var sealedDirectory = Path.Combine(sealedRoot, sessionId);
+
+        try
+        {
+            var isolation = new RecordingIsolationStrategy(string.Empty, homeDirectory);
+            using var manager = new SessionProcessManager(options, isolation, SealedVfsBuilder(), new RecordingCommandRunner(string.Empty)) { PrepareSealedHost = HostLockedDown };
+            await manager.StartSessionAsync(SealedStart(sessionId), CancellationToken.None);
+            var deleteDirectory = manager.DeleteDirectoryRecursively;
+            manager.DeleteDirectoryRecursively = _ => throw new IOException("Device or resource busy");
+
+            var pending = Assert.ThrowsAsync<InvalidOperationException>(() => manager.StopSessionAsync(sessionId, CancellationToken.None));
+            Assert.That(Directory.Exists(sealedDirectory), Is.True);
+
+            manager.DeleteDirectoryRecursively = deleteDirectory;
+            await manager.StopSessionAsync(sessionId, CancellationToken.None);
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(pending!.Message, Does.Contain("not complete"));
+                Assert.That(Directory.Exists(sealedDirectory), Is.False);
+                Assert.That(isolation.CleanupCallCount, Is.EqualTo(1), "the retry acts only on the sealed data");
+            });
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+            TryDelete(sealedRoot);
+        }
+    }
+
+    [Test]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
     public async Task SealedSession_UnexpectedEditorExitRemovesTheSealedDirectory()
     {
         LinuxTestPrerequisites.RequireLinux();
@@ -808,7 +852,8 @@ public partial class SessionProcessManagerOwnershipTests
 
         try
         {
-            using var manager = new SessionProcessManager(options, new RecordingIsolationStrategy("sess_undeletable", homeDirectory), SealedVfsBuilder(), new RecordingCommandRunner(string.Empty)) { PrepareSealedHost = HostLockedDown };
+            var isolation = new RecordingIsolationStrategy("sess_undeletable", homeDirectory);
+            using var manager = new SessionProcessManager(options, isolation, SealedVfsBuilder(), new RecordingCommandRunner(string.Empty)) { PrepareSealedHost = HostLockedDown };
             var deleteDirectory = manager.DeleteDirectoryRecursively;
             manager.DeleteDirectoryRecursively = _ => throw new IOException("Directory not empty: 'output/my-secret-portrait.png'");
 
@@ -832,6 +877,8 @@ public partial class SessionProcessManagerOwnershipTests
             {
                 Assert.That(Directory.Exists(sealedDirectory), Is.False);
                 Assert.That(manager.GetSessionSealingStatus(sessionId), Is.Null);
+                // The account went with the first cleanup; its uid may be someone else's by now.
+                Assert.That(isolation.CleanupCallCount, Is.EqualTo(1), "retries act only on the sealed data");
             });
         }
         finally

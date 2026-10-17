@@ -422,6 +422,7 @@ internal sealed partial class SessionProcessManager : IDisposable
 
         context.Cancellation.Cancel();
         var beforeCleanupCompleted = false;
+        var cleanedUp = false;
         try
         {
             await TerminateProcessAsync(context, cancellationToken).ConfigureAwait(false);
@@ -432,6 +433,7 @@ internal sealed partial class SessionProcessManager : IDisposable
             }
 
             await CleanupTrackedContextAsync(context, cancellationToken).ConfigureAwait(false);
+            cleanedUp = true;
             ThrowIfTeardownPending(sessionId);
             stopCompletion.TrySetResult();
             return true;
@@ -442,7 +444,9 @@ internal sealed partial class SessionProcessManager : IDisposable
 
             try
             {
-                if (context.Process.HasExited)
+                // After its cleanup the process handle is disposed; what is left is retried as a
+                // pending teardown by the next Stop.
+                if (!cleanedUp && context.Process.HasExited)
                 {
                     if (!beforeCleanupCompleted)
                     {
@@ -1396,13 +1400,14 @@ internal sealed partial class SessionProcessManager : IDisposable
             {
                 // Closed to everyone but root meanwhile; the session's Stop retries and stays
                 // pending until the plaintext is gone.
-                _undeletedStaleSealedSessions[sessionId] = 0;
+                _pendingSealedDeletes[sessionId] = 0;
             }
         }
     }
 
     private readonly ConcurrentDictionary<string, ulong> _staleSealedSessions = new(StringComparer.Ordinal);
-    private readonly ConcurrentDictionary<string, byte> _undeletedStaleSealedSessions = new(StringComparer.Ordinal);
+    // Sessions whose sealed directory is still to be removed; their Stop retries only that.
+    private readonly ConcurrentDictionary<string, byte> _pendingSealedDeletes = new(StringComparer.Ordinal);
 
     /// <summary>
     /// Takes the sessions, with the lifecycle generation that wrote it (0 when unknown), whose
@@ -1769,16 +1774,18 @@ internal sealed partial class SessionProcessManager : IDisposable
             return;
         }
 
+        // The account is gone, and its uid may be handed out again: a retry must never act on
+        // that uid, only on what is left of this session.
+        _pendingTeardowns.TryRemove(new KeyValuePair<string, PreparedSessionIdentity>(sessionId, identity));
         DeleteSessionHomeDirectory(identity.HomeDirectory);
         if (!DeleteSealedSessionDirectory(sessionId))
         {
             // Plaintext session data is still there: Stop stays pending until a retry removes it,
             // and the reader key is kept until then.
-            _pendingTeardowns[sessionId] = identity;
+            _pendingSealedDeletes[sessionId] = 0;
             return;
         }
 
-        _pendingTeardowns.TryRemove(new KeyValuePair<string, PreparedSessionIdentity>(sessionId, identity));
         ReleaseTransferSealing(sessionId);
     }
 
@@ -1793,16 +1800,17 @@ internal sealed partial class SessionProcessManager : IDisposable
             await CleanupPreparedStartupAsync(identity, sessionId).ConfigureAwait(false);
         }
 
-        // Sealed data an earlier runner process left that startup could not remove.
-        if (_undeletedStaleSealedSessions.ContainsKey(sessionId))
+        // Sealed data a teardown, or startup for an earlier runner process, could not remove.
+        if (_pendingSealedDeletes.ContainsKey(sessionId))
         {
             if (!DeleteSealedSessionDirectory(sessionId))
             {
                 throw new InvalidOperationException(
-                    $"Sealed data of session '{sessionId}' left by an earlier runner process could not be removed; the stop is not complete.");
+                    $"Sealed data of session '{sessionId}' could not be removed; the stop is not complete.");
             }
 
-            _undeletedStaleSealedSessions.TryRemove(sessionId, out _);
+            _pendingSealedDeletes.TryRemove(sessionId, out _);
+            ReleaseTransferSealing(sessionId);
         }
 
         ThrowIfTeardownPending(sessionId);
@@ -1810,7 +1818,7 @@ internal sealed partial class SessionProcessManager : IDisposable
 
     private void ThrowIfTeardownPending(string sessionId)
     {
-        if (_pendingTeardowns.ContainsKey(sessionId))
+        if (_pendingTeardowns.ContainsKey(sessionId) || _pendingSealedDeletes.ContainsKey(sessionId))
         {
             throw new InvalidOperationException(
                 $"The teardown of session '{sessionId}' is not complete (its processes still run or its sealed data is not removed); the stop is not complete.");
