@@ -169,6 +169,7 @@ var runtimeTelemetryReporter = new ActiveSessionRuntimeTelemetryReporter(
     sessionRuntimeTelemetryRelay.Enqueue,
     options.RuntimeTelemetryInterval,
     sessionId => runtimeIdentities.TryGet(sessionId, out var identity) ? identity : null);
+sessionManager.SessionOwnershipApplied = artifactUploadService.RefreshRecordedVersions;
 sessionManager.UnexpectedSessionExitCleanup = async (sessionId, exitedRuntime, exitCode, token) =>
 {
     var exitSummary = exitCode.HasValue ? $" code={exitCode.Value}" : string.Empty;

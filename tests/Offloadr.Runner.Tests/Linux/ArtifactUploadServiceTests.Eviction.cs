@@ -347,6 +347,43 @@ public partial class ArtifactUploadServiceTests
         }
     }
 
+    [Test]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public async Task RecordedVersions_SurviveTheOwnershipPassBeforeTheEditorStarts()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = CreateEvictionPaths(root, sealedSession: true);
+            var catalog = new RunnerArtifactServiceListArtifactsResponse();
+            catalog.Artifacts.Add(new Offloadr.EditorRuntime.V1.EditorArtifactMetadata
+            {
+                EditorSid = "editor-1",
+                Filename = "remote.png",
+                Type = "output",
+                SizeBytes = 10,
+                CreatedUtc = Google.Protobuf.WellKnownTypes.Timestamp.FromDateTime(DateTime.UtcNow.AddHours(-1)),
+            });
+            var artifactClient = new FakeRunnerArtifactClient(catalog);
+            await using var service = new ArtifactUploadService("runner-secret-value", artifactClient, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            var placeholder = Path.Combine(paths.OutputDirectory, "remote.png");
+            Assert.That(new FileInfo(placeholder).Length, Is.Zero);
+
+            // What chown -R does to every file: only the change time moves.
+            await Task.Delay(20);
+            File.SetUnixFileMode(placeholder, File.GetUnixFileMode(placeholder));
+            service.RefreshRecordedVersions("session-1");
+
+            Assert.That(await service.StopSessionAsync("session-1"), Is.Zero, "the placeholder still stands for the remote artifact");
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
     private static async Task<long> EvictWhenRecordedAsync(ArtifactUploadService service, string sessionId)
     {
         // The upload is recorded once the control plane's response arrives.

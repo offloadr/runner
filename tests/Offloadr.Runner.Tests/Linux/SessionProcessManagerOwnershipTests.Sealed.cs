@@ -27,6 +27,13 @@ public partial class SessionProcessManagerOwnershipTests
         try
         {
             using var manager = new SessionProcessManager(options, new RecordingIsolationStrategy("sess_sealed", homeDirectory), SealedVfsBuilder(), commands);
+            string? ownershipAppliedFor = null;
+            var chownsBeforeHook = -1;
+            manager.SessionOwnershipApplied = id =>
+            {
+                ownershipAppliedFor = id;
+                chownsBeforeHook = commands.Commands.Count(command => command.Arguments.Contains("-R"));
+            };
 
             // The entry point does not exist, so the launch fails after provisioning.
             Assert.CatchAsync(() => manager.StartSessionAsync(
@@ -72,6 +79,10 @@ public partial class SessionProcessManagerOwnershipTests
                 Assert.That(chownTargets, Is.SupersetOf(paths.SealedSessionOwnedDirectories));
                 Assert.That(chownTargets, Does.Not.Contain(sealedDirectory));
                 Assert.That(chownTargets, Does.Not.Contain(paths.SealedAgentDirectory));
+
+                // Recorded file versions are re-read only after every ownership change.
+                Assert.That(ownershipAppliedFor, Is.EqualTo(sessionId));
+                Assert.That(chownsBeforeHook, Is.EqualTo(chownTargets.Length));
 
                 // A failed launch removes the sealed data along with the home.
                 Assert.That(Directory.Exists(sealedDirectory), Is.False);

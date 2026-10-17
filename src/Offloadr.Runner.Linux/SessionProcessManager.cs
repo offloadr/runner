@@ -68,6 +68,12 @@ internal sealed partial class SessionProcessManager : IDisposable
 
     internal Func<string, RuntimeIdentity, int?, CancellationToken, Task>? UnexpectedSessionExitCleanup { get; set; }
 
+    /// <summary>
+    /// Runs once the session's files have been handed to its user, before the editor starts. The
+    /// ownership pass moves every file's change time, so recorded file versions are re-read here.
+    /// </summary>
+    internal Action<string>? SessionOwnershipApplied { get; set; }
+
     internal int? TryGetTrackedProcessId(string sessionId)
         => _sessions.TryGetValue(sessionId, out var context) ? context.Process.Id : null;
 
@@ -272,6 +278,8 @@ internal sealed partial class SessionProcessManager : IDisposable
                         .ConfigureAwait(false);
                 }
             }
+
+            SessionOwnershipApplied?.Invoke(sessionId);
 
             if (string.Equals(_runtimeKind, "comfyui", StringComparison.OrdinalIgnoreCase))
             {

@@ -103,6 +103,18 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
     }
 
     /// <summary>
+    /// Re-reads the file versions recorded for the session's artifacts after something other than
+    /// a rewrite moved their change time, such as the ownership pass before the editor starts.
+    /// </summary>
+    public void RefreshRecordedVersions(string sessionId)
+    {
+        if (_sessions.TryGetValue(sessionId, out var uploader))
+        {
+            uploader.RefreshRecordedVersions();
+        }
+    }
+
+    /// <summary>
     /// Takes the artifacts the session lost across all its runtimes, for its stop acknowledgement,
     /// and forgets them.
     /// </summary>
@@ -1588,6 +1600,31 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
         public bool IsSealed => _paths.IsSealed;
 
+        internal void RefreshRecordedVersions()
+        {
+            lock (_evictionGate)
+            {
+                foreach (var state in _catalog.Values)
+                {
+                    if ((state.LocalVersion is null && state.PlaceholderVersion is null) ||
+                        !TryResolveSecureLocation(state.Type, state.LocalPath, out var root, out var relativePath))
+                    {
+                        continue;
+                    }
+
+                    try
+                    {
+                        using var secureRoot = new LinuxSecureDirectoryRoot(root);
+                        state.RefreshVersion(secureRoot.GetVersion(relativePath));
+                    }
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                    {
+                        state.RefreshVersion(null);
+                    }
+                }
+            }
+        }
+
         private readonly object _evictionGate = new();
 
         private readonly struct EvictionGateScope : IDisposable
@@ -2111,6 +2148,23 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             {
                 Downloaded = false;
                 MarkPlaceholder(placeholder);
+            }
+
+            /// <summary>
+            /// Takes on <paramref name="current"/> when it is the recorded file with only its change
+            /// time moved; a record whose file changed in any other way no longer stands for it.
+            /// </summary>
+            public void RefreshVersion(SecureFileVersion? current)
+            {
+                if (LocalVersion is { } local)
+                {
+                    LocalVersion = current is { } now && now.IsSameFileAs(local) ? now : null;
+                }
+
+                if (PlaceholderVersion is { } placeholder)
+                {
+                    PlaceholderVersion = current is { } now && now.IsSameFileAs(placeholder) ? now : null;
+                }
             }
 
             /// <summary>
