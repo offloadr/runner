@@ -762,6 +762,35 @@ public partial class SessionProcessManagerOwnershipTests
 
     [Test]
     [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public void SealedStart_IsRefusedWhenItsLifecycleCannotBeNoted()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        LinuxTestPrerequisites.RequireRoot();
+
+        var (tempRoot, sealedRoot, options) = CreateSealedOptions("comfyui");
+        const string sessionId = "session-unnoted";
+        // Something that is not the notes' folder is in its place.
+        Directory.CreateDirectory(options.SessionRoot);
+        File.WriteAllText(Path.Combine(options.SessionRoot, ".offloadr-sealed-lifecycles"), "not a folder");
+
+        try
+        {
+            using var manager = new SessionProcessManager(options, new RecordingIsolationStrategy("sess_unnoted", Path.Combine(options.SessionRoot, sessionId)), SealedVfsBuilder(), new RecordingCommandRunner(string.Empty)) { PrepareSealedHost = HostLockedDown };
+
+            var refused = Assert.CatchAsync(() => manager.StartSessionAsync(SealedStart(sessionId), CancellationToken.None));
+
+            Assert.That(refused!.Message, Does.Contain("lifecycle cannot be noted"));
+            Assert.That(Directory.Exists(Path.Combine(sealedRoot, sessionId)), Is.False, "no sealed data without the note");
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+            TryDelete(sealedRoot);
+        }
+    }
+
+    [Test]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
     public async Task SealedLifecycleNote_OutlivesARestartUntilItsStopTakesTheCount()
     {
         LinuxTestPrerequisites.RequireLinux();

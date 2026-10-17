@@ -544,7 +544,8 @@ internal sealed partial class SessionProcessManager : IDisposable
     /// <summary>
     /// Notes on disk that <paramref name="sessionId"/>'s lifecycle has sealed data, until its Stop
     /// takes the count of what it lost. The note outlives a restart of the agent, which loses the
-    /// counts and, with the container, the memory-backed data itself.
+    /// counts and, with the container, the memory-backed data itself. Throws when it cannot be
+    /// written: the sealed start is then refused.
     /// </summary>
     private void RecordSealedLifecycle(string sessionId, ulong lifecycleGeneration)
     {
@@ -552,15 +553,24 @@ internal sealed partial class SessionProcessManager : IDisposable
         {
             Directory.CreateDirectory(_sessionRoot);
             var rootOnly = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
-            _ = LinuxSecureDirectoryRoot.CreateDirectoryNoFollow(SealedLifecycleRecords, rootOnly);
             var sessionRecords = Path.Combine(SealedLifecycleRecords, sessionId);
-            _ = LinuxSecureDirectoryRoot.CreateDirectoryNoFollow(sessionRecords, rootOnly);
+            foreach (var directory in new[] { SealedLifecycleRecords, sessionRecords })
+            {
+                _ = LinuxSecureDirectoryRoot.CreateDirectoryNoFollow(directory, rootOnly);
+                if (SealedStorageProbe.ReadEntryStatus(directory) is not { IsDirectory: true, IsSymbolicLink: false, OwnerId: 0 })
+                {
+                    throw new IOException("The sealed lifecycle notes' folder is not a directory owned by root.");
+                }
+            }
+
             // One note per lifecycle: a newer one never replaces an older one still awaiting its Stop.
             File.WriteAllText(Path.Combine(sessionRecords, lifecycleGeneration.ToString(System.Globalization.CultureInfo.InvariantCulture)), string.Empty);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            RunnerLog.Warning<SessionProcessManager>($"Could not note sealed session '{sessionId}' on disk: {ex.GetType().Name}");
+            throw new InvalidOperationException(
+                $"Sealed storage is unavailable: the session's lifecycle cannot be noted under '{SealedLifecycleRecords}' ({ex.GetType().Name}).",
+                ex);
         }
     }
 
@@ -1348,6 +1358,8 @@ internal sealed partial class SessionProcessManager : IDisposable
             throw new InvalidOperationException($"Sealed storage is unavailable: '{directory}' exists and is not a sealed session directory.");
         }
 
+        // Before any data exists: without the note a restart could not report its loss as unknown.
+        RecordSealedLifecycle(sessionId, lifecycleGeneration);
         var traversable = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
             UnixFileMode.GroupRead | UnixFileMode.GroupExecute | UnixFileMode.OtherRead | UnixFileMode.OtherExecute;
         Directory.CreateDirectory(directory, traversable);
@@ -1364,7 +1376,6 @@ internal sealed partial class SessionProcessManager : IDisposable
             marker.Write(System.Text.Encoding.UTF8.GetBytes(FormattableString.Invariant($"{sessionId}\n{lifecycleGeneration}")));
         }
 
-        RecordSealedLifecycle(sessionId, lifecycleGeneration);
 
         foreach (var name in SealedSessionDirectoryNames)
         {
