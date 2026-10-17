@@ -1382,7 +1382,13 @@ internal static class ServiceClientManager
             Shutdown = shutdown,
             GetSessionSealing = sessionManager.GetSessionSealingStatus,
             SealsStart = start => start.Sealing?.Required != true && sessionManager.ShouldSeal(start),
-            TakeUnsavedArtifacts = artifactUploadService.TakeUnsavedUploads,
+            TakeUnsavedArtifacts = (sessionId, generation) =>
+            {
+                var unsaved = artifactUploadService.TakeUnsavedUploads(sessionId, generation);
+                // Taken: a restart from here on no longer has to report this lifecycle as unknown.
+                sessionManager.ForgetSealedLifecycle(sessionId, generation);
+                return unsaved;
+            },
         };
 
         while (!shutdown.IsCancellationRequested)

@@ -762,6 +762,51 @@ public partial class SessionProcessManagerOwnershipTests
 
     [Test]
     [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public async Task SealedLifecycleNote_OutlivesARestartUntilItsStopTakesTheCount()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        LinuxTestPrerequisites.RequireRoot();
+
+        var (tempRoot, sealedRoot, options) = CreateSealedOptions("comfyui");
+        const string sessionId = "session-noted";
+        var note = Path.Combine(options.SessionRoot, ".offloadr-sealed-lifecycles", sessionId);
+        bool? notedDuringStart = null;
+
+        try
+        {
+            using (var manager = new SessionProcessManager(options, new RecordingIsolationStrategy("sess_noted", Path.Combine(options.SessionRoot, sessionId)), SealedVfsBuilder(), new RecordingCommandRunner(string.Empty)) { PrepareSealedHost = HostLockedDown })
+            {
+                // The launch fails after provisioning; its data goes, the note stays for the Stop.
+                Assert.CatchAsync(() => manager.StartSessionAsync(
+                    SealedStart(sessionId),
+                    (_, _) =>
+                    {
+                        notedDuringStart = File.Exists(note);
+                        return Task.CompletedTask;
+                    },
+                    CancellationToken.None));
+            }
+
+            Assert.That(notedDuringStart, Is.True);
+            Assert.That(File.Exists(note), Is.True, "no Stop has taken the count yet");
+
+            // The agent restarts before that Stop: the new process knows the count is unknown.
+            using var restarted = new SessionProcessManager(options, new RecordingIsolationStrategy("unused", Path.Combine(options.SessionRoot, "unused")), SealedVfsBuilder(), new RecordingCommandRunner(string.Empty)) { PrepareSealedHost = HostLockedDown };
+            await restarted.CleanupStaleSessionsAsync(CancellationToken.None);
+            Assert.That(restarted.TakeStaleSealedSessions().Select(static stale => stale.SessionId), Does.Contain(sessionId));
+
+            restarted.ForgetSealedLifecycle(sessionId, 0);
+            Assert.That(File.Exists(note), Is.False);
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+            TryDelete(sealedRoot);
+        }
+    }
+
+    [Test]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
     public async Task SealedDeletion_ThatFailsPartwayKeepsTheMarkerForTheRetry()
     {
         LinuxTestPrerequisites.RequireLinux();

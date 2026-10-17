@@ -536,6 +536,107 @@ internal sealed partial class SessionProcessManager : IDisposable
 
         // Sealed data of a crashed run cannot be uploaded or used again; it only costs memory.
         RemoveStaleSealedSessionDirectories();
+        ReadRecordedSealedLifecycles();
+    }
+
+    private string SealedLifecycleRecords => Path.Combine(_sessionRoot, ".offloadr-sealed-lifecycles");
+
+    /// <summary>
+    /// Notes on disk that <paramref name="sessionId"/>'s lifecycle has sealed data, until its Stop
+    /// takes the count of what it lost. The note outlives a restart of the agent, which loses the
+    /// counts and, with the container, the memory-backed data itself.
+    /// </summary>
+    private void RecordSealedLifecycle(string sessionId, ulong lifecycleGeneration)
+    {
+        try
+        {
+            Directory.CreateDirectory(_sessionRoot);
+            _ = LinuxSecureDirectoryRoot.CreateDirectoryNoFollow(SealedLifecycleRecords, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            var record = Path.Combine(SealedLifecycleRecords, sessionId);
+            var staged = record + ".new";
+            File.WriteAllText(staged, lifecycleGeneration.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            File.Move(staged, record, overwrite: true);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            RunnerLog.Warning<SessionProcessManager>($"Could not note sealed session '{sessionId}' on disk: {ex.GetType().Name}");
+        }
+    }
+
+    /// <summary>
+    /// At startup: every sealed lifecycle still noted on disk had no Stop take its count, so what
+    /// it lost is unknown, whether or not its data was found.
+    /// </summary>
+    private void ReadRecordedSealedLifecycles()
+    {
+        if (SealedStorageProbe.ReadEntryStatus(SealedLifecycleRecords) is not { IsDirectory: true, IsSymbolicLink: false, OwnerId: 0 })
+        {
+            return;
+        }
+
+        string[] records;
+        try
+        {
+            records = Directory.GetFiles(SealedLifecycleRecords);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return;
+        }
+
+        foreach (var record in records.Where(static record => !record.EndsWith(".new", StringComparison.Ordinal)))
+        {
+            var sessionId = Path.GetFileName(record);
+            var generation = ReadRecordedGeneration(record);
+            _staleSealedSessions.AddOrUpdate(sessionId, generation, (_, known) => Math.Max(known, generation));
+        }
+    }
+
+    private static ulong ReadRecordedGeneration(string record)
+    {
+        try
+        {
+            return ulong.TryParse(File.ReadAllText(record).Trim(), System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var generation)
+                ? generation
+                : 0;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return 0;
+        }
+    }
+
+    /// <summary>
+    /// Drops the note for <paramref name="sessionId"/> once a Stop of its lifecycle (or an
+    /// unfenced one) has taken the count of what it lost. A newer lifecycle's note stays.
+    /// </summary>
+    public void ForgetSealedLifecycle(string sessionId, ulong lifecycleGeneration)
+    {
+        if (ResolveSealedSessionDirectory(sessionId) is null)
+        {
+            return;
+        }
+
+        var record = Path.Combine(SealedLifecycleRecords, sessionId);
+        if (!File.Exists(record))
+        {
+            return;
+        }
+
+        var recorded = ReadRecordedGeneration(record);
+        if (lifecycleGeneration != 0 && recorded > lifecycleGeneration)
+        {
+            return;
+        }
+
+        try
+        {
+            File.Delete(record);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            RunnerLog.Warning<SessionProcessManager>($"Could not drop the note for sealed session '{sessionId}': {ex.GetType().Name}");
+        }
     }
 
     /// <summary>The uid of the Linux user prepared for <paramref name="sessionId"/>, if any.</summary>
@@ -1260,6 +1361,8 @@ internal sealed partial class SessionProcessManager : IDisposable
             // whose Stop must hear about data it removes.
             marker.Write(System.Text.Encoding.UTF8.GetBytes(FormattableString.Invariant($"{sessionId}\n{lifecycleGeneration}")));
         }
+
+        RecordSealedLifecycle(sessionId, lifecycleGeneration);
 
         foreach (var name in SealedSessionDirectoryNames)
         {

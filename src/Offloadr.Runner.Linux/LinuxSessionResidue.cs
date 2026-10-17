@@ -14,6 +14,30 @@ public static class LinuxSessionResidue
     public static readonly IReadOnlyList<string> SharedTemporaryRoots = ["/tmp", "/var/tmp", "/dev/shm", "/dev/mqueue"];
 
     /// <summary>
+    /// <see cref="SharedTemporaryRoots"/> and every other writable memory-backed mount, such as a
+    /// memory-backed volume or a shared <c>/run</c>: a session may leave files there too. Not
+    /// <c>/dev</c> itself (device nodes and terminals, which cannot be removed), nor anything
+    /// under <c>/proc</c> or <c>/sys</c>.
+    /// </summary>
+    public static IReadOnlyList<string> CurrentResidueRoots()
+    {
+        var roots = new List<string>(SharedTemporaryRoots);
+        foreach (var mount in SealedHostLockdown.ReadMounts() ?? [])
+        {
+            if (!mount.ReadOnly && mount.Type is "tmpfs" or "ramfs" &&
+                mount.MountPoint is not ("/" or "/dev") &&
+                !mount.MountPoint.StartsWith("/proc/", StringComparison.Ordinal) &&
+                !mount.MountPoint.StartsWith("/sys/", StringComparison.Ordinal) &&
+                !roots.Contains(mount.MountPoint, StringComparer.Ordinal))
+            {
+                roots.Add(mount.MountPoint);
+            }
+        }
+
+        return roots;
+    }
+
+    /// <summary>
     /// How many System V shared memory segments, message queues and semaphore sets the user owns,
     /// as <c>/proc/sysvipc</c> lists them; null when a table cannot be read. They outlive their
     /// creator, and the next user of the uid would own them.

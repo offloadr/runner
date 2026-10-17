@@ -24,7 +24,7 @@ public sealed class LinuxUserIsolationStrategy : ISessionIsolationStrategy
 
     private readonly ILinuxCommandRunner _commandRunner;
     private readonly Func<uint, CancellationToken, Task<bool>> _killUserProcesses;
-    private readonly IReadOnlyList<string> _residueRoots;
+    private readonly IReadOnlyList<string>? _residueRoots;
     private readonly string _passwdPath;
 
     public LinuxUserIsolationStrategy(ILinuxCommandRunner commandRunner)
@@ -49,7 +49,8 @@ public sealed class LinuxUserIsolationStrategy : ISessionIsolationStrategy
         _countIpcObjects = countIpcObjects ?? (static userId => LinuxSessionResidue.CountIpcObjectsOwnedBy(userId));
         _commandRunner = commandRunner ?? throw new ArgumentNullException(nameof(commandRunner));
         _killUserProcesses = killUserProcesses ?? throw new ArgumentNullException(nameof(killUserProcesses));
-        _residueRoots = residueRoots ?? LinuxSessionResidue.SharedTemporaryRoots;
+        // Null: the shared roots and the memory-backed mounts there are at each teardown.
+        _residueRoots = residueRoots;
         _passwdPath = passwdPath;
     }
 
@@ -304,7 +305,7 @@ public sealed class LinuxUserIsolationStrategy : ISessionIsolationStrategy
         int remaining;
         try
         {
-            _removeOwnedEntries(userId, _residueRoots, out remaining);
+            _removeOwnedEntries(userId, _residueRoots ?? LinuxSessionResidue.CurrentResidueRoots(), out remaining);
         }
         catch (Exception ex)
         {

@@ -85,6 +85,19 @@ public class LinuxSessionResidueLinuxTests
 
     [Test]
     [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public void CurrentResidueRoots_AddWritableMemoryMountsButNotDev()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+
+        var roots = LinuxSessionResidue.CurrentResidueRoots();
+
+        Assert.That(roots, Is.SupersetOf(LinuxSessionResidue.SharedTemporaryRoots));
+        Assert.That(roots, Has.None.EqualTo("/dev"));
+        Assert.That(roots, Has.None.StartsWith("/proc/").And.None.StartsWith("/sys/"));
+    }
+
+    [Test]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
     public void RemoveEntriesOwnedBy_SkipsOnlyARootThatDoesNotExist()
     {
         LinuxTestPrerequisites.RequireLinux();
