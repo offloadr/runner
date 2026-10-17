@@ -760,6 +760,51 @@ public partial class SessionProcessManagerOwnershipTests
 
     private static string? HostLockedDown() => null;
 
+    [Test]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public async Task SealedDeletion_ThatFailsPartwayKeepsTheMarkerForTheRetry()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        LinuxTestPrerequisites.RequireRoot();
+
+        var (tempRoot, sealedRoot, options) = CreateSealedOptions("comfyui");
+        var stale = Path.Combine(sealedRoot, "old-session");
+        Directory.CreateDirectory(Path.Combine(stale, "input"));
+        Directory.CreateDirectory(Path.Combine(stale, "output"));
+        File.WriteAllText(Path.Combine(stale, "output", "image.png"), "left behind");
+        MarkAsSealedSession(stale, "old-session");
+        File.SetUnixFileMode(sealedRoot, Mode0711);
+
+        try
+        {
+            using var manager = new SessionProcessManager(options, new RecordingIsolationStrategy("unused", Path.Combine(options.SessionRoot, "unused")), SealedVfsBuilder(), new RecordingCommandRunner(string.Empty)) { PrepareSealedHost = HostLockedDown };
+            var deleteDirectory = manager.DeleteDirectoryRecursively;
+            // The first folder goes, then the output cannot: deletion stops partway.
+            manager.DeleteDirectoryRecursively = directory =>
+            {
+                if (directory.EndsWith("output", StringComparison.Ordinal))
+                {
+                    throw new IOException("Device or resource busy");
+                }
+
+                deleteDirectory(directory);
+            };
+
+            await manager.CleanupStaleSessionsAsync(CancellationToken.None);
+            Assert.That(File.Exists(Path.Combine(stale, SessionProcessManager.SealedSessionMarker)), Is.True, "the marker outlives a partial deletion");
+            Assert.ThrowsAsync<InvalidOperationException>(() => manager.StopSessionAsync("old-session", CancellationToken.None));
+
+            manager.DeleteDirectoryRecursively = deleteDirectory;
+            await manager.StopSessionAsync("old-session", CancellationToken.None);
+            Assert.That(Directory.Exists(stale), Is.False);
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+            TryDelete(sealedRoot);
+        }
+    }
+
     [TestCase("session\nother")]
     [TestCase("session\rother")]
     [TestCase("session\tother")]

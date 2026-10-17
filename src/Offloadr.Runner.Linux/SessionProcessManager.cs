@@ -1358,7 +1358,15 @@ internal sealed partial class SessionProcessManager : IDisposable
                 File.SetUnixFileMode(directory, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
             }
 
-            DeleteDirectoryRecursively(directory);
+            // The marker goes last: while anything else is left, a retry must still recognise
+            // the directory as this session's, or it would take it for someone else's and stop.
+            var agentDirectory = Path.Combine(directory, ".agent");
+            var markerPath = Path.Combine(directory, SealedSessionMarker);
+            DeleteEntriesExcept(directory, agentDirectory);
+            DeleteEntriesExcept(agentDirectory, markerPath);
+            File.Delete(markerPath);
+            Directory.Delete(agentDirectory);
+            Directory.Delete(directory);
             return true;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -1366,6 +1374,27 @@ internal sealed partial class SessionProcessManager : IDisposable
             // The message names the file that could not go, which is session data.
             RunnerLog.Error<SessionProcessManager>($"Failed to remove sealed session directory '{directory}': {ex.GetType().Name}.");
             return false;
+        }
+    }
+
+    /// <summary>Removes every entry of <paramref name="directory"/> but <paramref name="kept"/>, without following links.</summary>
+    private void DeleteEntriesExcept(string directory, string kept)
+    {
+        foreach (var entry in Directory.GetFileSystemEntries(directory))
+        {
+            if (string.Equals(entry, kept, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            if (SealedStorageProbe.ReadEntryStatus(entry) is { IsDirectory: true, IsSymbolicLink: false })
+            {
+                DeleteDirectoryRecursively(entry);
+            }
+            else
+            {
+                File.Delete(entry);
+            }
         }
     }
 
