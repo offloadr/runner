@@ -1392,11 +1392,17 @@ internal sealed partial class SessionProcessManager : IDisposable
             RunnerLog.Warning<SessionProcessManager>($"Removing sealed session data left by an earlier runner process: '{entry}'.");
             // Whatever that run had not uploaded is gone, and nobody counted it.
             _staleSealedSessions[sessionId] = ReadSealedSessionMarker(Path.Combine(entry, SealedSessionMarker))?.LifecycleGeneration ?? 0;
-            _ = DeleteSealedSessionDirectory(sessionId);
+            if (!DeleteSealedSessionDirectory(sessionId))
+            {
+                // Closed to everyone but root meanwhile; the session's Stop retries and stays
+                // pending until the plaintext is gone.
+                _undeletedStaleSealedSessions[sessionId] = 0;
+            }
         }
     }
 
     private readonly ConcurrentDictionary<string, ulong> _staleSealedSessions = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, byte> _undeletedStaleSealedSessions = new(StringComparer.Ordinal);
 
     /// <summary>
     /// Takes the sessions, with the lifecycle generation that wrote it (0 when unknown), whose
@@ -1785,6 +1791,18 @@ internal sealed partial class SessionProcessManager : IDisposable
         if (_pendingTeardowns.TryGetValue(sessionId, out var identity))
         {
             await CleanupPreparedStartupAsync(identity, sessionId).ConfigureAwait(false);
+        }
+
+        // Sealed data an earlier runner process left that startup could not remove.
+        if (_undeletedStaleSealedSessions.ContainsKey(sessionId))
+        {
+            if (!DeleteSealedSessionDirectory(sessionId))
+            {
+                throw new InvalidOperationException(
+                    $"Sealed data of session '{sessionId}' left by an earlier runner process could not be removed; the stop is not complete.");
+            }
+
+            _undeletedStaleSealedSessions.TryRemove(sessionId, out _);
         }
 
         ThrowIfTeardownPending(sessionId);

@@ -716,6 +716,45 @@ public partial class SessionProcessManagerOwnershipTests
 
     private static string? HostLockedDown() => null;
 
+    [Test]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public async Task StaleSealedData_ThatCannotBeRemovedKeepsTheSessionsStopPending()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        LinuxTestPrerequisites.RequireRoot();
+
+        var (tempRoot, sealedRoot, options) = CreateSealedOptions("comfyui");
+        var stale = Path.Combine(sealedRoot, "old-session");
+        Directory.CreateDirectory(Path.Combine(stale, "output"));
+        File.WriteAllText(Path.Combine(stale, "output", "image.png"), "left behind");
+        MarkAsSealedSession(stale, "old-session");
+        File.SetUnixFileMode(sealedRoot, Mode0711);
+
+        try
+        {
+            using var manager = new SessionProcessManager(options, new RecordingIsolationStrategy("unused", Path.Combine(options.SessionRoot, "unused")), SealedVfsBuilder(), new RecordingCommandRunner(string.Empty)) { PrepareSealedHost = HostLockedDown };
+            var deleteDirectory = manager.DeleteDirectoryRecursively;
+            manager.DeleteDirectoryRecursively = _ => throw new IOException("Device or resource busy");
+
+            await manager.CleanupStaleSessionsAsync(CancellationToken.None);
+            var pending = Assert.ThrowsAsync<InvalidOperationException>(() => manager.StopSessionAsync("old-session", CancellationToken.None));
+
+            manager.DeleteDirectoryRecursively = deleteDirectory;
+            await manager.StopSessionAsync("old-session", CancellationToken.None);
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(pending!.Message, Does.Contain("not complete"));
+                Assert.That(Directory.Exists(stale), Is.False, "the retried Stop removed it");
+            });
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+            TryDelete(sealedRoot);
+        }
+    }
+
     [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "umask")]
     private static extern uint SetUmask(uint mask);
 
