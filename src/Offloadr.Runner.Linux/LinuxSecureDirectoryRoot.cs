@@ -857,6 +857,8 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
                 return false;
             }
 
+            AfterExchange?.Invoke();
+
             // The temporary name now holds the displaced file. The rename itself moved its change
             // time, so the comparison leaves that out.
             if (ReadVersion(_parent, _temporaryName, _relativePath) is { } displaced && displaced.IsSameFileAs(expected))
@@ -866,14 +868,22 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
                 return true;
             }
 
-            if (renameat2(GetDescriptor(_parent), _temporaryName, GetDescriptor(_parent), _destinationName, RenameExchange) != 0 &&
-                renameat(GetDescriptor(_parent), _temporaryName, GetDescriptor(_parent), _destinationName) != 0)
+            // Restore only while the destination still holds this publication's placeholder. A file
+            // the editor put there since is newer than the one displaced and stays; the displaced
+            // one, already superseded, is removed with the temporary name.
+            if (ReadVersion(_file, _relativePath) is { } placeholder &&
+                ReadVersion(_parent, _destinationName, _relativePath) is { } current &&
+                current.Inode == placeholder.Inode &&
+                renameat2(GetDescriptor(_parent), _temporaryName, GetDescriptor(_parent), _destinationName, RenameExchange) != 0)
             {
                 throw CreateException($"restoring '{_relativePath}' after a replacement it did not expect");
             }
 
             return false;
         }
+
+        /// <summary>Runs right after the first exchange; lets tests replace the destination at that moment.</summary>
+        internal Action? AfterExchange { get; set; }
 
         public void Dispose()
         {
