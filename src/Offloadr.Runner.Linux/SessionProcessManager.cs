@@ -1226,13 +1226,10 @@ internal sealed partial class SessionProcessManager : IDisposable
 
         // The agent holds sealed data in its buffers too.
         LinuxProcessHardening.RequireCoreDumpsDisabled();
-        var root = _sealing.Root;
-        if (!Directory.Exists(root))
-        {
-            Directory.CreateDirectory(root);
-            File.SetUnixFileMode(root, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
-                UnixFileMode.GroupExecute | UnixFileMode.OtherExecute);
-        }
+        // Under a world-writable parent such as /dev/shm another process may race a link into the
+        // root's place: created without following one, and whatever is there is checked below.
+        _ = LinuxSecureDirectoryRoot.CreateDirectoryNoFollow(_sealing.Root, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
+            UnixFileMode.GroupExecute | UnixFileMode.OtherExecute);
 
         // Created under a world-writable parent such as /dev/shm: re-check what is there now.
         ThrowIfSealedStorageUnavailable();

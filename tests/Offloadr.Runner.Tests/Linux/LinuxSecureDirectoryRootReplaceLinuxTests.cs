@@ -166,6 +166,34 @@ public class LinuxSecureDirectoryRootReplaceLinuxTests
         }
     }
 
+    [Test]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public void CreateDirectoryNoFollow_LeavesALinkInItsPlaceAndItsTargetAlone()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = CreateRoot();
+        try
+        {
+            var target = Path.Combine(root, "target");
+            Directory.CreateDirectory(target);
+            File.SetUnixFileMode(target, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            var raced = Path.Combine(root, "raced");
+            Directory.CreateSymbolicLink(raced, target);
+            var mode = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute | UnixFileMode.GroupExecute | UnixFileMode.OtherExecute;
+
+            Assert.That(LinuxSecureDirectoryRoot.CreateDirectoryNoFollow(raced, mode), Is.False);
+            Assert.That(File.GetUnixFileMode(target), Is.EqualTo(UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute), "the link's target is untouched");
+
+            var fresh = Path.Combine(root, "fresh");
+            Assert.That(LinuxSecureDirectoryRoot.CreateDirectoryNoFollow(fresh, mode), Is.True);
+            Assert.That(File.GetUnixFileMode(fresh), Is.EqualTo(mode), "exactly the mode asked for, whatever the umask");
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
     private static void ReplaceAtomically(string root, string path, string content)
     {
         var staged = Path.Combine(root, $"staged-{Guid.NewGuid():N}");

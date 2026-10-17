@@ -54,6 +54,50 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
 
     private readonly SafeFileHandle _rootHandle;
 
+    private const int AlreadyExists = 17;
+    private const int AtFdcwd = -100;
+
+    /// <summary>
+    /// Creates <paramref name="path"/> as a directory with exactly <paramref name="mode"/> when it
+    /// does not exist, without following a link anyone put in its place: <c>mkdir</c> never
+    /// follows a final link, and the mode is set through a descriptor opened without following
+    /// one, so neither step can touch another directory. Leaves an existing entry alone for the
+    /// caller to judge. Returns whether it created the directory.
+    /// </summary>
+    public static bool CreateDirectoryNoFollow(string path, UnixFileMode mode)
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            throw new PlatformNotSupportedException("Secure directory creation requires Linux.");
+        }
+
+        if (mkdirat(AtFdcwd, path, (uint)mode) != 0)
+        {
+            var error = Marshal.GetLastPInvokeError();
+            if (error == AlreadyExists)
+            {
+                return false;
+            }
+
+            throw CreateException($"creating directory '{path}'", error);
+        }
+
+        var descriptor = open(path, OReadOnly | ODirectory | ONoFollow | OCloseOnExec);
+        if (descriptor < 0)
+        {
+            throw CreateException($"opening created directory '{path}'");
+        }
+
+        using var handle = new SafeFileHandle((nint)descriptor, ownsHandle: true);
+        // The umask took bits away from the mode mkdir was given.
+        if (fchmod(descriptor, (uint)mode) != 0)
+        {
+            throw CreateException($"setting the mode of directory '{path}'");
+        }
+
+        return true;
+    }
+
     public LinuxSecureDirectoryRoot(string rootPath)
     {
         if (!OperatingSystem.IsLinux())
