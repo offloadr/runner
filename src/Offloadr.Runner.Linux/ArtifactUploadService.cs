@@ -1569,6 +1569,9 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             // Write and publish relative to a pinned directory descriptor so that a
             // swapped symlink in the session tree cannot redirect the root-owned write.
             using var secureRoot = new LinuxSecureDirectoryRoot(root);
+            // The placeholder (or whatever) the download is to replace, as it is now: a write by
+            // the session while it runs is newer than the remote bytes and must stay.
+            var replacing = secureRoot.GetVersion(relativePath);
             using (var publication = secureRoot.CreatePublication(relativePath))
             {
                 CarryOwnership(publication, state.LocalPath);
@@ -1670,7 +1673,18 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 }
 
                 // Disposing an uncommitted publication removes its temporary file.
-                publication.Commit();
+                if (replacing is { } expected)
+                {
+                    if (!publication.CommitReplacing(expected))
+                    {
+                        // The session wrote the file meanwhile: it stays, and its watcher uploads it.
+                        return null;
+                    }
+                }
+                else
+                {
+                    publication.Commit();
+                }
             }
 
             return secureRoot.GetVersion(relativePath);

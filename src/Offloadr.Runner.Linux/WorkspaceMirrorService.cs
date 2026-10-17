@@ -642,6 +642,8 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
         private async Task FetchToFileAsync(WorkspaceFileState state, IAsyncStreamReader<RunnerWorkspaceServiceReadWorkspaceFileResponse> responseStream, CancellationToken cancellationToken)
         {
             EnsureSafeInputHydrationPath(state.LocalPath);
+            // What the download is to replace, as it is now: a write by the session meanwhile stays.
+            var replacing = _secureInputRoot.GetVersion(state.RelativePath);
             using var publication = _secureInputRoot.CreatePublication(state.RelativePath);
             var sawMetadata = false;
             string? expectedSha256 = null;
@@ -749,7 +751,15 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                 }
             }
 
-            publication.Commit();
+            if (replacing is { } expected)
+            {
+                // False when the session wrote the file meanwhile: its newer bytes stay.
+                _ = publication.CommitReplacing(expected);
+            }
+            else
+            {
+                publication.Commit();
+            }
         }
 
         private static DateTime? ToDateTime(Timestamp? timestamp)

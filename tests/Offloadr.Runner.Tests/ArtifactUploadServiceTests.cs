@@ -326,6 +326,73 @@ public partial class ArtifactUploadServiceTests
     }
 
     [Test]
+    public async Task Readback_KeepsAWriteTheSessionMadeWhileItDownloaded()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var outputDirectory = Path.Combine(root, "output");
+            Directory.CreateDirectory(outputDirectory);
+            const string filename = "ComfyUI_00009_.png";
+            var outputPath = Path.Combine(outputDirectory, filename);
+            // The workflow writes its new output into the placeholder while the old one downloads.
+            var reader = new CallbackReadArtifactStreamReader(
+                [
+                    new() { Metadata = new RunnerReadStreamMetadata { SizeBytes = 6, ModifiedUtc = Timestamp.FromDateTime(DateTime.UtcNow) } },
+                    new() { Chunk = Google.Protobuf.ByteString.CopyFrom("remote"u8.ToArray()) },
+                ],
+                afterFirst: () => File.WriteAllText(outputPath, "newer!"));
+            var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse()) { BlockingReadArtifactReader = reader };
+            await using var service = new ArtifactUploadService("runner-secret-value", artifactClient, NullLogger<ArtifactUploadService>.Instance);
+            var paths = new SessionProcessManager.SessionPaths
+            {
+                HomeDirectory = root,
+                UserDirectory = root,
+                OutputDirectory = outputDirectory,
+                InputDirectory = root,
+                TempDirectory = Path.Combine(root, "temp"),
+                CacheDirectory = root,
+                LogsDirectory = root
+            };
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.SeedSessionAsync(
+                "session-1",
+                "editor-1",
+                "owner-1",
+                [new EditorArtifactMetadata { EditorSid = "editor-1", Filename = filename, Type = "output", Subfolder = string.Empty, SizeBytes = 6 }],
+                CancellationToken.None);
+
+            await service.TryEnsureArtifactAvailableAsync(outputPath, highPriority: false, CancellationToken.None);
+
+            Assert.That(File.ReadAllText(outputPath), Is.EqualTo("newer!"), "the older remote bytes do not replace it");
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    /// <summary>Answers a read with fixed frames, running an action after the first.</summary>
+    private sealed class CallbackReadArtifactStreamReader(RunnerArtifactServiceReadArtifactResponse[] frames, Action afterFirst)
+        : IAsyncStreamReader<RunnerArtifactServiceReadArtifactResponse>
+    {
+        private int _index = -1;
+
+        public RunnerArtifactServiceReadArtifactResponse Current => frames[_index];
+
+        public Task<bool> MoveNext(CancellationToken cancellationToken)
+        {
+            if (_index == 0)
+            {
+                afterFirst();
+            }
+
+            _index++;
+            return Task.FromResult(_index < frames.Length);
+        }
+    }
+
+    [Test]
     public async Task Readback_ThatSendsMetadataTwicePublishesNothing()
     {
         var root = CreateTempDirectory();
