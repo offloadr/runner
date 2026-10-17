@@ -31,6 +31,13 @@ public static class LinuxCommandFactory
     public static LinuxCommand SendSignal(int pid, string signal)
         => new("/bin/kill", [$"-{signal}", pid.ToString()], ThrowOnError: false);
 
+    /// <summary>
+    /// Removes the System V IPC objects the user may remove, as that user: root without
+    /// CAP_SYS_ADMIN, as in a container, may not remove another user's.
+    /// </summary>
+    public static LinuxCommand RemoveIpcObjectsAs(string userName)
+        => new("/usr/sbin/runuser", ["-u", userName, "--", "/usr/bin/ipcrm", "--all"], ThrowOnError: false);
+
     public static LinuxCommand RemoveUser(string userName)
         => new("/usr/sbin/userdel", ["--force", "--remove", userName], ThrowOnError: false);
 }

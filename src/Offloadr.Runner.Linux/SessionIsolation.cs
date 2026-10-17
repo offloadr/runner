@@ -35,15 +35,18 @@ public sealed class LinuxUserIsolationStrategy : ISessionIsolationStrategy
     internal delegate int RemoveOwnedEntries(uint userId, IEnumerable<string> roots, out int remaining);
 
     private readonly RemoveOwnedEntries _removeOwnedEntries;
+    private readonly Func<uint, int?> _countIpcObjects;
 
     internal LinuxUserIsolationStrategy(
         ILinuxCommandRunner commandRunner,
         Func<uint, CancellationToken, Task<bool>> killUserProcesses,
         IReadOnlyList<string>? residueRoots = null,
         string passwdPath = "/etc/passwd",
-        RemoveOwnedEntries? removeOwnedEntries = null)
+        RemoveOwnedEntries? removeOwnedEntries = null,
+        Func<uint, int?>? countIpcObjects = null)
     {
         _removeOwnedEntries = removeOwnedEntries ?? LinuxSessionResidue.RemoveEntriesOwnedBy;
+        _countIpcObjects = countIpcObjects ?? (static userId => LinuxSessionResidue.CountIpcObjectsOwnedBy(userId));
         _commandRunner = commandRunner ?? throw new ArgumentNullException(nameof(commandRunner));
         _killUserProcesses = killUserProcesses ?? throw new ArgumentNullException(nameof(killUserProcesses));
         _residueRoots = residueRoots ?? LinuxSessionResidue.SharedTemporaryRoots;
@@ -205,6 +208,7 @@ public sealed class LinuxUserIsolationStrategy : ISessionIsolationStrategy
             // stop that asked for it is not reported as complete while they run.
             await KillUserProcessesAsync(identity.UserName, uid, cancellationToken, requireNoSurvivors: true).ConfigureAwait(false);
             RemoveSharedResidue(identity.UserName, uid);
+            await RemoveIpcResidueAsync(identity.UserName, uid, cancellationToken).ConfigureAwait(false);
         }
 
         // Any other failure fails the teardown, so the Stop that asked for it stays pending and a
@@ -301,6 +305,25 @@ public sealed class LinuxUserIsolationStrategy : ISessionIsolationStrategy
         {
             throw new InvalidOperationException(
                 $"{remaining} temporary file(s) of session user '{userName}' (uid {userId}) could not be removed; the account is kept so its uid is not reused.");
+        }
+    }
+
+    /// <summary>
+    /// Removes the user's System V IPC objects (shared memory, message queues, semaphores), which
+    /// outlive its processes. Throws while any stays: the account, and its uid, is then kept.
+    /// </summary>
+    private async Task RemoveIpcResidueAsync(string userName, uint userId, CancellationToken cancellationToken)
+    {
+        if (_countIpcObjects(userId) is 0)
+        {
+            return;
+        }
+
+        await _commandRunner.RunAsync(LinuxCommandFactory.RemoveIpcObjectsAs(userName), cancellationToken).ConfigureAwait(false);
+        if (_countIpcObjects(userId) is not 0 and var left)
+        {
+            throw new InvalidOperationException(
+                $"{(left is { } count ? count.ToString(System.Globalization.CultureInfo.InvariantCulture) : "Unknown")} System V IPC object(s) of session user '{userName}' (uid {userId}) could not be removed; the account is kept so its uid is not reused.");
         }
     }
 

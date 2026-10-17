@@ -151,6 +151,26 @@ public class SessionIsolationTests
     }
 
     [Test]
+    public void CleanupAsync_KeepsTheAccountWhileItsIpcObjectsCannotBeRemoved()
+    {
+        var runner = new RecordingCommandRunner(userExists: true);
+        var strategy = new LinuxUserIsolationStrategy(
+            runner,
+            static (_, _) => Task.FromResult(true),
+            residueRoots: [],
+            passwdPath: "/nonexistent/passwd",
+            countIpcObjects: static _ => 2);
+
+        Assert.That(
+            async () => await strategy.CleanupAsync(
+                new PreparedSessionIdentity("sess_6f1c2d3e4b5a", "/sessions/x", CleanupIdentity: true, 4242),
+                CancellationToken.None),
+            Throws.InvalidOperationException.With.Message.Contains("IPC"));
+        Assert.That(runner.Commands.Select(static command => command.FileName), Does.Contain("/usr/sbin/runuser"));
+        Assert.That(runner.Commands.Select(static command => command.FileName), Does.Not.Contain("/usr/sbin/userdel"));
+    }
+
+    [Test]
     public void CleanupAsync_FailsWhenUserdelFails()
     {
         var runner = new RecordingCommandRunner(userExists: true, userdelExitCode: 12);

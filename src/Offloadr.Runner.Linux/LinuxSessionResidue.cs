@@ -10,7 +10,52 @@ namespace Offloadr.Runner.Linux;
 /// </summary>
 public static class LinuxSessionResidue
 {
-    public static readonly IReadOnlyList<string> SharedTemporaryRoots = ["/tmp", "/var/tmp", "/dev/shm"];
+    // /dev/mqueue holds POSIX message queues, which outlive the process that made them.
+    public static readonly IReadOnlyList<string> SharedTemporaryRoots = ["/tmp", "/var/tmp", "/dev/shm", "/dev/mqueue"];
+
+    /// <summary>
+    /// How many System V shared memory segments, message queues and semaphore sets the user owns,
+    /// as <c>/proc/sysvipc</c> lists them; null when a table cannot be read. They outlive their
+    /// creator, and the next user of the uid would own them.
+    /// </summary>
+    public static int? CountIpcObjectsOwnedBy(uint userId, string sysvipcDirectory = "/proc/sysvipc")
+    {
+        var owned = 0;
+        foreach (var table in new[] { "shm", "msg", "sem" })
+        {
+            string[] lines;
+            try
+            {
+                lines = File.ReadAllLines(Path.Combine(sysvipcDirectory, table));
+            }
+            catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
+            {
+                // No System V IPC in this kernel: nothing to leave behind.
+                continue;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                return null;
+            }
+
+            var header = lines.Length > 0 ? lines[0].Split(' ', StringSplitOptions.RemoveEmptyEntries) : [];
+            var uidColumn = Array.IndexOf(header, "uid");
+            if (uidColumn < 0)
+            {
+                return null;
+            }
+
+            owned += lines.Skip(1).Count(line =>
+            {
+                var fields = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                return fields.Length > uidColumn &&
+                    uint.TryParse(fields[uidColumn], NumberStyles.None, CultureInfo.InvariantCulture, out var owner) &&
+                    owner == userId;
+            });
+        }
+
+        return owned;
+    }
 
     private const int AtFdcwd = -100;
     private const int AtSymlinkNofollow = 0x100;

@@ -469,9 +469,10 @@ public static class SealedHostLockdown
             SealedStorageProbe.ReadFileSystemStats,
             static (path, mode) =>
             {
+                // Through the checked entry itself: a link swapped in meanwhile is refused, never followed.
                 if (OperatingSystem.IsLinux())
                 {
-                    File.SetUnixFileMode(path, mode);
+                    LinuxSecureDirectoryRoot.SetModeNoFollow(path, mode);
                 }
             });
 

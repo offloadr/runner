@@ -98,6 +98,33 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
         return true;
     }
 
+    /// <summary>
+    /// Sets the mode of the directory or regular file at <paramref name="path"/> through a
+    /// descriptor opened without following a link, so a link swapped into its place cannot make
+    /// root change another file. Throws when it is a link.
+    /// </summary>
+    public static void SetModeNoFollow(string path, UnixFileMode mode)
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            throw new PlatformNotSupportedException("Secure mode changes require Linux.");
+        }
+
+        var descriptor = open(path, OReadOnly | ONoFollow | ONonBlock | OCloseOnExec);
+        if (descriptor < 0)
+        {
+            throw CreateException($"opening '{path}' to change its mode");
+        }
+
+        // A link fails the open (ELOOP); a session user cannot make device nodes, so what opened
+        // here is the entry itself.
+        using var handle = new SafeFileHandle((nint)descriptor, ownsHandle: true);
+        if (fchmod(descriptor, (uint)mode) != 0)
+        {
+            throw CreateException($"setting the mode of '{path}'");
+        }
+    }
+
     public LinuxSecureDirectoryRoot(string rootPath)
     {
         if (!OperatingSystem.IsLinux())
