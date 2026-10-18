@@ -22,6 +22,13 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
     private const int OCloseOnExec = 0x80000;
     private const int OPath = 0x200000;
     private const int FDuplicateCloseOnExec = 1030;
+    private const int FSetLease = 1024;
+    private const int FGetLease = 1025;
+    private const int FWriteLock = 1;
+    private const int FUnlock = 2;
+    private const int FSetSignal = 10;
+    private const int SignalUrgent = 23;
+    private const int ETryAgain = 11;
     private const int ENoEntry = 2;
     private const int ENoDeviceOrAddress = 6;
     private const int EExists = 17;
@@ -34,6 +41,7 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
     private const int AtSymlinkNoFollow = 0x100;
     private const uint StatxType = 0x0001;
     private const uint StatxNlink = 0x0004;
+    private const uint StatxUid = 0x0008;
     private const uint StatxMtime = 0x0040;
     private const uint StatxSize = 0x0200;
     private const uint StatxIno = 0x0100;
@@ -45,6 +53,7 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
     private const uint RenameNoReplace = 1;
     private const int StatxBufferSize = 256;
     private const int StatxNlinkOffset = 16;
+    private const int StatxUidOffset = 20;
     private const int StatxModeOffset = 28;
     private const int StatxSizeOffset = 40;
     private const int StatxMtimeSecondsOffset = 112;
@@ -685,6 +694,21 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
         }
     }
 
+    private static uint? ReadOwnerId(SafeFileHandle file)
+    {
+        var buffer = Marshal.AllocHGlobal(StatxBufferSize);
+        try
+        {
+            return statx(GetDescriptor(file), string.Empty, AtEmptyPath | AtSymlinkNoFollow, StatxUid, buffer) == 0
+                ? unchecked((uint)Marshal.ReadInt32(buffer, StatxUidOffset))
+                : null;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
+    }
+
     private static UnauthorizedAccessException NotRegularFile(string relativePath)
         => new($"Path is not a regular file beneath its trusted root: '{relativePath}'.");
 
@@ -952,8 +976,16 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
         /// so a rewrite that lands after a caller's check is not discarded. What remains is a
         /// rewrite in place within the moment between the last check and the exchange that also
         /// restores length and modification time. Returns whether the publication replaced it.
+        /// <para>
+        /// With <paramref name="whileUnopened"/>, it replaces the destination only while no other
+        /// process has it open or mapped, and swaps back when one opens it before the displaced
+        /// file is removed: a write lease on it, held across the exchange, makes the kernel hold
+        /// any such open until the lease is let go, and shows that it came. What remains is an
+        /// open that had already looked the name up before the exchange and reaches the file only
+        /// after the displaced file is removed, a moment within one system call.
+        /// </para>
         /// </summary>
-        public bool CommitReplacing(SecureFileVersion expected)
+        public bool CommitReplacing(SecureFileVersion expected, bool whileUnopened = false)
         {
             if (fchmod(GetDescriptor(_file), Convert.ToUInt32("644", 8)) != 0)
             {
@@ -964,6 +996,14 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
             // modification time moves only the change time, which the exchange overwrites, so it
             // is compared here, as late as possible.
             if (ReadVersion(_parent, _destinationName, _relativePath) is not { } before || before != expected)
+            {
+                return false;
+            }
+
+            // Let go only once the exchange is kept or undone: an open it held then reaches
+            // whichever file is in the destination's place for good.
+            using var lease = whileUnopened ? TakeWriteLease(expected) : null;
+            if (whileUnopened && lease is null)
             {
                 return false;
             }
@@ -981,8 +1021,10 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
             AfterExchange?.Invoke();
 
             // The temporary name now holds the displaced file. The rename itself moved its change
-            // time, so the comparison leaves that out.
-            if (ReadVersion(_parent, _temporaryName, _relativePath) is { } displaced && displaced.IsSameFileAs(expected))
+            // time, so the comparison leaves that out. A broken lease means something opened it
+            // since the lease was taken: it then goes back.
+            if (ReadVersion(_parent, _temporaryName, _relativePath) is { } displaced && displaced.IsSameFileAs(expected) &&
+                lease?.IsHeld != false)
             {
                 _ = unlinkat(GetDescriptor(_parent), _temporaryName, 0);
                 _committed = true;
@@ -992,7 +1034,8 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
             // Restore only while the destination still holds this publication's placeholder as it
             // was written. A file the editor put there since, or a rewrite of the placeholder in
             // place, is newer than the one displaced and stays; the displaced one, already
-            // superseded, is removed with the temporary name.
+            // superseded, is removed with the temporary name. An open the lease held reaches the
+            // restored file.
             if (placeholder is { } written &&
                 ReadVersion(_parent, _destinationName, _relativePath) is { } current &&
                 current.IsSameFileAs(written) &&
@@ -1002,6 +1045,77 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
             }
 
             return false;
+        }
+
+        /// <summary>
+        /// A write lease on the destination, which is <paramref name="expected"/>, or null when
+        /// another process has it open or mapped. The kernel grants one only then, and only to the
+        /// file's owner, so it is asked for as that owner, on this thread alone.
+        /// </summary>
+        private WriteLease? TakeWriteLease(SecureFileVersion expected)
+        {
+            // Non-blocking: opening a FIFO put there since must not wait for a writer.
+            var descriptor = openat(GetDescriptor(_parent), _destinationName, OReadOnly | ONoFollow | OCloseOnExec | ONonBlock);
+            if (descriptor < 0)
+            {
+                return null;
+            }
+
+            var file = new SafeFileHandle((nint)descriptor, ownsHandle: true);
+            try
+            {
+                if (ReadVersion(file, _relativePath) != expected || ReadOwnerId(file) is not { } ownerId)
+                {
+                    file.Dispose();
+                    return null;
+                }
+
+                // A break is signalled to this process, by default with SIGIO, which ends it:
+                // SIGURG instead, which is ignored unless handled.
+                if (fcntl(descriptor, FSetSignal, SignalUrgent) != 0)
+                {
+                    throw CreateException($"preparing a lease on '{_relativePath}'");
+                }
+
+                var previous = setfsuid(ownerId);
+                int result;
+                int error;
+                try
+                {
+                    result = fcntl(descriptor, FSetLease, FWriteLock);
+                    error = Marshal.GetLastPInvokeError();
+                }
+                finally
+                {
+                    _ = setfsuid(unchecked((uint)previous));
+                }
+
+                if (result == 0)
+                {
+                    return new WriteLease(file);
+                }
+
+                file.Dispose();
+                // Open or mapped elsewhere; anything else (leases turned off, say) is reported.
+                return error == ETryAgain ? null : throw CreateException($"taking a lease on '{_relativePath}'", error);
+            }
+            catch
+            {
+                file.Dispose();
+                throw;
+            }
+        }
+
+        private sealed class WriteLease(SafeFileHandle file) : IDisposable
+        {
+            /// <summary>False once an open, by any process, has begun breaking it.</summary>
+            public bool IsHeld => fcntl(GetDescriptor(file), FGetLease, 0) == FWriteLock;
+
+            public void Dispose()
+            {
+                _ = fcntl(GetDescriptor(file), FSetLease, FUnlock);
+                file.Dispose();
+            }
         }
 
         /// <summary>Runs right before the first exchange, after the last check; lets tests rewrite the destination then.</summary>
@@ -1046,6 +1160,9 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
 
     [DllImport("libc", SetLastError = true)]
     private static extern int fchown(int fileDescriptor, uint owner, uint group);
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int setfsuid(uint fileSystemUserId);
 
     [DllImport("libc", SetLastError = true)]
     private static extern int fcntl(int fileDescriptor, int command, int argument);

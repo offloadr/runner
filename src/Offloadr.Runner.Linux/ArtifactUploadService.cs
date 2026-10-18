@@ -504,13 +504,10 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         private long _lastDropWarningTicks = long.MinValue / 2;
 
         private readonly RunnerReadRequester _readRequester;
-        // Sealed sessions only, where eviction runs: which artifacts some process still has open.
-        private readonly LinuxOpenFileTracker? _openFiles;
 
         public SessionUploader(string? runnerSecret, RunnerArtifactService.RunnerArtifactServiceClient artifactClient, Metadata? authHeaders, string sessionId, SessionProcessManager.SessionPaths paths, ILogger logger, RuntimeIdentityRegistry? runtimeIdentities = null, string? runnerId = null, RunnerReadRequesterIdentity? requester = null)
         {
             _readRequester = (requester ?? new RunnerReadRequesterIdentity(runnerId, null, runtimeIdentities)).For(sessionId);
-            _openFiles = paths.IsSealed ? new LinuxOpenFileTracker([paths.OutputDirectory, paths.TempDirectory]) : null;
             CreatedFor = runtimeIdentities?.TryGet(sessionId, out var createdFor) == true ? createdFor : null;
             _runnerSecret = runnerSecret;
             _artifactClient = artifactClient;
@@ -1898,8 +1895,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         internal long EvictUploadedArtifacts(long bytesToFree, TimeSpan minimumIdle, DateTimeOffset now)
         {
             long released = 0;
-            // An artifact still open or mapped keeps its memory until it closes: the pass stops
-            // on the space that actually came back, not on the lengths it replaced.
+            // The pass stops on the space that actually came back, not on the lengths it replaced.
             var freeBefore = ReadSealedFreeBytes();
             var candidates = _catalog.Values
                 .Where(state => state.LocalVersion is { Status.Length: > 0 } &&
@@ -1934,13 +1930,6 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         continue;
                     }
 
-                    // A process that still has it open, a writer above all, would go on with an
-                    // inode nobody can reach after the swap: what it wrote then would be lost.
-                    if (_openFiles?.MayBeOpen(state.LocalPath) == true)
-                    {
-                        continue;
-                    }
-
                     using var secureRoot = new LinuxSecureDirectoryRoot(root);
                     // A rewrite of the same length is a different version: only the one the control
                     // plane holds may be replaced, since opening the placeholder downloads that one.
@@ -1951,13 +1940,13 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
                     var status = version.Status;
 
-                    // Replace rather than truncate: a reader or mapping that still has the file
-                    // open keeps the uploaded bytes until it closes, and memory is released then.
                     using var placeholder = secureRoot.CreatePublication(relativePath);
                     placeholder.SetModifiedUtc(status.LastWriteTimeUtc);
                     CarryOwnership(placeholder, state.LocalPath);
-                    // Swapped in atomically and kept only if it displaced exactly that version.
-                    if (!placeholder.CommitReplacing(version))
+                    // Swapped in atomically and kept only if it displaced exactly that version,
+                    // which no process had open, mapped or opened meanwhile: one holding it, a
+                    // writer above all, would go on with an inode nobody can reach again.
+                    if (!placeholder.CommitReplacing(version, whileUnopened: true))
                     {
                         continue;
                     }
@@ -2488,7 +2477,6 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         private async Task StopAsyncCore(bool cancelOutstandingWork)
         {
             StopWatchers();
-            _openFiles?.Dispose();
             _queue.Writer.TryComplete();
 
             if (cancelOutstandingWork)

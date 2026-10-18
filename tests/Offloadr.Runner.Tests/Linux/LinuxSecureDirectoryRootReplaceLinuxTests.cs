@@ -1,7 +1,102 @@
+using System.Runtime.InteropServices;
+
 namespace Offloadr.Runner.Tests;
 
 public class LinuxSecureDirectoryRootReplaceLinuxTests
 {
+    [Test]
+    public void CommitReplacing_WhileUnopened_LeavesAFileOpenOrMappedElsewhere()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        // On tmpfs, as sealed sessions are: overlayfs hands a mapping to the file beneath, so
+        // the file opened through it is no longer held once its descriptor closes.
+        if (SealedStorageProbe.ReadFileSystemStats("/dev/shm") is not { Type: SealedStorageProbe.TmpfsMagic })
+        {
+            Assert.Ignore("/dev/shm is not a tmpfs here.");
+        }
+
+        var root = CreateRoot("/dev/shm");
+        try
+        {
+            var path = Path.Combine(root, "a.png");
+            File.WriteAllText(path, "uploaded");
+            using var secureRoot = new LinuxSecureDirectoryRoot(root);
+            var version = secureRoot.GetVersion("a.png")!.Value;
+
+            using (var writer = new FileStream(path, FileMode.Open, FileAccess.Write))
+            using (var placeholder = secureRoot.CreatePublication("a.png"))
+            {
+                Assert.That(placeholder.CommitReplacing(version, whileUnopened: true), Is.False, "a writer still has it");
+            }
+
+            // Mapped writable and shared, then closed: the mapping still writes to it.
+            var descriptor = open(path, 2);
+            Assert.That(descriptor, Is.GreaterThanOrEqualTo(0));
+            var mapping = mmap(0, 8, 3, 1, descriptor, 0);
+            _ = close(descriptor);
+            Assert.That(mapping, Is.Not.EqualTo((nint)(-1)));
+            try
+            {
+                using var placeholder = secureRoot.CreatePublication("a.png");
+                Assert.That(placeholder.CommitReplacing(version, whileUnopened: true), Is.False, "a mapping still has it");
+            }
+            finally
+            {
+                _ = munmap(mapping, 8);
+            }
+
+            Assert.That(File.ReadAllText(path), Is.EqualTo("uploaded"));
+            using (var placeholder = secureRoot.CreatePublication("a.png"))
+            {
+                Assert.That(placeholder.CommitReplacing(version, whileUnopened: true), Is.True, "nothing has it now");
+            }
+
+            Assert.That(new FileInfo(path).Length, Is.Zero);
+            Assert.That(Directory.GetFiles(root), Has.Length.EqualTo(1));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Test]
+    public void CommitReplacing_WhileUnopened_SwapsBackForAnOpenDuringTheExchange()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = CreateRoot();
+        try
+        {
+            var path = Path.Combine(root, "a.png");
+            File.WriteAllText(path, "uploaded");
+            using var secureRoot = new LinuxSecureDirectoryRoot(root);
+            var version = secureRoot.GetVersion("a.png")!.Value;
+            using var placeholder = secureRoot.CreatePublication("a.png");
+
+            // A workflow opens it for writing just as it is swapped: the lease holds that open.
+            Thread? opener = null;
+            placeholder.BeforeExchange = () =>
+            {
+                opener = new Thread(() =>
+                {
+                    using var writer = new FileStream(path, FileMode.Open, FileAccess.Write);
+                    writer.Write("UP"u8);
+                });
+                opener.Start();
+                Thread.Sleep(300);
+            };
+
+            Assert.That(placeholder.CommitReplacing(version, whileUnopened: true), Is.False);
+            Assert.That(opener!.Join(TimeSpan.FromSeconds(10)), Is.True, "the open goes on once the lease is let go");
+            Assert.That(File.ReadAllText(path), Is.EqualTo("UPloaded"), "it wrote to the file that stayed");
+            Assert.That(secureRoot.GetVersion("a.png")!.Value.Inode, Is.EqualTo(version.Inode));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
     [Test]
     public void CommitReplacing_ReplacesTheExpectedVersion()
     {
@@ -235,9 +330,21 @@ public class LinuxSecureDirectoryRootReplaceLinuxTests
         File.Move(staged, path, overwrite: true);
     }
 
-    private static string CreateRoot()
+    [DllImport("libc", SetLastError = true)]
+    private static extern int open(string path, int flags);
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern nint mmap(nint address, nuint length, int protection, int flags, int descriptor, nint offset);
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int munmap(nint address, nuint length);
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int close(int descriptor);
+
+    private static string CreateRoot(string? parent = null)
     {
-        var root = Path.Combine(Path.GetTempPath(), $"runner-replace-{Guid.NewGuid():N}");
+        var root = Path.Combine(parent ?? Path.GetTempPath(), $"runner-replace-{Guid.NewGuid():N}");
         Directory.CreateDirectory(root);
         return root;
     }
