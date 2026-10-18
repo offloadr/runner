@@ -120,7 +120,8 @@ public sealed class RunnerVfsEnvironmentBuilder
 
             return process.ExitCode == 0 &&
                 stderr.Wait(TimeSpan.FromSeconds(5)) &&
-                stderr.Result.Split('\n').Contains("offloadr-vfs-no-dump=0", StringComparer.Ordinal);
+                stderr.Result.Split('\n').Contains("offloadr-vfs-no-dump=0", StringComparer.Ordinal) &&
+                stderr.Result.Split('\n').Contains("offloadr-vfs-core-locked=1", StringComparer.Ordinal);
         }
         catch (Exception ex) when (ex is Win32Exception or InvalidOperationException or IOException)
         {

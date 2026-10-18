@@ -188,7 +188,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 }
             }
 
-            return incomplete ? taken with { Incomplete = true } : taken;
+            return incomplete || Volatile.Read(ref _everyLossUncounted) ? taken with { Incomplete = true } : taken;
         }
     }
 
@@ -199,6 +199,14 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
     /// lost, such as sealed data an earlier runner process left: that lifecycle's Stop reports
     /// the count as unknown.
     /// </summary>
+    /// <summary>
+    /// Marks every lifecycle's loss as uncounted, for good: which lifecycles an earlier runner
+    /// process left data of is not known (their notes could not be read).
+    /// </summary>
+    public void MarkEveryLossUncounted() => Volatile.Write(ref _everyLossUncounted, true);
+
+    private bool _everyLossUncounted;
+
     public void MarkLossUncounted(string sessionId, ulong lifecycleGeneration = 0)
     {
         if (!string.IsNullOrWhiteSpace(sessionId))

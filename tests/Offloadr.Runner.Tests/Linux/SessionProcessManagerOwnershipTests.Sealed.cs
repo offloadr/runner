@@ -762,6 +762,38 @@ public partial class SessionProcessManagerOwnershipTests
 
     [Test]
     [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public async Task UnreadableLifecycleNotes_MakeEveryLossUnknown()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        LinuxTestPrerequisites.RequireRoot();
+
+        var (tempRoot, sealedRoot, options) = CreateSealedOptions("comfyui");
+        try
+        {
+            // Nothing noted: nothing unknown.
+            using (var fresh = new SessionProcessManager(options, new RecordingIsolationStrategy("unused", Path.Combine(options.SessionRoot, "unused")), SealedVfsBuilder(), new RecordingCommandRunner(string.Empty)) { PrepareSealedHost = HostLockedDown })
+            {
+                await fresh.CleanupStaleSessionsAsync(CancellationToken.None);
+                Assert.That(fresh.SealedLifecyclesUnknown, Is.False);
+            }
+
+            // Something that is not the notes' folder stands in its place: what it held is unknown.
+            Directory.CreateDirectory(options.SessionRoot);
+            File.WriteAllText(Path.Combine(options.SessionRoot, ".offloadr-sealed-lifecycles"), "unreadable");
+            using var restarted = new SessionProcessManager(options, new RecordingIsolationStrategy("unused", Path.Combine(options.SessionRoot, "unused")), SealedVfsBuilder(), new RecordingCommandRunner(string.Empty)) { PrepareSealedHost = HostLockedDown };
+            await restarted.CleanupStaleSessionsAsync(CancellationToken.None);
+
+            Assert.That(restarted.SealedLifecyclesUnknown, Is.True);
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+            TryDelete(sealedRoot);
+        }
+    }
+
+    [Test]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
     public void SealedStart_IsRefusedWhenItsLifecycleCannotBeNoted()
     {
         LinuxTestPrerequisites.RequireLinux();

@@ -587,8 +587,17 @@ internal sealed partial class SessionProcessManager : IDisposable
     /// </summary>
     private void ReadRecordedSealedLifecycles()
     {
-        if (SealedStorageProbe.ReadEntryStatus(SealedLifecycleRecords) is not { IsDirectory: true, IsSymbolicLink: false, OwnerId: 0 })
+        var records = SealedStorageProbe.ReadEntryStatus(SealedLifecycleRecords);
+        if (records is null && SealedHostLockdown.IsGone(SealedLifecycleRecords))
         {
+            return;
+        }
+
+        if (records is not { IsDirectory: true, IsSymbolicLink: false, OwnerId: 0 })
+        {
+            // Something is there that cannot be trusted or read: any lifecycle may be noted in it.
+            SealedLifecyclesUnknown = true;
+            RunnerLog.Warning<SessionProcessManager>("The sealed lifecycle notes cannot be read; every Stop reports its loss as unknown.");
             return;
         }
 
@@ -605,9 +614,16 @@ internal sealed partial class SessionProcessManager : IDisposable
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            RunnerLog.Warning<SessionProcessManager>($"Could not read the sealed lifecycle notes: {ex.GetType().Name}");
+            SealedLifecyclesUnknown = true;
+            RunnerLog.Warning<SessionProcessManager>($"Could not read the sealed lifecycle notes ({ex.GetType().Name}); every Stop reports its loss as unknown.");
         }
     }
+
+    /// <summary>
+    /// Whether the notes of sealed lifecycles could not all be read at startup: any Stop may then
+    /// be for a lifecycle whose data an earlier runner process left, so none can report a full count.
+    /// </summary>
+    public bool SealedLifecyclesUnknown { get; private set; }
 
     private static IEnumerable<ulong> ReadRecordedGenerations(string sessionRecords)
         => Directory.GetFiles(sessionRecords)

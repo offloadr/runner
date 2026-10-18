@@ -214,6 +214,19 @@ public partial class ArtifactUploadServiceTests
     }
 
     [Test]
+    public async Task UnsavedCount_IsUnknownForEveryStopWhenTheLifecycleNotesCouldNotBeRead()
+    {
+        var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse());
+        await using var service = new ArtifactUploadService("runner-secret-value", artifactClient, NullLogger<ArtifactUploadService>.Instance);
+
+        service.MarkEveryLossUncounted();
+
+        Assert.That(service.TakeUnsavedUploads("session-1", 7).Incomplete, Is.True);
+        Assert.That(service.TakeUnsavedUploads("session-2", 3).Incomplete, Is.True);
+        Assert.That(service.TakeUnsavedUploads("session-1", 7).Incomplete, Is.True, "for as long as this process runs");
+    }
+
+    [Test]
     public async Task UnsavedCount_IsUnknownForASessionWhoseDataARestartRemoved()
     {
         var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse());

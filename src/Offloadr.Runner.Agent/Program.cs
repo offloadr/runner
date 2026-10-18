@@ -145,6 +145,11 @@ foreach (var (staleSessionId, staleGeneration) in sessionManager.TakeStaleSealed
     artifactUploadService.MarkLossUncounted(staleSessionId, staleGeneration);
 }
 
+if (sessionManager.SealedLifecyclesUnknown)
+{
+    artifactUploadService.MarkEveryLossUncounted();
+}
+
 await using var workspaceMirrorService = new WorkspaceMirrorService(
     workspaceCatalogClient,
     options.RunnerSecret,

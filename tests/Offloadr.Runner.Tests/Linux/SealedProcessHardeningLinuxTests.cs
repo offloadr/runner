@@ -20,6 +20,77 @@ public class SealedProcessHardeningLinuxTests
         }
         """;
 
+    private const string CoreLockProbeSource = """
+        #include <stdio.h>
+        #include <stdlib.h>
+        #include <string.h>
+        #include <sys/prctl.h>
+        #include <sys/resource.h>
+        #include <unistd.h>
+
+        int main(int argc, char **argv) {
+            struct rlimit limit;
+            int read = getrlimit(RLIMIT_CORE, &limit) == 0;
+            unsigned long soft = (unsigned long)limit.rlim_cur;
+            limit.rlim_cur = 0;
+            int lowered = setrlimit(RLIMIT_CORE, &limit) == 0;
+            int madeDumpable = prctl(PR_SET_DUMPABLE, 1, 0, 0, 0) == 0;
+            printf("%d %d %d %d %lu\n", read, lowered, madeDumpable, prctl(PR_GET_DUMPABLE, 0, 0, 0, 0), soft);
+            fflush(stdout);
+            if (argc > 1 && strcmp(argv[1], "exec") == 0) {
+                /* Without the shim from here on: the lock must come with the process. */
+                unsetenv("LD_PRELOAD");
+                execl(argv[0], argv[0], (char *)NULL);
+                return 2;
+            }
+            return 0;
+        }
+        """;
+
+    [TestCase("1", "1 0 0 0 1\n1 0 0 1 1\n")]
+    [TestCase(null, "1 1 1 1 1\n")]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public async Task Shim_LocksTheSessionUsersCoreLimitAndDumpability(string? noDump, string expected)
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        LinuxTestPrerequisites.RequireRoot();
+        LinuxTestPrerequisites.RequireCommand("/usr/bin/gcc");
+
+        var root = Path.Combine(Path.GetTempPath(), $"runner-core-lock-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        File.SetUnixFileMode(root, (UnixFileMode)Convert.ToInt32("755", 8));
+        var original = LinuxProcessHardening.ReadCoreSizeLimit()!.Value;
+        try
+        {
+            var shimPath = Path.Combine(root, "liboffloadr_model_vfs.so");
+            var probeSourcePath = Path.Combine(root, "probe.c");
+            var probePath = Path.Combine(root, "probe");
+            await VfsShimLinuxTests.CompileShimAsync(shimPath);
+            await File.WriteAllTextAsync(probeSourcePath, CoreLockProbeSource);
+            await VfsShimLinuxTests.RunProcessAsync("/usr/bin/gcc", [probeSourcePath, "-o", probePath], root);
+            // As the agent leaves it for sealed sessions.
+            Assert.That(LinuxProcessHardening.SetCoreSizeLimit(1, 1), Is.True);
+            await using var user = await LinuxTestUser.CreateAsync();
+
+            string[] environment = noDump is null
+                ? [$"LD_PRELOAD={shimPath}", "VFS_ROOTS="]
+                : [$"LD_PRELOAD={shimPath}", "VFS_ROOTS=", $"VFS_NO_DUMP={noDump}"];
+            var result = await VfsShimLinuxTests.RunProcessAsync(
+                "/usr/sbin/runuser",
+                ["-u", user.Name, "--", "/usr/bin/env", .. environment, probePath, noDump is null ? "once" : "exec"],
+                root);
+
+            // Sealed: the soft limit stays at 1 byte and the process cannot make itself dumpable,
+            // after an exec without the shim too (which makes it dumpable, the limit covering it).
+            Assert.That(result.Stdout, Is.EqualTo(expected));
+        }
+        finally
+        {
+            LinuxProcessHardening.SetCoreSizeLimit(original.Soft, original.Hard);
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
     [TestCase("1", "0\n0\n")]
     [TestCase(null, "1\n1\n")]
     public async Task Shim_MakesProcessesNonDumpableAcrossExecWhenAsked(string? noDump, string expected)
