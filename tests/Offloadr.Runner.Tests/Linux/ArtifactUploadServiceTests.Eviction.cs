@@ -24,16 +24,11 @@ public partial class ArtifactUploadServiceTests
             var outputPath = Path.Combine(paths.OutputDirectory, "ComfyUI_00001_.png");
             await File.WriteAllBytesAsync(outputPath, content);
             await artifactClient.WaitForUploadAsync(TimeSpan.FromSeconds(5));
-            await using var openBeforeEviction = new FileStream(outputPath, FileMode.Open, FileAccess.Read);
 
             var released = await EvictWhenRecordedAsync(service, "session-1");
 
             Assert.That(released, Is.EqualTo(content.Length));
             Assert.That(new FileInfo(outputPath).Length, Is.Zero);
-            // A reader that had it open still sees the uploaded bytes.
-            var stillOpen = new byte[content.Length];
-            await openBeforeEviction.ReadExactlyAsync(stillOpen);
-            Assert.That(stillOpen, Is.EqualTo(content));
 
             Assert.That(await service.TryEnsureArtifactAvailableAsync(outputPath, highPriority: true, CancellationToken.None), Is.True);
             Assert.That(await File.ReadAllBytesAsync(outputPath), Is.EqualTo(content));
@@ -392,13 +387,15 @@ public partial class ArtifactUploadServiceTests
             await artifactClient.WaitForUploadAsync(TimeSpan.FromSeconds(5));
             await Task.Delay(200);
 
-            // The editor still reads the older one: evicting it alone gives nothing back yet.
+            // The editor still has the older one open: it is left alone, and replacing it would
+            // give nothing back yet anyway.
             using (var reader = new FileStream(older, FileMode.Open, FileAccess.Read))
             {
+                await Task.Delay(200);
                 service.EvictUploadedArtifacts("session-1", Size, TimeSpan.Zero);
             }
 
-            Assert.That(new FileInfo(older).Length, Is.Zero);
+            Assert.That(new FileInfo(older).Length, Is.EqualTo(Size), "an open artifact stays");
             Assert.That(new FileInfo(newer).Length, Is.Zero, "the pass went on to an artifact whose memory it could free");
         }
         finally
@@ -469,6 +466,41 @@ public partial class ArtifactUploadServiceTests
 
             // Without its catalog entry an emptied file could never be downloaded again.
             Assert.That(File.ReadAllBytes(outputPath), Is.EqualTo(new byte[] { 1, 2, 3 }));
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public async Task EvictUploadedArtifacts_LeavesAnArtifactAProcessStillHasOpen()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = CreateEvictionPaths(root, sealedSession: true);
+            var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse());
+            await using var service = new ArtifactUploadService("runner-secret-value", artifactClient, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            var outputPath = Path.Combine(paths.OutputDirectory, "still-writing.png");
+            await File.WriteAllBytesAsync(outputPath, [1, 2, 3]);
+            await artifactClient.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+
+            // The workflow keeps a handle it may still write through.
+            using (var writer = new FileStream(outputPath, FileMode.Open, FileAccess.ReadWrite))
+            {
+                await Task.Delay(300);
+                Assert.That(service.EvictUploadedArtifacts("session-1", long.MaxValue, TimeSpan.Zero), Is.Zero);
+                Assert.That(new FileInfo(outputPath).Length, Is.EqualTo(3));
+            }
+
+            // Closed: it may go now.
+            await Task.Delay(300);
+            Assert.That(await EvictWhenRecordedAsync(service, "session-1"), Is.EqualTo(3));
         }
         finally
         {

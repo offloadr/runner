@@ -85,6 +85,55 @@ public class LinuxSessionResidueLinuxTests
 
     [Test]
     [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public async Task OpenFileTracker_SeesOpensAndClosesBelowItsRoots()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+
+        var root = Path.Combine(Path.GetTempPath(), $"runner-opens-{Guid.NewGuid():N}");
+        try
+        {
+            Directory.CreateDirectory(root);
+            var file = Path.Combine(root, "out.png");
+            File.WriteAllText(file, "x");
+            using var tracker = new LinuxOpenFileTracker([root]);
+
+            using (var handle = new FileStream(file, FileMode.Open, FileAccess.Write))
+            {
+                await WaitForAsync(() => tracker.MayBeOpen(file));
+                Assert.That(tracker.MayBeOpen(file), Is.True);
+            }
+
+            await WaitForAsync(() => !tracker.MayBeOpen(file));
+            Assert.That(tracker.MayBeOpen(file), Is.False);
+
+            // A folder made later is watched too.
+            var nested = Path.Combine(root, "sub");
+            Directory.CreateDirectory(nested);
+            await Task.Delay(200);
+            var nestedFile = Path.Combine(nested, "late.png");
+            using (var handle = new FileStream(nestedFile, FileMode.CreateNew, FileAccess.Write))
+            {
+                await WaitForAsync(() => tracker.MayBeOpen(nestedFile));
+                Assert.That(tracker.MayBeOpen(nestedFile), Is.True);
+            }
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+
+        static async Task WaitForAsync(Func<bool> condition)
+        {
+            var deadline = DateTime.UtcNow.AddSeconds(5);
+            while (!condition() && DateTime.UtcNow < deadline)
+            {
+                await Task.Delay(20);
+            }
+        }
+    }
+
+    [Test]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
     public void CurrentResidueRoots_AddWritableMemoryMountsButNotDev()
     {
         LinuxTestPrerequisites.RequireLinux();
