@@ -423,7 +423,11 @@ internal static class ServiceClientManager
     }
 
     /// <summary>The shared result of one physical startup, acknowledged by every command that joined it.</summary>
-    internal readonly record struct StartupOutcome(bool Ready, string Message);
+    /// <summary>
+    /// How a startup ended. <paramref name="Sealing"/> is captured inside the startup, which a Stop
+    /// or replacement waits for, so it always describes the runtime this command started.
+    /// </summary>
+    internal readonly record struct StartupOutcome(bool Ready, string Message, SessionSealingStatus? Sealing = null);
 
     internal sealed class TrackedCommandWork
     {
@@ -434,6 +438,9 @@ internal static class ServiceClientManager
         public required CancellationTokenSource CancellationSource { get; init; }
         public required string SessionId { get; init; }
         public RuntimeIdentity RuntimeIdentity { get; init; }
+
+        /// <summary>The sealing a startup runs with; only a command asking for the same joins it.</summary>
+        public SessionSealing? Sealing { get; init; }
 
         public void Cancel()
         {
@@ -474,6 +481,14 @@ internal static class ServiceClientManager
         public required Action<string?> SetDownloadActiveSession { get; init; }
         public required Func<Action, CancellationToken, Task> ActivateSession { get; init; }
         public required CancellationToken Shutdown { get; init; }
+        /// <summary>What a started session's runtime got, for its start acknowledgement.</summary>
+        public Func<string, SessionSealingStatus?>? GetSessionSealing { get; init; }
+        /// <summary>Whether this runner seals a start that does not ask for it (required mode).</summary>
+        public Func<StartSessionCommand, bool>? SealsStart { get; init; }
+        /// <summary>Takes the artifacts the session lost when its runtimes' data was removed, for its stop acknowledgement.</summary>
+        public Func<string, ulong, UnsavedUploads>? TakeUnsavedArtifacts { get; init; }
+        /// <summary>Drops the durable note of a sealed lifecycle once its Stop is acknowledged with the count.</summary>
+        public Action<string, ulong>? ForgetSealedLifecycle { get; init; }
     }
 
     internal sealed class RunnerCommandWorkState(CancellationToken shutdown)
@@ -483,6 +498,9 @@ internal static class ServiceClientManager
         // Retain successful Stops for the process lifetime, including reconnects.
         // Evicting a nonce would allow a delayed retry to stop a replacement runtime.
         public ConcurrentDictionary<Guid, StopCommandWork> Stops { get; } = new();
+        // The sealing each logical session was started with, by the lifecycle that started it; a
+        // relaunch of its runtime keeps it.
+        public ConcurrentDictionary<string, RetainedSealing> SessionSealing { get; } = new(StringComparer.Ordinal);
         private TrackedCommandWork? _activeStartup;
 
         public TrackedCommandWork? GetActiveStartup()
@@ -524,6 +542,8 @@ internal static class ServiceClientManager
         public SemaphoreSlim Gate { get; } = new(1, 1);
         public AcknowledgeSessionStopRequest Acknowledgement { get; } = acknowledgement;
         public bool Completed { get; set; }
+        /// <summary>Whether this Stop took the session's count of lost artifacts.</summary>
+        public bool CountTaken { get; set; }
         public Task? AcknowledgementTask { get; set; }
 
         public bool Matches(AcknowledgeSessionStopRequest delivery)
@@ -532,6 +552,9 @@ internal static class ServiceClientManager
             // the original spelling in every replay of the acknowledgement.
             delivery = delivery.Clone();
             delivery.CommandId = Acknowledgement.CommandId;
+            // Filled in from the completed stop, never by a delivery.
+            delivery.UnsavedArtifactCount = Acknowledgement.UnsavedArtifactCount;
+            delivery.UnsavedArtifactsUnknown = Acknowledgement.UnsavedArtifactsUnknown;
             return Acknowledgement.Equals(delivery);
         }
     }
@@ -1005,7 +1028,8 @@ internal static class ServiceClientManager
                 supportedEditorTemplates,
                 minBackoff,
                 maxBackoff,
-                initialStatusApplied);
+                initialStatusApplied,
+                sessionManager.DescribeSealedStorage);
             var localModelTask = localModelSnapshotProvider is null
                 ? Task.CompletedTask
                 : RunLocalModelSyncLoopAsync(
@@ -1068,7 +1092,8 @@ internal static class ServiceClientManager
         IReadOnlyList<string> supportedEditorTemplates,
         TimeSpan minBackoff,
         TimeSpan maxBackoff,
-        TaskCompletionSource initialStatusApplied)
+        TaskCompletionSource initialStatusApplied,
+        Func<RunnerSealedStorage>? describeSealedStorage = null)
     {
         ArgumentNullException.ThrowIfNull(sessionSink);
 
@@ -1086,7 +1111,7 @@ internal static class ServiceClientManager
                 }
 
                 var response = await sessionSink.RegisterRunnerAsync(
-                    BuildStatusUpdateRequest(runnerId, instanceId, version, resources, getActiveSessionId, supportedEditorTemplates),
+                    BuildStatusUpdateRequest(runnerId, instanceId, version, resources, getActiveSessionId, supportedEditorTemplates, describeSealedStorage),
                     shutdown).ConfigureAwait(false);
 
                 RunnerLog.Info(nameof(ServiceClientManager), $"Status update accepted={response.Accepted} message='{response.Message}' next={response.RefreshSeconds}s");
@@ -1362,6 +1387,10 @@ internal static class ServiceClientManager
             SetDownloadActiveSession = downloadService.SetActiveSession,
             ActivateSession = gpuPowerLimitService.ActivateSessionAsync,
             Shutdown = shutdown,
+            GetSessionSealing = sessionManager.GetSessionSealingStatus,
+            SealsStart = start => start.Sealing?.Required != true && sessionManager.ShouldSeal(start),
+            TakeUnsavedArtifacts = artifactUploadService.TakeUnsavedUploads,
+            ForgetSealedLifecycle = sessionManager.ForgetSealedLifecycle,
         };
 
         while (!shutdown.IsCancellationRequested)
@@ -2032,6 +2061,9 @@ internal static class ServiceClientManager
     /// remains the session's identity; a cleanup that could not stop the child keeps
     /// the state until the process exits.
     /// </summary>
+    /// <summary>A session's start sealing and the runtime of the start that set it.</summary>
+    internal sealed record RetainedSealing(RuntimeIdentity StartRuntime, SessionSealing Sealing);
+
     private static async Task CleanUpFailedStartupAsync(
         string sessionId,
         RuntimeIdentity failedRuntime,
@@ -2057,6 +2089,15 @@ internal static class ServiceClientManager
                 failedRuntime.LifecycleGeneration,
                 failedRuntime.RuntimeEpoch,
                 failedRuntime.RuntimeInstanceId);
+            // A failed start's sealing goes with it: a later launch that omits its own must not
+            // inherit that recipient. A failed or refused relaunch keeps it: the session still
+            // started sealed, and its next launch must be too.
+            if (deps.WorkState.SessionSealing.TryGetValue(sessionId, out var retained) &&
+                retained.StartRuntime.SameRuntime(failedRuntime))
+            {
+                ((ICollection<KeyValuePair<string, RetainedSealing>>)deps.WorkState.SessionSealing).Remove(new(sessionId, retained));
+            }
+
             return;
         }
 
@@ -2113,15 +2154,27 @@ internal static class ServiceClientManager
         {
             if (!work.Completed)
             {
-                work.Completed = await ExecuteStopSessionCommandAsync(command, deps).ConfigureAwait(false);
+                var outcome = await ExecuteStopSessionCommandAsync(command, deps).ConfigureAwait(false);
+                work.Completed = outcome != StopOutcome.NotCompleted;
+                // The Stop that tore the session down reports what its lifecycle lost, and so
+                // does an older lifecycle's Stop that came after a newer lifecycle began: the
+                // counts are kept by lifecycle, so it takes none of the current one's. A Stop
+                // for an older runtime of the current lifecycle leaves the count for that
+                // lifecycle's own Stop.
+                if (outcome is StopOutcome.Stopped or StopOutcome.SupersededLifecycle)
+                {
+                    var unsaved = deps.TakeUnsavedArtifacts?.Invoke(command.SessionId, command.LifecycleGeneration) ?? default;
+                    work.Acknowledgement.UnsavedArtifactCount = (uint)Math.Max(0, unsaved.Count);
+                    work.Acknowledgement.UnsavedArtifactsUnknown = unsaved.Incomplete;
+                    work.CountTaken = true;
+                }
             }
 
             if (work.Completed && (work.AcknowledgementTask is null || work.AcknowledgementTask.IsCompleted))
             {
                 // One retry loop per command; redelivery after a finished loop
                 // replays the same result without touching runtime state.
-                work.AcknowledgementTask = AcknowledgeRuntimeCommandWithRetryAsync(
-                    deps.Sink.AckStopSessionAsync, work.Acknowledgement, acknowledgementKey, deps.Shutdown);
+                work.AcknowledgementTask = AcknowledgeStopAsync(work, acknowledgementKey, command, deps);
             }
         }
         finally
@@ -2130,17 +2183,26 @@ internal static class ServiceClientManager
         }
     }
 
-    private static async Task<bool> ExecuteStopSessionCommandAsync(StopSessionCommand command, RuntimeCommandDependencies deps)
+    private enum StopOutcome
+    {
+        NotCompleted,
+        Superseded,
+        // Superseded by a newer lifecycle, not only a newer runtime of the same one.
+        SupersededLifecycle,
+        Stopped,
+    }
+
+    private static async Task<StopOutcome> ExecuteStopSessionCommandAsync(StopSessionCommand command, RuntimeCommandDependencies deps)
     {
         deps.Shutdown.ThrowIfCancellationRequested();
-        if (IsStopSuperseded(command, deps))
+        if (FindRuntimeNewerThanStop(command, deps) is { } newer)
         {
             // A delayed or redelivered Stop for an older runtime must not stop the
             // newer one. The runtime it names is no longer running here.
             RunnerLog.Warning(
                 nameof(ServiceClientManager),
                 $"Ignoring stale stop for session {command.SessionId}; a newer runtime is current.");
-            return true;
+            return newer.LifecycleGeneration > command.LifecycleGeneration ? StopOutcome.SupersededLifecycle : StopOutcome.Superseded;
         }
 
         await deps.WorkState.Prompts.CancelAndWaitAsync(
@@ -2165,12 +2227,13 @@ internal static class ServiceClientManager
             // Keep the heartbeat and identity of a child that may still be alive,
             // and do not acknowledge: the control plane retains the Stop.
             RunnerLog.Error(nameof(ServiceClientManager), ex, $"Stop of session {command.SessionId} did not complete; retaining its state.");
-            return false;
+            return StopOutcome.NotCompleted;
         }
 
         deps.LogicalSessionState.ClearAndRetire(command.SessionId, command.LifecycleGeneration);
         deps.RuntimeIdentities.Remove(command.SessionId);
-        return true;
+        deps.WorkState.SessionSealing.TryRemove(command.SessionId, out _);
+        return StopOutcome.Stopped;
     }
 
     /// <summary>
@@ -2178,27 +2241,30 @@ internal static class ServiceClientManager
     /// the session's current runtime, tracked child or active startup is newer.
     /// A Stop without one is not runtime-fenced; its command identity still deduplicates retries.
     /// </summary>
-    private static bool IsStopSuperseded(StopSessionCommand command, RuntimeCommandDependencies deps)
+    /// <summary>A runtime of the session newer than the one a fenced Stop names, if any.</summary>
+    private static RuntimeIdentity? FindRuntimeNewerThanStop(StopSessionCommand command, RuntimeCommandDependencies deps)
     {
         if (command.LifecycleGeneration == 0)
         {
-            return false;
+            return null;
         }
 
         if (deps.LogicalSessionState.TryGetRuntime(command.SessionId, out var logical, out _) &&
             IsNewerThanStop(logical, command))
         {
-            return true;
+            return logical;
         }
 
         if (deps.GetTrackedRuntime(command.SessionId) is { } tracked && IsNewerThanStop(tracked, command))
         {
-            return true;
+            return tracked;
         }
 
         return deps.WorkState.GetActiveStartup() is { } startup &&
                string.Equals(startup.SessionId, command.SessionId, StringComparison.Ordinal) &&
-               IsNewerThanStop(startup.RuntimeIdentity, command);
+               IsNewerThanStop(startup.RuntimeIdentity, command)
+            ? startup.RuntimeIdentity
+            : null;
     }
 
     private static bool IsNewerThanStop(RuntimeIdentity current, StopSessionCommand stop)
@@ -2286,6 +2352,18 @@ internal static class ServiceClientManager
 
                         deps.RuntimeIdentities.Set(command.SessionId, command.LifecycleGeneration,
                             command.RuntimeEpoch, command.RuntimeInstanceId);
+                        // Retained for relaunches only by the start that was admitted, never by a
+                        // delivery that joined it, nor by a duplicate of a runtime already running.
+                        var duplicateOfRunning = deps.GetTrackedRuntime(command.SessionId) is { } tracked &&
+                            tracked.SameRuntime(runtimeIdentity);
+                        if (!duplicateOfRunning && command.Sealing is { } sealing)
+                        {
+                            deps.WorkState.SessionSealing[command.SessionId] = new RetainedSealing(runtimeIdentity, sealing.Clone());
+                        }
+                        else if (!duplicateOfRunning)
+                        {
+                            deps.WorkState.SessionSealing.TryRemove(command.SessionId, out _);
+                        }
                     }, cancellationToken).ConfigureAwait(false);
 
                     var preemptedSessionId = await PreemptActiveSessionIfNeededAsync(
@@ -2303,11 +2381,18 @@ internal static class ServiceClientManager
                     await deps.StartRuntimeAndWaitForReady(command, cancellationToken).ConfigureAwait(false);
                     return new StartupOutcome(
                         true,
-                        IsComfyRuntime(command.EditorRuntimeKind) ? "ComfyUI ready" : "GPU runtime ready");
+                        IsComfyRuntime(command.EditorRuntimeKind) ? "ComfyUI ready" : "GPU runtime ready",
+                        deps.GetSessionSealing?.Invoke(command.SessionId));
+                }
+                catch (SessionAlreadyRunningException ex)
+                {
+                    // That runtime runs on, as it was admitted: only this command is refused.
+                    LogStartFailure(command, deps, ex, $"Refused a start of session {command.SessionId}");
+                    return new StartupOutcome(false, ex.Message);
                 }
                 catch (Exception ex)
                 {
-                    RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed to start session {command.SessionId}: {ex.Message}");
+                    LogStartFailure(command, deps, ex, $"Failed to start session {command.SessionId}");
                     await CleanUpFailedStartupAsync(command.SessionId, runtimeIdentity, deps).ConfigureAwait(false);
                     return new StartupOutcome(false, ex.Message);
                 }
@@ -2316,10 +2401,28 @@ internal static class ServiceClientManager
             {
                 ack.Ready = outcome.Ready;
                 ack.Message = outcome.Message;
+                ack.Sealing = outcome.Ready ? outcome.Sealing : null;
                 return ack;
             },
             deps.Sink.AckStartSessionAsync,
-            command.SessionId);
+            command.SessionId,
+            command.Sealing);
+    }
+
+    /// <summary>
+    /// Logs why a start or launch failed. For a sealed one only the exception's type is logged: its
+    /// message can name session files (a workspace seed's entries, say), and the console reaches
+    /// the host's disk. The acknowledgement still carries the message to the control plane.
+    /// </summary>
+    private static void LogStartFailure(StartSessionCommand start, RuntimeCommandDependencies deps, Exception ex, string context)
+    {
+        if (start.Sealing?.Required == true || deps.SealsStart?.Invoke(start) == true)
+        {
+            RunnerLog.Error(nameof(ServiceClientManager), $"{context}: {ex.GetType().Name} (details withheld for a sealed session).");
+            return;
+        }
+
+        RunnerLog.Error(nameof(ServiceClientManager), ex, $"{context}: {ex.Message}");
     }
 
     internal static async Task HandleQuiesceRuntimeCommandAsync(
@@ -2501,6 +2604,12 @@ internal static class ServiceClientManager
             command.LifecycleGeneration,
             command.RuntimeEpoch,
             command.RuntimeInstanceId);
+        // Only the current lifecycle's start counts: a newer lifecycle may have begun without
+        // this runner seeing the older one stop.
+        var startSealing = deps.WorkState.SessionSealing.TryGetValue(command.SessionId, out var retained) &&
+            retained.StartRuntime.LifecycleGeneration == command.LifecycleGeneration
+                ? retained.Sealing
+                : null;
         var start = new StartSessionCommand
         {
             SessionId = command.SessionId,
@@ -2511,7 +2620,14 @@ internal static class ServiceClientManager
             LifecycleGeneration = command.LifecycleGeneration,
             RuntimeEpoch = command.RuntimeEpoch,
             RuntimeInstanceId = command.RuntimeInstanceId,
+            // The launch's own sealing wins; the start's covers a control plane that omits it.
+            Sealing = command.Sealing?.Clone() ?? startSealing?.Clone(),
         };
+        // A restart keeps the logical session: it never runs it with less sealing than it started
+        // with, neither unsealed nor encrypting its uploads to another recipient, or to none.
+        var weakensSealing = command.Sealing is { } launchSealing && startSealing is not null &&
+            ((startSealing.Required && !launchSealing.Required) ||
+             (startSealing.OutputRecipient is not null && !startSealing.OutputRecipient.Equals(launchSealing.OutputRecipient)));
         start.InitialModels.AddRange(command.InitialModels);
         start.InitialArtifacts.AddRange(command.InitialArtifacts);
         start.InitialWorkspaceFiles.AddRange(command.InitialWorkspaceFiles);
@@ -2524,14 +2640,44 @@ internal static class ServiceClientManager
             {
                 try
                 {
+                    if (weakensSealing)
+                    {
+                        throw new InvalidOperationException("The session started sealed; a runtime launch cannot run it with less sealing.");
+                    }
+
                     await deps.StartRuntimeAndWaitForReady(start, cancellationToken).ConfigureAwait(false);
+                    if (command.Sealing is { } learned)
+                    {
+                        // What this launch ran with stands for the lifecycle from now on: it is
+                        // never weaker than what it replaces, and may be stronger (the Start was
+                        // unsealed, or this runner never saw it), so a later launch that omits
+                        // sealing keeps it. A Start's identity stays, so only that Start failing
+                        // drops it; a newer lifecycle's sealing is never replaced.
+                        var retainedFromLaunch = new RetainedSealing(runtimeIdentity, learned.Clone());
+                        deps.WorkState.SessionSealing.AddOrUpdate(
+                            command.SessionId,
+                            retainedFromLaunch,
+                            (_, existing) => existing.StartRuntime.LifecycleGeneration < command.LifecycleGeneration
+                                ? retainedFromLaunch
+                                : existing.StartRuntime.LifecycleGeneration == command.LifecycleGeneration
+                                    ? existing with { Sealing = learned.Clone() }
+                                    : existing);
+                    }
+
                     return new StartupOutcome(
                         true,
-                        IsComfyRuntime(command.EditorRuntimeKind) ? "ComfyUI ready" : "GPU runtime ready");
+                        IsComfyRuntime(command.EditorRuntimeKind) ? "ComfyUI ready" : "GPU runtime ready",
+                        deps.GetSessionSealing?.Invoke(command.SessionId));
+                }
+                catch (SessionAlreadyRunningException ex)
+                {
+                    // That runtime runs on, as it was admitted: only this command is refused.
+                    LogStartFailure(start, deps, ex, $"Refused a launch for restart {command.RestartId}");
+                    return new StartupOutcome(false, ex.Message);
                 }
                 catch (Exception ex)
                 {
-                    RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed launching runtime for restart {command.RestartId}: {ex.Message}");
+                    LogStartFailure(start, deps, ex, $"Failed launching runtime for restart {command.RestartId}");
                     // Clean up only this launch's runtime, never a valid runtime of
                     // another identity that happens to share the session id.
                     await CleanUpFailedStartupAsync(command.SessionId, runtimeIdentity, deps).ConfigureAwait(false);
@@ -2542,10 +2688,12 @@ internal static class ServiceClientManager
             {
                 ack.Ready = outcome.Ready;
                 ack.Message = outcome.Message;
+                ack.Sealing = outcome.Ready ? outcome.Sealing : null;
                 return ack;
             },
             deps.Sink.AckEditorRuntimeLaunchAsync,
-            command.CommandId);
+            command.CommandId,
+            start.Sealing);
     }
 
     private const string StaleRuntimeCommandMessage = "The command targets a superseded runtime or another runner.";
@@ -2569,16 +2717,26 @@ internal static class ServiceClientManager
         Func<CancellationToken, Task<StartupOutcome>> startup,
         Func<StartupOutcome, TAck> toAcknowledgement,
         Func<TAck, CancellationToken, Task> acknowledge,
-        string acknowledgementKey)
+        string acknowledgementKey,
+        SessionSealing? sealing)
     {
         // Another command for the runtime already starting joins that startup: replacing it
         // would cancel the work starting this very runtime, and that work's failure cleanup
         // would stop it. The joined command still acknowledges under its own command id and
-        // attempt, with the shared startup's result.
+        // attempt, with the shared startup's result. One asking for other sealing is refused
+        // instead: that startup never checked it, and it may be running on disk.
         if (deps.WorkState.GetActiveStartup() is { Outcome: { } inProgress } active &&
             string.Equals(active.SessionId, sessionId, StringComparison.Ordinal) &&
             active.RuntimeIdentity.SameRuntime(runtimeIdentity))
         {
+            if (!Equals(active.Sealing, sealing))
+            {
+                RunnerLog.Warning(
+                    nameof(ServiceClientManager),
+                    $"Startup {acknowledgementKey} for session {sessionId} asks for other sealing than the one in progress; refusing it.");
+                return AcknowledgeOutcomeAsync(Task.FromResult(new StartupOutcome(false, OtherSealingMessage)));
+            }
+
             RunnerLog.Info(
                 nameof(ServiceClientManager),
                 $"Startup {acknowledgementKey} for session {sessionId} is already in progress; joining it.");
@@ -2592,6 +2750,7 @@ internal static class ServiceClientManager
             CancellationSource = cancellationSource,
             SessionId = sessionId,
             RuntimeIdentity = runtimeIdentity,
+            Sealing = sealing?.Clone(),
         };
 
         // Publish a joinable task before it starts, so Stop and Quiesce can never
@@ -2628,6 +2787,8 @@ internal static class ServiceClientManager
                 deps.Shutdown).ConfigureAwait(false);
         }
     }
+
+    internal const string OtherSealingMessage = "This runtime is already starting with other sealing than this command asks for.";
 
     private static bool IsComfyRuntime(string? runtimeKind)
         => string.IsNullOrWhiteSpace(runtimeKind) ||
@@ -2968,6 +3129,19 @@ internal static class ServiceClientManager
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// Acknowledges a Stop, then, once the control plane has its count of lost artifacts, drops
+    /// the lifecycle's durable note: until then a restart must still report the count unknown.
+    /// </summary>
+    private static async Task AcknowledgeStopAsync(StopCommandWork work, string acknowledgementKey, StopSessionCommand command, RuntimeCommandDependencies deps)
+    {
+        if (await AcknowledgeRuntimeCommandWithRetryAsync(deps.Sink.AckStopSessionAsync, work.Acknowledgement, acknowledgementKey, deps.Shutdown).ConfigureAwait(false) &&
+            work.CountTaken)
+        {
+            deps.ForgetSealedLifecycle?.Invoke(command.SessionId, command.LifecycleGeneration);
+        }
     }
 
     internal static async Task<bool> AcknowledgeRuntimeCommandWithRetryAsync<TRequest>(
@@ -3602,13 +3776,14 @@ internal static class ServiceClientManager
             getActiveSessionId,
             ["comfyui-latest", "comfyui-master"]);
 
-    private static RegisterRunnerRequest BuildStatusUpdateRequest(
+    internal static RegisterRunnerRequest BuildStatusUpdateRequest(
         string runnerId,
         string instanceId,
         string version,
         RunnerResources resources,
         Func<string> getActiveSessionId,
-        IReadOnlyList<string> supportedEditorTemplates)
+        IReadOnlyList<string> supportedEditorTemplates,
+        Func<RunnerSealedStorage>? describeSealedStorage = null)
     {
         // Refresh dynamic metrics each call
         resources.SystemRamBytes = ResourceDetection.GetTotalRamBytes();
@@ -3623,6 +3798,16 @@ internal static class ServiceClientManager
             Resources = resources
         };
         request.SupportedEditorTemplates.AddRange(supportedEditorTemplates);
+        try
+        {
+            request.SealedStorage = describeSealedStorage?.Invoke();
+        }
+        catch (Exception ex)
+        {
+            // A failed probe must not stop heartbeats; the runner then offers no sealed sessions.
+            RunnerLog.Warning(nameof(ServiceClientManager), $"Could not describe sealed storage: {ex.Message}");
+        }
+
         return request;
     }
 

@@ -73,8 +73,10 @@ WORKDIR /app
 
 ENV DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1
 
-RUN apt-get update && apt-get install -y --no-install-recommends aria2 \
-  && rm -rf /var/lib/apt/lists/*
+# util-linux provides runuser and ipcrm, which remove a session user's IPC objects.
+RUN apt-get update && apt-get install -y --no-install-recommends aria2 util-linux \
+  && rm -rf /var/lib/apt/lists/* \
+  && test -x /usr/sbin/runuser && test -x /usr/bin/ipcrm
 
 # aria2 runs as this account, never as root. The uid/gid sit above the range useradd hands
 # out to session users. The state directory is root-owned and sticky: aria2 adds its session

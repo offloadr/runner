@@ -24,7 +24,7 @@ public sealed class LinuxUserIsolationStrategy : ISessionIsolationStrategy
 
     private readonly ILinuxCommandRunner _commandRunner;
     private readonly Func<uint, CancellationToken, Task<bool>> _killUserProcesses;
-    private readonly IReadOnlyList<string> _residueRoots;
+    private readonly IReadOnlyList<string>? _residueRoots;
     private readonly string _passwdPath;
 
     public LinuxUserIsolationStrategy(ILinuxCommandRunner commandRunner)
@@ -32,19 +32,32 @@ public sealed class LinuxUserIsolationStrategy : ISessionIsolationStrategy
     {
     }
 
+    internal delegate int RemoveOwnedEntries(uint userId, IEnumerable<string> roots, out int remaining);
+
+    private readonly RemoveOwnedEntries _removeOwnedEntries;
+    private readonly Func<uint, int?> _countIpcObjects;
+
     internal LinuxUserIsolationStrategy(
         ILinuxCommandRunner commandRunner,
         Func<uint, CancellationToken, Task<bool>> killUserProcesses,
         IReadOnlyList<string>? residueRoots = null,
-        string passwdPath = "/etc/passwd")
+        string passwdPath = "/etc/passwd",
+        RemoveOwnedEntries? removeOwnedEntries = null,
+        Func<uint, int?>? countIpcObjects = null)
     {
+        _removeOwnedEntries = removeOwnedEntries ?? LinuxSessionResidue.RemoveEntriesOwnedBy;
+        _countIpcObjects = countIpcObjects ?? (static userId => LinuxSessionResidue.CountIpcObjectsOwnedBy(userId));
         _commandRunner = commandRunner ?? throw new ArgumentNullException(nameof(commandRunner));
         _killUserProcesses = killUserProcesses ?? throw new ArgumentNullException(nameof(killUserProcesses));
-        _residueRoots = residueRoots ?? LinuxSessionResidue.SharedTemporaryRoots;
+        // Null: the shared roots and the memory-backed mounts there are at each teardown.
+        _residueRoots = residueRoots;
         _passwdPath = passwdPath;
     }
 
     public void ValidatePrerequisites(ICollection<string> errors)
+        => ValidatePrerequisites(errors, File.Exists);
+
+    internal void ValidatePrerequisites(ICollection<string> errors, Func<string, bool> fileExists)
     {
         ArgumentNullException.ThrowIfNull(errors);
 
@@ -53,24 +66,34 @@ public sealed class LinuxUserIsolationStrategy : ISessionIsolationStrategy
             errors.Add("Linux user isolation requires running as root so useradd/chown/userdel can execute.");
         }
 
-        if (!File.Exists("/usr/bin/id"))
+        if (!fileExists("/usr/bin/id"))
         {
             errors.Add("Missing '/usr/bin/id' required for Linux user isolation.");
         }
 
-        if (!File.Exists("/usr/sbin/useradd"))
+        if (!fileExists("/usr/sbin/useradd"))
         {
             errors.Add("Missing '/usr/sbin/useradd' required for Linux user isolation.");
         }
 
-        if (!File.Exists("/bin/chown"))
+        if (!fileExists("/bin/chown"))
         {
             errors.Add("Missing '/bin/chown' required for Linux user isolation.");
         }
 
-        if (!File.Exists("/usr/sbin/userdel"))
+        if (!fileExists("/usr/sbin/userdel"))
         {
             errors.Add("Missing '/usr/sbin/userdel' required for Linux user isolation.");
+        }
+
+        // A session's System V IPC objects are removed as its user; without these a teardown
+        // after any such object could never complete.
+        foreach (var tool in new[] { "/usr/sbin/runuser", "/usr/bin/ipcrm" })
+        {
+            if (!fileExists(tool))
+            {
+                errors.Add($"Missing '{tool}' (util-linux) required to remove session users' IPC objects.");
+            }
         }
     }
 
@@ -199,6 +222,7 @@ public sealed class LinuxUserIsolationStrategy : ISessionIsolationStrategy
             // stop that asked for it is not reported as complete while they run.
             await KillUserProcessesAsync(identity.UserName, uid, cancellationToken, requireNoSurvivors: true).ConfigureAwait(false);
             RemoveSharedResidue(identity.UserName, uid);
+            await RemoveIpcResidueAsync(identity.UserName, uid, cancellationToken).ConfigureAwait(false);
         }
 
         // Any other failure fails the teardown, so the Stop that asked for it stays pending and a
@@ -271,17 +295,58 @@ public sealed class LinuxUserIsolationStrategy : ISessionIsolationStrategy
                string.Equals(LinuxSessionIdentity.BuildUserName(sessionId), userName, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// Removes what the user left in the shared temporary directories (including the
+    /// memory-backed <c>/dev/shm</c>). Throws while any of it stays: the account, and so its uid,
+    /// is then kept, since the next session user to get that uid would own what is left.
+    /// </summary>
     private void RemoveSharedResidue(string userName, uint userId)
     {
+        int remaining;
         try
         {
-            LinuxSessionResidue.RemoveEntriesOwnedBy(userId, _residueRoots);
+            var roots = _residueRoots ?? LinuxSessionResidue.CurrentResidueRoots();
+            _removeOwnedEntries(userId, roots ?? LinuxSessionResidue.SharedTemporaryRoots, out remaining);
+            if (roots is null)
+            {
+                // Without the mount table, other memory-backed mounts it may have written to are
+                // unknown: the shared ones are still cleaned, but the uid is not freed.
+                RunnerLog.Error<LinuxUserIsolationStrategy>(
+                    $"Could not read the mount table to find all temporary files of session user '{userName}' (uid {userId}).");
+                remaining = Math.Max(remaining, 1);
+            }
         }
         catch (Exception ex)
         {
+            // The message would name the session's files.
             RunnerLog.Error<LinuxUserIsolationStrategy>(
-                ex,
-                $"Failed removing temporary files of session user '{userName}' (uid {userId}): {ex.Message}");
+                $"Failed removing temporary files of session user '{userName}' (uid {userId}): {ex.GetType().Name}");
+            remaining = 1;
+        }
+
+        if (remaining > 0)
+        {
+            throw new InvalidOperationException(
+                $"{remaining} temporary file(s) of session user '{userName}' (uid {userId}) could not be removed; the account is kept so its uid is not reused.");
+        }
+    }
+
+    /// <summary>
+    /// Removes the user's System V IPC objects (shared memory, message queues, semaphores), which
+    /// outlive its processes. Throws while any stays: the account, and its uid, is then kept.
+    /// </summary>
+    private async Task RemoveIpcResidueAsync(string userName, uint userId, CancellationToken cancellationToken)
+    {
+        if (_countIpcObjects(userId) is 0)
+        {
+            return;
+        }
+
+        await _commandRunner.RunAsync(LinuxCommandFactory.RemoveIpcObjectsAs(userName), cancellationToken).ConfigureAwait(false);
+        if (_countIpcObjects(userId) is not 0 and var left)
+        {
+            throw new InvalidOperationException(
+                $"{(left is { } count ? count.ToString(System.Globalization.CultureInfo.InvariantCulture) : "Unknown")} System V IPC object(s) of session user '{userName}' (uid {userId}) could not be removed; the account is kept so its uid is not reused.");
         }
     }
 

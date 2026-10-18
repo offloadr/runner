@@ -127,6 +127,62 @@ public class SessionIsolationTests
     }
 
     [Test]
+    public void CleanupAsync_KeepsTheAccountWhileItsTemporaryFilesCannotBeRemoved()
+    {
+        var runner = new RecordingCommandRunner(userExists: true);
+        var strategy = new LinuxUserIsolationStrategy(
+            runner,
+            static (_, _) => Task.FromResult(true),
+            residueRoots: ["/dev/shm"],
+            passwdPath: "/nonexistent/passwd",
+            removeOwnedEntries: static (uint _, IEnumerable<string> _, out int remaining) =>
+            {
+                // A file in /dev/shm the session left and that cannot be deleted.
+                remaining = 1;
+                return 0;
+            });
+
+        Assert.That(
+            async () => await strategy.CleanupAsync(
+                new PreparedSessionIdentity("sess_6f1c2d3e4b5a", "/sessions/x", CleanupIdentity: true, 4242),
+                CancellationToken.None),
+            Throws.InvalidOperationException.With.Message.Contains("could not be removed"));
+        Assert.That(runner.Commands.Select(static command => command.FileName), Does.Not.Contain("/usr/sbin/userdel"));
+    }
+
+    [Test]
+    public void CleanupAsync_KeepsTheAccountWhileItsIpcObjectsCannotBeRemoved()
+    {
+        var runner = new RecordingCommandRunner(userExists: true);
+        var strategy = new LinuxUserIsolationStrategy(
+            runner,
+            static (_, _) => Task.FromResult(true),
+            residueRoots: [],
+            passwdPath: "/nonexistent/passwd",
+            countIpcObjects: static _ => 2);
+
+        Assert.That(
+            async () => await strategy.CleanupAsync(
+                new PreparedSessionIdentity("sess_6f1c2d3e4b5a", "/sessions/x", CleanupIdentity: true, 4242),
+                CancellationToken.None),
+            Throws.InvalidOperationException.With.Message.Contains("IPC"));
+        Assert.That(runner.Commands.Select(static command => command.FileName), Does.Contain("/usr/sbin/runuser"));
+        Assert.That(runner.Commands.Select(static command => command.FileName), Does.Not.Contain("/usr/sbin/userdel"));
+    }
+
+    [Test]
+    public void ValidatePrerequisites_NeedsTheToolsThatRemoveIpcObjects()
+    {
+        var strategy = new LinuxUserIsolationStrategy(new RecordingCommandRunner(userExists: true), static (_, _) => Task.FromResult(true), residueRoots: []);
+        var errors = new List<string>();
+
+        strategy.ValidatePrerequisites(errors, static path => path is not ("/usr/sbin/runuser" or "/usr/bin/ipcrm"));
+
+        Assert.That(errors, Has.Some.Contains("/usr/sbin/runuser"));
+        Assert.That(errors, Has.Some.Contains("/usr/bin/ipcrm"));
+    }
+
+    [Test]
     public void CleanupAsync_FailsWhenUserdelFails()
     {
         var runner = new RecordingCommandRunner(userExists: true, userdelExitCode: 12);

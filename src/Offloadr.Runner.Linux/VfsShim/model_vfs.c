@@ -7,19 +7,25 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <linux/audit.h>
 #include <linux/fiemap.h>
+#include <linux/filter.h>
 #include <linux/fs.h>
+#include <linux/seccomp.h>
 #include <pthread.h>
 #include <sched.h>
 #include <spawn.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/ioctl.h>
+#include <sys/resource.h>
 #include <sys/sendfile.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -237,6 +243,103 @@ static pending_release_t *pending_releases = NULL;
 static int pending_release_worker_started = 0;
 static __thread int reentry = 0;
 static int log_state = -1;
+
+#if defined(__x86_64__)
+#define VFS_AUDIT_ARCH AUDIT_ARCH_X86_64
+#elif defined(__aarch64__)
+#define VFS_AUDIT_ARCH AUDIT_ARCH_AARCH64
+#endif
+
+/* Whether this process already runs under the core lock below: PR_SET_DUMPABLE with 2 is
+ * refused by the kernel as invalid (EINVAL), by the lock first (EPERM). */
+static int core_locked(void) {
+    errno = 0;
+    return prctl(PR_SET_DUMPABLE, 2, 0, 0, 0) == -1 && errno == EPERM;
+}
+
+#ifdef VFS_AUDIT_ARCH
+#define VFS_ARG_LOW(n) (offsetof(struct seccomp_data, args) + (n) * sizeof(__u64))
+#define VFS_ARG_HIGH(n) (VFS_ARG_LOW(n) + sizeof(__u32))
+#endif
+
+/* The core size limit the agent leaves at 1 byte stops a core file, and a core piped to a host
+ * helper only at exactly 1, but any process may lower its own soft limit, and make itself
+ * dumpable again. A seccomp filter, inherited by every descendant and impossible to remove,
+ * refuses both: prctl(PR_SET_DUMPABLE) other than to 0, and setting RLIMIT_CORE. Calls of
+ * another ABI (i386 or x32 on x86-64, AArch32 on arm64) are refused altogether, as their
+ * numbers differ. execve still makes a program dumpable, which the limit then covers. */
+static int lock_core_dumps(void) {
+#ifdef VFS_AUDIT_ARCH
+    struct sock_filter filter[] = {
+        /* 0 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
+        /* 1 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, VFS_AUDIT_ARCH, 1, 0),
+        /* 2 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+        /* 3 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+        /* 4 */ BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 0x40000000, 19, 0),
+        /* 5 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_prctl, 3, 0),
+        /* 6 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_setrlimit, 8, 0),
+        /* 7 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_prlimit64, 9, 0),
+        /* 8 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        /* 9: prctl, option and its value */
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, VFS_ARG_LOW(0)),
+        /* 10 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, PR_SET_DUMPABLE, 0, 12),
+        /* 11 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, VFS_ARG_LOW(1)),
+        /* 12 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 11),
+        /* 13 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, VFS_ARG_HIGH(1)),
+        /* 14 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 8, 9),
+        /* 15: setrlimit, resource */
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, VFS_ARG_LOW(0)),
+        /* 16 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, RLIMIT_CORE, 7, 6),
+        /* 17: prlimit64, resource and new limit (NULL only reads) */
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, VFS_ARG_LOW(1)),
+        /* 18 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, RLIMIT_CORE, 0, 4),
+        /* 19 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, VFS_ARG_LOW(2)),
+        /* 20 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 3),
+        /* 21 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, VFS_ARG_HIGH(2)),
+        /* 22 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1),
+        /* 23 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        /* 24 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+    };
+    struct sock_fprog program = { .len = (unsigned short)(sizeof filter / sizeof filter[0]), .filter = filter };
+    /* Without CAP_SYS_ADMIN a filter needs no_new_privs: the session then cannot gain privileges
+     * through a setuid program, which it has no business with. */
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) return -1;
+    return prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program, 0, 0);
+#else
+    return -1;
+#endif
+}
+
+/* Sealed sessions set VFS_NO_DUMP=1: every process that loads the shim becomes non-dumpable,
+ * so no core dump writes session memory to the host's disk. execve resets dumpability, which
+ * is why this runs in each new program rather than once in the editor. The first such process
+ * of the session user also takes the core lock, which every program below it inherits; a root
+ * process (a PAM session, say, which may set limits) is left to the session user's own. */
+__attribute__((constructor)) static void apply_no_dump(void) {
+    const char *value = getenv("VFS_NO_DUMP");
+    if (value && strcmp(value, "1") == 0) {
+        prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+        const char *report = getenv("VFS_NO_DUMP_REPORT");
+        int reporting = report && strcmp(report, "1") == 0;
+        if ((geteuid() != 0 || reporting) && !core_locked() && lock_core_dumps() != 0) {
+            /* Reported below; the agent then refuses sealed sessions. */
+        }
+
+        /* The agent's probe: proof that the shim loaded and the flag and the lock took, which
+         * the loader's silent skip of an unloadable LD_PRELOAD entry would not give. */
+        if (reporting) {
+            struct rlimit limit;
+            int locked = core_locked() && getrlimit(RLIMIT_CORE, &limit) == 0 &&
+                setrlimit(RLIMIT_CORE, &limit) == -1 && errno == EPERM;
+            char line[96];
+            int length = snprintf(line, sizeof line, "offloadr-vfs-no-dump=%d\noffloadr-vfs-core-locked=%d\n",
+                prctl(PR_GET_DUMPABLE, 0, 0, 0, 0), locked);
+            if (length > 0 && (size_t)length < sizeof line && write(STDERR_FILENO, line, (size_t)length) < 0) {
+                /* Nothing to do: the probe then fails closed. */
+            }
+        }
+    }
+}
 
 static void init_syms(void) {
     if (!real_openat_fn) real_openat_fn = dlsym(RTLD_NEXT, "openat");

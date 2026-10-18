@@ -18,7 +18,8 @@ internal sealed class ModelDownloadIpcServer : IAsyncDisposable
         ModelDownloadService downloadService,
         ArtifactUploadService artifactUploadService,
         WorkspaceMirrorService workspaceMirrorService,
-        Func<string, uint?>? resolveSessionUserId = null)
+        Func<string, uint?>? resolveSessionUserId = null,
+        Func<bool>? isSealedSessionActive = null)
     {
         if (string.IsNullOrWhiteSpace(socketPath)) throw new ArgumentException("Socket path is required.", nameof(socketPath));
 
@@ -32,7 +33,10 @@ internal sealed class ModelDownloadIpcServer : IAsyncDisposable
             socketPath,
             HandleRequestAsync,
             logEnabled,
-            authorizePeer: peer => TryResolvePeerSession(peer, out _));
+            authorizePeer: peer => TryResolvePeerSession(peer, out _))
+        {
+            RedactPaths = isSealedSessionActive ?? (static () => false),
+        };
     }
 
     public void Start()

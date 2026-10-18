@@ -33,7 +33,13 @@ Repeat for each editor you release: ComfyUI `latest` and `master`, Forge Neo `ne
 5. Run one prompt that needs a model the runner has not downloaded yet. It finishes, the output appears in the editor, and the log shows the download progressing.
 6. Run a second prompt with the same model. It starts without downloading again.
 7. Stop the session from the web app. The container keeps running, and the status file's `active_session_id` is empty again.
-8. Stop the container (Ctrl+C in its window, or `docker stop <container>`) before the next image or section 2. Runners started with the same key are the same runner to Offloadr, so two running at once would take turns answering for it and spoil the remaining checks.
+8. Repeat steps 4 to 7 with sealed storage, on a GPU pod with a few GiB of `/dev/shm` (a rental provider, or `--shm-size=8g` locally) and `-e RUNNER_SEALED_STORAGE=required`:
+   1. Before starting the session, `touch /tmp/sealed-marker` in the container.
+   2. Use a distinctive prompt and upload an input image. Run one prompt that succeeds, one that fails in a node, and one you cancel, then restart the editor from the Manager if it offers that.
+   3. For each process of the session user (`docker exec <container> ps -eo pid,user,args`, user `sess_…`), `docker exec <container> stat -c %U /proc/<pid>` prints `root`: the `/proc` entries of non-dumpable processes belong to root. Only static binaries that do not load the VFS shim may show the session user. `docker exec <container> grep 'Max core file size' /proc/<pid>/limits` shows `1` for both limits.
+   4. `docker exec <container> find / -xdev -newer /tmp/sealed-marker -type f` lists only the virtualenv, models, custom nodes and caches under `/sessions/<id>`, and none of your prompt, input or output names. `docker logs <container>` contains no prompt text or output filenames.
+   5. `docker exec <container> du -sh /dev/shm/offloadr` grows while you generate, `status.json` shows `sealed_storage` with a budget, and after you stop the session `/dev/shm/offloadr` is empty.
+9. Stop the container (Ctrl+C in its window, or `docker stop <container>`) before the next image or section 2. Runners started with the same key are the same runner to Offloadr, so two running at once would take turns answering for it and spoil the remaining checks.
 
 ## 2. Desktop app
 

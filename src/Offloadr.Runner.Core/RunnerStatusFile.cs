@@ -15,7 +15,8 @@ public sealed record RunnerStatusSnapshot(
     [property: JsonPropertyName("version")] string Version,
     [property: JsonPropertyName("supported_editor_templates")] IReadOnlyList<string> SupportedEditorTemplates,
     [property: JsonPropertyName("active_session_id")] string ActiveSessionId,
-    [property: JsonPropertyName("updated_utc")] DateTimeOffset UpdatedUtc);
+    [property: JsonPropertyName("updated_utc")] DateTimeOffset UpdatedUtc,
+    [property: JsonPropertyName("sealed_storage")] SealedStorageStatus? SealedStorage = null);
 
 /// <summary>
 /// Periodically writes <see cref="RunnerStatusSnapshot"/> to a file with an atomic replace.
@@ -31,7 +32,8 @@ internal sealed class RunnerStatusFileWriter(
     Func<string> activeSessionId,
     TimeSpan? pollInterval = null,
     TimeSpan? refreshInterval = null,
-    TimeProvider? timeProvider = null)
+    TimeProvider? timeProvider = null,
+    Func<SealedStorageStatus?>? sealedStorage = null)
 {
     private static readonly JsonSerializerOptions SerializerOptions = new()
     {
@@ -82,7 +84,14 @@ internal sealed class RunnerStatusFileWriter(
 
     internal void Write(string sessionId, DateTimeOffset now)
     {
-        var snapshot = new RunnerStatusSnapshot(runnerId, instanceId, version, supportedEditorTemplates, sessionId, now);
+        var snapshot = new RunnerStatusSnapshot(
+            runnerId,
+            instanceId,
+            version,
+            supportedEditorTemplates,
+            sessionId,
+            now,
+            sealedStorage?.Invoke());
         var directory = System.IO.Path.GetDirectoryName(Path);
         if (!string.IsNullOrEmpty(directory))
         {

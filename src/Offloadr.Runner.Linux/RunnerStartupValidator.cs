@@ -7,11 +7,19 @@ public sealed class RunnerStartupValidator
 {
     private readonly ISessionIsolationStrategy _sessionIsolationStrategy;
     private readonly string _passwdPath;
+    private readonly SealedStorageProbe _sealedStorageProbe;
+    private readonly RunnerVfsEnvironmentBuilder _vfsEnvironmentBuilder;
 
-    public RunnerStartupValidator(ISessionIsolationStrategy sessionIsolationStrategy, string passwdPath = "/etc/passwd")
+    public RunnerStartupValidator(
+        ISessionIsolationStrategy sessionIsolationStrategy,
+        string passwdPath = "/etc/passwd",
+        SealedStorageProbe? sealedStorageProbe = null,
+        RunnerVfsEnvironmentBuilder? vfsEnvironmentBuilder = null)
     {
         _sessionIsolationStrategy = sessionIsolationStrategy ?? throw new ArgumentNullException(nameof(sessionIsolationStrategy));
         _passwdPath = passwdPath;
+        _sealedStorageProbe = sealedStorageProbe ?? new SealedStorageProbe();
+        _vfsEnvironmentBuilder = vfsEnvironmentBuilder ?? new RunnerVfsEnvironmentBuilder();
     }
 
     public void ValidateOrThrow(RunnerAgentOptions options)
@@ -71,11 +79,44 @@ public sealed class RunnerStartupValidator
         }
 
         ValidateBinary(options.Session.UvBinaryPath, "RUNNER_UV_BINARY", errors);
+        ValidateSealedStorage(options.Session.Sealing, errors);
         _sessionIsolationStrategy.ValidatePrerequisites(errors);
 
         if (errors.Count > 0)
         {
             throw new InvalidOperationException($"Runner startup validation failed:{Environment.NewLine} - {string.Join($"{Environment.NewLine} - ", errors)}");
+        }
+    }
+
+    private void ValidateSealedStorage(SealedStorageOptions sealing, ICollection<string> errors)
+    {
+        if (sealing.InvalidMode is not null)
+        {
+            errors.Add($"RUNNER_SEALED_STORAGE must be off, auto or required, not '{sealing.InvalidMode}'.");
+            return;
+        }
+
+        if (sealing.Mode != SealedStorageMode.Required)
+        {
+            return;
+        }
+
+        var status = _sealedStorageProbe.Probe(sealing);
+        if (!status.Available)
+        {
+            errors.Add($"RUNNER_SEALED_STORAGE=required but the sealed root '{sealing.Root}' is unusable: {status.Reason}.");
+        }
+
+        if (string.Equals(Environment.GetEnvironmentVariable("RUNNER_VFS_LOG"), "1", StringComparison.Ordinal))
+        {
+            errors.Add("RUNNER_VFS_LOG=1 logs session file paths to the console, which sealed storage keeps off the host's disk.");
+        }
+
+        // Session processes are made non-dumpable by the VFS shim.
+        if (!_vfsEnvironmentBuilder.CanDisableCoreDumps())
+        {
+            var vfsLibrary = Environment.GetEnvironmentVariable("RUNNER_VFS_LIB") ?? _vfsEnvironmentBuilder.DefaultVfsLibraryPath;
+            errors.Add($"RUNNER_SEALED_STORAGE=required needs the VFS shim at '{vfsLibrary}' (RUNNER_VFS_LIB) to load and make session processes non-dumpable.");
         }
     }
 

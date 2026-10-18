@@ -22,6 +22,13 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
     private const int OCloseOnExec = 0x80000;
     private const int OPath = 0x200000;
     private const int FDuplicateCloseOnExec = 1030;
+    private const int FSetLease = 1024;
+    private const int FGetLease = 1025;
+    private const int FWriteLock = 1;
+    private const int FUnlock = 2;
+    private const int FSetSignal = 10;
+    private const int SignalUrgent = 23;
+    private const int ETryAgain = 11;
     private const int ENoEntry = 2;
     private const int ENoDeviceOrAddress = 6;
     private const int EExists = 17;
@@ -34,10 +41,19 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
     private const int AtSymlinkNoFollow = 0x100;
     private const uint StatxType = 0x0001;
     private const uint StatxNlink = 0x0004;
+    private const uint StatxUid = 0x0008;
     private const uint StatxMtime = 0x0040;
     private const uint StatxSize = 0x0200;
+    private const uint StatxIno = 0x0100;
+    private const uint StatxCtime = 0x0080;
+    private const int StatxInoOffset = 32;
+    private const int StatxCtimeSecondsOffset = 96;
+    private const int StatxCtimeNanosecondsOffset = 104;
+    private const uint RenameExchange = 2;
+    private const uint RenameNoReplace = 1;
     private const int StatxBufferSize = 256;
     private const int StatxNlinkOffset = 16;
+    private const int StatxUidOffset = 20;
     private const int StatxModeOffset = 28;
     private const int StatxSizeOffset = 40;
     private const int StatxMtimeSecondsOffset = 112;
@@ -47,6 +63,77 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
     private const long UTimeOmit = (1L << 30) - 2;
 
     private readonly SafeFileHandle _rootHandle;
+
+    private const int AlreadyExists = 17;
+    private const int AtFdcwd = -100;
+
+    /// <summary>
+    /// Creates <paramref name="path"/> as a directory with exactly <paramref name="mode"/> when it
+    /// does not exist, without following a link anyone put in its place: <c>mkdir</c> never
+    /// follows a final link, and the mode is set through a descriptor opened without following
+    /// one, so neither step can touch another directory. Leaves an existing entry alone for the
+    /// caller to judge. Returns whether it created the directory.
+    /// </summary>
+    public static bool CreateDirectoryNoFollow(string path, UnixFileMode mode)
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            throw new PlatformNotSupportedException("Secure directory creation requires Linux.");
+        }
+
+        if (mkdirat(AtFdcwd, path, (uint)mode) != 0)
+        {
+            var error = Marshal.GetLastPInvokeError();
+            if (error == AlreadyExists)
+            {
+                return false;
+            }
+
+            throw CreateException($"creating directory '{path}'", error);
+        }
+
+        var descriptor = open(path, OReadOnly | ODirectory | ONoFollow | OCloseOnExec);
+        if (descriptor < 0)
+        {
+            throw CreateException($"opening created directory '{path}'");
+        }
+
+        using var handle = new SafeFileHandle((nint)descriptor, ownsHandle: true);
+        // The umask took bits away from the mode mkdir was given.
+        if (fchmod(descriptor, (uint)mode) != 0)
+        {
+            throw CreateException($"setting the mode of directory '{path}'");
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Sets the mode of the directory or regular file at <paramref name="path"/> through a
+    /// descriptor opened without following a link, so a link swapped into its place cannot make
+    /// root change another file. Throws when it is a link.
+    /// </summary>
+    public static void SetModeNoFollow(string path, UnixFileMode mode)
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            throw new PlatformNotSupportedException("Secure mode changes require Linux.");
+        }
+
+        var descriptor = open(path, OReadOnly | ONoFollow | ONonBlock | OCloseOnExec);
+        if (descriptor < 0)
+        {
+            throw CreateException($"opening '{path}' to change its mode");
+        }
+
+        // A link fails the open (ELOOP); a session user cannot make device nodes, so what opened
+        // here is the entry itself.
+        using var handle = new SafeFileHandle((nint)descriptor, ownsHandle: true);
+        if (fchmod(descriptor, (uint)mode) != 0)
+        {
+            throw CreateException($"setting the mode of '{path}'");
+        }
+    }
 
     public LinuxSecureDirectoryRoot(string rootPath)
     {
@@ -188,6 +275,69 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
 
             using var entry = new SafeFileHandle((nint)descriptor, ownsHandle: true);
             return ReadStatus(entry, relativePath);
+        }
+    }
+
+    /// <summary>
+    /// The status and inode of <paramref name="relativePath"/>, so a later replacement can check
+    /// that it displaces exactly this file. Null when it is not a single-link regular file.
+    /// </summary>
+    public SecureFileVersion? GetVersion(string relativePath)
+    {
+        var (_, parent, leafName) = TryOpenExistingParent(relativePath);
+        if (parent is null)
+        {
+            return null;
+        }
+
+        using (parent)
+        {
+            return ReadVersion(parent, leafName, relativePath);
+        }
+    }
+
+    private static SecureFileVersion? ReadVersion(SafeFileHandle parent, string leafName, string relativePath)
+    {
+        var descriptor = openat(GetDescriptor(parent), leafName, OPath | ONoFollow | OCloseOnExec);
+        if (descriptor < 0)
+        {
+            return null;
+        }
+
+        using var entry = new SafeFileHandle((nint)descriptor, ownsHandle: true);
+        return ReadVersion(entry, relativePath);
+    }
+
+    /// <summary>The version of a file this process has open, as it was read.</summary>
+    public static SecureFileVersion? GetOpenFileVersion(SafeFileHandle file, string relativePath)
+        => ReadVersion(file, relativePath);
+
+    private static SecureFileVersion? ReadVersion(SafeFileHandle entry, string relativePath)
+    {
+        var status = ReadStatus(entry, relativePath);
+        if (!status.IsRegularFile)
+        {
+            return null;
+        }
+
+        var buffer = Marshal.AllocHGlobal(StatxBufferSize);
+        try
+        {
+            if (statx(GetDescriptor(entry), string.Empty, AtEmptyPath | AtSymlinkNoFollow, StatxIno | StatxCtime, buffer) != 0)
+            {
+                return null;
+            }
+
+            var seconds = Marshal.ReadInt64(buffer, StatxCtimeSecondsOffset);
+            var nanoseconds = unchecked((uint)Marshal.ReadInt32(buffer, StatxCtimeNanosecondsOffset));
+            return new SecureFileVersion(
+                status,
+                unchecked((ulong)Marshal.ReadInt64(buffer, StatxInoOffset)),
+                DateTime.UnixEpoch.AddTicks((seconds * TimeSpan.TicksPerSecond) + (nanoseconds / 100)));
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
         }
     }
 
@@ -544,6 +694,21 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
         }
     }
 
+    private static uint? ReadOwnerId(SafeFileHandle file)
+    {
+        var buffer = Marshal.AllocHGlobal(StatxBufferSize);
+        try
+        {
+            return statx(GetDescriptor(file), string.Empty, AtEmptyPath | AtSymlinkNoFollow, StatxUid, buffer) == 0
+                ? unchecked((uint)Marshal.ReadInt32(buffer, StatxUidOffset))
+                : null;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
+    }
+
     private static UnauthorizedAccessException NotRegularFile(string relativePath)
         => new($"Path is not a regular file beneath its trusted root: '{relativePath}'.");
 
@@ -750,6 +915,15 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
         public void SetModifiedUtc(DateTime modifiedUtc)
             => LinuxSecureDirectoryRoot.SetModifiedUtc(_file, modifiedUtc);
 
+        /// <summary>Gives the publication to an owner and group before it is published.</summary>
+        public void SetOwner(uint ownerId, uint groupId)
+        {
+            if (fchown(GetDescriptor(_file), ownerId, groupId) != 0)
+            {
+                throw CreateException($"setting the owner of workspace file '{_relativePath}'");
+            }
+        }
+
         public void Commit()
         {
             if (fchmod(GetDescriptor(_file), Convert.ToUInt32("644", 8)) != 0)
@@ -768,6 +942,187 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
 
             _committed = true;
         }
+
+        /// <summary>
+        /// Publishes only while nothing is at the destination: an entry that appeared since (a
+        /// file the session wrote) is never replaced. Returns whether the publication went in.
+        /// </summary>
+        public bool CommitIfAbsent()
+        {
+            if (fchmod(GetDescriptor(_file), Convert.ToUInt32("644", 8)) != 0)
+            {
+                throw CreateException($"setting published workspace file mode for '{_relativePath}'");
+            }
+
+            if (renameat2(GetDescriptor(_parent), _temporaryName, GetDescriptor(_parent), _destinationName, RenameNoReplace) != 0)
+            {
+                if (Marshal.GetLastPInvokeError() == AlreadyExists)
+                {
+                    return false;
+                }
+
+                throw CreateException($"publishing workspace file '{_relativePath}'");
+            }
+
+            _committed = true;
+            return true;
+        }
+
+        /// <summary>
+        /// Swaps the publication with the existing destination in one step and keeps the swap only
+        /// when the destination is <paramref name="expected"/>: checked in full, change time
+        /// included, right before the exchange, and by inode, length and modification time on the
+        /// displaced file after it (the exchange moves its change time). Otherwise it swaps back,
+        /// so a rewrite that lands after a caller's check is not discarded. What remains is a
+        /// rewrite in place within the moment between the last check and the exchange that also
+        /// restores length and modification time. Returns whether the publication replaced it.
+        /// <para>
+        /// With <paramref name="whileUnopened"/>, it replaces the destination only while no other
+        /// process has it open or mapped, and swaps back when one opens it before the displaced
+        /// file is removed: a write lease on it, held across the exchange, makes the kernel hold
+        /// any such open until the lease is let go, and shows that it came. What remains is an
+        /// open that had already looked the name up before the exchange and reaches the file only
+        /// after the displaced file is removed, a moment within one system call.
+        /// </para>
+        /// </summary>
+        public bool CommitReplacing(SecureFileVersion expected, bool whileUnopened = false)
+        {
+            if (fchmod(GetDescriptor(_file), Convert.ToUInt32("644", 8)) != 0)
+            {
+                throw CreateException($"setting published workspace file mode for '{_relativePath}'");
+            }
+
+            // The caller's check may be a while ago. An in-place rewrite that restores length and
+            // modification time moves only the change time, which the exchange overwrites, so it
+            // is compared here, as late as possible.
+            if (ReadVersion(_parent, _destinationName, _relativePath) is not { } before || before != expected)
+            {
+                return false;
+            }
+
+            // Let go only once the exchange is kept or undone: an open it held then reaches
+            // whichever file is in the destination's place for good.
+            using var lease = whileUnopened ? TakeWriteLease(expected) : null;
+            if (whileUnopened && lease is null)
+            {
+                return false;
+            }
+
+            // Taken before the exchange: once the placeholder is at the destination the editor can
+            // rewrite it in place, which only a version from before shows.
+            var placeholder = ReadVersion(_file, _relativePath);
+            BeforeExchange?.Invoke();
+            if (renameat2(GetDescriptor(_parent), _temporaryName, GetDescriptor(_parent), _destinationName, RenameExchange) != 0)
+            {
+                // The destination went away or cannot be exchanged: nothing was replaced.
+                return false;
+            }
+
+            AfterExchange?.Invoke();
+
+            // The temporary name now holds the displaced file. The rename itself moved its change
+            // time, so the comparison leaves that out. A broken lease means something opened it
+            // since the lease was taken: it then goes back.
+            if (ReadVersion(_parent, _temporaryName, _relativePath) is { } displaced && displaced.IsSameFileAs(expected) &&
+                lease?.IsHeld != false)
+            {
+                _ = unlinkat(GetDescriptor(_parent), _temporaryName, 0);
+                _committed = true;
+                return true;
+            }
+
+            // Restore only while the destination still holds this publication's placeholder as it
+            // was written. A file the editor put there since, or a rewrite of the placeholder in
+            // place, is newer than the one displaced and stays; the displaced one, already
+            // superseded, is removed with the temporary name. An open the lease held reaches the
+            // restored file.
+            if (placeholder is { } written &&
+                ReadVersion(_parent, _destinationName, _relativePath) is { } current &&
+                current.IsSameFileAs(written) &&
+                renameat2(GetDescriptor(_parent), _temporaryName, GetDescriptor(_parent), _destinationName, RenameExchange) != 0)
+            {
+                throw CreateException($"restoring '{_relativePath}' after a replacement it did not expect");
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// A write lease on the destination, which is <paramref name="expected"/>, or null when
+        /// another process has it open or mapped. The kernel grants one only then, and only to the
+        /// file's owner, so it is asked for as that owner, on this thread alone.
+        /// </summary>
+        private WriteLease? TakeWriteLease(SecureFileVersion expected)
+        {
+            // Non-blocking: opening a FIFO put there since must not wait for a writer.
+            var descriptor = openat(GetDescriptor(_parent), _destinationName, OReadOnly | ONoFollow | OCloseOnExec | ONonBlock);
+            if (descriptor < 0)
+            {
+                return null;
+            }
+
+            var file = new SafeFileHandle((nint)descriptor, ownsHandle: true);
+            try
+            {
+                if (ReadVersion(file, _relativePath) != expected || ReadOwnerId(file) is not { } ownerId)
+                {
+                    file.Dispose();
+                    return null;
+                }
+
+                // A break is signalled to this process, by default with SIGIO, which ends it:
+                // SIGURG instead, which is ignored unless handled.
+                if (fcntl(descriptor, FSetSignal, SignalUrgent) != 0)
+                {
+                    throw CreateException($"preparing a lease on '{_relativePath}'");
+                }
+
+                var previous = setfsuid(ownerId);
+                int result;
+                int error;
+                try
+                {
+                    result = fcntl(descriptor, FSetLease, FWriteLock);
+                    error = Marshal.GetLastPInvokeError();
+                }
+                finally
+                {
+                    _ = setfsuid(unchecked((uint)previous));
+                }
+
+                if (result == 0)
+                {
+                    return new WriteLease(file);
+                }
+
+                file.Dispose();
+                // Open or mapped elsewhere; anything else (leases turned off, say) is reported.
+                return error == ETryAgain ? null : throw CreateException($"taking a lease on '{_relativePath}'", error);
+            }
+            catch
+            {
+                file.Dispose();
+                throw;
+            }
+        }
+
+        private sealed class WriteLease(SafeFileHandle file) : IDisposable
+        {
+            /// <summary>False once an open, by any process, has begun breaking it.</summary>
+            public bool IsHeld => fcntl(GetDescriptor(file), FGetLease, 0) == FWriteLock;
+
+            public void Dispose()
+            {
+                _ = fcntl(GetDescriptor(file), FSetLease, FUnlock);
+                file.Dispose();
+            }
+        }
+
+        /// <summary>Runs right before the first exchange, after the last check; lets tests rewrite the destination then.</summary>
+        internal Action? BeforeExchange { get; set; }
+
+        /// <summary>Runs right after the first exchange; lets tests replace the destination at that moment.</summary>
+        internal Action? AfterExchange { get; set; }
 
         public void Dispose()
         {
@@ -804,6 +1159,12 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
     private static extern int fchmod(int fileDescriptor, uint mode);
 
     [DllImport("libc", SetLastError = true)]
+    private static extern int fchown(int fileDescriptor, uint owner, uint group);
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int setfsuid(uint fileSystemUserId);
+
+    [DllImport("libc", SetLastError = true)]
     private static extern int fcntl(int fileDescriptor, int command, int argument);
 
     [DllImport("libc", SetLastError = true)]
@@ -812,6 +1173,14 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
         string oldPath,
         int newDirectoryFileDescriptor,
         string newPath);
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int renameat2(
+        int oldDirectoryFileDescriptor,
+        string oldPath,
+        int newDirectoryFileDescriptor,
+        string newPath,
+        uint flags);
 
     [DllImport("libc", SetLastError = true)]
     private static extern int unlinkat(int directoryFileDescriptor, string path, int flags);
@@ -861,4 +1230,16 @@ internal enum SecureEntryKind
 internal readonly record struct SecureFileStatus(SecureEntryKind Kind, long Length, DateTime LastWriteTimeUtc)
 {
     public bool IsRegularFile => Kind == SecureEntryKind.RegularFile;
+}
+
+/// <summary>
+/// One version of a regular file. A rewrite through a rename changes the inode; a rewrite in place
+/// changes the change time, which programs cannot set back, even when they restore the length and
+/// modification time (<c>cp -p</c>).
+/// </summary>
+internal readonly record struct SecureFileVersion(SecureFileStatus Status, ulong Inode, DateTime ChangeTimeUtc)
+{
+    /// <summary>Same inode, length and modification time; a rename of the file changes only its change time.</summary>
+    public bool IsSameFileAs(SecureFileVersion other)
+        => Inode == other.Inode && Status == other.Status;
 }

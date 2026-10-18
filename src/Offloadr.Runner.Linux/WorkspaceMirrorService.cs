@@ -2,6 +2,7 @@ using System.Buffers;
 using System.Collections.Concurrent;
 using System.IO.Compression;
 using System.Security.Cryptography;
+using Offloadr.Runner.Core.Sealing;
 using Offloadr.Runner.V1;
 using Google.Protobuf.WellKnownTypes;
 using Grpc.Core;
@@ -22,12 +23,18 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
     private readonly int _maxDynamicInputEntries;
     private readonly ConcurrentDictionary<string, SessionMirror> _sessions = new(StringComparer.Ordinal);
 
+    private readonly RunnerReadRequesterIdentity _requester;
+
     public WorkspaceMirrorService(
         RunnerWorkspaceService.RunnerWorkspaceServiceClient workspaceClient,
         string? runnerSecret,
         ILogger<WorkspaceMirrorService> logger,
-        int maxDynamicInputEntries = DefaultMaxDynamicInputEntries)
+        int maxDynamicInputEntries = DefaultMaxDynamicInputEntries,
+        RuntimeIdentityRegistry? runtimeIdentities = null,
+        string? runnerId = null,
+        string? instanceId = null)
     {
+        _requester = new RunnerReadRequesterIdentity(runnerId, instanceId, runtimeIdentities);
         _workspaceClient = workspaceClient ?? throw new ArgumentNullException(nameof(workspaceClient));
         _authHeaders = BuildAuthHeaders(runnerSecret);
         _logger = logger;
@@ -46,7 +53,8 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
     {
         await StopSessionAsync(sessionId).ConfigureAwait(false);
 
-        var mirror = new SessionMirror(_workspaceClient, _authHeaders, sessionId, paths, _logger, _maxDynamicInputEntries);
+        ILogger logger = paths.IsSealed ? new SealedSessionLogger(_logger) : _logger;
+        var mirror = new SessionMirror(_workspaceClient, _authHeaders, sessionId, paths, logger, _maxDynamicInputEntries, _requester);
         if (!_sessions.TryAdd(sessionId, mirror))
         {
             await mirror.DisposeAsync().ConfigureAwait(false);
@@ -163,14 +171,18 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
         private string? _editorSid;
         private int _dynamicInputCount;
 
+        private readonly RunnerReadRequester _readRequester;
+
         public SessionMirror(
             RunnerWorkspaceService.RunnerWorkspaceServiceClient workspaceClient,
             Metadata? authHeaders,
             string sessionId,
             SessionProcessManager.SessionPaths paths,
             ILogger logger,
-            int maxDynamicInputEntries)
+            int maxDynamicInputEntries,
+            RunnerReadRequesterIdentity requester)
         {
+            _readRequester = requester.For(sessionId);
             _workspaceClient = workspaceClient;
             _authHeaders = authHeaders;
             _sessionId = sessionId;
@@ -376,7 +388,9 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                 {
                     EditorSid = state.EditorSid,
                     Root = state.Root,
-                    RelativePath = state.RelativePath
+                    RelativePath = state.RelativePath,
+                    ReaderKey = _paths.TransferSealing?.ReaderKeyMessage,
+                    Requester = _readRequester.Clone(),
                 },
                 headers: _authHeaders,
                 cancellationToken: linkedCancellationToken);
@@ -391,12 +405,14 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                 new RunnerWorkspaceServiceReadWorkspaceSeedArchiveRequest
                 {
                     EditorSid = _editorSid!,
-                    Root = root
+                    Root = root,
+                    ReaderKey = _paths.TransferSealing?.ReaderKeyMessage,
+                    Requester = _readRequester.Clone(),
                 },
                 headers: _authHeaders,
                 cancellationToken: cancellationToken);
 
-            var tempPath = await DownloadArchiveAsync(call.ResponseStream, cancellationToken).ConfigureAwait(false);
+            var tempPath = await DownloadArchiveAsync(root, call.ResponseStream, cancellationToken).ConfigureAwait(false);
             try
             {
                 ExtractArchiveSafely(tempPath, destinationRoot, cancellationToken);
@@ -407,14 +423,20 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
             }
         }
 
-        private async Task<string> DownloadArchiveAsync(IAsyncStreamReader<RunnerWorkspaceServiceReadWorkspaceSeedArchiveResponse> responseStream, CancellationToken cancellationToken)
+        private async Task<string> DownloadArchiveAsync(
+            WorkspaceRoot root,
+            IAsyncStreamReader<RunnerWorkspaceServiceReadWorkspaceSeedArchiveResponse> responseStream,
+            CancellationToken cancellationToken)
         {
-            var tempPath = Path.Combine(Path.GetTempPath(), $"workspace-seed-{_sessionId}-{Guid.NewGuid():N}.zip");
+            // A sealed session stages its seed on the memory-backed root, never on disk.
+            var tempPath = Path.Combine(_paths.SealedAgentDirectory ?? Path.GetTempPath(), $"workspace-seed-{_sessionId}-{Guid.NewGuid():N}.zip");
             long totalBytes = 0;
             bool sawMetadata = false;
             long? expectedSize = null;
             string? expectedSha256 = null;
             using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            using var sinkSlot = new SealedReadSinkSlot();
+            var archiveWireLimit = MaxArchiveBytes;
 
             try
             {
@@ -426,7 +448,8 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                     {
                         case RunnerWorkspaceServiceReadWorkspaceSeedArchiveResponse.PayloadOneofCase.Metadata:
                             sawMetadata = true;
-                            if (response.Metadata.SizeBytes.HasValue && response.Metadata.SizeBytes.Value > MaxArchiveBytes)
+                            archiveWireLimit = SealedReadSink.WireLimit(response.Metadata.Envelope, MaxArchiveBytes);
+                            if (response.Metadata.SizeBytes.HasValue && response.Metadata.SizeBytes.Value > archiveWireLimit)
                             {
                                 throw new InvalidOperationException($"Workspace seed archive exceeds max allowed size ({MaxArchiveBytes} bytes).");
                             }
@@ -437,6 +460,16 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                                 expectedSha256 = response.Metadata.Sha256.Trim();
                             }
 
+                            var archiveSink = sinkSlot.Begin(SealedReadSink.Open(
+                                destination,
+                                response.Metadata.Envelope,
+                                _paths.TransferSealing,
+                                () => new SealedSeedArchiveIdentity(_sessionId, SealedRootName(root))));
+                            if (archiveSink.SealedPlaintextSize > MaxArchiveBytes)
+                            {
+                                throw new InvalidOperationException($"Workspace seed archive exceeds max allowed size ({MaxArchiveBytes} bytes).");
+                            }
+
                             break;
                         case RunnerWorkspaceServiceReadWorkspaceSeedArchiveResponse.PayloadOneofCase.Chunk:
                             if (!sawMetadata)
@@ -445,14 +478,14 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                             }
 
                             totalBytes += response.Chunk.Length;
-                            if (totalBytes > MaxArchiveBytes || totalBytes > expectedSize)
+                            if (totalBytes > archiveWireLimit || totalBytes > expectedSize)
                             {
                                 throw new InvalidOperationException(
                                     $"Workspace seed archive exceeds its declared or maximum size ({expectedSize ?? MaxArchiveBytes} bytes).");
                             }
 
                             hash.AppendData(response.Chunk.Span);
-                            await destination.WriteAsync(response.Chunk.Memory, cancellationToken).ConfigureAwait(false);
+                            await sinkSlot.Current.WriteAsync(response.Chunk.Memory, cancellationToken).ConfigureAwait(false);
                             break;
                     }
                 }
@@ -461,6 +494,8 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                 {
                     throw new InvalidOperationException("Workspace seed archive stream completed without metadata.");
                 }
+
+                await sinkSlot.Current.CompleteAsync(cancellationToken).ConfigureAwait(false);
 
                 // Only an archive that matches its declared size and digest seeds the workspace.
                 if (expectedSize is { } size && totalBytes != size)
@@ -484,6 +519,16 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                 throw;
             }
         }
+
+        /// <summary>The workspace root's name in a sealed envelope's identity.</summary>
+        private static string SealedRootName(WorkspaceRoot root)
+            => root switch
+            {
+                WorkspaceRoot.User => "user",
+                WorkspaceRoot.CustomNodes => "custom_nodes",
+                WorkspaceRoot.Input => "input",
+                _ => throw new InvalidOperationException($"Workspace root {root} has no sealed name."),
+            };
 
         private void ExtractArchiveSafely(string archivePath, string destinationRoot, CancellationToken cancellationToken)
         {
@@ -597,11 +642,18 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
         private async Task FetchToFileAsync(WorkspaceFileState state, IAsyncStreamReader<RunnerWorkspaceServiceReadWorkspaceFileResponse> responseStream, CancellationToken cancellationToken)
         {
             EnsureSafeInputHydrationPath(state.LocalPath);
+            // What the download is to replace, as it is now: a write by the session meanwhile stays.
+            var replacing = _secureInputRoot.GetVersion(state.RelativePath);
             using var publication = _secureInputRoot.CreatePublication(state.RelativePath);
             var sawMetadata = false;
             string? expectedSha256 = null;
+            // Without a declared size, an unsealed stream is held to the catalog's size.
+            var catalogSize = state.SizeBytes;
+            long? declaredWireSize = null;
+            var fileWireLimit = MaxWorkspaceFileBytes;
             long written = 0;
             using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            using var sinkSlot = new SealedReadSinkSlot();
             await using (var destination = publication.OpenWriteStream())
             {
                 while (await responseStream.MoveNext(cancellationToken).ConfigureAwait(false))
@@ -617,20 +669,33 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                                 state.ModifiedUtc = modifiedUtc;
                             }
 
+                            fileWireLimit = SealedReadSink.WireLimit(response.Metadata.Envelope, MaxWorkspaceFileBytes);
                             if (response.Metadata.SizeBytes.HasValue)
                             {
-                                if (response.Metadata.SizeBytes.Value > MaxWorkspaceFileBytes)
+                                if (response.Metadata.SizeBytes.Value > fileWireLimit)
                                 {
                                     throw new InvalidOperationException(
                                         $"Workspace file declares {response.Metadata.SizeBytes.Value} bytes, above the {MaxWorkspaceFileBytes} byte limit.");
                                 }
 
-                                state.SizeBytes = response.Metadata.SizeBytes.Value;
+                                declaredWireSize = response.Metadata.SizeBytes.Value;
                             }
 
                             if (!string.IsNullOrWhiteSpace(response.Metadata.Sha256))
                             {
                                 expectedSha256 = response.Metadata.Sha256.Trim();
+                            }
+
+                            var sink = sinkSlot.Begin(SealedReadSink.Open(
+                                destination,
+                                response.Metadata.Envelope,
+                                _paths.TransferSealing,
+                                () => new SealedWorkspaceFileIdentity(_sessionId, SealedRootName(state.Root), state.RelativePath)));
+                            declaredWireSize ??= sink.SealedCiphertextSize ?? catalogSize;
+                            // The state records the local file's size: a sealed header's plaintext size.
+                            if ((sink.SealedPlaintextSize ?? declaredWireSize) is { } localSize)
+                            {
+                                state.SizeBytes = localSize;
                             }
 
                             break;
@@ -641,20 +706,20 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                             }
 
                             written += response.Chunk.Length;
-                            if (state.SizeBytes is { } limit && written > limit)
+                            if (declaredWireSize is { } limit && written > limit)
                             {
                                 throw new InvalidOperationException(
                                     $"Workspace file stream exceeded its declared size of {limit} bytes.");
                             }
 
-                            if (written > MaxWorkspaceFileBytes)
+                            if (written > fileWireLimit)
                             {
                                 throw new InvalidOperationException(
                                     $"Workspace file stream exceeded the {MaxWorkspaceFileBytes} byte limit.");
                             }
 
                             hash.AppendData(response.Chunk.Span);
-                            await destination.WriteAsync(response.Chunk.Memory, cancellationToken).ConfigureAwait(false);
+                            await sinkSlot.Current.WriteAsync(response.Chunk.Memory, cancellationToken).ConfigureAwait(false);
                             break;
                     }
                 }
@@ -666,7 +731,7 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
 
                 // A stream that ends early or carries other bytes must not become the input
                 // the editor reads: nothing is committed unless size and digest match.
-                if (state.SizeBytes is { } expectedSize && written != expectedSize)
+                if (declaredWireSize is { } expectedSize && written != expectedSize)
                 {
                     throw new InvalidOperationException(
                         $"Workspace file stream size mismatch: expected {expectedSize} bytes but received {written} bytes.");
@@ -678,6 +743,7 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                     throw new InvalidOperationException("Workspace file stream SHA-256 mismatch.");
                 }
 
+                await sinkSlot.Current.CompleteAsync(cancellationToken).ConfigureAwait(false);
                 await destination.FlushAsync(cancellationToken).ConfigureAwait(false);
                 if (state.ModifiedUtc.HasValue)
                 {
@@ -685,7 +751,14 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                 }
             }
 
-            publication.Commit();
+            // False when the session wrote, created or opened the file meanwhile: its newer bytes
+            // stay, and a writer that opened the placeholder keeps writing to the file that stays.
+            if (!(replacing is { } expected ? publication.CommitReplacing(expected, whileUnopened: true) : publication.CommitIfAbsent()) &&
+                replacing is { } placeholder && _secureInputRoot.GetVersion(state.RelativePath) is { } current && current.IsSameFileAs(placeholder))
+            {
+                // Still the placeholder, only open elsewhere: not downloaded, so a later open asks again.
+                throw new PlaceholderInUseException();
+            }
         }
 
         private static DateTime? ToDateTime(Timestamp? timestamp)
