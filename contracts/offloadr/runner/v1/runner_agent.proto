@@ -323,6 +323,7 @@ message AcknowledgeSessionStartRequest {
     uint64 runtime_epoch = 6;
     string runtime_instance_id = 7;
     SessionSealingStatus sealing = 8; // What the started session got; unset when it did not start.
+    string instance_id = 9; // Registered process that executed the assignment.
 }
 
 message AcknowledgeEditorRuntimeQuiesceRequest {
@@ -353,9 +354,16 @@ message AcknowledgeEditorRuntimeLaunchRequest {
     bool ready = 10;
     string message = 12;
     SessionSealingStatus sealing = 14; // What the launched runtime got; unset when it did not launch.
+    string instance_id = 15; // Registered process that executed the assignment.
 }
 
 // Unary ack request message for stop-session.
+enum RunnerCleanupDisposition {
+    RUNNER_CLEANUP_DISPOSITION_UNSPECIFIED = 0;
+    RUNNER_CLEANUP_DISPOSITION_PERFORMED = 1;
+    RUNNER_CLEANUP_DISPOSITION_SUPERSEDED = 2;
+}
+
 message AcknowledgeSessionStopRequest {
     string session_id = 1;
     string user = 2;
@@ -373,6 +381,7 @@ message AcknowledgeSessionStopRequest {
     // time, or an artifact folder could not be read): unsaved_artifact_count is then only what
     // it could see, and the session must not be reported as fully saved.
     bool unsaved_artifacts_unknown = 9;
+    RunnerCleanupDisposition cleanup_disposition = 10;
 }
 
 message AcknowledgePromptResultRequest {
@@ -634,6 +643,7 @@ message RunnerArtifactUploadMetadata {
     // then the plaintext size the header declares, and sha256 is not sent: a plaintext digest
     // would reveal when two uploads carry equal content.
     SealedEnvelope envelope = 15;
+    string instance_id = 16; // Captured registered process; never read from mutable session state.
 }
 
 message RunnerArtifactServiceUploadArtifactRequest {
@@ -643,8 +653,14 @@ message RunnerArtifactServiceUploadArtifactRequest {
     }
 }
 
+enum RunnerArtifactUploadOutcome {
+    RUNNER_ARTIFACT_UPLOAD_OUTCOME_UNSPECIFIED = 0;
+    RUNNER_ARTIFACT_UPLOAD_OUTCOME_COMMITTED = 1;
+    RUNNER_ARTIFACT_UPLOAD_OUTCOME_REJECTED_STALE_RUNTIME = 2;
+}
+
 message RunnerArtifactServiceUploadArtifactResponse {
-    bool success = 1;
+    RunnerArtifactUploadOutcome outcome = 1;
     string message = 2;
     offloadr.editor_runtime.v1.EditorArtifactMetadata artifact = 3;
 }
