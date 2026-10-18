@@ -44,6 +44,42 @@ public partial class ArtifactUploadServiceTests
     }
 
     [Test]
+    public async Task Download_LeavesAPlaceholderAWriterHasOpen()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = CreateEvictionPaths(root, sealedSession: true);
+            var content = "uploaded-output-bytes"u8.ToArray();
+            var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse())
+            {
+                ReadArtifactContent = content,
+            };
+            await using var service = new ArtifactUploadService("runner-secret-value", artifactClient, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            var outputPath = Path.Combine(paths.OutputDirectory, "ComfyUI_00001_.png");
+            await File.WriteAllBytesAsync(outputPath, content);
+            await artifactClient.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            Assert.That(await EvictWhenRecordedAsync(service, "session-1"), Is.EqualTo(content.Length));
+
+            // A workflow opens the placeholder to write a new version, then another process reads it.
+            await using (var writer = new FileStream(outputPath, FileMode.Open, FileAccess.Write))
+            {
+                await service.TryEnsureArtifactAvailableAsync(outputPath, highPriority: true, CancellationToken.None);
+                await writer.WriteAsync("rewritten"u8.ToArray());
+            }
+
+            Assert.That(await File.ReadAllTextAsync(outputPath), Is.EqualTo("rewritten"), "what the writer wrote is where it can be found");
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
     [System.Runtime.Versioning.SupportedOSPlatform("linux")]
     public async Task EvictionAndDownload_KeepTheSessionUsersOwnershipOfItsOutput()
     {

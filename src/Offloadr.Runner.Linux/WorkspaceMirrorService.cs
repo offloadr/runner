@@ -751,8 +751,9 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                 }
             }
 
-            // False when the session wrote or created the file meanwhile: its newer bytes stay.
-            _ = replacing is { } expected ? publication.CommitReplacing(expected) : publication.CommitIfAbsent();
+            // False when the session wrote, created or opened the file meanwhile: its newer bytes
+            // stay, and a writer that opened the placeholder keeps writing to the file that stays.
+            _ = replacing is { } expected ? publication.CommitReplacing(expected, whileUnopened: true) : publication.CommitIfAbsent();
         }
 
         private static DateTime? ToDateTime(Timestamp? timestamp)

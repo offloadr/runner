@@ -1674,10 +1674,14 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     // ignore timestamp failures
                 }
 
-                // Disposing an uncommitted publication removes its temporary file.
-                if (!(replacing is { } expected ? publication.CommitReplacing(expected) : publication.CommitIfAbsent()))
+                // Disposing an uncommitted publication removes its temporary file. The placeholder is
+                // replaced only while no process has it open: a writer that opened it before its
+                // first write would otherwise go on with an inode nobody can reach. The shim asks
+                // for the download before it opens the file itself.
+                if (!(replacing is { } expected ? publication.CommitReplacing(expected, whileUnopened: true) : publication.CommitIfAbsent()))
                 {
-                    // The session wrote or created the file meanwhile: it stays, and its watcher uploads it.
+                    // The session wrote, created or opened the file meanwhile: it stays, and its
+                    // watcher uploads what it writes.
                     return null;
                 }
             }

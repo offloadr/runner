@@ -140,6 +140,55 @@ public class WorkspaceMirrorServiceTests
     }
 
     [Test]
+    public async Task TryEnsureWorkspaceFileAvailableAsync_LeavesAPlaceholderAWriterHasOpen()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            Assert.Ignore("Publication into the session tree requires Linux.");
+        }
+
+        const string sessionId = "session-open-writer";
+        var tempRoot = CreateTempDirectory();
+
+        try
+        {
+            var paths = CreateSessionPaths(tempRoot);
+            var workspaceClient = new FakeRunnerWorkspaceClient
+            {
+                FileContentsByRelativePath = new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["input.png"] = "remote",
+                }
+            };
+            await using var service = new WorkspaceMirrorService(
+                workspaceClient,
+                "runner-secret-value",
+                NullLogger<WorkspaceMirrorService>.Instance);
+            await service.PrepareSessionAsync(
+                sessionId,
+                paths,
+                "editor-1",
+                "comfyui",
+                [new WorkspaceFileMetadata { Root = WorkspaceRoot.Input, RelativePath = "input.png", SizeBytes = 6 }],
+                CancellationToken.None);
+            var inputPath = Path.Combine(paths.InputDirectory, "input.png");
+
+            // The workflow opens the placeholder to write its own input, then a read asks for it.
+            await using (var writer = new FileStream(inputPath, FileMode.Open, FileAccess.Write))
+            {
+                await service.TryEnsureWorkspaceFileAvailableAsync(inputPath, highPriority: true, CancellationToken.None);
+                await writer.WriteAsync("local!"u8.ToArray());
+            }
+
+            Assert.That(await File.ReadAllTextAsync(inputPath), Is.EqualTo("local!"));
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+        }
+    }
+
+    [Test]
     public async Task TryEnsureWorkspaceFileAvailableAsync_TreatsInputPathsAsCaseSensitive()
     {
         if (!OperatingSystem.IsLinux())
