@@ -37,6 +37,30 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
+    public async Task LaunchThatStrengthensTheStartsSealing_KeepsItForTheNextLaunch()
+    {
+        var harness = new RuntimeCommandHarness();
+        // Started with a weaker, unsealed profile; a launch then runs it sealed.
+        var start = SealedStart(7, 3, InstanceA);
+        start.Sealing = new SessionSealing { Required = false };
+        await ServiceClientManager.HandleStartSessionCommand(start, harness.Deps);
+        await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
+        await ServiceClientManager.HandleQuiesceRuntimeCommandAsync(Quiesce(7, 3, InstanceA, revision: 1), harness.Deps);
+        var sealedLaunch = Launch(7, 4, InstanceB, revision: 2);
+        sealedLaunch.Sealing = SealedStart(7, 4, InstanceB).Sealing;
+        await ServiceClientManager.HandleLaunchRuntimeCommand(sealedLaunch, harness.Deps);
+        await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 1);
+
+        // The next restart's launch omits sealing.
+        await ServiceClientManager.HandleQuiesceRuntimeCommandAsync(Quiesce(7, 4, InstanceB, revision: 3), harness.Deps);
+        await ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 5, InstanceA, revision: 4), harness.Deps);
+        await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 2);
+
+        Assert.That(harness.Sink.LaunchAcks.Select(static ack => ack.Ready), Is.All.True);
+        Assert.That(harness.Starts.Last().Sealing, Is.EqualTo(sealedLaunch.Sealing), "it stays as sealed as it last ran");
+    }
+
+    [Test]
     public async Task RefusedLaunch_KeepsTheSealingForTheNextLaunch()
     {
         var harness = new RuntimeCommandHarness();

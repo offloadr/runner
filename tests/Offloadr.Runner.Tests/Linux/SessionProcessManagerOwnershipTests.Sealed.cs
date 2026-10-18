@@ -829,8 +829,11 @@ public partial class SessionProcessManagerOwnershipTests
             var noted = stale.Where(lifecycle => lifecycle.SessionId == sessionId).Select(static lifecycle => lifecycle.LifecycleGeneration).ToArray();
             Assert.That(noted, Has.Member(99UL).And.Length.EqualTo(2));
 
-            // The older lifecycle's Stop drops only its own note.
+            // Each lifecycle's Stop drops only its own note, the newer one's first included.
             var older = stale.Where(lifecycle => lifecycle.SessionId == sessionId).Min(static lifecycle => lifecycle.LifecycleGeneration);
+            restarted.ForgetSealedLifecycle(sessionId, 99);
+            Assert.That(Directory.EnumerateFiles(notes).Select(Path.GetFileName), Is.EqualTo(new[] { older.ToString(System.Globalization.CultureInfo.InvariantCulture) }));
+            File.WriteAllText(Path.Combine(notes, "99"), string.Empty);
             restarted.ForgetSealedLifecycle(sessionId, older);
             Assert.That(Directory.EnumerateFiles(notes).Select(Path.GetFileName), Is.EqualTo(new[] { "99" }));
             restarted.ForgetSealedLifecycle(sessionId, 0);

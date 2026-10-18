@@ -176,17 +176,15 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         {
             var taken = TakeRecordedUnsavedUploads(sessionId, lifecycleGeneration);
             // The Stop of a lifecycle whose data a restart removed reports that nobody counted
-            // it; so does an unfenced Stop, or any when the generation was not recorded. A newer
-            // lifecycle's Stop drops older marks unreported, as it does older counts; marks of
-            // newer lifecycles stay.
+            // it; so does an unfenced Stop, or any when the generation was not recorded. Other
+            // lifecycles' marks stay for their own Stops, which may still come.
             var incomplete = false;
             foreach (var mark in _lossUncounted.Keys.Where(mark => mark.SessionId == sessionId).ToArray())
             {
-                var mine = lifecycleGeneration == 0 || mark.Generation == 0 || mark.Generation == lifecycleGeneration;
-                if (mine || mark.Generation < lifecycleGeneration)
+                if (lifecycleGeneration == 0 || mark.Generation == 0 || mark.Generation == lifecycleGeneration)
                 {
                     _lossUncounted.TryRemove(mark, out _);
-                    incomplete |= mine;
+                    incomplete = true;
                 }
             }
 
@@ -237,11 +235,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 return all;
             }
 
-            foreach (var older in _unsavedBySession.Keys.Where(key => key.SessionId == sessionId && key.Generation < lifecycleGeneration))
-            {
-                _unsavedBySession.TryRemove(older, out _);
-            }
-
+            // Only this lifecycle's: an older one's Stop may still come, after a newer one's.
             return _unsavedBySession.TryRemove((sessionId, lifecycleGeneration), out var unsaved) ? unsaved : default;
         }
     }

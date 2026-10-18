@@ -628,13 +628,13 @@ internal sealed partial class SessionProcessManager : IDisposable
 
         try
         {
-            // That lifecycle's note and older ones, whose Stops a newer one superseded; an
-            // unfenced Stop takes them all.
+            // That lifecycle's note alone: an older one's Stop may still come after a newer one's.
+            // An unfenced Stop takes them all.
             foreach (var record in Directory.GetFiles(sessionRecords))
             {
                 if (lifecycleGeneration == 0 ||
-                    !ulong.TryParse(Path.GetFileName(record), System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var recorded) ||
-                    recorded <= lifecycleGeneration)
+                    (ulong.TryParse(Path.GetFileName(record), System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var recorded) &&
+                     recorded == lifecycleGeneration))
                 {
                     File.Delete(record);
                 }

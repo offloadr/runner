@@ -226,10 +226,11 @@ public partial class ArtifactUploadServiceTests
         Assert.That(service.TakeUnsavedUploads("session-1", 7), Is.EqualTo(new UnsavedUploads(0, Incomplete: true)), "fenced Stop");
         Assert.That(service.TakeUnsavedUploads("session-1", 7), Is.EqualTo(default(UnsavedUploads)), "reported once");
 
-        // Lifecycle 8 reused the session id before lifecycle 7's Stop came: not its loss.
+        // Lifecycle 8 reused the session id before lifecycle 7's Stop came: not its loss, and
+        // lifecycle 7's Stop, coming after it, still reports its own.
         service.MarkLossUncounted("session-1", 7);
         Assert.That(service.TakeUnsavedUploads("session-1", 8), Is.EqualTo(default(UnsavedUploads)));
-        Assert.That(service.TakeUnsavedUploads("session-1", 7), Is.EqualTo(default(UnsavedUploads)), "and the mark is gone");
+        Assert.That(service.TakeUnsavedUploads("session-1", 7), Is.EqualTo(new UnsavedUploads(0, Incomplete: true)), "the mark stayed for it");
 
         service.MarkLossUncounted("session-2", 3);
         Assert.That(service.TakeUnsavedUploads("session-2").Incomplete, Is.True, "unfenced Stop");
@@ -263,7 +264,7 @@ public partial class ArtifactUploadServiceTests
             Assert.That(await service.StopSessionAsync("session-1"), Is.Zero);
 
             Assert.That(service.TakeUnsavedUploadCount("session-1", 2), Is.Zero, "the older lifecycle's loss is not this one's");
-            Assert.That(service.TakeUnsavedUploadCount("session-1", 1), Is.Zero, "and is dropped once a newer lifecycle reported");
+            Assert.That(service.TakeUnsavedUploadCount("session-1", 1), Is.EqualTo(1), "its own Stop still reports it after the newer one's");
 
             // An unfenced Stop (no generation) takes whatever the session lost, in any lifecycle.
             identities.Set("session-1", 3, 1, "instance-3");

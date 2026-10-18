@@ -2628,16 +2628,22 @@ internal static class ServiceClientManager
                     }
 
                     await deps.StartRuntimeAndWaitForReady(start, cancellationToken).ConfigureAwait(false);
-                    if (startSealing is null && command.Sealing is { } learned)
+                    if (command.Sealing is { } learned)
                     {
-                        // This runner did not see the lifecycle's Start: the first launch that
-                        // brought sealing stands in for it, so a later launch that omits sealing
-                        // keeps it. A newer lifecycle's sealing is never replaced.
+                        // What this launch ran with stands for the lifecycle from now on: it is
+                        // never weaker than what it replaces, and may be stronger (the Start was
+                        // unsealed, or this runner never saw it), so a later launch that omits
+                        // sealing keeps it. A Start's identity stays, so only that Start failing
+                        // drops it; a newer lifecycle's sealing is never replaced.
                         var retainedFromLaunch = new RetainedSealing(runtimeIdentity, learned.Clone());
                         deps.WorkState.SessionSealing.AddOrUpdate(
                             command.SessionId,
                             retainedFromLaunch,
-                            (_, existing) => existing.StartRuntime.LifecycleGeneration < command.LifecycleGeneration ? retainedFromLaunch : existing);
+                            (_, existing) => existing.StartRuntime.LifecycleGeneration < command.LifecycleGeneration
+                                ? retainedFromLaunch
+                                : existing.StartRuntime.LifecycleGeneration == command.LifecycleGeneration
+                                    ? existing with { Sealing = learned.Clone() }
+                                    : existing);
                     }
 
                     return new StartupOutcome(
