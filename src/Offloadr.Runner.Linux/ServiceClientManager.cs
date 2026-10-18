@@ -2153,9 +2153,12 @@ internal static class ServiceClientManager
             {
                 var outcome = await ExecuteStopSessionCommandAsync(command, deps).ConfigureAwait(false);
                 work.Completed = outcome != StopOutcome.NotCompleted;
-                // Only the Stop that tore the session down reports what it lost; a superseded
-                // Stop leaves the count for the current runtime's Stop.
-                if (outcome == StopOutcome.Stopped)
+                // The Stop that tore the session down reports what its lifecycle lost, and so
+                // does an older lifecycle's Stop that came after a newer lifecycle began: the
+                // counts are kept by lifecycle, so it takes none of the current one's. A Stop
+                // for an older runtime of the current lifecycle leaves the count for that
+                // lifecycle's own Stop.
+                if (outcome is StopOutcome.Stopped or StopOutcome.SupersededLifecycle)
                 {
                     var unsaved = deps.TakeUnsavedArtifacts?.Invoke(command.SessionId, command.LifecycleGeneration) ?? default;
                     work.Acknowledgement.UnsavedArtifactCount = (uint)Math.Max(0, unsaved.Count);
@@ -2181,20 +2184,22 @@ internal static class ServiceClientManager
     {
         NotCompleted,
         Superseded,
+        // Superseded by a newer lifecycle, not only a newer runtime of the same one.
+        SupersededLifecycle,
         Stopped,
     }
 
     private static async Task<StopOutcome> ExecuteStopSessionCommandAsync(StopSessionCommand command, RuntimeCommandDependencies deps)
     {
         deps.Shutdown.ThrowIfCancellationRequested();
-        if (IsStopSuperseded(command, deps))
+        if (FindRuntimeNewerThanStop(command, deps) is { } newer)
         {
             // A delayed or redelivered Stop for an older runtime must not stop the
             // newer one. The runtime it names is no longer running here.
             RunnerLog.Warning(
                 nameof(ServiceClientManager),
                 $"Ignoring stale stop for session {command.SessionId}; a newer runtime is current.");
-            return StopOutcome.Superseded;
+            return newer.LifecycleGeneration > command.LifecycleGeneration ? StopOutcome.SupersededLifecycle : StopOutcome.Superseded;
         }
 
         await deps.WorkState.Prompts.CancelAndWaitAsync(
@@ -2233,27 +2238,30 @@ internal static class ServiceClientManager
     /// the session's current runtime, tracked child or active startup is newer.
     /// A Stop without one is not runtime-fenced; its command identity still deduplicates retries.
     /// </summary>
-    private static bool IsStopSuperseded(StopSessionCommand command, RuntimeCommandDependencies deps)
+    /// <summary>A runtime of the session newer than the one a fenced Stop names, if any.</summary>
+    private static RuntimeIdentity? FindRuntimeNewerThanStop(StopSessionCommand command, RuntimeCommandDependencies deps)
     {
         if (command.LifecycleGeneration == 0)
         {
-            return false;
+            return null;
         }
 
         if (deps.LogicalSessionState.TryGetRuntime(command.SessionId, out var logical, out _) &&
             IsNewerThanStop(logical, command))
         {
-            return true;
+            return logical;
         }
 
         if (deps.GetTrackedRuntime(command.SessionId) is { } tracked && IsNewerThanStop(tracked, command))
         {
-            return true;
+            return tracked;
         }
 
         return deps.WorkState.GetActiveStartup() is { } startup &&
                string.Equals(startup.SessionId, command.SessionId, StringComparison.Ordinal) &&
-               IsNewerThanStop(startup.RuntimeIdentity, command);
+               IsNewerThanStop(startup.RuntimeIdentity, command)
+            ? startup.RuntimeIdentity
+            : null;
     }
 
     private static bool IsNewerThanStop(RuntimeIdentity current, StopSessionCommand stop)

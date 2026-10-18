@@ -386,6 +386,25 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
+    public async Task OlderLifecyclesStop_ReportsThatLifecyclesLossWithoutStoppingTheNewerOne()
+    {
+        var harness = RunningHarness(8, 1, InstanceB);
+        harness.UnsavedArtifacts = 2;
+
+        await ServiceClientManager.HandleStopSessionCommandAsync(Stop(7, 3, InstanceA), harness.Deps);
+        var older = await harness.Sink.WaitForAsync(harness.Sink.StopAcks, 1);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(older.UnsavedArtifactCount, Is.EqualTo(2), "lifecycle 7's own loss");
+            Assert.That(harness.UnsavedTakenFor, Is.EqualTo(new[] { 7UL }), "none of lifecycle 8's");
+            Assert.That(harness.ForgottenLifecycles, Has.Count.EqualTo(1), "its note goes once acknowledged");
+            Assert.That(harness.Calls.Any(call => call.StartsWith("stop:", StringComparison.Ordinal)), Is.False, "the newer runtime keeps running");
+            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(new RuntimeIdentity(8, 1, InstanceB)));
+        });
+    }
+
+    [Test]
     public async Task LaunchRuntime_UsesItsOwnSealingAndAcknowledgesWhatItGot()
     {
         var harness = new RuntimeCommandHarness
