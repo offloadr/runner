@@ -67,11 +67,50 @@ public partial class ArtifactUploadServiceTests
             // A workflow opens the placeholder to write a new version, then another process reads it.
             await using (var writer = new FileStream(outputPath, FileMode.Open, FileAccess.Write))
             {
-                await service.TryEnsureArtifactAvailableAsync(outputPath, highPriority: true, CancellationToken.None);
+                // Refused while the writer has it open: the placeholder stays what it writes to.
+                Assert.CatchAsync(() => service.TryEnsureArtifactAvailableAsync(outputPath, highPriority: true, CancellationToken.None));
                 await writer.WriteAsync("rewritten"u8.ToArray());
             }
 
             Assert.That(await File.ReadAllTextAsync(outputPath), Is.EqualTo("rewritten"), "what the writer wrote is where it can be found");
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
+    public async Task Download_ThatAReaderHeldOffIsTriedAgain()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = CreateEvictionPaths(root, sealedSession: true);
+            var content = "uploaded-output-bytes"u8.ToArray();
+            var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse())
+            {
+                ReadArtifactContent = content,
+            };
+            await using var service = new ArtifactUploadService("runner-secret-value", artifactClient, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            var outputPath = Path.Combine(paths.OutputDirectory, "ComfyUI_00001_.png");
+            await File.WriteAllBytesAsync(outputPath, content);
+            await artifactClient.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            Assert.That(await EvictWhenRecordedAsync(service, "session-1"), Is.EqualTo(content.Length));
+
+            // A process outside the shim has the placeholder open to read: the download waits.
+            await using (var reader = new FileStream(outputPath, FileMode.Open, FileAccess.Read))
+            {
+                Assert.CatchAsync(() => service.TryEnsureArtifactAvailableAsync(outputPath, highPriority: true, CancellationToken.None));
+                Assert.That(new FileInfo(outputPath).Length, Is.Zero);
+            }
+
+            // Closed: the next open downloads it.
+            Assert.That(await service.TryEnsureArtifactAvailableAsync(outputPath, highPriority: true, CancellationToken.None), Is.True);
+            Assert.That(await File.ReadAllBytesAsync(outputPath), Is.EqualTo(content));
         }
         finally
         {

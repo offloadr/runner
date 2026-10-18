@@ -176,11 +176,78 @@ public class WorkspaceMirrorServiceTests
             // The workflow opens the placeholder to write its own input, then a read asks for it.
             await using (var writer = new FileStream(inputPath, FileMode.Open, FileAccess.Write))
             {
-                await service.TryEnsureWorkspaceFileAvailableAsync(inputPath, highPriority: true, CancellationToken.None);
+                // Refused while the writer has it open: the placeholder stays what it writes to.
+                try
+                {
+                    await service.TryEnsureWorkspaceFileAvailableAsync(inputPath, highPriority: true, CancellationToken.None);
+                }
+                catch (IOException)
+                {
+                }
+
                 await writer.WriteAsync("local!"u8.ToArray());
             }
 
             Assert.That(await File.ReadAllTextAsync(inputPath), Is.EqualTo("local!"));
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+        }
+    }
+
+    [Test]
+    public async Task TryEnsureWorkspaceFileAvailableAsync_TriesAgainAfterAReaderHeldItOff()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            Assert.Ignore("Publication into the session tree requires Linux.");
+        }
+
+        const string sessionId = "session-open-reader";
+        var tempRoot = CreateTempDirectory();
+
+        try
+        {
+            var paths = CreateSessionPaths(tempRoot);
+            var workspaceClient = new FakeRunnerWorkspaceClient
+            {
+                FileContentsByRelativePath = new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["input.png"] = "remote",
+                }
+            };
+            await using var service = new WorkspaceMirrorService(
+                workspaceClient,
+                "runner-secret-value",
+                NullLogger<WorkspaceMirrorService>.Instance);
+            await service.PrepareSessionAsync(
+                sessionId,
+                paths,
+                "editor-1",
+                "comfyui",
+                [new WorkspaceFileMetadata { Root = WorkspaceRoot.Input, RelativePath = "input.png", SizeBytes = 6 }],
+                CancellationToken.None);
+            var inputPath = Path.Combine(paths.InputDirectory, "input.png");
+
+            // A process outside the shim has the placeholder open to read: the download waits.
+            await using (var reader = new FileStream(inputPath, FileMode.Open, FileAccess.Read))
+            {
+                try
+                {
+                    await service.TryEnsureWorkspaceFileAvailableAsync(inputPath, highPriority: true, CancellationToken.None);
+                }
+                catch (IOException)
+                {
+                    // Refused for now.
+                }
+
+                Assert.That(new FileInfo(inputPath).Length, Is.Zero);
+            }
+
+            // Closed: the next open downloads it.
+            Assert.That(await service.TryEnsureWorkspaceFileAvailableAsync(inputPath, highPriority: true, CancellationToken.None), Is.True);
+            Assert.That(await File.ReadAllTextAsync(inputPath), Is.EqualTo("remote"));
         }
         finally
         {

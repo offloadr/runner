@@ -1706,8 +1706,15 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 // for the download before it opens the file itself.
                 if (!(replacing is { } expected ? publication.CommitReplacing(expected, whileUnopened: true) : publication.CommitIfAbsent()))
                 {
-                    // The session wrote, created or opened the file meanwhile: it stays, and its
-                    // watcher uploads what it writes.
+                    // Still the placeholder, only open elsewhere: not downloaded, so a later open
+                    // asks again.
+                    if (replacing is { } placeholder && secureRoot.GetVersion(relativePath) is { } current && current.IsSameFileAs(placeholder))
+                    {
+                        throw new PlaceholderInUseException();
+                    }
+
+                    // The session wrote or created the file meanwhile: it stays, and its watcher
+                    // uploads it.
                     return null;
                 }
             }
