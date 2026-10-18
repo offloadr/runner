@@ -131,6 +131,20 @@ public class SealedProcessHardeningLinuxTests
         }
     }
 
+    [TestCase(1UL, 1UL, "|/usr/lib/systemd/systemd-coredump %P", true)]
+    [TestCase(0UL, 0UL, "|/usr/share/apport/apport %p", false)]
+    [TestCase(0UL, 0UL, "core", true)]
+    [TestCase(1UL, 1UL, "core", true)]
+    [TestCase(1UL, 1UL, "@/run/coredump.socket", false)]
+    [TestCase(0UL, 1UL, "|/bin/handler", false)]
+    [TestCase(1UL, ulong.MaxValue, "core", false)]
+    public void CoreSizeLimit_StopsDumpsOnlyWhereTheHostsHandlerHonoursIt(ulong soft, ulong hard, string pattern, bool stops)
+    {
+        // A piped handler ignores the limit unless it is exactly 1; a socket handler always does.
+        Assert.That(LinuxProcessHardening.StopsCoreDumps((soft, hard), pattern + Environment.NewLine), Is.EqualTo(stops));
+        Assert.That(LinuxProcessHardening.StopsCoreDumps((1, 1), null), Is.False, "an unreadable pattern");
+    }
+
     [Test]
     public void ProcessHardening_ReadsTheDumpableFlag()
     {
