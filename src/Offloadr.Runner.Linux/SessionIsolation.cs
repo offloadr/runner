@@ -305,7 +305,16 @@ public sealed class LinuxUserIsolationStrategy : ISessionIsolationStrategy
         int remaining;
         try
         {
-            _removeOwnedEntries(userId, _residueRoots ?? LinuxSessionResidue.CurrentResidueRoots(), out remaining);
+            var roots = _residueRoots ?? LinuxSessionResidue.CurrentResidueRoots();
+            _removeOwnedEntries(userId, roots ?? LinuxSessionResidue.SharedTemporaryRoots, out remaining);
+            if (roots is null)
+            {
+                // Without the mount table, other memory-backed mounts it may have written to are
+                // unknown: the shared ones are still cleaned, but the uid is not freed.
+                RunnerLog.Error<LinuxUserIsolationStrategy>(
+                    $"Could not read the mount table to find all temporary files of session user '{userName}' (uid {userId}).");
+                remaining = Math.Max(remaining, 1);
+            }
         }
         catch (Exception ex)
         {

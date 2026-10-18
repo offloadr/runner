@@ -75,7 +75,9 @@ public class LinuxSessionResidueLinuxTests
 
             File.WriteAllText(Path.Combine(directory, "sem"), "key semid perms nsems uid gid\n");
             Assert.That(LinuxSessionResidue.CountIpcObjectsOwnedBy(54321, directory), Is.EqualTo(1));
-            Assert.That(LinuxSessionResidue.CountIpcObjectsOwnedBy(54321, Path.Combine(directory, "absent")), Is.Zero, "a kernel without System V IPC");
+            var absent = Path.Combine(directory, "absent");
+            Assert.That(LinuxSessionResidue.CountIpcObjectsOwnedBy(54321, absent, ipcUnavailable: () => true), Is.Zero, "a kernel without System V IPC");
+            Assert.That(LinuxSessionResidue.CountIpcObjectsOwnedBy(54321, absent, ipcUnavailable: () => false), Is.Null, "a hidden directory");
         }
         finally
         {
@@ -94,6 +96,7 @@ public class LinuxSessionResidueLinuxTests
         Assert.That(roots, Is.SupersetOf(LinuxSessionResidue.SharedTemporaryRoots));
         Assert.That(roots, Has.None.EqualTo("/dev"));
         Assert.That(roots, Has.None.StartsWith("/proc/").And.None.StartsWith("/sys/"));
+        Assert.That(LinuxSessionResidue.CurrentResidueRoots(mounts: null), Is.Null, "an unreadable mount table");
     }
 
     [Test]

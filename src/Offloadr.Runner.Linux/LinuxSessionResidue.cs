@@ -17,12 +17,21 @@ public static class LinuxSessionResidue
     /// <see cref="SharedTemporaryRoots"/> and every other writable memory-backed mount, such as a
     /// memory-backed volume or a shared <c>/run</c>: a session may leave files there too. Not
     /// <c>/dev</c> itself (device nodes and terminals, which cannot be removed), nor anything
-    /// under <c>/proc</c> or <c>/sys</c>.
+    /// under <c>/proc</c> or <c>/sys</c>. Null when the mount table cannot be read: where else
+    /// the session may have left files is then unknown.
     /// </summary>
-    public static IReadOnlyList<string> CurrentResidueRoots()
+    public static IReadOnlyList<string>? CurrentResidueRoots()
+        => CurrentResidueRoots(SealedHostLockdown.ReadMounts());
+
+    internal static IReadOnlyList<string>? CurrentResidueRoots(IReadOnlyList<SealedHostLockdown.Mount>? mounts)
     {
+        if (mounts is null)
+        {
+            return null;
+        }
+
         var roots = new List<string>(SharedTemporaryRoots);
-        foreach (var mount in SealedHostLockdown.ReadMounts() ?? [])
+        foreach (var mount in mounts)
         {
             if (!mount.ReadOnly && mount.Type is "tmpfs" or "ramfs" &&
                 mount.MountPoint is not ("/" or "/dev") &&
@@ -42,13 +51,14 @@ public static class LinuxSessionResidue
     /// as <c>/proc/sysvipc</c> lists them; null when a table cannot be read. They outlive their
     /// creator, and the next user of the uid would own them.
     /// </summary>
-    public static int? CountIpcObjectsOwnedBy(uint userId, string sysvipcDirectory = "/proc/sysvipc")
+    public static int? CountIpcObjectsOwnedBy(uint userId, string sysvipcDirectory = "/proc/sysvipc", Func<bool>? ipcUnavailable = null)
     {
         // A kernel without System V IPC has no such directory; with one, every table is there,
-        // and one that is missing (masked, say) hides what it would list.
+        // and one that is missing (masked, say) hides what it would list. A missing directory is
+        // taken as no IPC only once the kernel says so itself; hidden, it hides every table.
         if (!Directory.Exists(sysvipcDirectory))
         {
-            return 0;
+            return (ipcUnavailable ?? SystemVIpcUnavailable)() ? 0 : null;
         }
 
         var owned = 0;
@@ -82,6 +92,34 @@ public static class LinuxSessionResidue
 
         return owned;
     }
+
+    private const int IpcInfo = 3;
+    private const int NoSuchSystemCall = 38;
+
+    /// <summary>
+    /// Whether the kernel has no System V IPC: asking it for its shared memory limits then fails
+    /// with ENOSYS, as it would for the session's own calls.
+    /// </summary>
+    private static bool SystemVIpcUnavailable()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            return false;
+        }
+
+        var limits = Marshal.AllocHGlobal(256);
+        try
+        {
+            return shmctl(0, IpcInfo, limits) < 0 && Marshal.GetLastPInvokeError() == NoSuchSystemCall;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(limits);
+        }
+    }
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int shmctl(int segment, int command, nint buffer);
 
     private const int AtFdcwd = -100;
     private const int AtSymlinkNofollow = 0x100;
