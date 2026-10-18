@@ -800,7 +800,8 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             {
                 IncludeSubdirectories = true,
                 EnableRaisingEvents = true,
-                NotifyFilter = NotifyFilters.FileName | NotifyFilters.Size | NotifyFilters.LastWrite
+                // Folders too: one made or moved in brings files no event names.
+                NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.Size | NotifyFilters.LastWrite
             };
 
             FileSystemEventHandler handler = (sender, args) => OnArtifactWatcherEvent(type, root, args.ChangeType, args.FullPath);
@@ -993,7 +994,32 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 _logger.LogDebug(ex, "Failed to inspect watcher event for session {SessionId}", _sessionId);
             }
 
+            if (changeType is WatcherChangeTypes.Created or WatcherChangeTypes.Renamed &&
+                SealedStorageProbe.ReadEntryStatus(fullPath) is { IsDirectory: true, IsSymbolicLink: false })
+            {
+                // A new or renamed-in folder: files written in it before the watcher took it up
+                // (or that came with it) raise no event of their own.
+                QueueFilesBelow(type, fullPath);
+                return;
+            }
+
             OnFileEvent(type, fullPath, $"watcher:{changeType}");
+        }
+
+        private void QueueFilesBelow(string type, string directory)
+        {
+            try
+            {
+                foreach (var file in EnumerateArtifactFiles(directory))
+                {
+                    OnFileEvent(type, file, "watcher:new-folder");
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // What could not be listed is left to the next refresh scan.
+                _logger.LogDebug(ex, "Could not list a new artifact folder session={SessionId} type={Type}", _sessionId, type);
+            }
         }
 
         private bool TryGetArtifactRootType(string? path, out string type)

@@ -7,6 +7,34 @@ namespace Offloadr.Runner.Tests;
 public partial class ArtifactUploadServiceTests
 {
     [Test]
+    public async Task FolderMovedIntoTheOutput_HasItsFilesUploaded()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = CreateEvictionPaths(root, sealedSession: false);
+            var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse());
+            await using var service = new ArtifactUploadService("runner-secret-value", artifactClient, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+
+            // Written elsewhere, then moved in whole: no event names the file inside.
+            var staged = Path.Combine(root, "staged-batch");
+            Directory.CreateDirectory(staged);
+            await File.WriteAllBytesAsync(Path.Combine(staged, "x.png"), [1, 2, 3]);
+            Directory.Move(staged, Path.Combine(paths.OutputDirectory, "batch"));
+
+            var upload = await artifactClient.WaitForUploadAsync(TimeSpan.FromSeconds(10));
+            Assert.That(upload.Metadata!.Subfolder, Is.EqualTo("batch"));
+            Assert.That(upload.Metadata.Filename, Is.EqualTo("x.png"));
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
     public async Task SealedSession_UploadsCiphertextOnlyTheOutputRecipientOpens()
     {
         var root = CreateTempDirectory();
