@@ -568,6 +568,14 @@ internal sealed partial class SessionProcessManager : IDisposable
                 {
                     throw new IOException("The sealed lifecycle notes' folder is not a directory owned by root.");
                 }
+
+                // One that was already there may let others in, who could remove a note: root's
+                // alone (with an ACL, its mask too), checked again after.
+                LinuxSecureDirectoryRoot.SetModeNoFollow(directory, rootOnly);
+                if (!IsRootOnlyDirectory(directory))
+                {
+                    throw new IOException("The sealed lifecycle notes' folder cannot be made root's alone.");
+                }
             }
 
             // One note per lifecycle: a newer one never replaces an older one still awaiting its Stop.
@@ -593,9 +601,10 @@ internal sealed partial class SessionProcessManager : IDisposable
             return;
         }
 
-        if (records is not { IsDirectory: true, IsSymbolicLink: false, OwnerId: 0 })
+        if (!IsRootOnlyDirectory(SealedLifecycleRecords))
         {
-            // Something is there that cannot be trusted or read: any lifecycle may be noted in it.
+            // Something is there that cannot be trusted or read, or that others could have
+            // removed notes from: any lifecycle may have been noted in it.
             SealedLifecyclesUnknown = true;
             RunnerLog.Warning<SessionProcessManager>("The sealed lifecycle notes cannot be read; every Stop reports its loss as unknown.");
             return;
@@ -606,6 +615,12 @@ internal sealed partial class SessionProcessManager : IDisposable
             foreach (var sessionRecords in Directory.GetDirectories(SealedLifecycleRecords))
             {
                 var sessionId = Path.GetFileName(sessionRecords);
+                if (!IsRootOnlyDirectory(sessionRecords))
+                {
+                    SealedLifecyclesUnknown = true;
+                    RunnerLog.Warning<SessionProcessManager>("A sealed session's lifecycle notes were open to others; every Stop reports its loss as unknown.");
+                }
+
                 foreach (var generation in ReadRecordedGenerations(sessionRecords))
                 {
                     _staleSealedSessions[(sessionId, generation)] = 0;
@@ -618,6 +633,11 @@ internal sealed partial class SessionProcessManager : IDisposable
             RunnerLog.Warning<SessionProcessManager>($"Could not read the sealed lifecycle notes ({ex.GetType().Name}); every Stop reports its loss as unknown.");
         }
     }
+
+    private static bool IsRootOnlyDirectory(string path)
+        => SealedStorageProbe.ReadEntryStatus(path) is { IsDirectory: true, IsSymbolicLink: false, OwnerId: 0 } status &&
+           (status.Mode & (UnixFileMode.GroupWrite | UnixFileMode.OtherWrite | UnixFileMode.GroupRead | UnixFileMode.OtherRead |
+                           UnixFileMode.GroupExecute | UnixFileMode.OtherExecute)) == 0;
 
     /// <summary>
     /// Whether the notes of sealed lifecycles could not all be read at startup: any Stop may then

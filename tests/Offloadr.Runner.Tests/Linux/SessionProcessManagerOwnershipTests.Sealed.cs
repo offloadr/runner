@@ -777,6 +777,18 @@ public partial class SessionProcessManagerOwnershipTests
                 Assert.That(fresh.SealedLifecyclesUnknown, Is.False);
             }
 
+            // The notes' folder was open to others, who could have removed a note.
+            var notes = Path.Combine(options.SessionRoot, ".offloadr-sealed-lifecycles");
+            Directory.CreateDirectory(notes);
+            File.SetUnixFileMode(notes, (UnixFileMode)Convert.ToInt32("777", 8));
+            using (var opened = new SessionProcessManager(options, new RecordingIsolationStrategy("unused", Path.Combine(options.SessionRoot, "unused")), SealedVfsBuilder(), new RecordingCommandRunner(string.Empty)) { PrepareSealedHost = HostLockedDown })
+            {
+                await opened.CleanupStaleSessionsAsync(CancellationToken.None);
+                Assert.That(opened.SealedLifecyclesUnknown, Is.True);
+            }
+
+            Directory.Delete(notes);
+
             // Something that is not the notes' folder stands in its place: what it held is unknown.
             Directory.CreateDirectory(options.SessionRoot);
             File.WriteAllText(Path.Combine(options.SessionRoot, ".offloadr-sealed-lifecycles"), "unreadable");
@@ -850,6 +862,7 @@ public partial class SessionProcessManagerOwnershipTests
             }
 
             Assert.That(notedDuringStart, Is.True);
+            Assert.That(File.GetUnixFileMode(notes) & (UnixFileMode)Convert.ToInt32("077", 8), Is.EqualTo((UnixFileMode)0), "root's alone");
             Assert.That(Noted(), Is.True, "no Stop has taken the count yet");
             // A newer lifecycle of the session keeps its own note beside the older one.
             File.WriteAllText(Path.Combine(notes, "99"), string.Empty);
