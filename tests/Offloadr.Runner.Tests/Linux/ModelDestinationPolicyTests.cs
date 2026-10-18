@@ -181,7 +181,7 @@ public class ModelDestinationPolicyTests
             Assert.That(() => service.SeedDownloads("session-1", [download]), Throws.InvalidOperationException);
             Assert.That(() => service.RegisterDownloads("session-1", [download]), Throws.InvalidOperationException);
             Assert.That(
-                () => service.EnsureDownloadsAsync([download], CancellationToken.None, highPriority: false),
+                () => service.PreparePromptDownloadsAsync([download], CancellationToken.None, highPriority: false),
                 Throws.InvalidOperationException);
         });
         Assert.That(File.Exists(outsidePath), Is.False);

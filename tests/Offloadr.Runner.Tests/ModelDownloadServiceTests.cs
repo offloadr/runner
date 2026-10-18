@@ -135,7 +135,7 @@ public class ModelDownloadServiceTests
                 SourceUrl = "https://models.example.test/promoted.safetensors"
             };
             service.SeedDownloads("session-1", [enrichedRequest]);
-            await service.EnsureDownloadsAsync(
+            await service.PreparePromptDownloadsAsync(
                 [enrichedRequest],
                 CancellationToken.None,
                 highPriority: true);
@@ -392,7 +392,7 @@ public class ModelDownloadServiceTests
             service.SeedDownloads("session-1", downloads);
 
             Assert.That(
-                async () => await service.EnsureDownloadsAsync(
+                async () => await service.PreparePromptDownloadsAsync(
                     downloads,
                     CancellationToken.None,
                     highPriority: true),

@@ -721,6 +721,21 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
         IEnumerable<ModelDownloadRequest> downloads,
         CancellationToken cancellationToken)
     {
+        var completion = await RequestPromptDownloadsAsync(sessionId, downloads, cancellationToken).ConfigureAwait(false);
+        await completion.ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Attaches every registered prompt dependency and publishes its ordered prompt
+    /// demand. The returned task completes once all dependencies are fully hydrated;
+    /// it does not have to be awaited before the native runtime is invoked, because
+    /// managed reads and mappings remain gated by the VFS shim.
+    /// </summary>
+    public async Task<Task> RequestPromptDownloadsAsync(
+        string? sessionId,
+        IEnumerable<ModelDownloadRequest> downloads,
+        CancellationToken cancellationToken)
+    {
         var dependencies = new List<(TransferState State, int Ordinal)>();
         var ordinal = 0;
         foreach (var download in downloads.Where(static download => download is not null))
@@ -794,7 +809,7 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
         // Publish the complete ordered dependency set before allowing the scheduler
         // to choose a runnable prompt transfer.
         SignalScheduler();
-        await Task.WhenAll(completionTasks).ConfigureAwait(false);
+        return Task.WhenAll(completionTasks);
     }
 
     public void CancelSession(string? sessionId)

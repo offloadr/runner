@@ -1504,7 +1504,7 @@ internal static class ServiceClientManager
                             (sessionId, editorSid, owner, artifacts, token) => artifactUploadService.SeedSessionAsync(sessionId, editorSid, owner, artifacts, token),
                             artifactUploadService.CaptureSessionRefresh,
                             downloadService.RegisterDownloads,
-                            (downloads, token, highPriority) => downloadService.EnsureDownloadsAsync(downloads, token, highPriority),
+                            (downloads, token, highPriority) => downloadService.PreparePromptDownloadsAsync(downloads, token, highPriority),
                             (submitPromptCommand, responseChunkSink, onNativeRequestAttempt, token) => sessionManager.SubmitEditorActionAsync(submitPromptCommand, responseChunkSink, token, onNativeRequestAttempt),
                             (sessionId, clientId, promptId, _) => sessionEventRelay.MapPrompt(sessionId, clientId, captured, promptId),
                             physicalCancellation,
@@ -3062,7 +3062,7 @@ internal static class ServiceClientManager
         Func<string, string, string?, IEnumerable<EditorArtifactMetadata>, CancellationToken, Task> seedSessionArtifacts,
         Func<string, Func<Task>> captureSessionArtifactRefresh,
         Action<string, IEnumerable<ModelDownloadRequest>> registerDownloads,
-        Func<IEnumerable<ModelDownloadRequest>, CancellationToken, bool, Task> ensureDownloads,
+        Func<IEnumerable<ModelDownloadRequest>, CancellationToken, bool, Task> preparePromptDownloads,
         Func<SubmitPromptCommand, Func<string, ReadOnlyMemory<byte>, CancellationToken, Task>?, Action, CancellationToken, Task<SessionProcessManager.PromptSubmissionResult>> submitPrompt,
         Action<string, string, string, string> mapPrompt,
         CancellationToken cancellationToken,
@@ -3190,7 +3190,7 @@ internal static class ServiceClientManager
                     await TryRefreshSessionArtifactsBeforePromptAsync(prompt.SessionId, RefreshCapturedArtifacts, cancellationToken).ConfigureAwait(false);
                 }
 
-                await ensureDownloads(remoteDownloads, cancellationToken, false).ConfigureAwait(false);
+                await preparePromptDownloads(remoteDownloads, cancellationToken, false).ConfigureAwait(false);
             }
             cancellationToken.ThrowIfCancellationRequested();
             var result = await submitPrompt(
