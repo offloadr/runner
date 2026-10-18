@@ -312,21 +312,20 @@ public static class LinuxSessionResidue
             catch (IOException) when (Directory.Exists(directory) && Directory.EnumerateFileSystemEntries(directory).Any())
             {
                 // Someone else's files are in it: it becomes root's alone, and they stay. Closed to
-                // everyone else (with an ACL, its mask too): no later session may enter it.
-                if (lchown(directory, 0, 0) != 0)
+                // everyone else (with an ACL, its mask too) before it changes hands: one whose mode
+                // cannot be changed stays the user's, so a retry finds it again, rather than passing
+                // as root's while a later session can still enter it.
+                try
                 {
-                    remaining++;
-                }
-                else
-                {
-                    try
-                    {
-                        LinuxSecureDirectoryRoot.SetModeNoFollow(directory, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
-                    }
-                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                    LinuxSecureDirectoryRoot.SetModeNoFollow(directory, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+                    if (lchown(directory, 0, 0) != 0)
                     {
                         remaining++;
                     }
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    remaining++;
                 }
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
