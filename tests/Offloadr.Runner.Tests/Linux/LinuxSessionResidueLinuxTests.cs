@@ -106,6 +106,27 @@ public class LinuxSessionResidueLinuxTests
             await WaitForAsync(() => !tracker.MayBeOpen(file));
             Assert.That(tracker.MayBeOpen(file), Is.False);
 
+            // Renamed within the watched folder after it was closed: still closed.
+            var renamed = Path.Combine(root, "renamed.png");
+            File.Move(file, renamed);
+            await Task.Delay(200);
+            Assert.That(tracker.MayBeOpen(renamed), Is.False);
+
+            // Renamed in from outside: a handle may have come with it, so it stays possibly open,
+            // whatever opens and closes follow.
+            var outside = Path.Combine(Path.GetTempPath(), $"runner-staging-{Guid.NewGuid():N}.png");
+            var arrived = Path.Combine(root, "arrived.png");
+            using (var staging = new FileStream(outside, FileMode.CreateNew, FileAccess.Write))
+            {
+                File.Move(outside, arrived);
+                await WaitForAsync(() => tracker.MayBeOpen(arrived));
+                Assert.That(tracker.MayBeOpen(arrived), Is.True);
+            }
+
+            File.ReadAllBytes(arrived);
+            await Task.Delay(200);
+            Assert.That(tracker.MayBeOpen(arrived), Is.True, "a close seen later may not be that handle's");
+
             // A folder made later is watched too.
             var nested = Path.Combine(root, "sub");
             Directory.CreateDirectory(nested);

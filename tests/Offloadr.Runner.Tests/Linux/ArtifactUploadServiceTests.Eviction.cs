@@ -64,12 +64,11 @@ public partial class ArtifactUploadServiceTests
             await service.StartSessionAsync("session-1", paths, CancellationToken.None);
             await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
 
-            // The editor's output belongs to the session user; it arrives whole, as by a rename.
-            var staged = Path.Combine(root, "staged.png");
-            await File.WriteAllBytesAsync(staged, content);
-            await VfsShimLinuxTests.RunProcessAsync("/bin/chown", ["54321:54322", staged], root);
+            // The editor's output belongs to the session user: made, given to it, then written.
             var outputPath = Path.Combine(paths.OutputDirectory, "ComfyUI_00002_.png");
-            File.Move(staged, outputPath);
+            File.Create(outputPath).Dispose();
+            await VfsShimLinuxTests.RunProcessAsync("/bin/chown", ["54321:54322", outputPath], root);
+            await File.WriteAllBytesAsync(outputPath, content);
             await artifactClient.WaitForUploadAsync(TimeSpan.FromSeconds(5));
 
             Assert.That(await EvictWhenRecordedAsync(service, "session-1"), Is.EqualTo(content.Length));
