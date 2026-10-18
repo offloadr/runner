@@ -564,6 +564,7 @@ message RunnerArtifactServiceListArtifactsRequest {
     string editor_sid = 1;
     string type = 2;
     string subfolder = 3;
+    RunnerReadRequester requester = 4;
 }
 
 message RunnerArtifactServiceListArtifactsResponse {
