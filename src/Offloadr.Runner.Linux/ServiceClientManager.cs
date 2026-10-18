@@ -439,6 +439,9 @@ internal static class ServiceClientManager
         public required string SessionId { get; init; }
         public RuntimeIdentity RuntimeIdentity { get; init; }
 
+        /// <summary>The sealing a startup runs with; only a command asking for the same joins it.</summary>
+        public SessionSealing? Sealing { get; init; }
+
         public void Cancel()
         {
             try
@@ -2381,6 +2384,12 @@ internal static class ServiceClientManager
                         IsComfyRuntime(command.EditorRuntimeKind) ? "ComfyUI ready" : "GPU runtime ready",
                         deps.GetSessionSealing?.Invoke(command.SessionId));
                 }
+                catch (SessionAlreadyRunningException ex)
+                {
+                    // That runtime runs on, as it was admitted: only this command is refused.
+                    LogStartFailure(command, deps, ex, $"Refused a start of session {command.SessionId}");
+                    return new StartupOutcome(false, ex.Message);
+                }
                 catch (Exception ex)
                 {
                     LogStartFailure(command, deps, ex, $"Failed to start session {command.SessionId}");
@@ -2396,7 +2405,8 @@ internal static class ServiceClientManager
                 return ack;
             },
             deps.Sink.AckStartSessionAsync,
-            command.SessionId);
+            command.SessionId,
+            command.Sealing);
     }
 
     /// <summary>
@@ -2659,6 +2669,12 @@ internal static class ServiceClientManager
                         IsComfyRuntime(command.EditorRuntimeKind) ? "ComfyUI ready" : "GPU runtime ready",
                         deps.GetSessionSealing?.Invoke(command.SessionId));
                 }
+                catch (SessionAlreadyRunningException ex)
+                {
+                    // That runtime runs on, as it was admitted: only this command is refused.
+                    LogStartFailure(start, deps, ex, $"Refused a launch for restart {command.RestartId}");
+                    return new StartupOutcome(false, ex.Message);
+                }
                 catch (Exception ex)
                 {
                     LogStartFailure(start, deps, ex, $"Failed launching runtime for restart {command.RestartId}");
@@ -2676,7 +2692,8 @@ internal static class ServiceClientManager
                 return ack;
             },
             deps.Sink.AckEditorRuntimeLaunchAsync,
-            command.CommandId);
+            command.CommandId,
+            start.Sealing);
     }
 
     private const string StaleRuntimeCommandMessage = "The command targets a superseded runtime or another runner.";
@@ -2700,16 +2717,26 @@ internal static class ServiceClientManager
         Func<CancellationToken, Task<StartupOutcome>> startup,
         Func<StartupOutcome, TAck> toAcknowledgement,
         Func<TAck, CancellationToken, Task> acknowledge,
-        string acknowledgementKey)
+        string acknowledgementKey,
+        SessionSealing? sealing)
     {
         // Another command for the runtime already starting joins that startup: replacing it
         // would cancel the work starting this very runtime, and that work's failure cleanup
         // would stop it. The joined command still acknowledges under its own command id and
-        // attempt, with the shared startup's result.
+        // attempt, with the shared startup's result. One asking for other sealing is refused
+        // instead: that startup never checked it, and it may be running on disk.
         if (deps.WorkState.GetActiveStartup() is { Outcome: { } inProgress } active &&
             string.Equals(active.SessionId, sessionId, StringComparison.Ordinal) &&
             active.RuntimeIdentity.SameRuntime(runtimeIdentity))
         {
+            if (!Equals(active.Sealing, sealing))
+            {
+                RunnerLog.Warning(
+                    nameof(ServiceClientManager),
+                    $"Startup {acknowledgementKey} for session {sessionId} asks for other sealing than the one in progress; refusing it.");
+                return AcknowledgeOutcomeAsync(Task.FromResult(new StartupOutcome(false, OtherSealingMessage)));
+            }
+
             RunnerLog.Info(
                 nameof(ServiceClientManager),
                 $"Startup {acknowledgementKey} for session {sessionId} is already in progress; joining it.");
@@ -2723,6 +2750,7 @@ internal static class ServiceClientManager
             CancellationSource = cancellationSource,
             SessionId = sessionId,
             RuntimeIdentity = runtimeIdentity,
+            Sealing = sealing?.Clone(),
         };
 
         // Publish a joinable task before it starts, so Stop and Quiesce can never
@@ -2759,6 +2787,8 @@ internal static class ServiceClientManager
                 deps.Shutdown).ConfigureAwait(false);
         }
     }
+
+    internal const string OtherSealingMessage = "This runtime is already starting with other sealing than this command asks for.";
 
     private static bool IsComfyRuntime(string? runtimeKind)
         => string.IsNullOrWhiteSpace(runtimeKind) ||

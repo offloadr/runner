@@ -212,6 +212,12 @@ internal sealed partial class SessionProcessManager : IDisposable
             {
                 throw new InvalidOperationException("The tracked session is a different or retired runtime.");
             }
+            else if (!Equals(existing.Sealing, command.Sealing))
+            {
+                // The running one was admitted with other sealing, and may be running on disk:
+                // this start is refused, and that runtime left as it is.
+                throw new SessionAlreadyRunningException("The session is already running with other sealing than this start asks for.");
+            }
             else
             {
                 LogSessionInfo(sessionId, "Already running at the exact identity; ignoring duplicate start.");
@@ -298,6 +304,7 @@ internal sealed partial class SessionProcessManager : IDisposable
             }
 
             launchedContext = await LaunchSessionProcessAsync(sessionId, runtimeIdentity, identity, paths).ConfigureAwait(false);
+            launchedContext.Sealing = command.Sealing?.Clone();
             if (!_sessions.TryAdd(sessionId, launchedContext))
             {
                 throw new InvalidOperationException($"Failed to track session '{sessionId}'.");
@@ -3650,6 +3657,9 @@ internal sealed partial class SessionProcessManager : IDisposable
 
         public string SessionId { get; }
         public RuntimeIdentity RuntimeIdentity { get; }
+
+        /// <summary>The sealing its start asked for; a duplicate start must ask for the same.</summary>
+        public SessionSealing? Sealing { get; set; }
         public CancellationTokenSource Cancellation { get; } = new();
         public PreparedSessionIdentity Identity { get; }
         public string UserName => Identity.UserName;

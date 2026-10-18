@@ -190,6 +190,38 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
+    public async Task StartAskingForOtherSealing_DoesNotJoinTheStartupInProgress()
+    {
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var harness = new RuntimeCommandHarness
+        {
+            BeforeStart = async (_, token) =>
+            {
+                entered.TrySetResult();
+                await release.Task.WaitAsync(token);
+            },
+        };
+
+        // An unsealed start of the runtime is under way when a sealed one for it arrives.
+        var unsealed = ServiceClientManager.HandleStartSessionCommand(Start(7, 3, InstanceA), harness.Deps);
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await ServiceClientManager.HandleStartSessionCommand(SealedStart(7, 3, InstanceA), harness.Deps);
+        var refused = await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
+        release.TrySetResult();
+        await unsealed.WaitAsync(TimeSpan.FromSeconds(5));
+        var started = await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 2);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(refused.Ready, Is.False);
+            Assert.That(refused.Message, Is.EqualTo(ServiceClientManager.OtherSealingMessage));
+            Assert.That(started.Ready, Is.True, "the startup in progress goes on");
+            Assert.That(harness.Starts, Has.Count.EqualTo(1));
+        });
+    }
+
+    [Test]
     public async Task DuplicateStartOfARunningRuntime_KeepsTheAdmittedSealing()
     {
         var harness = new RuntimeCommandHarness();

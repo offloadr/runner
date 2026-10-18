@@ -393,6 +393,21 @@ public partial class SessionProcessManagerOwnershipTests
     }
 
     [Test]
+    public async Task DuplicateStartMustAskForTheSameSealing()
+    {
+        await using var fixture = await PromptRuntimeFixture.CreateAsync();
+        await fixture.Manager.StartSessionAsync(fixture.Start, CancellationToken.None);
+
+        // The same runtime, asked for again with sealing: refused, and the runtime runs on.
+        var sealedDuplicate = fixture.Start.Clone();
+        sealedDuplicate.Sealing = new SessionSealing { Required = true };
+        Assert.ThrowsAsync<SessionAlreadyRunningException>(() => fixture.Manager.StartSessionAsync(sealedDuplicate, CancellationToken.None));
+        await fixture.Manager.StartSessionAsync(fixture.Start.Clone(), CancellationToken.None);
+        var result = await fixture.Manager.SubmitEditorActionAsync(fixture.Command(), CancellationToken.None);
+        Assert.That(result.StatusCode, Is.EqualTo(200));
+    }
+
+    [Test]
     public async Task ComfyRecoveryOnlyReadsHistoryAndQueueAndRetainsExactTarget()
     {
         await using var fixture = await PromptRuntimeFixture.CreateAsync();
