@@ -470,6 +470,25 @@ public class SealedHostLockdownLinuxTests
     }
 
     [Test]
+    public void CloseToRoot_KeepsTheOldOwnerWhenTheModeCannotBeChanged()
+    {
+        var calls = new List<string>();
+        var entry = new LinuxEntryStatus(true, false, 1001, Mode0755);
+
+        // A filesystem that takes ownership changes but refuses chmod.
+        Assert.Throws<IOException>(() => SealedHostLockdown.CloseToRoot(
+            "/mnt/fuse/left",
+            entry,
+            (_, _) => throw new IOException("chmod refused"),
+            path => calls.Add("chown " + path)));
+
+        Assert.That(calls, Is.Empty, "still the old owner's, so the next scan reports it again");
+
+        SealedHostLockdown.CloseToRoot("/tmp/left", entry, (path, mode) => calls.Add($"chmod {path} {Convert.ToString((int)mode, 8)}"), path => calls.Add("chown " + path));
+        Assert.That(calls, Is.EqualTo(new[] { "chmod /tmp/left 700", "chown /tmp/left" }));
+    }
+
+    [Test]
     [System.Runtime.Versioning.SupportedOSPlatform("linux")]
     public void HandToRoot_ChangesTheRealOwner()
     {

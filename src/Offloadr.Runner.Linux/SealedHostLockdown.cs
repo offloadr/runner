@@ -384,16 +384,26 @@ public static class SealedHostLockdown
     /// </summary>
     public static Result HandToRoot(IEnumerable<string> paths)
         => HandToRoot(paths, SealedStorageProbe.ReadEntryStatus, static (path, entry) =>
-        {
-            if (lchown(path, 0, 0) != 0)
+            CloseToRoot(path, entry, LinuxSecureDirectoryRoot.SetModeNoFollow, static path =>
             {
-                throw new IOException($"lchown failed with errno {Marshal.GetLastPInvokeError()}.");
-            }
+                if (lchown(path, 0, 0) != 0)
+                {
+                    throw new IOException($"lchown failed with errno {Marshal.GetLastPInvokeError()}.");
+                }
+            }));
 
-            // Root's alone: a later session must not even read what the earlier one left. With an
-            // ACL the group bits are its mask, so clearing them shuts out every named entry too.
-            LinuxSecureDirectoryRoot.SetModeNoFollow(path, entry.Mode & OwnerOnly);
-        });
+    /// <summary>
+    /// Closes an entry to everyone but its owner, then gives it to root. In that order: an entry
+    /// whose mode cannot be changed keeps its reusable owner, so every later scan reports it again,
+    /// rather than passing as root's while still readable by a later session.
+    /// </summary>
+    internal static void CloseToRoot(string path, LinuxEntryStatus entry, Action<string, UnixFileMode> setMode, Action<string> giveToRoot)
+    {
+        // Root's alone: a later session must not even read what the earlier one left. With an ACL
+        // the group bits are its mask, so clearing them shuts out every named entry too.
+        setMode(path, entry.Mode & OwnerOnly);
+        giveToRoot(path);
+    }
 
     private const UnixFileMode OwnerOnly = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
     private const UnixFileMode GroupOrOther = UnixFileMode.GroupRead | UnixFileMode.GroupWrite | UnixFileMode.GroupExecute |
