@@ -18,6 +18,7 @@ public partial class ServiceClientManagerTests
         var ack = await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
         Assert.That(ack.Ready, Is.True);
         Assert.That(ack.Sealing, Is.EqualTo(harness.SealingStatus));
+        Assert.That(ack.InstanceId, Is.EqualTo(harness.InstanceId.Trim()), "the process that ran it");
     }
 
     [Test]
@@ -432,6 +433,8 @@ public partial class ServiceClientManagerTests
         Assert.Multiple(() =>
         {
             Assert.That(older.UnsavedArtifactCount, Is.EqualTo(2), "lifecycle 7's own loss");
+            Assert.That(older.CleanupDisposition, Is.EqualTo(RunnerCleanupDisposition.Superseded), "it tore nothing down");
+            Assert.That(older.UnsavedArtifactsUnknown, Is.True, "a superseded Stop's evidence stays unknown");
             Assert.That(harness.UnsavedTakenFor, Is.EqualTo(new[] { 7UL }), "none of lifecycle 8's");
             Assert.That(harness.ForgottenLifecycles, Has.Count.EqualTo(1), "its note goes once acknowledged");
             Assert.That(harness.Calls.Any(call => call.StartsWith("stop:", StringComparison.Ordinal)), Is.False, "the newer runtime keeps running");
@@ -455,6 +458,7 @@ public partial class ServiceClientManagerTests
 
         Assert.That(harness.Starts.Single().Sealing, Is.EqualTo(launch.Sealing));
         Assert.That(ack.Sealing, Is.EqualTo(harness.SealingStatus));
+        Assert.That(ack.InstanceId, Is.EqualTo(harness.InstanceId.Trim()), "the process that ran it");
     }
 
     [Test]

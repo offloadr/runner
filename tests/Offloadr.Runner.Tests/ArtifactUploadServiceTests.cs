@@ -1841,6 +1841,9 @@ public partial class ArtifactUploadServiceTests
         /// <summary>Answers every upload with success=false, as a control plane refusing it would.</summary>
         public bool RejectUploads { get; set; }
 
+        /// <summary>Answers every upload as from a runtime whose authority retired.</summary>
+        public bool RejectAsStaleRuntime { get; set; }
+
         /// <summary>Runs when an upload's metadata frame is written, before any chunk.</summary>
         public Action? AfterUploadMetadata { get; set; }
 
@@ -1889,6 +1892,12 @@ public partial class ArtifactUploadServiceTests
             {
                 _uploads.Enqueue(captured);
                 _uploadSignals.Writer.TryWrite(captured);
+                if (RejectAsStaleRuntime)
+                {
+                    response.TrySetResult(new RunnerArtifactServiceUploadArtifactResponse { Outcome = RunnerArtifactUploadOutcome.RejectedStaleRuntime });
+                    return;
+                }
+
                 response.TrySetResult(new RunnerArtifactServiceUploadArtifactResponse
                 {
                     Outcome = RejectUploads ? RunnerArtifactUploadOutcome.Unspecified : RunnerArtifactUploadOutcome.Committed,

@@ -81,6 +81,37 @@ public partial class ArtifactUploadServiceTests
     }
 
     [Test]
+    public async Task UploadRejectedForAStaleRuntime_IsNeitherSavedNorEvicted()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = CreateEvictionPaths(root, sealedSession: true);
+            var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse())
+            {
+                RejectAsStaleRuntime = true,
+            };
+            await using var service = new ArtifactUploadService("runner-secret-value", artifactClient, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            var outputPath = Path.Combine(paths.OutputDirectory, "late.png");
+            await File.WriteAllBytesAsync(outputPath, [1, 2, 3]);
+            await artifactClient.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            await Task.Delay(300);
+
+            // A rejection proves nothing reached storage: the file stays, and is lost at Stop.
+            Assert.That(artifactClient.UploadCount, Is.EqualTo(1), "not retried");
+            Assert.That(service.EvictUploadedArtifacts("session-1", long.MaxValue, TimeSpan.Zero), Is.Zero);
+            Assert.That(new FileInfo(outputPath).Length, Is.EqualTo(3));
+            Assert.That(await service.StopSessionAsync("session-1"), Is.EqualTo(1));
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
     public async Task Download_ThatAReaderHeldOffIsTriedAgain()
     {
         LinuxTestPrerequisites.RequireLinux();
