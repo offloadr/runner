@@ -564,6 +564,8 @@ message RunnerArtifactServiceListArtifactsRequest {
     string editor_sid = 1;
     string type = 2;
     string subfolder = 3;
+    // Catalog metadata uses the same process/runtime authority as artifact downloads.
+    RunnerReadRequester requester = 4;
 }
 
 message RunnerArtifactServiceListArtifactsResponse {

@@ -1108,7 +1108,8 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             {
                 var request = new RunnerArtifactServiceListArtifactsRequest
                 {
-                    EditorSid = editorSid
+                    EditorSid = editorSid,
+                    Requester = _readRequester.Clone()
                 };
 
                 var response = await _artifactClient.ListArtifactsAsync(request, headers: _authHeaders, cancellationToken: token).ConfigureAwait(false);

@@ -13,6 +13,53 @@ namespace Offloadr.Runner.Tests;
 public partial class ArtifactUploadServiceTests
 {
     [Test]
+    public async Task CatalogRefreshRetainsTheUploadersOriginalProcessAndRuntimeIdentity()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse());
+            var identities = new RuntimeIdentityRegistry();
+            identities.Set("session-1", 5, 2, "runtime-a");
+            await using var service = new ArtifactUploadService("runner-secret", artifactClient,
+                NullLogger<ArtifactUploadService>.Instance, identities, "runner-1", "process-1");
+            var paths = new SessionProcessManager.SessionPaths
+            {
+                HomeDirectory = root,
+                UserDirectory = root,
+                InputDirectory = Path.Combine(root, "input"),
+                OutputDirectory = Path.Combine(root, "output"),
+                TempDirectory = Path.Combine(root, "temp"),
+                CacheDirectory = root,
+                LogsDirectory = root
+            };
+            Directory.CreateDirectory(paths.InputDirectory);
+            Directory.CreateDirectory(paths.OutputDirectory);
+            Directory.CreateDirectory(paths.TempDirectory);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.SeedSessionAsync("session-1", "editor-1", "owner-1", [], CancellationToken.None);
+            var initialCalls = artifactClient.ListCallCount;
+            Assert.That(initialCalls, Is.GreaterThan(0));
+            identities.Set("session-1", 6, 1, "runtime-b");
+            await service.RefreshSessionAsync("session-1");
+            Assert.That(artifactClient.ListCallCount, Is.GreaterThan(initialCalls));
+            Assert.That(artifactClient.LastListRequest!.Requester, Is.EqualTo(new RunnerReadRequester
+            {
+                RunnerId = "runner-1",
+                InstanceId = "process-1",
+                SessionId = "session-1",
+                LifecycleGeneration = 5,
+                RuntimeEpoch = 2,
+                RuntimeInstanceId = "runtime-a"
+            }));
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
     public async Task ActivateSession_WithCatalogPlaceholder_UploadsWhenLocalFileGetsRealContent()
     {
         var root = CreateTempDirectory();
@@ -1826,6 +1873,7 @@ public partial class ArtifactUploadServiceTests
             SingleWriter = false
         });
         public Metadata? LastListHeaders { get; private set; }
+        public RunnerArtifactServiceListArtifactsRequest? LastListRequest { get; private set; }
         public Metadata? LastUploadHeaders { get; private set; }
         public byte[] ReadArtifactContent { get; set; } = [1, 2, 3, 4];
         /// <summary>Sent with the read metadata; ReadArtifactContent then holds the ciphertext.</summary>
@@ -1872,6 +1920,7 @@ public partial class ArtifactUploadServiceTests
         {
             ListCallCount++;
             LastListHeaders = options.Headers;
+            LastListRequest = request.Clone();
             var responseTask = ListArtifactsException is null
                 ? Task.FromResult(_listResponse)
                 : Task.FromException<RunnerArtifactServiceListArtifactsResponse>(ListArtifactsException);
