@@ -1232,7 +1232,8 @@ public partial class ServiceClientManagerTests
         CancellationToken demandCancellation = default,
         Func<CancellationToken, Task<Task>>? prepare = null,
         Func<string, CancellationToken, Task<bool?>>? isPromptQueued = null,
-        string nativeBody = "{}")
+        string nativeBody = "{}",
+        Action? duringNativeRequest = null)
     {
         var prompt = new Offloadr.Runner.V1.SubmitPromptCommand
         {
@@ -1257,8 +1258,13 @@ public partial class ServiceClientManagerTests
             _ => () => Task.CompletedTask,
             (_, _) => { },
             (_, token, _) => prepare is null ? Task.FromResult(demand(token)) : prepare(token),
-            (_, _, _, _) => Task.FromResult(new SessionProcessManager.PromptSubmissionResult(
-                nativeStatus is >= 200 and < 300, nativeStatus, System.Text.Encoding.UTF8.GetBytes(nativeBody), "native")),
+            (_, _, onNativeRequestAttempt, _) =>
+            {
+                onNativeRequestAttempt();
+                duringNativeRequest?.Invoke();
+                return Task.FromResult(new SessionProcessManager.PromptSubmissionResult(
+                    nativeStatus is >= 200 and < 300, nativeStatus, System.Text.Encoding.UTF8.GetBytes(nativeBody), "native"));
+            },
             (_, _, _, _) => { },
             cancellationToken,
             promptDemandCancellation: demandCancellation,
@@ -1353,6 +1359,39 @@ public partial class ServiceClientManagerTests
         demand.Cancel();
         await handled.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.That(demandToken.IsCancellationRequested, Is.True);
+    }
+
+    [Test]
+    public async Task HandleSubmitEditorActionAsync_InterruptRacingAcceptanceKeepsModelDemand()
+    {
+        // A global interrupt can cancel the work after the native request started
+        // but before its accepted result is seen. The runtime still queues the
+        // prompt, so its demand must survive.
+        var demandToken = CancellationToken.None;
+        Offloadr.Runner.V1.AcknowledgePromptResultRequest? capturedAck = null;
+        using var physical = new CancellationTokenSource();
+        using var demand = new CancellationTokenSource();
+
+        var handled = HandlePromptWithDemandAsync(
+            token => { demandToken = token; return Task.Delay(Timeout.InfiniteTimeSpan, token); },
+            nativeStatus: 200,
+            ack => capturedAck = ack,
+            physical.Token,
+            demand.Token,
+            duringNativeRequest: physical.Cancel);
+        await WaitForConditionAsync(() => capturedAck is not null, TimeSpan.FromSeconds(5));
+        await Task.Delay(50);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(capturedAck!.Result.NativeResponse.StatusCode, Is.EqualTo(200));
+            Assert.That(physical.IsCancellationRequested, Is.True);
+            Assert.That(demandToken.IsCancellationRequested, Is.False);
+            Assert.That(handled.IsCompleted, Is.False);
+        });
+
+        demand.Cancel();
+        await handled.WaitAsync(TimeSpan.FromSeconds(5));
     }
 
     [Test]
@@ -1484,6 +1523,9 @@ public partial class ServiceClientManagerTests
     [TestCase("api/jobs/pending/cancel", "", 200, false)]
     [TestCase("api/interrupt", "{\"prompt_id\":\"running\"}", 500, false)]
     [TestCase("api/queue", "{\"delete\":[\"running\"]}", 200, false)]
+    [TestCase("api/interrupt", "", 200, true)]
+    [TestCase("api/interrupt", "{}", 200, true)]
+    [TestCase("api/interrupt", "", 500, false)]
     public async Task InterruptBlockedReadsForCancelAsync_FailsReadsOnlyForTheRunningPrompt(
         string path, string body, int status, bool interrupted)
     {
@@ -1511,6 +1553,22 @@ public partial class ServiceClientManagerTests
         {
             Assert.That(queried, Is.EqualTo(new Offloadr.Runner.Core.RuntimeIdentity(1, 1, request.RuntimeInstanceId)));
         }
+    }
+
+    [Test]
+    public async Task InterruptBlockedReadsForCancelAsync_GlobalInterruptWithNothingRunningLeavesReads()
+    {
+        var interrupted = false;
+        await ServiceClientManager.InterruptBlockedReadsForCancelAsync(
+            CancelControl("api/interrupt", ""),
+            new AcknowledgeEditorRuntimeRequestRequest { TransportSucceeded = true, StatusCode = 200 },
+            (_, _, _) => Task.FromResult<ComfyPromptQueue?>(new(
+                new HashSet<string>(),
+                new HashSet<string> { "pending" })),
+            _ => interrupted = true,
+            CancellationToken.None);
+
+        Assert.That(interrupted, Is.False);
     }
 
     [Test]

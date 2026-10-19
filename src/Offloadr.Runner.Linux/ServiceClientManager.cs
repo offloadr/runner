@@ -1468,15 +1468,6 @@ internal static class ServiceClientManager
                                     {
                                         commandWorkState.Prompts.Cancel(prompt =>
                                             TargetsPromptRuntime(request, prompt) && !ShouldStreamHttpResponse(prompt));
-                                        // ComfyUI's interrupt is cooperative: a loader blocked on a
-                                        // model download never sees it. Failing the session's pending
-                                        // reads lets the executing prompt end with an error now.
-                                        if (sessionManager.IsTrackedRuntime(
-                                                request.SessionId,
-                                                new RuntimeIdentity(request.LifecycleGeneration, request.RuntimeEpoch, request.RuntimeInstanceId)))
-                                        {
-                                            downloadService.InterruptSessionReads(request.SessionId);
-                                        }
                                     }
                                 },
                                 token,
@@ -3186,14 +3177,27 @@ internal static class ServiceClientManager
         string? clientId = null;
         var nativeInvocationStarted = false;
         // Prompt model demand outlives preparation; this work owns its lifetime.
-        // Until the runtime accepts the prompt, cancelling this work (interrupt,
-        // Stop) withdraws the demand. An accepted prompt may sit in the runtime's
-        // queue, so afterwards only promptDemandCancellation (Stop, replacement,
-        // its terminal event, shutdown) withdraws it.
+        // Until the native request starts, cancelling this work (interrupt, Stop)
+        // withdraws the demand. From then on the native outcome decides: an
+        // accepted prompt may sit in the runtime's queue, so only
+        // promptDemandCancellation (Stop, replacement, its terminal event,
+        // shutdown) or leaving the queue withdraws it, and a failed or uncertain
+        // invocation withdraws it when it settles. The hand-over is atomic with
+        // the cancellation callback, so a racing interrupt cannot drop the demand
+        // of a prompt the runtime accepted.
         using var promptDemandLifetime = CancellationTokenSource.CreateLinkedTokenSource(promptDemandCancellation);
-        var withdrawDemandUntilAccepted = cancellationToken.Register(
-            static lifetime => ((CancellationTokenSource)lifetime!).Cancel(),
-            promptDemandLifetime);
+        var demandGate = new object();
+        var demandFollowsWork = true;
+        using var withdrawDemandBeforeInvocation = cancellationToken.Register(() =>
+        {
+            lock (demandGate)
+            {
+                if (demandFollowsWork)
+                {
+                    promptDemandLifetime.Cancel();
+                }
+            }
+        });
         Task? promptDemand = null;
         var keepPromptDemand = false;
         string? acceptedPromptId = null;
@@ -3277,12 +3281,18 @@ internal static class ServiceClientManager
                         }
                     }
             : null,
-                () => nativeInvocationStarted = true,
+                () =>
+                {
+                    lock (demandGate)
+                    {
+                        demandFollowsWork = false;
+                    }
+                    nativeInvocationStarted = true;
+                },
                 cancellationToken).ConfigureAwait(false);
             keepPromptDemand = result.Success;
             if (keepPromptDemand)
             {
-                withdrawDemandUntilAccepted.Dispose();
                 acceptedPromptId = !string.IsNullOrWhiteSpace(prompt.NativeIdentifiers?.PromptId)
                     ? prompt.NativeIdentifiers.PromptId
                     : RegistrationPolicy.TryExtractPromptId(System.Text.Encoding.UTF8.GetString(result.Body));
@@ -3351,7 +3361,7 @@ internal static class ServiceClientManager
             RunnerLog.Warning(nameof(ServiceClientManager), $"Prompt acknowledgement unavailable ({ex.GetType().Name}); recover its receipt.");
         }
 
-        withdrawDemandUntilAccepted.Dispose();
+        withdrawDemandBeforeInvocation.Dispose();
         await SettlePromptDemandAsync(
             promptDemand,
             keepPromptDemand,
@@ -3445,10 +3455,12 @@ internal static class ServiceClientManager
     }
 
     /// <summary>
-    /// ComfyUI cancels a named prompt cooperatively, which a loader blocked on a
-    /// model download never sees. When a targeted interrupt or job cancel names the
-    /// prompt that is still running, the session's pending model reads fail so it
-    /// ends now. A global interrupt is handled before it is sent.
+    /// ComfyUI interrupts and cancels cooperatively, which a loader blocked on a
+    /// model download never sees. Once ComfyUI accepted a global interrupt while a
+    /// prompt runs, or a targeted interrupt or job cancel naming the running
+    /// prompt, the session's pending model reads fail so that prompt ends now.
+    /// This runs only after the control succeeded: failing reads first could end
+    /// the prompt before the interrupt arrives, letting it hit the next queued one.
     /// </summary>
     internal static async Task InterruptBlockedReadsForCancelAsync(
         RelayEditorRuntimeRequestCommand request,
@@ -3463,8 +3475,9 @@ internal static class ServiceClientManager
             return;
         }
 
-        var targets = ComfyCancelTargets.PromptIds(request.Path, request.Body.Span);
-        if (targets.Count == 0)
+        var global = ComfyRuntimeRoutes.IsGlobalInterrupt(request.Path, request.Body.Span);
+        IReadOnlyList<string> targets = global ? [] : ComfyCancelTargets.PromptIds(request.Path, request.Body.Span);
+        if (!global && targets.Count == 0)
         {
             return;
         }
@@ -3473,7 +3486,7 @@ internal static class ServiceClientManager
             request.SessionId,
             new RuntimeIdentity(request.LifecycleGeneration, request.RuntimeEpoch, request.RuntimeInstanceId),
             cancellationToken).ConfigureAwait(false);
-        if (queue is not null && targets.Any(queue.Running.Contains))
+        if (queue is not null && (global ? queue.Running.Count > 0 : targets.Any(queue.Running.Contains)))
         {
             interruptSessionReads(request.SessionId);
         }
