@@ -434,6 +434,9 @@ internal sealed class ModelDownloadService : IAsyncDisposable
         return demand.Result;
     }
 
+    /// <summary>Fails the session's pending range-managed reads; see the coordinator.</summary>
+    public void InterruptSessionReads(string? sessionId) => _hydrationCoordinator?.InterruptSessionReads(sessionId);
+
     public Task EnsureDownloadedAsync(string destinationPath, CancellationToken cancellationToken, bool highPriority)
     {
         _destinationPolicy?.Confine(destinationPath);

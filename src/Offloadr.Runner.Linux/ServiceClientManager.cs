@@ -925,9 +925,8 @@ internal static class ServiceClientManager
         // ComfyUI's terminal event (success, error or interrupted) ends an
         // accepted prompt's model demand; a global interrupt alone cannot tell
         // which accepted prompt it stopped.
-        void WithdrawFinishedPromptDemand(SubmitPromptCommand finished)
-            => commandWorkState.Prompts.WithdrawDemand(prompt =>
-                prompt.CommandId == finished.CommandId && prompt.SubmissionId == finished.SubmissionId);
+        void WithdrawFinishedPromptDemand(ComfySessionEventRelay.PromptTerminalEvent finished)
+            => commandWorkState.Prompts.WithdrawDemand(prompt => IsFinishedPrompt(prompt, finished));
         sessionEventRelay.PromptFinished += WithdrawFinishedPromptDemand;
         sessionProcessLogRelay.AttachSink(sessionSink);
         runnerLogRelay.AttachSink(sessionSink);
@@ -1469,6 +1468,15 @@ internal static class ServiceClientManager
                                     {
                                         commandWorkState.Prompts.Cancel(prompt =>
                                             TargetsPromptRuntime(request, prompt) && !ShouldStreamHttpResponse(prompt));
+                                        // ComfyUI's interrupt is cooperative: a loader blocked on a
+                                        // model download never sees it. Failing the session's pending
+                                        // reads lets the executing prompt end with an error now.
+                                        if (sessionManager.IsTrackedRuntime(
+                                                request.SessionId,
+                                                new RuntimeIdentity(request.LifecycleGeneration, request.RuntimeEpoch, request.RuntimeInstanceId)))
+                                        {
+                                            downloadService.InterruptSessionReads(request.SessionId);
+                                        }
                                     }
                                 },
                                 token),
@@ -3352,6 +3360,13 @@ internal static class ServiceClientManager
             lifetime.Cancel();
         }
     }
+
+    internal static bool IsFinishedPrompt(SubmitPromptCommand prompt, ComfySessionEventRelay.PromptTerminalEvent finished)
+        => PromptTargetsRuntime(prompt, finished.SessionId, finished.Runtime)
+           && (!string.IsNullOrEmpty(finished.PromptId)
+               && string.Equals(prompt.NativeIdentifiers?.PromptId, finished.PromptId, StringComparison.Ordinal)
+               || finished.SubmissionId is not null
+               && string.Equals(prompt.SubmissionId, finished.SubmissionId, StringComparison.Ordinal));
 
     internal static bool TargetsPromptRuntime(RelayEditorRuntimeRequestCommand request, SubmitPromptCommand prompt)
         => prompt.Target is { } target && request.LifecycleGeneration > 0 && request.RuntimeEpoch > 0

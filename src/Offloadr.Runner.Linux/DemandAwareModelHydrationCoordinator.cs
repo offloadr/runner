@@ -861,6 +861,45 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
         SignalScheduler();
     }
 
+    /// <summary>
+    /// Fails the session's pending range and mapping waits with an I/O error, which
+    /// the VFS shim reports as <c>EIO</c>. A runtime interrupt is cooperative, so a
+    /// loader blocked on a model read would otherwise wait for the whole download
+    /// before the interrupt takes effect. Descriptors stay open and later reads wait
+    /// again; the transfers keep only the demand that remains.
+    /// </summary>
+    public void InterruptSessionReads(string? sessionId)
+    {
+        if (string.IsNullOrWhiteSpace(sessionId))
+        {
+            return;
+        }
+
+        var normalized = sessionId.Trim();
+        List<(RangeWaiter Waiter, long TransferEpoch)> interrupted = [];
+        lock (_sync)
+        {
+            foreach (var lease in _descriptorLeases.Values
+                         .Where(lease => string.Equals(lease.SessionId, normalized, StringComparison.Ordinal)))
+            {
+                foreach (var waiter in RemoveLeaseWaitersLocked(lease.State, lease.LeaseId))
+                {
+                    interrupted.Add((waiter, lease.State.TransferEpoch));
+                }
+            }
+        }
+
+        foreach (var (waiter, transferEpoch) in interrupted)
+        {
+            UnregisterWaiterCancellation(waiter);
+            waiter.Completion.TrySetException(new ModelHydrationIOException(
+                "The runtime was interrupted while this model read waited for its bytes.",
+                transferEpoch: transferEpoch));
+        }
+
+        SignalScheduler();
+    }
+
     public void ActivateSession(string? sessionId)
     {
         if (string.IsNullOrWhiteSpace(sessionId))

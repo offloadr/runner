@@ -126,6 +126,56 @@ public class DemandAwareModelHydrationCoordinatorTests
     }
 
     [Test]
+    public async Task InterruptSessionReads_FailsPendingReadsOfThatSession()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var backend = new DemandBackend();
+            await using var coordinator = CreateCoordinator(backend, root);
+            await coordinator.InitializeAsync(CancellationToken.None);
+            var request = CreateRequest(root, "interrupted.bin");
+            coordinator.RegisterDownloads("session-1", [request], replaceExisting: true);
+            var handle = new ModelTransferHandle(
+                ModelTransferIdentity.Create(request.ModelId, request.DestinationPath, request.SizeBytes)
+                    .DeterministicIdentifier);
+
+            var opened = await coordinator.OpenAsync(request.DestinationPath, "session-1", CancellationToken.None);
+            var blockedRead = coordinator.EnsureRangeAsync(
+                opened.LeaseId, opened.TransferEpoch, offset: 4, length: 4, CancellationToken.None);
+            var blockedMapping = coordinator.EnsureCompleteAsync(
+                opened.LeaseId, opened.TransferEpoch, "mapping", CancellationToken.None);
+            await Task.Delay(100);
+            coordinator.InterruptSessionReads("session-2");
+            await Task.Delay(100);
+            Assert.That(blockedRead.IsCompleted, Is.False, "Another session's interrupt leaves the read waiting.");
+
+            // ComfyUI's interrupt never reaches a loader blocked on a model read;
+            // the read itself fails (EIO in the shim) so the prompt can end.
+            coordinator.InterruptSessionReads("session-1");
+            Assert.That(
+                async () => await blockedRead.WaitAsync(TimeSpan.FromSeconds(2)),
+                Throws.InstanceOf<ModelHydrationIOException>());
+            Assert.That(
+                async () => await blockedMapping.WaitAsync(TimeSpan.FromSeconds(2)),
+                Throws.InstanceOf<ModelHydrationIOException>());
+
+            // The descriptor stays usable: a later read waits for the bytes again.
+            var laterRead = coordinator.EnsureRangeAsync(
+                opened.LeaseId, opened.TransferEpoch, offset: 4, length: 4, CancellationToken.None);
+            await WaitUntilAsync(() => backend.UnpausedHandles.Contains(handle), TimeSpan.FromSeconds(2));
+            backend.SetBitfield(handle, "c0", request.SizeBytes);
+            await laterRead.WaitAsync(TimeSpan.FromSeconds(2));
+
+            await coordinator.ReleaseAsync(opened.LeaseId);
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
     public async Task CompletionPersistenceFailure_HoldsWaitersAndRetries()
     {
         var root = CreateTempDirectory();

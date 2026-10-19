@@ -1382,6 +1382,38 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
+    public void IsFinishedPrompt_MatchesNativePromptOrMappedSubmissionOnTheSameRuntime()
+    {
+        var prompt = WithPromptIdentity(new Offloadr.Runner.V1.SubmitPromptCommand
+        {
+            SessionId = PromptSessionId,
+            SubmissionId = PromptSubmissionId,
+            EditorSid = "editor-1",
+            PromptJson = "{}"
+        });
+        var runtime = new Offloadr.Runner.Core.RuntimeIdentity(
+            prompt.Target.GpuGeneration, prompt.Target.RuntimeEpoch, prompt.Target.RuntimeInstanceId);
+        var nativePromptId = prompt.NativeIdentifiers.PromptId = Guid.NewGuid().ToString("D");
+        ComfySessionEventRelay.PromptTerminalEvent Finished(
+            string promptId, string? submissionId = null, Offloadr.Runner.Core.RuntimeIdentity? on = null)
+            => new(PromptSessionId, on ?? runtime, promptId, submissionId);
+
+        Assert.Multiple(() =>
+        {
+            // An evicted evidence identity leaves no submission id; the native prompt id still matches.
+            Assert.That(ServiceClientManager.IsFinishedPrompt(prompt, Finished(nativePromptId)), Is.True);
+            Assert.That(ServiceClientManager.IsFinishedPrompt(prompt, Finished("other-prompt", PromptSubmissionId)), Is.True);
+            Assert.That(ServiceClientManager.IsFinishedPrompt(prompt, Finished("other-prompt")), Is.False);
+            Assert.That(ServiceClientManager.IsFinishedPrompt(
+                WithPromptIdentity(new() { SessionId = PromptSessionId, SubmissionId = PromptSubmissionId }),
+                Finished(string.Empty)), Is.False, "A prompt without a native id never matches an empty one.");
+            Assert.That(ServiceClientManager.IsFinishedPrompt(
+                prompt,
+                Finished(nativePromptId, on: runtime with { RuntimeEpoch = runtime.RuntimeEpoch + 1 })), Is.False);
+        });
+    }
+
+    [Test]
     public async Task HandleSubmitEditorActionAsync_FailedPreparationWithdrawsPublishedModelDemand()
     {
         // A conventional download can fail after managed demand was published; the

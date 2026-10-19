@@ -108,8 +108,8 @@ public sealed class ComfyPromptEvidenceTests
             return Task.CompletedTask;
         });
         relay.AttachSink(sink);
-        var finished = new TaskCompletionSource<SubmitPromptCommand>(TaskCreationOptions.RunContinuationsAsynchronously);
-        relay.PromptFinished += prompt => finished.TrySetResult(prompt);
+        var finished = System.Threading.Channels.Channel.CreateUnbounded<ComfySessionEventRelay.PromptTerminalEvent>();
+        relay.PromptFinished += prompt => finished.Writer.TryWrite(prompt);
         await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", command.Target.GpuGeneration,
             command.Target.RuntimeEpoch, command.Target.RuntimeInstanceId, [], CancellationToken.None);
         var context = await listener.GetContextAsync().WaitAsync(TimeSpan.FromSeconds(3));
@@ -126,17 +126,32 @@ public sealed class ComfyPromptEvidenceTests
             var captured = await reporting.Task.WaitAsync(TimeSpan.FromSeconds(3));
             var live = await deliveredFrame.Task.WaitAsync(TimeSpan.FromSeconds(3));
             // The terminal event ends the prompt's model demand.
-            var ended = await finished.Task.WaitAsync(TimeSpan.FromSeconds(3));
+            var ended = await finished.Reader.ReadAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(3));
             Assert.Multiple(() =>
             {
-                Assert.That(ended.CommandId, Is.EqualTo(command.CommandId));
+                Assert.That(ended.PromptId, Is.EqualTo(command.NativeIdentifiers.PromptId));
                 Assert.That(ended.SubmissionId, Is.EqualTo(command.SubmissionId));
+                Assert.That(ended.SessionId, Is.EqualTo(command.SessionId));
+                Assert.That(ended.Runtime, Is.EqualTo(new Offloadr.Runner.Core.RuntimeIdentity(
+                    command.Target.GpuGeneration, command.Target.RuntimeEpoch, command.Target.RuntimeInstanceId)));
                 Assert.That(live.Payload.ToStringUtf8(), Is.EqualTo(payload));
                 Assert.That(captured.Evidence.NativePayload, Is.EqualTo(live.Payload));
                 Assert.That(captured.Target, Is.EqualTo(command.Target));
                 Assert.That(RetainedCommandCount(relay), Is.EqualTo(1), "Only the unfinished command remains in the bridge.");
                 Assert.That(deliveredEvidence.Task.IsCompleted, Is.False);
                 Assert.That(refreshCaptureAttempts, Is.EqualTo(eventType == "execution_success" ? 1 : 0));
+            });
+            // A prompt whose evidence identity was evicted from the bounded cache
+            // still reports its terminal event, so its model demand can end.
+            var evictedPromptId = Guid.NewGuid().ToString("D");
+            var evictedPayload = payload.Replace(command.NativeIdentifiers.PromptId, evictedPromptId);
+            Assert.That(evictedPayload, Is.Not.EqualTo(payload));
+            await socket.SendAsync(ByteString.CopyFromUtf8(evictedPayload).Memory, WebSocketMessageType.Text, true, CancellationToken.None);
+            var evicted = await finished.Reader.ReadAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(3));
+            Assert.Multiple(() =>
+            {
+                Assert.That(evicted.PromptId, Is.EqualTo(evictedPromptId));
+                Assert.That(evicted.SubmissionId, Is.Null);
             });
             await relay.StopSessionAsync(command.SessionId).WaitAsync(TimeSpan.FromSeconds(3));
             Assert.That(evidenceToken.IsCancellationRequested, Is.False, "Stopping the bridge does not retire captured evidence.");
