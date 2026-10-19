@@ -1529,7 +1529,8 @@ internal static class ServiceClientManager
                             async (promptId, token) => (await sessionManager.ReadComfyPromptQueueAsync(
                                 captured.SessionId,
                                 new RuntimeIdentity(captured.Target.GpuGeneration, captured.Target.RuntimeEpoch, captured.Target.RuntimeInstanceId),
-                                token).ConfigureAwait(false))?.Contains(promptId));
+                                token).ConfigureAwait(false))?.Contains(promptId),
+                            settling => commandWorkState.Prompts.HoldDemand(captured.CommandId, settling));
                         });
                     }
                 }
@@ -3103,7 +3104,8 @@ internal static class ServiceClientManager
         CancellationToken evidenceDeliveryCancellationToken = default,
         Action<string, string, SubmitPromptCommand>? unregisterUninvokedSubmission = null,
         CancellationToken promptDemandCancellation = default,
-        Func<string, CancellationToken, Task<bool?>>? isPromptQueued = null)
+        Func<string, CancellationToken, Task<bool?>>? isPromptQueued = null,
+        Action<Task>? holdPromptDemand = null)
     {
         // Reject malformed wire identities before granting or touching a runtime.
         _ = PromptRuntimeMarker.TargetFingerprint(prompt.Target);
@@ -3185,7 +3187,8 @@ internal static class ServiceClientManager
         // invocation withdraws it when it settles. The hand-over is atomic with
         // the cancellation callback, so a racing interrupt cannot drop the demand
         // of a prompt the runtime accepted.
-        using var promptDemandLifetime = CancellationTokenSource.CreateLinkedTokenSource(promptDemandCancellation);
+        // Owned by the settling demand, which can outlive this command.
+        var promptDemandLifetime = CancellationTokenSource.CreateLinkedTokenSource(promptDemandCancellation);
         var demandGate = new object();
         var demandFollowsWork = true;
         using var withdrawDemandBeforeInvocation = cancellationToken.Register(() =>
@@ -3362,13 +3365,38 @@ internal static class ServiceClientManager
         }
 
         withdrawDemandBeforeInvocation.Dispose();
-        await SettlePromptDemandAsync(
+        var settling = SettleAndReleasePromptDemandAsync(
             promptDemand,
             keepPromptDemand,
             promptDemandLifetime,
             isPromptQueued is not null && !string.IsNullOrWhiteSpace(acceptedPromptId)
                 ? token => isPromptQueued(acceptedPromptId!, token)
-                : null).ConfigureAwait(false);
+                : null);
+        if (holdPromptDemand is not null && !settling.IsCompleted)
+        {
+            // The command ends with its acknowledgement; only the demand stays, so a
+            // recovery delivery of the same command is not refused as a duplicate.
+            holdPromptDemand(settling);
+            return;
+        }
+
+        await settling.ConfigureAwait(false);
+    }
+
+    private static async Task SettleAndReleasePromptDemandAsync(
+        Task? demand,
+        bool keep,
+        CancellationTokenSource lifetime,
+        Func<CancellationToken, Task<bool?>>? isStillQueued)
+    {
+        try
+        {
+            await SettlePromptDemandAsync(demand, keep, lifetime, isStillQueued).ConfigureAwait(false);
+        }
+        finally
+        {
+            lifetime.Dispose();
+        }
     }
 
     /// <summary>

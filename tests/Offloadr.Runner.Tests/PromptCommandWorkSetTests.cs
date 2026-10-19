@@ -29,6 +29,56 @@ public sealed class PromptCommandWorkSetTests
         Assert.That(capturedSession, Is.EqualTo("original"));
     }
 
+    [TestCase("withdraw")]
+    [TestCase("stop")]
+    public async Task HeldDemandLetsRecoveryRunAndStaysWithdrawable(string withdrawal)
+    {
+        // An accepted prompt keeps only its model demand after its command ends, so a
+        // recovery delivery of the same command must start instead of being refused.
+        var work = new PromptCommandWorkSet(CancellationToken.None);
+        var command = new SubmitPromptCommand { CommandId = "accepted", SessionId = "session" };
+        CancellationToken demandToken = default;
+        var settled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var commandEnded = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Assert.That(work.Start(command, (captured, _, demand) =>
+        {
+            demandToken = demand;
+            var settling = Task.Delay(Timeout.Infinite, demand).ContinueWith(_ => settled.SetResult());
+            work.HoldDemand(captured.CommandId, settling);
+            commandEnded.SetResult();
+            return Task.CompletedTask;
+        }), Is.True);
+        await commandEnded.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        var recovered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await WaitUntilStartedAsync(() => work.Start(command, (_, _) =>
+        {
+            recovered.TrySetResult();
+            return Task.CompletedTask;
+        }));
+        await recovered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.That(demandToken.IsCancellationRequested, Is.False, "Recovery leaves the held demand in place.");
+
+        if (withdrawal == "withdraw")
+            work.WithdrawDemand(prompt => prompt.CommandId == "accepted");
+        else
+            await work.CancelAndWaitAsync(prompt => prompt.SessionId == "session").WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.That(demandToken.IsCancellationRequested, Is.True);
+        await settled.Task.WaitAsync(TimeSpan.FromSeconds(2));
+    }
+
+    private static async Task WaitUntilStartedAsync(Func<bool> start)
+    {
+        // The original work leaves the active set just after its body returns.
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(2);
+        while (!start())
+        {
+            if (DateTime.UtcNow >= deadline) Assert.Fail("The recovery delivery was refused as a duplicate.");
+            await Task.Delay(10);
+        }
+    }
+
     [Test]
     public async Task InterruptLeavesModelDemandWhileStopAndTerminalEventWithdrawIt()
     {

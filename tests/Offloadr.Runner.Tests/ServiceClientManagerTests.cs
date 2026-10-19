@@ -1233,7 +1233,8 @@ public partial class ServiceClientManagerTests
         Func<CancellationToken, Task<Task>>? prepare = null,
         Func<string, CancellationToken, Task<bool?>>? isPromptQueued = null,
         string nativeBody = "{}",
-        Action? duringNativeRequest = null)
+        Action? duringNativeRequest = null,
+        Action<Task>? holdPromptDemand = null)
     {
         var prompt = new Offloadr.Runner.V1.SubmitPromptCommand
         {
@@ -1268,7 +1269,8 @@ public partial class ServiceClientManagerTests
             (_, _, _, _) => { },
             cancellationToken,
             promptDemandCancellation: demandCancellation,
-            isPromptQueued: isPromptQueued);
+            isPromptQueued: isPromptQueued,
+            holdPromptDemand: holdPromptDemand);
     }
 
     private static async Task WaitForConditionAsync(Func<bool> condition, TimeSpan timeout)
@@ -1359,6 +1361,52 @@ public partial class ServiceClientManagerTests
         demand.Cancel();
         await handled.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.That(demandToken.IsCancellationRequested, Is.True);
+    }
+
+    [Test]
+    public async Task HandleSubmitEditorActionAsync_HandsOverAcceptedDemandAndEndsTheCommand()
+    {
+        // The command ends with its acknowledgement so a recovery delivery of it is
+        // not refused; the accepted prompt's demand settles separately.
+        var demandToken = CancellationToken.None;
+        Task? held = null;
+        Offloadr.Runner.V1.AcknowledgePromptResultRequest? capturedAck = null;
+        using var physical = new CancellationTokenSource();
+        using var demand = new CancellationTokenSource();
+
+        await HandlePromptWithDemandAsync(
+            token => { demandToken = token; return Task.Delay(Timeout.InfiniteTimeSpan, token); },
+            nativeStatus: 200,
+            ack => capturedAck = ack,
+            physical.Token,
+            demand.Token,
+            holdPromptDemand: settling => held = settling).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(capturedAck!.Result.NativeResponse.StatusCode, Is.EqualTo(200));
+            Assert.That(held, Is.Not.Null);
+            Assert.That(held!.IsCompleted, Is.False);
+            Assert.That(demandToken.IsCancellationRequested, Is.False);
+        });
+
+        demand.Cancel();
+        await held!.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.That(demandToken.IsCancellationRequested, Is.True);
+    }
+
+    [Test]
+    public async Task HandleSubmitEditorActionAsync_RejectedPromptHoldsNoDemand()
+    {
+        Task? held = null;
+        await HandlePromptWithDemandAsync(
+            token => Task.Delay(Timeout.InfiniteTimeSpan, token),
+            nativeStatus: 400,
+            _ => { },
+            CancellationToken.None,
+            holdPromptDemand: settling => held = settling).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.That(held, Is.Null);
     }
 
     [Test]
