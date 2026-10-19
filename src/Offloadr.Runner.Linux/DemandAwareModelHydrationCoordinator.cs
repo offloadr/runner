@@ -721,6 +721,21 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
         IEnumerable<ModelDownloadRequest> downloads,
         CancellationToken cancellationToken)
     {
+        var completion = await RequestPromptDownloadsAsync(sessionId, downloads, cancellationToken).ConfigureAwait(false);
+        await completion.ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Attaches every registered prompt dependency and publishes its ordered prompt
+    /// demand. The returned task completes once all dependencies are fully hydrated;
+    /// it does not have to be awaited before the native runtime is invoked, because
+    /// managed reads and mappings remain gated by the VFS shim.
+    /// </summary>
+    public async Task<Task> RequestPromptDownloadsAsync(
+        string? sessionId,
+        IEnumerable<ModelDownloadRequest> downloads,
+        CancellationToken cancellationToken)
+    {
         var dependencies = new List<(TransferState State, int Ordinal)>();
         var ordinal = 0;
         foreach (var download in downloads.Where(static download => download is not null))
@@ -794,7 +809,7 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
         // Publish the complete ordered dependency set before allowing the scheduler
         // to choose a runnable prompt transfer.
         SignalScheduler();
-        await Task.WhenAll(completionTasks).ConfigureAwait(false);
+        return Task.WhenAll(completionTasks);
     }
 
     public void CancelSession(string? sessionId)
@@ -843,6 +858,45 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
         }
 
         CancelWaiters(canceledWaiters);
+        SignalScheduler();
+    }
+
+    /// <summary>
+    /// Fails the session's pending range and mapping waits with an I/O error, which
+    /// the VFS shim reports as <c>EIO</c>. A runtime interrupt is cooperative, so a
+    /// loader blocked on a model read would otherwise wait for the whole download
+    /// before the interrupt takes effect. Descriptors stay open and later reads wait
+    /// again; the transfers keep only the demand that remains.
+    /// </summary>
+    public void InterruptSessionReads(string? sessionId)
+    {
+        if (string.IsNullOrWhiteSpace(sessionId))
+        {
+            return;
+        }
+
+        var normalized = sessionId.Trim();
+        List<(RangeWaiter Waiter, long TransferEpoch)> interrupted = [];
+        lock (_sync)
+        {
+            foreach (var lease in _descriptorLeases.Values
+                         .Where(lease => string.Equals(lease.SessionId, normalized, StringComparison.Ordinal)))
+            {
+                foreach (var waiter in RemoveLeaseWaitersLocked(lease.State, lease.LeaseId))
+                {
+                    interrupted.Add((waiter, lease.State.TransferEpoch));
+                }
+            }
+        }
+
+        foreach (var (waiter, transferEpoch) in interrupted)
+        {
+            UnregisterWaiterCancellation(waiter);
+            waiter.Completion.TrySetException(new ModelHydrationIOException(
+                "The runtime was interrupted while this model read waited for its bytes.",
+                transferEpoch: transferEpoch));
+        }
+
         SignalScheduler();
     }
 

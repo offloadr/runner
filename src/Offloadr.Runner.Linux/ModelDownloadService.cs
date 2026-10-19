@@ -384,7 +384,19 @@ internal sealed class ModelDownloadService : IAsyncDisposable
             .ToArray()
            ?? [];
 
-    public Task EnsureDownloadsAsync(IEnumerable<ModelDownloadRequest> downloads, CancellationToken cancellationToken, bool highPriority)
+    /// <summary>
+    /// Prepares a prompt's model dependencies before its native invocation and
+    /// returns their hydration completion. Conventional downloads complete first
+    /// because nothing gates their reads. Range-managed models are demanded in
+    /// prompt order but not awaited: the VFS shim gates their reads and mappings,
+    /// so a large first download cannot hold the native response past the editor's
+    /// own request timeout. The demand lasts until its completion settles or
+    /// <paramref name="demandCancellation"/> withdraws it.
+    /// </summary>
+    public async Task<Task> PreparePromptDownloadsAsync(
+        IEnumerable<ModelDownloadRequest> downloads,
+        CancellationToken demandCancellation,
+        bool highPriority)
     {
         var snapshot = FilterRemoteDownloadRequests(downloads);
         ConfineDestinations(snapshot);
@@ -392,17 +404,38 @@ internal sealed class ModelDownloadService : IAsyncDisposable
         Task conventional;
         lock (_conventionalPlaceholderGate)
         {
-            conventional = EnsureConventionalDownloadsAsync(full, cancellationToken, highPriority);
+            conventional = EnsureConventionalDownloadsAsync(full, demandCancellation, highPriority);
             TrackConventionalOperation(full, conventional);
         }
 
-        return Task.WhenAll(
-            conventional,
-            _hydrationCoordinator?.EnsurePromptDownloadsAsync(
-                _fullDownloadCoordinator.GetActiveSessionId(),
-                managed,
-                cancellationToken) ?? Task.CompletedTask);
+        var demand = _hydrationCoordinator?.RequestPromptDownloadsAsync(
+            _fullDownloadCoordinator.GetActiveSessionId(),
+            managed,
+            demandCancellation) ?? Task.FromResult(Task.CompletedTask);
+        try
+        {
+            await Task.WhenAll(conventional, demand).ConfigureAwait(false);
+        }
+        catch
+        {
+            // The caller never receives this completion; observe a later fault.
+            if (demand.IsCompletedSuccessfully)
+            {
+                _ = demand.Result.ContinueWith(
+                    static task => _ = task.Exception,
+                    CancellationToken.None,
+                    TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+                    TaskScheduler.Default);
+            }
+
+            throw;
+        }
+
+        return demand.Result;
     }
+
+    /// <summary>Fails the session's pending range-managed reads; see the coordinator.</summary>
+    public void InterruptSessionReads(string? sessionId) => _hydrationCoordinator?.InterruptSessionReads(sessionId);
 
     public Task EnsureDownloadedAsync(string destinationPath, CancellationToken cancellationToken, bool highPriority)
     {

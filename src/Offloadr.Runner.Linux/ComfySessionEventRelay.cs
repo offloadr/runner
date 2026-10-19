@@ -70,6 +70,24 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
 
     private IRunnerSessionSink? _sink;
 
+    /// <summary>
+    /// A prompt's terminal event (success, error or interrupt) as the runtime
+    /// reported it. <see cref="SubmissionId"/> is known only while the bridge
+    /// still maps the prompt.
+    /// </summary>
+    internal readonly record struct PromptTerminalEvent(
+        string SessionId,
+        RuntimeIdentity Runtime,
+        string PromptId,
+        string? SubmissionId);
+
+    /// <summary>
+    /// Raised for every terminal prompt event, independently of the bounded
+    /// evidence cache, so a prompt's model demand ends even when its evidence
+    /// identity was evicted.
+    /// </summary>
+    internal event Action<PromptTerminalEvent>? PromptFinished;
+
     public ComfySessionEventRelay(
         string runnerId,
         string comfyHost,
@@ -209,6 +227,21 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
         if (TryGetBridge(sessionId, clientId, TargetRuntime(command), out var bridge))
         {
             bridge.MapPrompt(promptId, command.SubmissionId);
+        }
+    }
+
+    internal static bool IsTerminalPromptEvent(string? eventType)
+        => eventType is "execution_success" or "execution_error" or "execution_interrupted";
+
+    private void OnPromptFinished(PromptTerminalEvent finished)
+    {
+        try
+        {
+            PromptFinished?.Invoke(finished);
+        }
+        catch (Exception ex)
+        {
+            RunnerLog.Warning(nameof(ComfySessionEventRelay), $"Prompt completion handling failed ({ex.GetType().Name}).");
         }
     }
 
@@ -1063,6 +1096,15 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
                         // Terminal evidence owns its immutable bytes and identity;
                         // releasing the full command does not depend on delivery.
                         _ = _owner.ReportRetainedPromptEvidenceAsync(evidence);
+                    }
+
+                    if (promptId is not null && IsTerminalPromptEvent(eventType))
+                    {
+                        _owner.OnPromptFinished(new(
+                            _sessionId,
+                            new RuntimeIdentity(_lifecycleGeneration, _runtimeEpoch, _runtimeInstanceId),
+                            promptId,
+                            string.IsNullOrWhiteSpace(evt.SubmissionId) ? null : evt.SubmissionId));
                     }
                 }
             }

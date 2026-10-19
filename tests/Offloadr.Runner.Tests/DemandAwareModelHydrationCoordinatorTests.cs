@@ -126,6 +126,56 @@ public class DemandAwareModelHydrationCoordinatorTests
     }
 
     [Test]
+    public async Task InterruptSessionReads_FailsPendingReadsOfThatSession()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var backend = new DemandBackend();
+            await using var coordinator = CreateCoordinator(backend, root);
+            await coordinator.InitializeAsync(CancellationToken.None);
+            var request = CreateRequest(root, "interrupted.bin");
+            coordinator.RegisterDownloads("session-1", [request], replaceExisting: true);
+            var handle = new ModelTransferHandle(
+                ModelTransferIdentity.Create(request.ModelId, request.DestinationPath, request.SizeBytes)
+                    .DeterministicIdentifier);
+
+            var opened = await coordinator.OpenAsync(request.DestinationPath, "session-1", CancellationToken.None);
+            var blockedRead = coordinator.EnsureRangeAsync(
+                opened.LeaseId, opened.TransferEpoch, offset: 4, length: 4, CancellationToken.None);
+            var blockedMapping = coordinator.EnsureCompleteAsync(
+                opened.LeaseId, opened.TransferEpoch, "mapping", CancellationToken.None);
+            await Task.Delay(100);
+            coordinator.InterruptSessionReads("session-2");
+            await Task.Delay(100);
+            Assert.That(blockedRead.IsCompleted, Is.False, "Another session's interrupt leaves the read waiting.");
+
+            // ComfyUI's interrupt never reaches a loader blocked on a model read;
+            // the read itself fails (EIO in the shim) so the prompt can end.
+            coordinator.InterruptSessionReads("session-1");
+            Assert.That(
+                async () => await blockedRead.WaitAsync(TimeSpan.FromSeconds(2)),
+                Throws.InstanceOf<ModelHydrationIOException>());
+            Assert.That(
+                async () => await blockedMapping.WaitAsync(TimeSpan.FromSeconds(2)),
+                Throws.InstanceOf<ModelHydrationIOException>());
+
+            // The descriptor stays usable: a later read waits for the bytes again.
+            var laterRead = coordinator.EnsureRangeAsync(
+                opened.LeaseId, opened.TransferEpoch, offset: 4, length: 4, CancellationToken.None);
+            await WaitUntilAsync(() => backend.UnpausedHandles.Contains(handle), TimeSpan.FromSeconds(2));
+            backend.SetBitfield(handle, "c0", request.SizeBytes);
+            await laterRead.WaitAsync(TimeSpan.FromSeconds(2));
+
+            await coordinator.ReleaseAsync(opened.LeaseId);
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
     public async Task CompletionPersistenceFailure_HoldsWaitersAndRetries()
     {
         var root = CreateTempDirectory();
@@ -2615,6 +2665,137 @@ public class DemandAwareModelHydrationCoordinatorTests
         }
         finally
         {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
+    public async Task PromptDemand_StartsTransferAndReturnsBeforeHydrationCompletes()
+    {
+        var root = CreateTempDirectory();
+        using var promptCancellation = new CancellationTokenSource();
+        try
+        {
+            var backend = new DemandBackend();
+            await using var coordinator = CreateCoordinator(backend, root);
+            await coordinator.InitializeAsync(CancellationToken.None);
+            var request = CreateRequest(root, "prompt-demand.bin");
+            coordinator.RegisterDownloads("session-1", [request], replaceExisting: true);
+            var handle = new ModelTransferHandle(
+                ModelTransferIdentity.Create(request.ModelId, request.DestinationPath, request.SizeBytes)
+                    .DeterministicIdentifier);
+
+            var completion = await coordinator.RequestPromptDownloadsAsync(
+                "session-1",
+                [request],
+                promptCancellation.Token).WaitAsync(TimeSpan.FromSeconds(2));
+            await WaitUntilAsync(
+                () => backend.CreateCallCount == 1 && backend.UnpausedHandles.Contains(handle),
+                TimeSpan.FromSeconds(2));
+            Assert.That(completion.IsCompleted, Is.False);
+
+            backend.SetBitfield(handle, "c0", request.SizeBytes);
+            backend.SetStatus(handle, "complete");
+            await completion.WaitAsync(TimeSpan.FromSeconds(2));
+        }
+        finally
+        {
+            // Like completed prompt work, dispose the token without cancelling it.
+            TryDelete(root);
+        }
+    }
+
+    [Test]
+    public async Task PromptDemand_CancellationCancelsPendingCompletion()
+    {
+        var root = CreateTempDirectory();
+        using var promptCancellation = new CancellationTokenSource();
+        try
+        {
+            var backend = new DemandBackend();
+            await using var coordinator = CreateCoordinator(backend, root);
+            await coordinator.InitializeAsync(CancellationToken.None);
+            var request = CreateRequest(root, "prompt-demand-canceled.bin");
+            coordinator.RegisterDownloads("session-1", [request], replaceExisting: true);
+
+            var completion = await coordinator.RequestPromptDownloadsAsync(
+                "session-1",
+                [request],
+                promptCancellation.Token).WaitAsync(TimeSpan.FromSeconds(2));
+            Assert.That(completion.IsCompleted, Is.False);
+
+            promptCancellation.Cancel();
+            Assert.That(
+                async () => await completion.WaitAsync(TimeSpan.FromSeconds(2)),
+                Throws.InstanceOf<OperationCanceledException>());
+        }
+        finally
+        {
+            promptCancellation.Cancel();
+            TryDelete(root);
+        }
+    }
+
+    [Test]
+    public async Task PreparePromptDownloads_RangeManagedModel_ReturnsBeforeHydrationCompletes()
+    {
+        var root = CreateTempDirectory();
+        using var promptCancellation = new CancellationTokenSource();
+        try
+        {
+            var backend = new DemandBackend();
+            var settings = Aria2Settings.FromEnvironment(name => name switch
+            {
+                "ARIA2_DOWNLOAD_DIR" => root,
+                "ARIA2_STATE_DIR" => Path.Combine(root, "aria2-state"),
+                _ => null
+            }, () => "generated-secret");
+            await using var service = new ModelDownloadService(
+                backend,
+                settings,
+                new ModelHydrationRuntimeCapabilities(
+                    "synthetic-editor",
+                    SupportsPersistentRangeHydration: true,
+                    PersistentModelRoots: [root]));
+            await service.InitializeAsync(CancellationToken.None);
+            var request = CreateRequest(root, "first-prompt.bin");
+            var handle = new ModelTransferHandle(
+                ModelTransferIdentity.Create(request.ModelId, request.DestinationPath, request.SizeBytes)
+                    .DeterministicIdentifier);
+            service.SetActiveSession("session-1");
+            service.RegisterDownloads("session-1", [request]);
+
+            // A first prompt must reach the native runtime while its model is still
+            // downloading; the VFS shim, not prompt preparation, gates the bytes.
+            await service.PreparePromptDownloadsAsync(
+                [request],
+                promptCancellation.Token,
+                highPriority: false).WaitAsync(TimeSpan.FromSeconds(2));
+            await WaitUntilAsync(
+                () => backend.CreateCallCount == 1 && backend.UnpausedHandles.Contains(handle),
+                TimeSpan.FromSeconds(2));
+
+            var opened = await service.OpenRangeManagedAsync(
+                request.DestinationPath,
+                "session-1",
+                CancellationToken.None);
+            Assert.That(opened.Disposition, Is.EqualTo(ModelHydrationOpenDisposition.RangeManaged));
+            var pendingRead = service.EnsureRangeAsync(
+                opened.LeaseId,
+                opened.TransferEpoch,
+                offset: 4,
+                length: 4,
+                CancellationToken.None);
+            await Task.Delay(200);
+            Assert.That(pendingRead.IsCompleted, Is.False);
+
+            backend.SetBitfield(handle, "c0", request.SizeBytes);
+            await pendingRead.WaitAsync(TimeSpan.FromSeconds(2));
+            await service.ReleaseAsync(opened.LeaseId);
+        }
+        finally
+        {
+            // Like completed prompt work, dispose the token without cancelling it.
             TryDelete(root);
         }
     }

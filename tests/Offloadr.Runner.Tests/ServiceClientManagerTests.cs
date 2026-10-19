@@ -1224,6 +1224,477 @@ public partial class ServiceClientManagerTests
         });
     }
 
+    private static Task HandlePromptWithDemandAsync(
+        Func<CancellationToken, Task> demand,
+        int nativeStatus,
+        Action<Offloadr.Runner.V1.AcknowledgePromptResultRequest> acknowledged,
+        CancellationToken cancellationToken,
+        CancellationToken demandCancellation = default,
+        Func<CancellationToken, Task<Task>>? prepare = null,
+        Func<string, CancellationToken, Task<bool?>>? isPromptQueued = null,
+        string nativeBody = "{}",
+        Action? duringNativeRequest = null,
+        Action<Task>? holdPromptDemand = null)
+    {
+        var prompt = new Offloadr.Runner.V1.SubmitPromptCommand
+        {
+            SessionId = PromptSessionId,
+            SubmissionId = PromptSubmissionId,
+            EditorSid = "editor-1",
+            PromptJson = "{}"
+        };
+        return ServiceClientManager.HandleSubmitEditorActionAsync(
+            (ack, _) => { acknowledged(ack); return Task.CompletedTask; },
+            (_, _) => Task.CompletedTask,
+            WithPromptIdentity(prompt),
+            PromptRunnerId,
+            GrantPromptForTestAsync,
+            (_, _) => Task.CompletedTask,
+            (_, _) => Task.CompletedTask,
+            (_, _, _, _) => Task.CompletedTask,
+            (_, _, _) => { },
+            _ => { },
+            (_, _, _, _) => Task.CompletedTask,
+            (_, _, _, _, _) => Task.CompletedTask,
+            _ => () => Task.CompletedTask,
+            (_, _) => { },
+            (_, token, _) => prepare is null ? Task.FromResult(demand(token)) : prepare(token),
+            (_, _, onNativeRequestAttempt, _) =>
+            {
+                onNativeRequestAttempt();
+                duringNativeRequest?.Invoke();
+                return Task.FromResult(new SessionProcessManager.PromptSubmissionResult(
+                    nativeStatus is >= 200 and < 300, nativeStatus, System.Text.Encoding.UTF8.GetBytes(nativeBody), "native"));
+            },
+            (_, _, _, _) => { },
+            cancellationToken,
+            promptDemandCancellation: demandCancellation,
+            isPromptQueued: isPromptQueued,
+            holdPromptDemand: holdPromptDemand);
+    }
+
+    private static async Task WaitForConditionAsync(Func<bool> condition, TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (!condition())
+        {
+            if (DateTime.UtcNow >= deadline) throw new TimeoutException("Timed out waiting for the expected condition.");
+            await Task.Delay(10);
+        }
+    }
+
+    [Test]
+    public async Task HandleSubmitEditorActionAsync_RejectedPromptWithdrawsItsModelDemand()
+    {
+        var demandToken = CancellationToken.None;
+        Offloadr.Runner.V1.AcknowledgePromptResultRequest? capturedAck = null;
+        using var cts = new CancellationTokenSource();
+
+        await HandlePromptWithDemandAsync(
+            token => { demandToken = token; return Task.Delay(Timeout.InfiniteTimeSpan, token); },
+            nativeStatus: 400,
+            ack => capturedAck = ack,
+            cts.Token).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(capturedAck?.Result.NativeResponse.StatusCode, Is.EqualTo(400));
+            Assert.That(demandToken.IsCancellationRequested, Is.True);
+            Assert.That(cts.IsCancellationRequested, Is.False);
+        });
+    }
+
+    [Test]
+    public async Task HandleSubmitEditorActionAsync_QueuedPromptKeepsModelDemandUntilHydrationSettles()
+    {
+        var demandToken = CancellationToken.None;
+        var hydration = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Offloadr.Runner.V1.AcknowledgePromptResultRequest? capturedAck = null;
+        using var cts = new CancellationTokenSource();
+
+        var handled = HandlePromptWithDemandAsync(
+            token => { demandToken = token; return hydration.Task; },
+            nativeStatus: 200,
+            ack => capturedAck = ack,
+            cts.Token);
+        await WaitForConditionAsync(() => capturedAck is not null, TimeSpan.FromSeconds(5));
+
+        // The native result is acknowledged before hydration; demand stays published.
+        Assert.Multiple(() =>
+        {
+            Assert.That(capturedAck!.Result.NativeResponse.StatusCode, Is.EqualTo(200));
+            Assert.That(handled.IsCompleted, Is.False);
+            Assert.That(demandToken.IsCancellationRequested, Is.False);
+        });
+
+        hydration.SetResult();
+        await handled.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Test]
+    public async Task HandleSubmitEditorActionAsync_InterruptAfterAcceptanceKeepsQueuedModelDemand()
+    {
+        var demandToken = CancellationToken.None;
+        Offloadr.Runner.V1.AcknowledgePromptResultRequest? capturedAck = null;
+        using var physical = new CancellationTokenSource();
+        using var demand = new CancellationTokenSource();
+
+        var handled = HandlePromptWithDemandAsync(
+            token => { demandToken = token; return Task.Delay(Timeout.InfiniteTimeSpan, token); },
+            nativeStatus: 200,
+            ack => capturedAck = ack,
+            physical.Token,
+            demand.Token);
+        await WaitForConditionAsync(() => capturedAck is not null, TimeSpan.FromSeconds(5));
+
+        // ComfyUI's interrupt stops only its executing prompt; this one may still
+        // be queued, so cancelling its physical work keeps the demand.
+        physical.Cancel();
+        await Task.Delay(100);
+        Assert.Multiple(() =>
+        {
+            Assert.That(handled.IsCompleted, Is.False);
+            Assert.That(demandToken.IsCancellationRequested, Is.False);
+        });
+
+        // Stop or the prompt's terminal event withdraws it.
+        demand.Cancel();
+        await handled.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.That(demandToken.IsCancellationRequested, Is.True);
+    }
+
+    [Test]
+    public async Task HandleSubmitEditorActionAsync_HandsOverAcceptedDemandAndEndsTheCommand()
+    {
+        // The command ends with its acknowledgement so a recovery delivery of it is
+        // not refused; the accepted prompt's demand settles separately.
+        var demandToken = CancellationToken.None;
+        Task? held = null;
+        Offloadr.Runner.V1.AcknowledgePromptResultRequest? capturedAck = null;
+        using var physical = new CancellationTokenSource();
+        using var demand = new CancellationTokenSource();
+
+        await HandlePromptWithDemandAsync(
+            token => { demandToken = token; return Task.Delay(Timeout.InfiniteTimeSpan, token); },
+            nativeStatus: 200,
+            ack => capturedAck = ack,
+            physical.Token,
+            demand.Token,
+            holdPromptDemand: settling => held = settling).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(capturedAck!.Result.NativeResponse.StatusCode, Is.EqualTo(200));
+            Assert.That(held, Is.Not.Null);
+            Assert.That(held!.IsCompleted, Is.False);
+            Assert.That(demandToken.IsCancellationRequested, Is.False);
+        });
+
+        demand.Cancel();
+        await held!.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.That(demandToken.IsCancellationRequested, Is.True);
+    }
+
+    [Test]
+    public async Task HandleSubmitEditorActionAsync_RejectedPromptHoldsNoDemand()
+    {
+        Task? held = null;
+        await HandlePromptWithDemandAsync(
+            token => Task.Delay(Timeout.InfiniteTimeSpan, token),
+            nativeStatus: 400,
+            _ => { },
+            CancellationToken.None,
+            holdPromptDemand: settling => held = settling).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.That(held, Is.Null);
+    }
+
+    [Test]
+    public async Task HandleSubmitEditorActionAsync_InterruptRacingAcceptanceKeepsModelDemand()
+    {
+        // A global interrupt can cancel the work after the native request started
+        // but before its accepted result is seen. The runtime still queues the
+        // prompt, so its demand must survive.
+        var demandToken = CancellationToken.None;
+        Offloadr.Runner.V1.AcknowledgePromptResultRequest? capturedAck = null;
+        using var physical = new CancellationTokenSource();
+        using var demand = new CancellationTokenSource();
+
+        var handled = HandlePromptWithDemandAsync(
+            token => { demandToken = token; return Task.Delay(Timeout.InfiniteTimeSpan, token); },
+            nativeStatus: 200,
+            ack => capturedAck = ack,
+            physical.Token,
+            demand.Token,
+            duringNativeRequest: physical.Cancel);
+        await WaitForConditionAsync(() => capturedAck is not null, TimeSpan.FromSeconds(5));
+        await Task.Delay(50);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(capturedAck!.Result.NativeResponse.StatusCode, Is.EqualTo(200));
+            Assert.That(physical.IsCancellationRequested, Is.True);
+            Assert.That(demandToken.IsCancellationRequested, Is.False);
+            Assert.That(handled.IsCompleted, Is.False);
+        });
+
+        demand.Cancel();
+        await handled.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Test]
+    public async Task HandleSubmitEditorActionAsync_InterruptBeforeAcceptanceWithdrawsModelDemand()
+    {
+        var demandToken = CancellationToken.None;
+        var acknowledged = false;
+        using var physical = new CancellationTokenSource();
+        using var demand = new CancellationTokenSource();
+
+        await HandlePromptWithDemandAsync(
+            _ => throw new AssertionException("Unused"),
+            nativeStatus: 200,
+            _ => acknowledged = true,
+            physical.Token,
+            demand.Token,
+            token =>
+            {
+                demandToken = token;
+                physical.Cancel();
+                return Task.FromResult<Task>(Task.Delay(Timeout.InfiniteTimeSpan, token));
+            }).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(acknowledged, Is.True);
+            Assert.That(demandToken.IsCancellationRequested, Is.True);
+            Assert.That(demand.IsCancellationRequested, Is.False);
+        });
+    }
+
+    [TestCase(0, TestName = "HandleSubmitEditorActionAsync_PromptAlreadyGoneWhenAccepted_WithdrawsDemand")]
+    [TestCase(2, TestName = "HandleSubmitEditorActionAsync_PromptRemovedFromQueue_WithdrawsDemand")]
+    public async Task HandleSubmitEditorActionAsync_WithdrawsDemandOnceThePromptLeavesTheQueue(int queuedProbes)
+    {
+        // A prompt deleted from ComfyUI's queue, cancelled while pending, or one that
+        // finished before its id was mapped sends no terminal event the runner can
+        // use; the queue shows it is gone.
+        var previousInterval = ServiceClientManager.PromptDemandQueueProbeInterval;
+        ServiceClientManager.PromptDemandQueueProbeInterval = TimeSpan.FromMilliseconds(20);
+        try
+        {
+            var demandToken = CancellationToken.None;
+            var probed = new List<string>();
+            using var physical = new CancellationTokenSource();
+            using var demand = new CancellationTokenSource();
+
+            await HandlePromptWithDemandAsync(
+                token => { demandToken = token; return Task.Delay(Timeout.InfiniteTimeSpan, token); },
+                nativeStatus: 200,
+                _ => { },
+                physical.Token,
+                demand.Token,
+                isPromptQueued: (promptId, _) =>
+                {
+                    lock (probed) probed.Add(promptId);
+                    return Task.FromResult<bool?>(probed.Count <= queuedProbes);
+                },
+                nativeBody: "{\"prompt_id\":\"native-prompt-1\"}").WaitAsync(TimeSpan.FromSeconds(5));
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(demandToken.IsCancellationRequested, Is.True);
+                Assert.That(demand.IsCancellationRequested, Is.False);
+                Assert.That(probed, Has.Count.EqualTo(queuedProbes + 1));
+                Assert.That(probed, Is.All.EqualTo("native-prompt-1"));
+            });
+        }
+        finally
+        {
+            ServiceClientManager.PromptDemandQueueProbeInterval = previousInterval;
+        }
+    }
+
+    [Test]
+    public async Task HandleSubmitEditorActionAsync_UnreadableQueueKeepsDemand()
+    {
+        var previousInterval = ServiceClientManager.PromptDemandQueueProbeInterval;
+        ServiceClientManager.PromptDemandQueueProbeInterval = TimeSpan.FromMilliseconds(20);
+        try
+        {
+            var demandToken = CancellationToken.None;
+            var hydration = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var probes = 0;
+            using var physical = new CancellationTokenSource();
+
+            var handled = HandlePromptWithDemandAsync(
+                token => { demandToken = token; return hydration.Task; },
+                nativeStatus: 200,
+                _ => { },
+                physical.Token,
+                isPromptQueued: (_, _) => Interlocked.Increment(ref probes) % 2 == 0
+                    ? Task.FromResult<bool?>(null)
+                    : Task.FromException<bool?>(new HttpRequestException("queue unavailable")),
+                nativeBody: "{\"prompt_id\":\"native-prompt-1\"}");
+            await WaitForConditionAsync(() => Volatile.Read(ref probes) >= 4, TimeSpan.FromSeconds(5));
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(handled.IsCompleted, Is.False);
+                Assert.That(demandToken.IsCancellationRequested, Is.False);
+            });
+            hydration.SetResult();
+            await handled.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+        finally
+        {
+            ServiceClientManager.PromptDemandQueueProbeInterval = previousInterval;
+        }
+    }
+
+    private static RelayEditorRuntimeRequestCommand CancelControl(string path, string body)
+        => new()
+        {
+            RequestId = "request-1",
+            SessionId = PromptSessionId,
+            Kind = Offloadr.EditorRuntime.V1.EditorRuntimeRequestKind.Control,
+            Path = path,
+            Body = ByteString.CopyFromUtf8(body),
+            LifecycleGeneration = 1,
+            RuntimeEpoch = 1,
+            RuntimeInstanceId = "77777777777747778777777777777777",
+        };
+
+    [TestCase("api/interrupt", "{\"prompt_id\":\"running\"}", 200, true)]
+    [TestCase("api/jobs/running/cancel", "", 200, true)]
+    [TestCase("api/jobs/cancel", "{\"job_ids\":[\"pending\",\"running\"]}", 200, true)]
+    [TestCase("api/interrupt", "{\"prompt_id\":\"pending\"}", 200, false)]
+    [TestCase("api/jobs/pending/cancel", "", 200, false)]
+    [TestCase("api/interrupt", "{\"prompt_id\":\"running\"}", 500, false)]
+    [TestCase("api/queue", "{\"delete\":[\"running\"]}", 200, false)]
+    [TestCase("api/interrupt", "", 200, true)]
+    [TestCase("api/interrupt", "{}", 200, true)]
+    [TestCase("api/interrupt", "", 500, false)]
+    public async Task InterruptBlockedReadsForCancelAsync_FailsReadsOnlyForTheRunningPrompt(
+        string path, string body, int status, bool interrupted)
+    {
+        // ComfyUI's targeted cancel is cooperative; a loader blocked on a model
+        // download never sees it unless its read fails.
+        var request = CancelControl(path, body);
+        string? interruptedSession = null;
+        Offloadr.Runner.Core.RuntimeIdentity? queried = null;
+
+        await ServiceClientManager.InterruptBlockedReadsForCancelAsync(
+            request,
+            new AcknowledgeEditorRuntimeRequestRequest { TransportSucceeded = true, StatusCode = status },
+            (_, runtime, _) =>
+            {
+                queried = runtime;
+                return Task.FromResult<ComfyPromptQueue?>(new(
+                    new HashSet<string> { "running" },
+                    new HashSet<string> { "pending" }));
+            },
+            sessionId => interruptedSession = sessionId,
+            CancellationToken.None);
+
+        Assert.That(interruptedSession, Is.EqualTo(interrupted ? PromptSessionId : null));
+        if (interrupted)
+        {
+            Assert.That(queried, Is.EqualTo(new Offloadr.Runner.Core.RuntimeIdentity(1, 1, request.RuntimeInstanceId)));
+        }
+    }
+
+    [Test]
+    public async Task InterruptBlockedReadsForCancelAsync_GlobalInterruptWithNothingRunningLeavesReads()
+    {
+        var interrupted = false;
+        await ServiceClientManager.InterruptBlockedReadsForCancelAsync(
+            CancelControl("api/interrupt", ""),
+            new AcknowledgeEditorRuntimeRequestRequest { TransportSucceeded = true, StatusCode = 200 },
+            (_, _, _) => Task.FromResult<ComfyPromptQueue?>(new(
+                new HashSet<string>(),
+                new HashSet<string> { "pending" })),
+            _ => interrupted = true,
+            CancellationToken.None);
+
+        Assert.That(interrupted, Is.False);
+    }
+
+    [Test]
+    public async Task InterruptBlockedReadsForCancelAsync_UnknownQueueLeavesReads()
+    {
+        var interrupted = false;
+        await ServiceClientManager.InterruptBlockedReadsForCancelAsync(
+            CancelControl("api/interrupt", "{\"prompt_id\":\"running\"}"),
+            new AcknowledgeEditorRuntimeRequestRequest { TransportSucceeded = true, StatusCode = 200 },
+            (_, _, _) => Task.FromResult<ComfyPromptQueue?>(null),
+            _ => interrupted = true,
+            CancellationToken.None);
+
+        Assert.That(interrupted, Is.False);
+    }
+
+    [Test]
+    public void IsFinishedPrompt_MatchesNativePromptOrMappedSubmissionOnTheSameRuntime()
+    {
+        var prompt = WithPromptIdentity(new Offloadr.Runner.V1.SubmitPromptCommand
+        {
+            SessionId = PromptSessionId,
+            SubmissionId = PromptSubmissionId,
+            EditorSid = "editor-1",
+            PromptJson = "{}"
+        });
+        var runtime = new Offloadr.Runner.Core.RuntimeIdentity(
+            prompt.Target.GpuGeneration, prompt.Target.RuntimeEpoch, prompt.Target.RuntimeInstanceId);
+        var nativePromptId = prompt.NativeIdentifiers.PromptId = Guid.NewGuid().ToString("D");
+        ComfySessionEventRelay.PromptTerminalEvent Finished(
+            string promptId, string? submissionId = null, Offloadr.Runner.Core.RuntimeIdentity? on = null)
+            => new(PromptSessionId, on ?? runtime, promptId, submissionId);
+
+        Assert.Multiple(() =>
+        {
+            // An evicted evidence identity leaves no submission id; the native prompt id still matches.
+            Assert.That(ServiceClientManager.IsFinishedPrompt(prompt, Finished(nativePromptId)), Is.True);
+            Assert.That(ServiceClientManager.IsFinishedPrompt(prompt, Finished("other-prompt", PromptSubmissionId)), Is.True);
+            Assert.That(ServiceClientManager.IsFinishedPrompt(prompt, Finished("other-prompt")), Is.False);
+            Assert.That(ServiceClientManager.IsFinishedPrompt(
+                WithPromptIdentity(new() { SessionId = PromptSessionId, SubmissionId = PromptSubmissionId }),
+                Finished(string.Empty)), Is.False, "A prompt without a native id never matches an empty one.");
+            Assert.That(ServiceClientManager.IsFinishedPrompt(
+                prompt,
+                Finished(nativePromptId, on: runtime with { RuntimeEpoch = runtime.RuntimeEpoch + 1 })), Is.False);
+        });
+    }
+
+    [Test]
+    public async Task HandleSubmitEditorActionAsync_FailedPreparationWithdrawsPublishedModelDemand()
+    {
+        // A conventional download can fail after managed demand was published; the
+        // hydration completion is then never handed over, but the demand must end.
+        var demandToken = CancellationToken.None;
+        var managedWaiter = Task.CompletedTask;
+        Offloadr.Runner.V1.AcknowledgePromptResultRequest? capturedAck = null;
+        using var physical = new CancellationTokenSource();
+
+        await HandlePromptWithDemandAsync(
+            _ => throw new AssertionException("Unused"),
+            nativeStatus: 200,
+            ack => capturedAck = ack,
+            physical.Token,
+            prepare: token =>
+            {
+                demandToken = token;
+                managedWaiter = Task.Delay(Timeout.InfiniteTimeSpan, token);
+                return Task.FromException<Task>(new IOException("conventional download failed"));
+            }).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(capturedAck?.Result.Outcome, Is.EqualTo(Offloadr.Common.V1.PromptInvocationOutcome.NotExecuted));
+            Assert.That(demandToken.IsCancellationRequested, Is.True);
+            Assert.That(managedWaiter.IsCanceled, Is.True);
+        });
+    }
+
     [Test]
     public async Task HandleSubmitEditorActionAsync_RecordsNotExecutedWhenPreparationIsCancelledBeforeNativeInvocation()
     {
@@ -1263,7 +1734,7 @@ public partial class ServiceClientManagerTests
             (_, _, _, _, _) => Task.CompletedTask,
             _ => () => Task.CompletedTask,
             (_, _) => { },
-            (_, token, _) => { cts.Cancel(); return Task.FromCanceled(token); },
+            (_, token, _) => { cts.Cancel(); return Task.FromCanceled<Task>(token); },
             (_, _, _, _) =>
             {
                 submitCalls++;
@@ -1323,7 +1794,7 @@ public partial class ServiceClientManagerTests
             (_, _, _, _, _) => Task.CompletedTask,
             _ => () => Task.CompletedTask,
             (_, _) => { },
-            (_, token, _) => Task.FromCanceled(token),
+            (_, token, _) => Task.FromCanceled<Task>(token),
             (_, _, _, _) => throw new AssertionException("No permission response can authorize native execution"),
             (_, _, _, _) => { },
                         cts.Token);
@@ -1376,7 +1847,7 @@ public partial class ServiceClientManagerTests
             (_, _, _, _, _) => Task.CompletedTask,
             _ => () => Task.CompletedTask,
             (_, _) => { },
-            (_, _, _) => Task.CompletedTask,
+            (_, _, _) => Task.FromResult(Task.CompletedTask),
             (_, _, _, _) =>
             {
                 nativeCalls++;
@@ -1442,7 +1913,7 @@ public partial class ServiceClientManagerTests
             (downloads, _, _) =>
             {
                 ensuredDownloads = downloads.ToArray();
-                return Task.CompletedTask;
+                return Task.FromResult(Task.CompletedTask);
             },
             (_, _, _, _) => Task.FromResult(new SessionProcessManager.PromptSubmissionResult(true, 200, System.Text.Encoding.UTF8.GetBytes("{}"), "Prompt submitted")),
             (_, _, _, _) => { },
@@ -1543,7 +2014,7 @@ public partial class ServiceClientManagerTests
                     return Task.CompletedTask;
                 },
                 (_, _) => { },
-                (_, _, _) => Task.CompletedTask,
+                (_, _, _) => Task.FromResult(Task.CompletedTask),
                 (_, _, _, _) => Task.FromResult(new SessionProcessManager.PromptSubmissionResult(true, 200, System.Text.Encoding.UTF8.GetBytes("{\"prompt_id\":\"prompt-1\"}"), "Prompt submitted")),
                 (_, _, promptId, submissionId) =>
                 {
@@ -1605,7 +2076,7 @@ public partial class ServiceClientManagerTests
             (_, _, _, _, _) => Task.CompletedTask,
             _ => () => Task.CompletedTask,
             (_, _) => { },
-            (_, _, _) => Task.CompletedTask,
+            (_, _, _) => Task.FromResult(Task.CompletedTask),
             async (_, responseEventSink, _, token) =>
             {
                 sinkWasProvided = responseEventSink is not null;
@@ -1654,7 +2125,7 @@ public partial class ServiceClientManagerTests
             (_, _) => throw new AssertionException("Unexpected recovery"),
             (_, _, _, _) => Task.CompletedTask, (_, _, _) => { }, _ => { },
             (_, _, _, _) => Task.CompletedTask, (_, _, _, _, _) => Task.CompletedTask,
-            _ => () => Task.CompletedTask, (_, _) => { }, (_, _, _) => Task.CompletedTask,
+            _ => () => Task.CompletedTask, (_, _) => { }, (_, _, _) => Task.FromResult(Task.CompletedTask),
             async (_, stream, _, token) =>
             {
                 await stream!(ServiceClientManager.HttpResponseChunkEventType,
@@ -1701,7 +2172,7 @@ public partial class ServiceClientManagerTests
             (_, _) => throw new AssertionException("Unexpected recovery"),
             (_, _, _, _) => Task.CompletedTask, (_, _, _) => { }, _ => { },
             (_, _, _, _) => Task.CompletedTask, (_, _, _, _, _) => Task.CompletedTask,
-            _ => () => Task.CompletedTask, (_, _) => { }, (_, _, _) => Task.CompletedTask,
+            _ => () => Task.CompletedTask, (_, _) => { }, (_, _, _) => Task.FromResult(Task.CompletedTask),
             async (_, stream, onNativeRequestAttempt, token) =>
             {
                 onNativeRequestAttempt();
@@ -1765,7 +2236,7 @@ public partial class ServiceClientManagerTests
             },
             _ => () => Task.CompletedTask,
             (_, _) => { },
-            (_, _, _) => Task.CompletedTask,
+            (_, _, _) => Task.FromResult(Task.CompletedTask),
             (_, _, _, _) => Task.FromResult(new SessionProcessManager.PromptSubmissionResult(true, 200, System.Text.Encoding.UTF8.GetBytes("{}"), "Prompt submitted")),
             (_, _, _, _) => { },
                         CancellationToken.None);
@@ -1817,7 +2288,7 @@ public partial class ServiceClientManagerTests
                 return Task.CompletedTask;
             },
             (_, _) => { },
-            (_, _, _) => Task.CompletedTask,
+            (_, _, _) => Task.FromResult(Task.CompletedTask),
             (_, _, _, _) =>
             {
                 order.Add("submit");
@@ -1861,7 +2332,7 @@ public partial class ServiceClientManagerTests
             (_, _, _, _, _) => { preparationCalls++; return Task.CompletedTask; },
             _ => () => { preparationCalls++; return Task.CompletedTask; },
             (_, _) => preparationCalls++,
-            (_, _, _) => { preparationCalls++; return Task.CompletedTask; },
+            (_, _, _) => { preparationCalls++; return Task.FromResult(Task.CompletedTask); },
             (_, _, _, _) =>
             {
                 submitCalls++;
@@ -2088,7 +2559,7 @@ public partial class ServiceClientManagerTests
                     return Task.CompletedTask;
                 },
                 (_, _) => { },
-                (_, _, _) => Task.CompletedTask,
+                (_, _, _) => Task.FromResult(Task.CompletedTask),
                 (_, _, _, _) => Task.FromResult(new SessionProcessManager.PromptSubmissionResult(true, 200, System.Text.Encoding.UTF8.GetBytes("{\"prompt_id\":\"prompt-1\"}"), "Prompt submitted")),
                 (_, _, _, _) => { },
                             CancellationToken.None);
@@ -2144,7 +2615,7 @@ public partial class ServiceClientManagerTests
                     return Task.CompletedTask;
                 },
                 (_, _) => { },
-                (_, _, _) => Task.CompletedTask,
+                (_, _, _) => Task.FromResult(Task.CompletedTask),
                 (_, _, _, _) => Task.FromResult(new SessionProcessManager.PromptSubmissionResult(
                     true,
                     200,
@@ -2199,7 +2670,7 @@ public partial class ServiceClientManagerTests
                 (_, _, _, _, _) => Task.CompletedTask,
                 _ => () => throw new InvalidOperationException("refresh failed"),
                 (_, _) => { },
-                (_, _, _) => Task.CompletedTask,
+                (_, _, _) => Task.FromResult(Task.CompletedTask),
                 (_, _, _, _) => Task.FromResult(new SessionProcessManager.PromptSubmissionResult(true, 200, System.Text.Encoding.UTF8.GetBytes("{\"prompt_id\":\"prompt-1\"}"), "Prompt submitted")),
                 (_, _, _, _) => { },
                             CancellationToken.None);
@@ -2255,7 +2726,7 @@ public partial class ServiceClientManagerTests
                     await releaseRefresh.Task.ConfigureAwait(false);
                 },
                 (_, _) => { },
-                (_, _, _) => Task.CompletedTask,
+                (_, _, _) => Task.FromResult(Task.CompletedTask),
                 (_, _, _, _) => Task.FromResult(new SessionProcessManager.PromptSubmissionResult(true, 200, System.Text.Encoding.UTF8.GetBytes("{\"prompt_id\":\"prompt-1\"}"), "Prompt submitted")),
                 (_, _, _, _) => { },
                             CancellationToken.None);

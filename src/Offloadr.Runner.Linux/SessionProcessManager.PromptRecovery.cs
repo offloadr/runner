@@ -87,6 +87,27 @@ internal sealed partial class SessionProcessManager
         }
     }
 
+    /// <summary>
+    /// Reads ComfyUI's queue on the tracked runtime. Returns null when the runtime
+    /// is not ComfyUI, is no longer current, or the queue cannot be read, so callers
+    /// treat the answer as unknown.
+    /// </summary>
+    public async Task<ComfyPromptQueue?> ReadComfyPromptQueueAsync(
+        string sessionId,
+        RuntimeIdentity runtime,
+        CancellationToken cancellationToken)
+    {
+        if (!string.Equals(_runtimeKind, "comfyui", StringComparison.Ordinal) || !IsTrackedRuntime(sessionId, runtime))
+            return null;
+        using var request = new HttpRequestMessage(HttpMethod.Get, new UriBuilder("http", _readyHost, _comfyPort, "api/queue").Uri);
+        using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode) return null;
+        var payload = await TryReadNativeResponseBytesAsync(response.Content, cancellationToken).ConfigureAwait(false);
+        // A replacement child answers on the same port; its queue says nothing
+        // about this runtime's prompts.
+        return payload is null || !IsTrackedRuntime(sessionId, runtime) ? null : ComfyPromptQueue.TryParse(payload);
+    }
+
     private static async Task<byte[]> ReadNativeResponseBytesAsync(HttpContent content, CancellationToken cancellationToken)
         => await TryReadNativeResponseBytesAsync(content, cancellationToken).ConfigureAwait(false)
             ?? throw new InvalidOperationException("The native response exceeds the retained response limit; its result is uncertain.");

@@ -29,6 +29,93 @@ public sealed class PromptCommandWorkSetTests
         Assert.That(capturedSession, Is.EqualTo("original"));
     }
 
+    [TestCase("withdraw")]
+    [TestCase("stop")]
+    public async Task HeldDemandLetsRecoveryRunAndStaysWithdrawable(string withdrawal)
+    {
+        // An accepted prompt keeps only its model demand after its command ends, so a
+        // recovery delivery of the same command must start instead of being refused.
+        var work = new PromptCommandWorkSet(CancellationToken.None);
+        var command = new SubmitPromptCommand { CommandId = "accepted", SessionId = "session" };
+        CancellationToken demandToken = default;
+        var settled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var commandEnded = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Assert.That(work.Start(command, (captured, _, demand) =>
+        {
+            demandToken = demand;
+            var settling = Task.Delay(Timeout.Infinite, demand).ContinueWith(_ => settled.SetResult());
+            work.HoldDemand(captured.CommandId, settling);
+            commandEnded.SetResult();
+            return Task.CompletedTask;
+        }), Is.True);
+        await commandEnded.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        var recovered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await WaitUntilStartedAsync(() => work.Start(command, (_, _) =>
+        {
+            recovered.TrySetResult();
+            return Task.CompletedTask;
+        }));
+        await recovered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.That(demandToken.IsCancellationRequested, Is.False, "Recovery leaves the held demand in place.");
+
+        if (withdrawal == "withdraw")
+            work.WithdrawDemand(prompt => prompt.CommandId == "accepted");
+        else
+            await work.CancelAndWaitAsync(prompt => prompt.SessionId == "session").WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.That(demandToken.IsCancellationRequested, Is.True);
+        await settled.Task.WaitAsync(TimeSpan.FromSeconds(2));
+    }
+
+    private static async Task WaitUntilStartedAsync(Func<bool> start)
+    {
+        // The original work leaves the active set just after its body returns.
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(2);
+        while (!start())
+        {
+            if (DateTime.UtcNow >= deadline) Assert.Fail("The recovery delivery was refused as a duplicate.");
+            await Task.Delay(10);
+        }
+    }
+
+    [Test]
+    public async Task InterruptLeavesModelDemandWhileStopAndTerminalEventWithdrawIt()
+    {
+        var work = new PromptCommandWorkSet(CancellationToken.None);
+        var tokens = new Dictionary<string, (CancellationToken Physical, CancellationToken Demand)>();
+        var entered = new CountdownEvent(2);
+        foreach (var name in new[] { "queued", "finished" })
+            Assert.That(work.Start(new() { CommandId = name, SessionId = "session" }, async (_, physical, demand) =>
+            {
+                lock (tokens) tokens[name] = (physical, demand);
+                entered.Signal();
+                try { await Task.Delay(Timeout.Infinite, demand); }
+                catch (OperationCanceledException) { }
+            }), Is.True);
+        Assert.That(entered.Wait(TimeSpan.FromSeconds(2)), Is.True);
+
+        // A runtime interrupt stops only its executing prompt; queued ones keep their demand.
+        work.Cancel(_ => true);
+        Assert.Multiple(() =>
+        {
+            Assert.That(tokens["queued"].Physical.IsCancellationRequested, Is.True);
+            Assert.That(tokens["queued"].Demand.IsCancellationRequested, Is.False);
+        });
+
+        // The interrupted prompt's terminal event withdraws only its own demand.
+        work.WithdrawDemand(command => command.CommandId == "finished");
+        Assert.Multiple(() =>
+        {
+            Assert.That(tokens["finished"].Demand.IsCancellationRequested, Is.True);
+            Assert.That(tokens["queued"].Demand.IsCancellationRequested, Is.False);
+        });
+
+        var queuedDemand = tokens["queued"].Demand;
+        await work.CancelAndWaitAsync(command => command.SessionId == "session").WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.That(queuedDemand.IsCancellationRequested, Is.True, "Stop withdraws every matching demand.");
+    }
+
     [Test]
     public async Task StopJoinsEveryMatchingPhysicalRequestBeforeReplacement()
     {
