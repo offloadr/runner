@@ -225,7 +225,7 @@ public sealed class PromptExecutionPermissionTests
             observe ?? ((_, _) => throw new AssertionException("Unexpected recovery")),
             (_, _, _, _) => Task.CompletedTask, (_, _, _) => { }, _ => { },
             (_, _, _, _) => Task.CompletedTask, (_, _, _, _, _) => Task.CompletedTask,
-            captureRefresh ?? (_ => () => Task.CompletedTask), (_, _) => { }, (_, _, _) => Task.CompletedTask,
+            captureRefresh ?? (_ => () => Task.CompletedTask), (_, _) => { }, (_, _, _) => Task.FromResult(Task.CompletedTask),
             (captured, _, onNativeRequestAttempt, token) =>
             {
                 if (nativeRequestAttempted) onNativeRequestAttempt();

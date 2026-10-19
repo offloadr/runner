@@ -3062,7 +3062,7 @@ internal static class ServiceClientManager
         Func<string, string, string?, IEnumerable<EditorArtifactMetadata>, CancellationToken, Task> seedSessionArtifacts,
         Func<string, Func<Task>> captureSessionArtifactRefresh,
         Action<string, IEnumerable<ModelDownloadRequest>> registerDownloads,
-        Func<IEnumerable<ModelDownloadRequest>, CancellationToken, bool, Task> preparePromptDownloads,
+        Func<IEnumerable<ModelDownloadRequest>, CancellationToken, bool, Task<Task>> preparePromptDownloads,
         Func<SubmitPromptCommand, Func<string, ReadOnlyMemory<byte>, CancellationToken, Task>?, Action, CancellationToken, Task<SessionProcessManager.PromptSubmissionResult>> submitPrompt,
         Action<string, string, string, string> mapPrompt,
         CancellationToken cancellationToken,
@@ -3142,6 +3142,10 @@ internal static class ServiceClientManager
 
         string? clientId = null;
         var nativeInvocationStarted = false;
+        // Prompt model demand outlives preparation; this work owns its lifetime.
+        using var promptDemandLifetime = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        Task? promptDemand = null;
+        var keepPromptDemand = false;
         using var forgeEvidence = ShouldStreamHttpResponse(prompt)
             ? new ForgePromptEvidenceReader(prompt.NativeIdentifiers.SessionHash) : null;
 
@@ -3190,7 +3194,7 @@ internal static class ServiceClientManager
                     await TryRefreshSessionArtifactsBeforePromptAsync(prompt.SessionId, RefreshCapturedArtifacts, cancellationToken).ConfigureAwait(false);
                 }
 
-                await preparePromptDownloads(remoteDownloads, cancellationToken, false).ConfigureAwait(false);
+                promptDemand = await preparePromptDownloads(remoteDownloads, promptDemandLifetime.Token, false).ConfigureAwait(false);
             }
             cancellationToken.ThrowIfCancellationRequested();
             var result = await submitPrompt(
@@ -3224,6 +3228,7 @@ internal static class ServiceClientManager
             : null,
                 () => nativeInvocationStarted = true,
                 cancellationToken).ConfigureAwait(false);
+            keepPromptDemand = result.Success;
             ack.Result = new()
             {
                 Outcome = PromptInvocationOutcome.NativeResponse,
@@ -3286,6 +3291,40 @@ internal static class ServiceClientManager
         catch (Exception ex)
         {
             RunnerLog.Warning(nameof(ServiceClientManager), $"Prompt acknowledgement unavailable ({ex.GetType().Name}); recover its receipt.");
+        }
+
+        await SettlePromptDemandAsync(promptDemand, keepPromptDemand, promptDemandLifetime).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// A queued prompt keeps its ordered model demand until hydration settles, after
+    /// its acknowledgement was handed over. Interrupt and Stop cancel this prompt work
+    /// and withdraw the demand; a rejected or failed prompt withdraws it at once.
+    /// </summary>
+    internal static async Task SettlePromptDemandAsync(Task? demand, bool keep, CancellationTokenSource lifetime)
+    {
+        if (demand is null)
+        {
+            return;
+        }
+
+        if (!keep)
+        {
+            lifetime.Cancel();
+        }
+
+        try
+        {
+            await demand.ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (lifetime.IsCancellationRequested) { }
+        catch (Exception ex)
+        {
+            RunnerLog.Warning(nameof(ServiceClientManager), $"Prompt model hydration ended with {ex.GetType().Name}; managed reads remain gated.");
+        }
+        finally
+        {
+            lifetime.Cancel();
         }
     }
 

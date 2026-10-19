@@ -385,13 +385,18 @@ internal sealed class ModelDownloadService : IAsyncDisposable
            ?? [];
 
     /// <summary>
-    /// Prepares a prompt's model dependencies before its native invocation.
-    /// Conventional downloads complete first because nothing gates their reads.
-    /// Range-managed models are demanded in prompt order but not awaited: the VFS
-    /// shim gates their reads and mappings, so a large first download cannot hold
-    /// the native response past the editor's own request timeout.
+    /// Prepares a prompt's model dependencies before its native invocation and
+    /// returns their hydration completion. Conventional downloads complete first
+    /// because nothing gates their reads. Range-managed models are demanded in
+    /// prompt order but not awaited: the VFS shim gates their reads and mappings,
+    /// so a large first download cannot hold the native response past the editor's
+    /// own request timeout. The demand lasts until its completion settles or
+    /// <paramref name="demandCancellation"/> withdraws it.
     /// </summary>
-    public async Task PreparePromptDownloadsAsync(IEnumerable<ModelDownloadRequest> downloads, CancellationToken cancellationToken, bool highPriority)
+    public async Task<Task> PreparePromptDownloadsAsync(
+        IEnumerable<ModelDownloadRequest> downloads,
+        CancellationToken demandCancellation,
+        bool highPriority)
     {
         var snapshot = FilterRemoteDownloadRequests(downloads);
         ConfineDestinations(snapshot);
@@ -399,35 +404,35 @@ internal sealed class ModelDownloadService : IAsyncDisposable
         Task conventional;
         lock (_conventionalPlaceholderGate)
         {
-            conventional = EnsureConventionalDownloadsAsync(full, cancellationToken, highPriority);
+            conventional = EnsureConventionalDownloadsAsync(full, demandCancellation, highPriority);
             TrackConventionalOperation(full, conventional);
         }
 
         var demand = _hydrationCoordinator?.RequestPromptDownloadsAsync(
             _fullDownloadCoordinator.GetActiveSessionId(),
             managed,
-            cancellationToken) ?? Task.FromResult(Task.CompletedTask);
+            demandCancellation) ?? Task.FromResult(Task.CompletedTask);
         try
         {
             await Task.WhenAll(conventional, demand).ConfigureAwait(false);
         }
-        finally
+        catch
         {
+            // The caller never receives this completion; observe a later fault.
             if (demand.IsCompletedSuccessfully)
             {
-                ObservePromptHydration(demand.Result);
+                _ = demand.Result.ContinueWith(
+                    static task => _ = task.Exception,
+                    CancellationToken.None,
+                    TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+                    TaskScheduler.Default);
             }
-        }
-    }
 
-    private static void ObservePromptHydration(Task completion)
-        => _ = completion.ContinueWith(
-            static task => RunnerLog.Warning(
-                nameof(ModelDownloadService),
-                $"Prompt model hydration ended with {task.Exception?.InnerException?.GetType().Name}; managed reads remain gated."),
-            CancellationToken.None,
-            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
-            TaskScheduler.Default);
+            throw;
+        }
+
+        return demand.Result;
+    }
 
     public Task EnsureDownloadedAsync(string destinationPath, CancellationToken cancellationToken, bool highPriority)
     {

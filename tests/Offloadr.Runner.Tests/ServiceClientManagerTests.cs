@@ -1224,6 +1224,120 @@ public partial class ServiceClientManagerTests
         });
     }
 
+    private static Task HandlePromptWithDemandAsync(
+        Func<CancellationToken, Task> demand,
+        int nativeStatus,
+        Action<Offloadr.Runner.V1.AcknowledgePromptResultRequest> acknowledged,
+        CancellationToken cancellationToken)
+    {
+        var prompt = new Offloadr.Runner.V1.SubmitPromptCommand
+        {
+            SessionId = PromptSessionId,
+            SubmissionId = PromptSubmissionId,
+            EditorSid = "editor-1",
+            PromptJson = "{}"
+        };
+        return ServiceClientManager.HandleSubmitEditorActionAsync(
+            (ack, _) => { acknowledged(ack); return Task.CompletedTask; },
+            (_, _) => Task.CompletedTask,
+            WithPromptIdentity(prompt),
+            PromptRunnerId,
+            GrantPromptForTestAsync,
+            (_, _) => Task.CompletedTask,
+            (_, _) => Task.CompletedTask,
+            (_, _, _, _) => Task.CompletedTask,
+            (_, _, _) => { },
+            _ => { },
+            (_, _, _, _) => Task.CompletedTask,
+            (_, _, _, _, _) => Task.CompletedTask,
+            _ => () => Task.CompletedTask,
+            (_, _) => { },
+            (_, token, _) => Task.FromResult(demand(token)),
+            (_, _, _, _) => Task.FromResult(new SessionProcessManager.PromptSubmissionResult(
+                nativeStatus is >= 200 and < 300, nativeStatus, "{}"u8.ToArray(), "native")),
+            (_, _, _, _) => { },
+            cancellationToken);
+    }
+
+    private static async Task WaitForConditionAsync(Func<bool> condition, TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (!condition())
+        {
+            if (DateTime.UtcNow >= deadline) throw new TimeoutException("Timed out waiting for the expected condition.");
+            await Task.Delay(10);
+        }
+    }
+
+    [Test]
+    public async Task HandleSubmitEditorActionAsync_RejectedPromptWithdrawsItsModelDemand()
+    {
+        var demandToken = CancellationToken.None;
+        Offloadr.Runner.V1.AcknowledgePromptResultRequest? capturedAck = null;
+        using var cts = new CancellationTokenSource();
+
+        await HandlePromptWithDemandAsync(
+            token => { demandToken = token; return Task.Delay(Timeout.InfiniteTimeSpan, token); },
+            nativeStatus: 400,
+            ack => capturedAck = ack,
+            cts.Token).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(capturedAck?.Result.NativeResponse.StatusCode, Is.EqualTo(400));
+            Assert.That(demandToken.IsCancellationRequested, Is.True);
+            Assert.That(cts.IsCancellationRequested, Is.False);
+        });
+    }
+
+    [Test]
+    public async Task HandleSubmitEditorActionAsync_QueuedPromptKeepsModelDemandUntilHydrationSettles()
+    {
+        var demandToken = CancellationToken.None;
+        var hydration = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Offloadr.Runner.V1.AcknowledgePromptResultRequest? capturedAck = null;
+        using var cts = new CancellationTokenSource();
+
+        var handled = HandlePromptWithDemandAsync(
+            token => { demandToken = token; return hydration.Task; },
+            nativeStatus: 200,
+            ack => capturedAck = ack,
+            cts.Token);
+        await WaitForConditionAsync(() => capturedAck is not null, TimeSpan.FromSeconds(5));
+
+        // The native result is acknowledged before hydration; demand stays published.
+        Assert.Multiple(() =>
+        {
+            Assert.That(capturedAck!.Result.NativeResponse.StatusCode, Is.EqualTo(200));
+            Assert.That(handled.IsCompleted, Is.False);
+            Assert.That(demandToken.IsCancellationRequested, Is.False);
+        });
+
+        hydration.SetResult();
+        await handled.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Test]
+    public async Task HandleSubmitEditorActionAsync_CancelledPromptWorkWithdrawsQueuedModelDemand()
+    {
+        var demandToken = CancellationToken.None;
+        Offloadr.Runner.V1.AcknowledgePromptResultRequest? capturedAck = null;
+        using var cts = new CancellationTokenSource();
+
+        var handled = HandlePromptWithDemandAsync(
+            token => { demandToken = token; return Task.Delay(Timeout.InfiniteTimeSpan, token); },
+            nativeStatus: 200,
+            ack => capturedAck = ack,
+            cts.Token);
+        await WaitForConditionAsync(() => capturedAck is not null, TimeSpan.FromSeconds(5));
+        Assert.That(handled.IsCompleted, Is.False);
+
+        // Interrupt and Stop cancel active prompt work, which withdraws its demand.
+        cts.Cancel();
+        await handled.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.That(demandToken.IsCancellationRequested, Is.True);
+    }
+
     [Test]
     public async Task HandleSubmitEditorActionAsync_RecordsNotExecutedWhenPreparationIsCancelledBeforeNativeInvocation()
     {
@@ -1263,7 +1377,7 @@ public partial class ServiceClientManagerTests
             (_, _, _, _, _) => Task.CompletedTask,
             _ => () => Task.CompletedTask,
             (_, _) => { },
-            (_, token, _) => { cts.Cancel(); return Task.FromCanceled(token); },
+            (_, token, _) => { cts.Cancel(); return Task.FromCanceled<Task>(token); },
             (_, _, _, _) =>
             {
                 submitCalls++;
@@ -1323,7 +1437,7 @@ public partial class ServiceClientManagerTests
             (_, _, _, _, _) => Task.CompletedTask,
             _ => () => Task.CompletedTask,
             (_, _) => { },
-            (_, token, _) => Task.FromCanceled(token),
+            (_, token, _) => Task.FromCanceled<Task>(token),
             (_, _, _, _) => throw new AssertionException("No permission response can authorize native execution"),
             (_, _, _, _) => { },
                         cts.Token);
@@ -1376,7 +1490,7 @@ public partial class ServiceClientManagerTests
             (_, _, _, _, _) => Task.CompletedTask,
             _ => () => Task.CompletedTask,
             (_, _) => { },
-            (_, _, _) => Task.CompletedTask,
+            (_, _, _) => Task.FromResult(Task.CompletedTask),
             (_, _, _, _) =>
             {
                 nativeCalls++;
@@ -1442,7 +1556,7 @@ public partial class ServiceClientManagerTests
             (downloads, _, _) =>
             {
                 ensuredDownloads = downloads.ToArray();
-                return Task.CompletedTask;
+                return Task.FromResult(Task.CompletedTask);
             },
             (_, _, _, _) => Task.FromResult(new SessionProcessManager.PromptSubmissionResult(true, 200, System.Text.Encoding.UTF8.GetBytes("{}"), "Prompt submitted")),
             (_, _, _, _) => { },
@@ -1543,7 +1657,7 @@ public partial class ServiceClientManagerTests
                     return Task.CompletedTask;
                 },
                 (_, _) => { },
-                (_, _, _) => Task.CompletedTask,
+                (_, _, _) => Task.FromResult(Task.CompletedTask),
                 (_, _, _, _) => Task.FromResult(new SessionProcessManager.PromptSubmissionResult(true, 200, System.Text.Encoding.UTF8.GetBytes("{\"prompt_id\":\"prompt-1\"}"), "Prompt submitted")),
                 (_, _, promptId, submissionId) =>
                 {
@@ -1605,7 +1719,7 @@ public partial class ServiceClientManagerTests
             (_, _, _, _, _) => Task.CompletedTask,
             _ => () => Task.CompletedTask,
             (_, _) => { },
-            (_, _, _) => Task.CompletedTask,
+            (_, _, _) => Task.FromResult(Task.CompletedTask),
             async (_, responseEventSink, _, token) =>
             {
                 sinkWasProvided = responseEventSink is not null;
@@ -1654,7 +1768,7 @@ public partial class ServiceClientManagerTests
             (_, _) => throw new AssertionException("Unexpected recovery"),
             (_, _, _, _) => Task.CompletedTask, (_, _, _) => { }, _ => { },
             (_, _, _, _) => Task.CompletedTask, (_, _, _, _, _) => Task.CompletedTask,
-            _ => () => Task.CompletedTask, (_, _) => { }, (_, _, _) => Task.CompletedTask,
+            _ => () => Task.CompletedTask, (_, _) => { }, (_, _, _) => Task.FromResult(Task.CompletedTask),
             async (_, stream, _, token) =>
             {
                 await stream!(ServiceClientManager.HttpResponseChunkEventType,
@@ -1701,7 +1815,7 @@ public partial class ServiceClientManagerTests
             (_, _) => throw new AssertionException("Unexpected recovery"),
             (_, _, _, _) => Task.CompletedTask, (_, _, _) => { }, _ => { },
             (_, _, _, _) => Task.CompletedTask, (_, _, _, _, _) => Task.CompletedTask,
-            _ => () => Task.CompletedTask, (_, _) => { }, (_, _, _) => Task.CompletedTask,
+            _ => () => Task.CompletedTask, (_, _) => { }, (_, _, _) => Task.FromResult(Task.CompletedTask),
             async (_, stream, onNativeRequestAttempt, token) =>
             {
                 onNativeRequestAttempt();
@@ -1765,7 +1879,7 @@ public partial class ServiceClientManagerTests
             },
             _ => () => Task.CompletedTask,
             (_, _) => { },
-            (_, _, _) => Task.CompletedTask,
+            (_, _, _) => Task.FromResult(Task.CompletedTask),
             (_, _, _, _) => Task.FromResult(new SessionProcessManager.PromptSubmissionResult(true, 200, System.Text.Encoding.UTF8.GetBytes("{}"), "Prompt submitted")),
             (_, _, _, _) => { },
                         CancellationToken.None);
@@ -1817,7 +1931,7 @@ public partial class ServiceClientManagerTests
                 return Task.CompletedTask;
             },
             (_, _) => { },
-            (_, _, _) => Task.CompletedTask,
+            (_, _, _) => Task.FromResult(Task.CompletedTask),
             (_, _, _, _) =>
             {
                 order.Add("submit");
@@ -1861,7 +1975,7 @@ public partial class ServiceClientManagerTests
             (_, _, _, _, _) => { preparationCalls++; return Task.CompletedTask; },
             _ => () => { preparationCalls++; return Task.CompletedTask; },
             (_, _) => preparationCalls++,
-            (_, _, _) => { preparationCalls++; return Task.CompletedTask; },
+            (_, _, _) => { preparationCalls++; return Task.FromResult(Task.CompletedTask); },
             (_, _, _, _) =>
             {
                 submitCalls++;
@@ -2088,7 +2202,7 @@ public partial class ServiceClientManagerTests
                     return Task.CompletedTask;
                 },
                 (_, _) => { },
-                (_, _, _) => Task.CompletedTask,
+                (_, _, _) => Task.FromResult(Task.CompletedTask),
                 (_, _, _, _) => Task.FromResult(new SessionProcessManager.PromptSubmissionResult(true, 200, System.Text.Encoding.UTF8.GetBytes("{\"prompt_id\":\"prompt-1\"}"), "Prompt submitted")),
                 (_, _, _, _) => { },
                             CancellationToken.None);
@@ -2144,7 +2258,7 @@ public partial class ServiceClientManagerTests
                     return Task.CompletedTask;
                 },
                 (_, _) => { },
-                (_, _, _) => Task.CompletedTask,
+                (_, _, _) => Task.FromResult(Task.CompletedTask),
                 (_, _, _, _) => Task.FromResult(new SessionProcessManager.PromptSubmissionResult(
                     true,
                     200,
@@ -2199,7 +2313,7 @@ public partial class ServiceClientManagerTests
                 (_, _, _, _, _) => Task.CompletedTask,
                 _ => () => throw new InvalidOperationException("refresh failed"),
                 (_, _) => { },
-                (_, _, _) => Task.CompletedTask,
+                (_, _, _) => Task.FromResult(Task.CompletedTask),
                 (_, _, _, _) => Task.FromResult(new SessionProcessManager.PromptSubmissionResult(true, 200, System.Text.Encoding.UTF8.GetBytes("{\"prompt_id\":\"prompt-1\"}"), "Prompt submitted")),
                 (_, _, _, _) => { },
                             CancellationToken.None);
@@ -2255,7 +2369,7 @@ public partial class ServiceClientManagerTests
                     await releaseRefresh.Task.ConfigureAwait(false);
                 },
                 (_, _) => { },
-                (_, _, _) => Task.CompletedTask,
+                (_, _, _) => Task.FromResult(Task.CompletedTask),
                 (_, _, _, _) => Task.FromResult(new SessionProcessManager.PromptSubmissionResult(true, 200, System.Text.Encoding.UTF8.GetBytes("{\"prompt_id\":\"prompt-1\"}"), "Prompt submitted")),
                 (_, _, _, _) => { },
                             CancellationToken.None);
