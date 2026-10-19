@@ -30,6 +30,43 @@ public sealed class PromptCommandWorkSetTests
     }
 
     [Test]
+    public async Task InterruptLeavesModelDemandWhileStopAndTerminalEventWithdrawIt()
+    {
+        var work = new PromptCommandWorkSet(CancellationToken.None);
+        var tokens = new Dictionary<string, (CancellationToken Physical, CancellationToken Demand)>();
+        var entered = new CountdownEvent(2);
+        foreach (var name in new[] { "queued", "finished" })
+            Assert.That(work.Start(new() { CommandId = name, SessionId = "session" }, async (_, physical, demand) =>
+            {
+                lock (tokens) tokens[name] = (physical, demand);
+                entered.Signal();
+                try { await Task.Delay(Timeout.Infinite, demand); }
+                catch (OperationCanceledException) { }
+            }), Is.True);
+        Assert.That(entered.Wait(TimeSpan.FromSeconds(2)), Is.True);
+
+        // A runtime interrupt stops only its executing prompt; queued ones keep their demand.
+        work.Cancel(_ => true);
+        Assert.Multiple(() =>
+        {
+            Assert.That(tokens["queued"].Physical.IsCancellationRequested, Is.True);
+            Assert.That(tokens["queued"].Demand.IsCancellationRequested, Is.False);
+        });
+
+        // The interrupted prompt's terminal event withdraws only its own demand.
+        work.WithdrawDemand(command => command.CommandId == "finished");
+        Assert.Multiple(() =>
+        {
+            Assert.That(tokens["finished"].Demand.IsCancellationRequested, Is.True);
+            Assert.That(tokens["queued"].Demand.IsCancellationRequested, Is.False);
+        });
+
+        var queuedDemand = tokens["queued"].Demand;
+        await work.CancelAndWaitAsync(command => command.SessionId == "session").WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.That(queuedDemand.IsCancellationRequested, Is.True, "Stop withdraws every matching demand.");
+    }
+
+    [Test]
     public async Task StopJoinsEveryMatchingPhysicalRequestBeforeReplacement()
     {
         var work = new PromptCommandWorkSet(CancellationToken.None);

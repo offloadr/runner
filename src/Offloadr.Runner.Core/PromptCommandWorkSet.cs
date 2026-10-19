@@ -13,6 +13,7 @@ internal sealed class PromptCommandWorkSet(CancellationToken shutdown)
     {
         public SubmitPromptCommand Command { get; } = command.Clone();
         public CancellationTokenSource Cancellation { get; } = CancellationTokenSource.CreateLinkedTokenSource(shutdown);
+        public CancellationTokenSource Demand { get; } = CancellationTokenSource.CreateLinkedTokenSource(shutdown);
         public TaskCompletionSource Completion { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
     }
 
@@ -20,6 +21,15 @@ internal sealed class PromptCommandWorkSet(CancellationToken shutdown)
     private readonly Dictionary<string, Work> active = new(StringComparer.Ordinal);
 
     public bool Start(SubmitPromptCommand command, Func<SubmitPromptCommand, CancellationToken, Task> execute)
+        => Start(command, (captured, physical, _) => execute(captured, physical));
+
+    /// <summary>
+    /// Starts prompt work with two tokens: the physical one, cancelled by
+    /// <see cref="Cancel"/> (interrupt) and <see cref="CancelAndWaitAsync"/>, and
+    /// the demand one for the prompt's model demand once the runtime accepted it,
+    /// cancelled only by <see cref="CancelAndWaitAsync"/> and <see cref="WithdrawDemand"/>.
+    /// </summary>
+    public bool Start(SubmitPromptCommand command, Func<SubmitPromptCommand, CancellationToken, CancellationToken, Task> execute)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(command.CommandId);
         Work work;
@@ -33,11 +43,22 @@ internal sealed class PromptCommandWorkSet(CancellationToken shutdown)
         return true;
     }
 
+    /// <summary>
+    /// Cancels physical work. A runtime interrupt stops only the prompt it is
+    /// executing, so accepted prompts that wait in its queue keep their demand.
+    /// </summary>
     public void Cancel(Func<SubmitPromptCommand, bool> matches)
     {
         lock (gate)
             foreach (var work in active.Values.Where(work => matches(work.Command)).ToArray())
                 work.Cancellation.Cancel();
+    }
+
+    public void WithdrawDemand(Func<SubmitPromptCommand, bool> matches)
+    {
+        lock (gate)
+            foreach (var work in active.Values.Where(work => matches(work.Command)).ToArray())
+                work.Demand.Cancel();
     }
 
     public Task CancelAndWaitAsync(Func<SubmitPromptCommand, bool> matches)
@@ -47,16 +68,20 @@ internal sealed class PromptCommandWorkSet(CancellationToken shutdown)
         {
             var matching = active.Values.Where(work => matches(work.Command)).ToArray();
             tasks = matching.Select(work => work.Completion.Task).ToArray();
-            foreach (var work in matching) work.Cancellation.Cancel();
+            foreach (var work in matching)
+            {
+                work.Cancellation.Cancel();
+                work.Demand.Cancel();
+            }
         }
         return Task.WhenAll(tasks);
     }
 
-    private async Task RunAsync(Work work, Func<SubmitPromptCommand, CancellationToken, Task> execute)
+    private async Task RunAsync(Work work, Func<SubmitPromptCommand, CancellationToken, CancellationToken, Task> execute)
     {
         try
         {
-            await execute(work.Command, work.Cancellation.Token).ConfigureAwait(false);
+            await execute(work.Command, work.Cancellation.Token, work.Demand.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (work.Cancellation.IsCancellationRequested) { }
         catch (Exception ex)
@@ -71,6 +96,7 @@ internal sealed class PromptCommandWorkSet(CancellationToken shutdown)
             {
                 active.Remove(work.Command.CommandId);
                 work.Cancellation.Dispose();
+                work.Demand.Dispose();
             }
             work.Completion.TrySetResult();
         }

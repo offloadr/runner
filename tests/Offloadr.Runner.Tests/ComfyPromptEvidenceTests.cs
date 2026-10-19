@@ -108,6 +108,8 @@ public sealed class ComfyPromptEvidenceTests
             return Task.CompletedTask;
         });
         relay.AttachSink(sink);
+        var finished = new TaskCompletionSource<SubmitPromptCommand>(TaskCreationOptions.RunContinuationsAsynchronously);
+        relay.PromptFinished += prompt => finished.TrySetResult(prompt);
         await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", command.Target.GpuGeneration,
             command.Target.RuntimeEpoch, command.Target.RuntimeInstanceId, [], CancellationToken.None);
         var context = await listener.GetContextAsync().WaitAsync(TimeSpan.FromSeconds(3));
@@ -123,8 +125,12 @@ public sealed class ComfyPromptEvidenceTests
             await socket.SendAsync(ByteString.CopyFromUtf8(payload).Memory, WebSocketMessageType.Text, true, CancellationToken.None);
             var captured = await reporting.Task.WaitAsync(TimeSpan.FromSeconds(3));
             var live = await deliveredFrame.Task.WaitAsync(TimeSpan.FromSeconds(3));
+            // The terminal event ends the prompt's model demand.
+            var ended = await finished.Task.WaitAsync(TimeSpan.FromSeconds(3));
             Assert.Multiple(() =>
             {
+                Assert.That(ended.CommandId, Is.EqualTo(command.CommandId));
+                Assert.That(ended.SubmissionId, Is.EqualTo(command.SubmissionId));
                 Assert.That(live.Payload.ToStringUtf8(), Is.EqualTo(payload));
                 Assert.That(captured.Evidence.NativePayload, Is.EqualTo(live.Payload));
                 Assert.That(captured.Target, Is.EqualTo(command.Target));

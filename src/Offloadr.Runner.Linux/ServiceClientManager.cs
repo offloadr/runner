@@ -922,6 +922,13 @@ internal static class ServiceClientManager
         var initialStatusApplied = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var commandWorkState = new RunnerCommandWorkState(shutdown);
         sessionEventRelay.AttachSink(sessionSink);
+        // ComfyUI's terminal event (success, error or interrupted) ends an
+        // accepted prompt's model demand; a global interrupt alone cannot tell
+        // which accepted prompt it stopped.
+        void WithdrawFinishedPromptDemand(SubmitPromptCommand finished)
+            => commandWorkState.Prompts.WithdrawDemand(prompt =>
+                prompt.CommandId == finished.CommandId && prompt.SubmissionId == finished.SubmissionId);
+        sessionEventRelay.PromptFinished += WithdrawFinishedPromptDemand;
         sessionProcessLogRelay.AttachSink(sessionSink);
         runnerLogRelay.AttachSink(sessionSink);
         sessionRuntimeTelemetryRelay.AttachSink(sessionSink);
@@ -1050,6 +1057,7 @@ internal static class ServiceClientManager
 
             downloadService.ProgressReporter = null;
             downloadService.SetActiveSession(null);
+            sessionEventRelay.PromptFinished -= WithdrawFinishedPromptDemand;
             sessionEventRelay.DetachSink(sessionSink);
             sessionProcessLogRelay.DetachSink(sessionSink);
             runnerLogRelay.DetachSink(sessionSink);
@@ -1472,7 +1480,7 @@ internal static class ServiceClientManager
                     if (evt.SubmitPrompt != null && !string.IsNullOrWhiteSpace(evt.SubmitPrompt.SessionId))
                     {
                         var prompt = evt.SubmitPrompt;
-                        commandWorkState.Prompts.Start(prompt, (captured, physicalCancellation) =>
+                        commandWorkState.Prompts.Start(prompt, (captured, physicalCancellation, demandCancellation) =>
                         {
                             return HandleSubmitEditorActionAsync(
                             (ack, acknowledgementCancellation) =>
@@ -1511,7 +1519,8 @@ internal static class ServiceClientManager
                             localModelProjectionReconciler,
                             sessionId => sessionManager.TryGetSessionPaths(sessionId, out var paths) ? paths : null,
                             shutdown,
-                            sessionEventRelay.UnregisterUninvokedSubmission);
+                            sessionEventRelay.UnregisterUninvokedSubmission,
+                            demandCancellation);
                         });
                     }
                 }
@@ -3069,7 +3078,8 @@ internal static class ServiceClientManager
         Action<IEnumerable<ModelDownloadRequest>, bool>? localModelProjectionReconciler = null,
         Func<string, SessionProcessManager.SessionPaths?>? sessionPathsProvider = null,
         CancellationToken evidenceDeliveryCancellationToken = default,
-        Action<string, string, SubmitPromptCommand>? unregisterUninvokedSubmission = null)
+        Action<string, string, SubmitPromptCommand>? unregisterUninvokedSubmission = null,
+        CancellationToken promptDemandCancellation = default)
     {
         // Reject malformed wire identities before granting or touching a runtime.
         _ = PromptRuntimeMarker.TargetFingerprint(prompt.Target);
@@ -3143,7 +3153,14 @@ internal static class ServiceClientManager
         string? clientId = null;
         var nativeInvocationStarted = false;
         // Prompt model demand outlives preparation; this work owns its lifetime.
-        using var promptDemandLifetime = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        // Until the runtime accepts the prompt, cancelling this work (interrupt,
+        // Stop) withdraws the demand. An accepted prompt may sit in the runtime's
+        // queue, so afterwards only promptDemandCancellation (Stop, replacement,
+        // its terminal event, shutdown) withdraws it.
+        using var promptDemandLifetime = CancellationTokenSource.CreateLinkedTokenSource(promptDemandCancellation);
+        var withdrawDemandUntilAccepted = cancellationToken.Register(
+            static lifetime => ((CancellationTokenSource)lifetime!).Cancel(),
+            promptDemandLifetime);
         Task? promptDemand = null;
         var keepPromptDemand = false;
         using var forgeEvidence = ShouldStreamHttpResponse(prompt)
@@ -3229,6 +3246,10 @@ internal static class ServiceClientManager
                 () => nativeInvocationStarted = true,
                 cancellationToken).ConfigureAwait(false);
             keepPromptDemand = result.Success;
+            if (keepPromptDemand)
+            {
+                withdrawDemandUntilAccepted.Dispose();
+            }
             ack.Result = new()
             {
                 Outcome = PromptInvocationOutcome.NativeResponse,
@@ -3293,18 +3314,22 @@ internal static class ServiceClientManager
             RunnerLog.Warning(nameof(ServiceClientManager), $"Prompt acknowledgement unavailable ({ex.GetType().Name}); recover its receipt.");
         }
 
+        withdrawDemandUntilAccepted.Dispose();
         await SettlePromptDemandAsync(promptDemand, keepPromptDemand, promptDemandLifetime).ConfigureAwait(false);
     }
 
     /// <summary>
     /// A queued prompt keeps its ordered model demand until hydration settles, after
-    /// its acknowledgement was handed over. Interrupt and Stop cancel this prompt work
-    /// and withdraw the demand; a rejected or failed prompt withdraws it at once.
+    /// its acknowledgement was handed over, or until Stop or its terminal event
+    /// withdraws it. A rejected or failed prompt withdraws it at once.
     /// </summary>
     internal static async Task SettlePromptDemandAsync(Task? demand, bool keep, CancellationTokenSource lifetime)
     {
         if (demand is null)
         {
+            // Preparation can fail after publishing managed demand without handing
+            // its completion over (a failed conventional download); withdraw it.
+            lifetime.Cancel();
             return;
         }
 

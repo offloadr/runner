@@ -1228,7 +1228,9 @@ public partial class ServiceClientManagerTests
         Func<CancellationToken, Task> demand,
         int nativeStatus,
         Action<Offloadr.Runner.V1.AcknowledgePromptResultRequest> acknowledged,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        CancellationToken demandCancellation = default,
+        Func<CancellationToken, Task<Task>>? prepare = null)
     {
         var prompt = new Offloadr.Runner.V1.SubmitPromptCommand
         {
@@ -1252,11 +1254,12 @@ public partial class ServiceClientManagerTests
             (_, _, _, _, _) => Task.CompletedTask,
             _ => () => Task.CompletedTask,
             (_, _) => { },
-            (_, token, _) => Task.FromResult(demand(token)),
+            (_, token, _) => prepare is null ? Task.FromResult(demand(token)) : prepare(token),
             (_, _, _, _) => Task.FromResult(new SessionProcessManager.PromptSubmissionResult(
                 nativeStatus is >= 200 and < 300, nativeStatus, "{}"u8.ToArray(), "native")),
             (_, _, _, _) => { },
-            cancellationToken);
+            cancellationToken,
+            promptDemandCancellation: demandCancellation);
     }
 
     private static async Task WaitForConditionAsync(Func<bool> condition, TimeSpan timeout)
@@ -1318,24 +1321,94 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
-    public async Task HandleSubmitEditorActionAsync_CancelledPromptWorkWithdrawsQueuedModelDemand()
+    public async Task HandleSubmitEditorActionAsync_InterruptAfterAcceptanceKeepsQueuedModelDemand()
     {
         var demandToken = CancellationToken.None;
         Offloadr.Runner.V1.AcknowledgePromptResultRequest? capturedAck = null;
-        using var cts = new CancellationTokenSource();
+        using var physical = new CancellationTokenSource();
+        using var demand = new CancellationTokenSource();
 
         var handled = HandlePromptWithDemandAsync(
             token => { demandToken = token; return Task.Delay(Timeout.InfiniteTimeSpan, token); },
             nativeStatus: 200,
             ack => capturedAck = ack,
-            cts.Token);
+            physical.Token,
+            demand.Token);
         await WaitForConditionAsync(() => capturedAck is not null, TimeSpan.FromSeconds(5));
-        Assert.That(handled.IsCompleted, Is.False);
 
-        // Interrupt and Stop cancel active prompt work, which withdraws its demand.
-        cts.Cancel();
+        // ComfyUI's interrupt stops only its executing prompt; this one may still
+        // be queued, so cancelling its physical work keeps the demand.
+        physical.Cancel();
+        await Task.Delay(100);
+        Assert.Multiple(() =>
+        {
+            Assert.That(handled.IsCompleted, Is.False);
+            Assert.That(demandToken.IsCancellationRequested, Is.False);
+        });
+
+        // Stop or the prompt's terminal event withdraws it.
+        demand.Cancel();
         await handled.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.That(demandToken.IsCancellationRequested, Is.True);
+    }
+
+    [Test]
+    public async Task HandleSubmitEditorActionAsync_InterruptBeforeAcceptanceWithdrawsModelDemand()
+    {
+        var demandToken = CancellationToken.None;
+        var acknowledged = false;
+        using var physical = new CancellationTokenSource();
+        using var demand = new CancellationTokenSource();
+
+        await HandlePromptWithDemandAsync(
+            _ => throw new AssertionException("Unused"),
+            nativeStatus: 200,
+            _ => acknowledged = true,
+            physical.Token,
+            demand.Token,
+            token =>
+            {
+                demandToken = token;
+                physical.Cancel();
+                return Task.FromResult<Task>(Task.Delay(Timeout.InfiniteTimeSpan, token));
+            }).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(acknowledged, Is.True);
+            Assert.That(demandToken.IsCancellationRequested, Is.True);
+            Assert.That(demand.IsCancellationRequested, Is.False);
+        });
+    }
+
+    [Test]
+    public async Task HandleSubmitEditorActionAsync_FailedPreparationWithdrawsPublishedModelDemand()
+    {
+        // A conventional download can fail after managed demand was published; the
+        // hydration completion is then never handed over, but the demand must end.
+        var demandToken = CancellationToken.None;
+        var managedWaiter = Task.CompletedTask;
+        Offloadr.Runner.V1.AcknowledgePromptResultRequest? capturedAck = null;
+        using var physical = new CancellationTokenSource();
+
+        await HandlePromptWithDemandAsync(
+            _ => throw new AssertionException("Unused"),
+            nativeStatus: 200,
+            ack => capturedAck = ack,
+            physical.Token,
+            prepare: token =>
+            {
+                demandToken = token;
+                managedWaiter = Task.Delay(Timeout.InfiniteTimeSpan, token);
+                return Task.FromException<Task>(new IOException("conventional download failed"));
+            }).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(capturedAck?.Result.Outcome, Is.EqualTo(Offloadr.Common.V1.PromptInvocationOutcome.NotExecuted));
+            Assert.That(demandToken.IsCancellationRequested, Is.True);
+            Assert.That(managedWaiter.IsCanceled, Is.True);
+        });
     }
 
     [Test]

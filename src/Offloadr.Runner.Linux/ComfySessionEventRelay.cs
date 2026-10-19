@@ -70,6 +70,12 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
 
     private IRunnerSessionSink? _sink;
 
+    /// <summary>
+    /// Raised with the retained identity when the runtime reports a prompt's
+    /// terminal event (success, error or interrupt).
+    /// </summary>
+    internal event Action<SubmitPromptCommand>? PromptFinished;
+
     public ComfySessionEventRelay(
         string runnerId,
         string comfyHost,
@@ -209,6 +215,18 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
         if (TryGetBridge(sessionId, clientId, TargetRuntime(command), out var bridge))
         {
             bridge.MapPrompt(promptId, command.SubmissionId);
+        }
+    }
+
+    private void OnPromptFinished(SubmitPromptCommand command)
+    {
+        try
+        {
+            PromptFinished?.Invoke(command);
+        }
+        catch (Exception ex)
+        {
+            RunnerLog.Warning(nameof(ComfySessionEventRelay), $"Prompt completion handling failed ({ex.GetType().Name}).");
         }
     }
 
@@ -1063,6 +1081,7 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
                         // Terminal evidence owns its immutable bytes and identity;
                         // releasing the full command does not depend on delivery.
                         _ = _owner.ReportRetainedPromptEvidenceAsync(evidence);
+                        _owner.OnPromptFinished(command);
                     }
                 }
             }
