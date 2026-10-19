@@ -1479,7 +1479,13 @@ internal static class ServiceClientManager
                                         }
                                     }
                                 },
-                                token),
+                                token,
+                                (response, sentToken) => InterruptBlockedReadsForCancelAsync(
+                                    request,
+                                    response,
+                                    sessionManager.ReadComfyPromptQueueAsync,
+                                    downloadService.InterruptSessionReads,
+                                    sentToken)),
                             sessionSink.AckEditorRuntimeRequestAsync,
                             shutdown);
                         continue;
@@ -1528,7 +1534,11 @@ internal static class ServiceClientManager
                             sessionId => sessionManager.TryGetSessionPaths(sessionId, out var paths) ? paths : null,
                             shutdown,
                             sessionEventRelay.UnregisterUninvokedSubmission,
-                            demandCancellation);
+                            demandCancellation,
+                            async (promptId, token) => (await sessionManager.ReadComfyPromptQueueAsync(
+                                captured.SessionId,
+                                new RuntimeIdentity(captured.Target.GpuGeneration, captured.Target.RuntimeEpoch, captured.Target.RuntimeInstanceId),
+                                token).ConfigureAwait(false))?.Contains(promptId));
                         });
                     }
                 }
@@ -2843,7 +2853,8 @@ internal static class ServiceClientManager
         SemaphoreSlim ordinaryControlGate,
         SemaphoreSlim readGate,
         Action beforeSend,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Func<AcknowledgeEditorRuntimeRequestRequest, CancellationToken, Task>? afterSend = null)
     {
         var response = new AcknowledgeEditorRuntimeRequestRequest
         {
@@ -2906,6 +2917,19 @@ internal static class ServiceClientManager
                 response.StatusCode = result.StatusCode;
                 response.Body = ByteString.CopyFrom(result.Body);
                 response.ContentType = result.ContentType;
+            }
+
+            if (afterSend is not null)
+            {
+                // Follow-up effects never change the relayed result.
+                try
+                {
+                    await afterSend(response, cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    RunnerLog.Warning(nameof(ServiceClientManager), $"Transient editor request {command.RequestId} follow-up failed ({ex.GetType().Name}).");
+                }
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -3087,7 +3111,8 @@ internal static class ServiceClientManager
         Func<string, SessionProcessManager.SessionPaths?>? sessionPathsProvider = null,
         CancellationToken evidenceDeliveryCancellationToken = default,
         Action<string, string, SubmitPromptCommand>? unregisterUninvokedSubmission = null,
-        CancellationToken promptDemandCancellation = default)
+        CancellationToken promptDemandCancellation = default,
+        Func<string, CancellationToken, Task<bool?>>? isPromptQueued = null)
     {
         // Reject malformed wire identities before granting or touching a runtime.
         _ = PromptRuntimeMarker.TargetFingerprint(prompt.Target);
@@ -3171,6 +3196,7 @@ internal static class ServiceClientManager
             promptDemandLifetime);
         Task? promptDemand = null;
         var keepPromptDemand = false;
+        string? acceptedPromptId = null;
         using var forgeEvidence = ShouldStreamHttpResponse(prompt)
             ? new ForgePromptEvidenceReader(prompt.NativeIdentifiers.SessionHash) : null;
 
@@ -3257,6 +3283,9 @@ internal static class ServiceClientManager
             if (keepPromptDemand)
             {
                 withdrawDemandUntilAccepted.Dispose();
+                acceptedPromptId = !string.IsNullOrWhiteSpace(prompt.NativeIdentifiers?.PromptId)
+                    ? prompt.NativeIdentifiers.PromptId
+                    : RegistrationPolicy.TryExtractPromptId(System.Text.Encoding.UTF8.GetString(result.Body));
             }
             ack.Result = new()
             {
@@ -3323,7 +3352,13 @@ internal static class ServiceClientManager
         }
 
         withdrawDemandUntilAccepted.Dispose();
-        await SettlePromptDemandAsync(promptDemand, keepPromptDemand, promptDemandLifetime).ConfigureAwait(false);
+        await SettlePromptDemandAsync(
+            promptDemand,
+            keepPromptDemand,
+            promptDemandLifetime,
+            isPromptQueued is not null && !string.IsNullOrWhiteSpace(acceptedPromptId)
+                ? token => isPromptQueued(acceptedPromptId!, token)
+                : null).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -3331,7 +3366,13 @@ internal static class ServiceClientManager
     /// its acknowledgement was handed over, or until Stop or its terminal event
     /// withdraws it. A rejected or failed prompt withdraws it at once.
     /// </summary>
-    internal static async Task SettlePromptDemandAsync(Task? demand, bool keep, CancellationTokenSource lifetime)
+    internal static TimeSpan PromptDemandQueueProbeInterval { get; set; } = TimeSpan.FromSeconds(10);
+
+    internal static async Task SettlePromptDemandAsync(
+        Task? demand,
+        bool keep,
+        CancellationTokenSource lifetime,
+        Func<CancellationToken, Task<bool?>>? isStillQueued = null)
     {
         if (demand is null)
         {
@@ -3344,6 +3385,10 @@ internal static class ServiceClientManager
         if (!keep)
         {
             lifetime.Cancel();
+        }
+        else if (isStillQueued is not null)
+        {
+            await WithdrawOnceDequeuedAsync(demand, lifetime, isStillQueued).ConfigureAwait(false);
         }
 
         try
@@ -3358,6 +3403,79 @@ internal static class ServiceClientManager
         finally
         {
             lifetime.Cancel();
+        }
+    }
+
+    /// <summary>
+    /// ComfyUI sends no terminal event for a prompt removed from its queue (queue
+    /// delete or clear, a pending job cancel), and a terminal frame can be missed
+    /// or arrive before the prompt id is mapped. The queue is the fallback: once
+    /// the accepted prompt is no longer in it, nothing will read its models. An
+    /// unreadable queue keeps the demand.
+    /// </summary>
+    private static async Task WithdrawOnceDequeuedAsync(
+        Task demand,
+        CancellationTokenSource lifetime,
+        Func<CancellationToken, Task<bool?>> isStillQueued)
+    {
+        while (!demand.IsCompleted && !lifetime.IsCancellationRequested)
+        {
+            bool? queued;
+            try
+            {
+                queued = await isStillQueued(lifetime.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (lifetime.IsCancellationRequested)
+            {
+                return;
+            }
+            catch (Exception)
+            {
+                queued = null;
+            }
+
+            if (queued == false)
+            {
+                lifetime.Cancel();
+                return;
+            }
+
+            await Task.WhenAny(demand, Task.Delay(PromptDemandQueueProbeInterval, lifetime.Token)).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// ComfyUI cancels a named prompt cooperatively, which a loader blocked on a
+    /// model download never sees. When a targeted interrupt or job cancel names the
+    /// prompt that is still running, the session's pending model reads fail so it
+    /// ends now. A global interrupt is handled before it is sent.
+    /// </summary>
+    internal static async Task InterruptBlockedReadsForCancelAsync(
+        RelayEditorRuntimeRequestCommand request,
+        AcknowledgeEditorRuntimeRequestRequest response,
+        Func<string, RuntimeIdentity, CancellationToken, Task<ComfyPromptQueue?>> readQueue,
+        Action<string> interruptSessionReads,
+        CancellationToken cancellationToken)
+    {
+        if (request.Kind != EditorRuntimeRequestKind.Control || !response.TransportSucceeded ||
+            response.StatusCode is < 200 or >= 300)
+        {
+            return;
+        }
+
+        var targets = ComfyCancelTargets.PromptIds(request.Path, request.Body.Span);
+        if (targets.Count == 0)
+        {
+            return;
+        }
+
+        var queue = await readQueue(
+            request.SessionId,
+            new RuntimeIdentity(request.LifecycleGeneration, request.RuntimeEpoch, request.RuntimeInstanceId),
+            cancellationToken).ConfigureAwait(false);
+        if (queue is not null && targets.Any(queue.Running.Contains))
+        {
+            interruptSessionReads(request.SessionId);
         }
     }
 

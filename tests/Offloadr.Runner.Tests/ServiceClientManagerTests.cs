@@ -1230,7 +1230,9 @@ public partial class ServiceClientManagerTests
         Action<Offloadr.Runner.V1.AcknowledgePromptResultRequest> acknowledged,
         CancellationToken cancellationToken,
         CancellationToken demandCancellation = default,
-        Func<CancellationToken, Task<Task>>? prepare = null)
+        Func<CancellationToken, Task<Task>>? prepare = null,
+        Func<string, CancellationToken, Task<bool?>>? isPromptQueued = null,
+        string nativeBody = "{}")
     {
         var prompt = new Offloadr.Runner.V1.SubmitPromptCommand
         {
@@ -1256,10 +1258,11 @@ public partial class ServiceClientManagerTests
             (_, _) => { },
             (_, token, _) => prepare is null ? Task.FromResult(demand(token)) : prepare(token),
             (_, _, _, _) => Task.FromResult(new SessionProcessManager.PromptSubmissionResult(
-                nativeStatus is >= 200 and < 300, nativeStatus, "{}"u8.ToArray(), "native")),
+                nativeStatus is >= 200 and < 300, nativeStatus, System.Text.Encoding.UTF8.GetBytes(nativeBody), "native")),
             (_, _, _, _) => { },
             cancellationToken,
-            promptDemandCancellation: demandCancellation);
+            promptDemandCancellation: demandCancellation,
+            isPromptQueued: isPromptQueued);
     }
 
     private static async Task WaitForConditionAsync(Func<bool> condition, TimeSpan timeout)
@@ -1379,6 +1382,149 @@ public partial class ServiceClientManagerTests
             Assert.That(demandToken.IsCancellationRequested, Is.True);
             Assert.That(demand.IsCancellationRequested, Is.False);
         });
+    }
+
+    [TestCase(0, TestName = "HandleSubmitEditorActionAsync_PromptAlreadyGoneWhenAccepted_WithdrawsDemand")]
+    [TestCase(2, TestName = "HandleSubmitEditorActionAsync_PromptRemovedFromQueue_WithdrawsDemand")]
+    public async Task HandleSubmitEditorActionAsync_WithdrawsDemandOnceThePromptLeavesTheQueue(int queuedProbes)
+    {
+        // A prompt deleted from ComfyUI's queue, cancelled while pending, or one that
+        // finished before its id was mapped sends no terminal event the runner can
+        // use; the queue shows it is gone.
+        var previousInterval = ServiceClientManager.PromptDemandQueueProbeInterval;
+        ServiceClientManager.PromptDemandQueueProbeInterval = TimeSpan.FromMilliseconds(20);
+        try
+        {
+            var demandToken = CancellationToken.None;
+            var probed = new List<string>();
+            using var physical = new CancellationTokenSource();
+            using var demand = new CancellationTokenSource();
+
+            await HandlePromptWithDemandAsync(
+                token => { demandToken = token; return Task.Delay(Timeout.InfiniteTimeSpan, token); },
+                nativeStatus: 200,
+                _ => { },
+                physical.Token,
+                demand.Token,
+                isPromptQueued: (promptId, _) =>
+                {
+                    lock (probed) probed.Add(promptId);
+                    return Task.FromResult<bool?>(probed.Count <= queuedProbes);
+                },
+                nativeBody: "{\"prompt_id\":\"native-prompt-1\"}").WaitAsync(TimeSpan.FromSeconds(5));
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(demandToken.IsCancellationRequested, Is.True);
+                Assert.That(demand.IsCancellationRequested, Is.False);
+                Assert.That(probed, Has.Count.EqualTo(queuedProbes + 1));
+                Assert.That(probed, Is.All.EqualTo("native-prompt-1"));
+            });
+        }
+        finally
+        {
+            ServiceClientManager.PromptDemandQueueProbeInterval = previousInterval;
+        }
+    }
+
+    [Test]
+    public async Task HandleSubmitEditorActionAsync_UnreadableQueueKeepsDemand()
+    {
+        var previousInterval = ServiceClientManager.PromptDemandQueueProbeInterval;
+        ServiceClientManager.PromptDemandQueueProbeInterval = TimeSpan.FromMilliseconds(20);
+        try
+        {
+            var demandToken = CancellationToken.None;
+            var hydration = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var probes = 0;
+            using var physical = new CancellationTokenSource();
+
+            var handled = HandlePromptWithDemandAsync(
+                token => { demandToken = token; return hydration.Task; },
+                nativeStatus: 200,
+                _ => { },
+                physical.Token,
+                isPromptQueued: (_, _) => Interlocked.Increment(ref probes) % 2 == 0
+                    ? Task.FromResult<bool?>(null)
+                    : Task.FromException<bool?>(new HttpRequestException("queue unavailable")),
+                nativeBody: "{\"prompt_id\":\"native-prompt-1\"}");
+            await WaitForConditionAsync(() => Volatile.Read(ref probes) >= 4, TimeSpan.FromSeconds(5));
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(handled.IsCompleted, Is.False);
+                Assert.That(demandToken.IsCancellationRequested, Is.False);
+            });
+            hydration.SetResult();
+            await handled.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+        finally
+        {
+            ServiceClientManager.PromptDemandQueueProbeInterval = previousInterval;
+        }
+    }
+
+    private static RelayEditorRuntimeRequestCommand CancelControl(string path, string body)
+        => new()
+        {
+            RequestId = "request-1",
+            SessionId = PromptSessionId,
+            Kind = Offloadr.EditorRuntime.V1.EditorRuntimeRequestKind.Control,
+            Path = path,
+            Body = ByteString.CopyFromUtf8(body),
+            LifecycleGeneration = 1,
+            RuntimeEpoch = 1,
+            RuntimeInstanceId = "77777777777747778777777777777777",
+        };
+
+    [TestCase("api/interrupt", "{\"prompt_id\":\"running\"}", 200, true)]
+    [TestCase("api/jobs/running/cancel", "", 200, true)]
+    [TestCase("api/jobs/cancel", "{\"job_ids\":[\"pending\",\"running\"]}", 200, true)]
+    [TestCase("api/interrupt", "{\"prompt_id\":\"pending\"}", 200, false)]
+    [TestCase("api/jobs/pending/cancel", "", 200, false)]
+    [TestCase("api/interrupt", "{\"prompt_id\":\"running\"}", 500, false)]
+    [TestCase("api/queue", "{\"delete\":[\"running\"]}", 200, false)]
+    public async Task InterruptBlockedReadsForCancelAsync_FailsReadsOnlyForTheRunningPrompt(
+        string path, string body, int status, bool interrupted)
+    {
+        // ComfyUI's targeted cancel is cooperative; a loader blocked on a model
+        // download never sees it unless its read fails.
+        var request = CancelControl(path, body);
+        string? interruptedSession = null;
+        Offloadr.Runner.Core.RuntimeIdentity? queried = null;
+
+        await ServiceClientManager.InterruptBlockedReadsForCancelAsync(
+            request,
+            new AcknowledgeEditorRuntimeRequestRequest { TransportSucceeded = true, StatusCode = status },
+            (_, runtime, _) =>
+            {
+                queried = runtime;
+                return Task.FromResult<ComfyPromptQueue?>(new(
+                    new HashSet<string> { "running" },
+                    new HashSet<string> { "pending" }));
+            },
+            sessionId => interruptedSession = sessionId,
+            CancellationToken.None);
+
+        Assert.That(interruptedSession, Is.EqualTo(interrupted ? PromptSessionId : null));
+        if (interrupted)
+        {
+            Assert.That(queried, Is.EqualTo(new Offloadr.Runner.Core.RuntimeIdentity(1, 1, request.RuntimeInstanceId)));
+        }
+    }
+
+    [Test]
+    public async Task InterruptBlockedReadsForCancelAsync_UnknownQueueLeavesReads()
+    {
+        var interrupted = false;
+        await ServiceClientManager.InterruptBlockedReadsForCancelAsync(
+            CancelControl("api/interrupt", "{\"prompt_id\":\"running\"}"),
+            new AcknowledgeEditorRuntimeRequestRequest { TransportSucceeded = true, StatusCode = 200 },
+            (_, _, _) => Task.FromResult<ComfyPromptQueue?>(null),
+            _ => interrupted = true,
+            CancellationToken.None);
+
+        Assert.That(interrupted, Is.False);
     }
 
     [Test]
