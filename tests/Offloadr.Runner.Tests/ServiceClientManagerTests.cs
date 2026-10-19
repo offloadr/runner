@@ -160,18 +160,18 @@ public partial class ServiceClientManagerTests
         };
         var cache = new ServiceClientManager.TransientAcknowledgementCache(
             maxEntries: 10,
-            maxBytes: first.CalculateSize());
+            maxBytes: first.CalculateSize() + 32);
 
-        cache.Set(first);
-        cache.Set(second);
+        cache.Set(first, ByteString.CopyFrom(new byte[32]));
+        cache.Set(second, ByteString.CopyFrom(new byte[32]));
 
         Assert.Multiple(() =>
         {
-            Assert.That(cache.TryGet(first.RequestId, out _), Is.False);
-            Assert.That(cache.TryGet(second.RequestId, out var cached), Is.True);
+            Assert.That(cache.TryGet(first.RequestId, out _, out _), Is.False);
+            Assert.That(cache.TryGet(second.RequestId, out var cached, out _), Is.True);
             Assert.That(cached.Body.Length, Is.EqualTo(64));
             Assert.That(cache.Count, Is.EqualTo(1));
-            Assert.That(cache.RetainedBytes, Is.LessThanOrEqualTo(first.CalculateSize()));
+            Assert.That(cache.RetainedBytes, Is.EqualTo(second.CalculateSize() + 32));
         });
     }
 
@@ -179,15 +179,15 @@ public partial class ServiceClientManagerTests
     public void TransientAcknowledgementCache_EvictsOldestResponseAtEntryLimit()
     {
         var cache = new ServiceClientManager.TransientAcknowledgementCache(maxEntries: 2, maxBytes: 1024);
-        cache.Set(new AcknowledgeEditorRuntimeRequestRequest { RequestId = "request-1" });
-        cache.Set(new AcknowledgeEditorRuntimeRequestRequest { RequestId = "request-2" });
-        cache.Set(new AcknowledgeEditorRuntimeRequestRequest { RequestId = "request-3" });
+        cache.Set(new AcknowledgeEditorRuntimeRequestRequest { RequestId = "request-1" }, ByteString.CopyFrom(new byte[32]));
+        cache.Set(new AcknowledgeEditorRuntimeRequestRequest { RequestId = "request-2" }, ByteString.CopyFrom(new byte[32]));
+        cache.Set(new AcknowledgeEditorRuntimeRequestRequest { RequestId = "request-3" }, ByteString.CopyFrom(new byte[32]));
 
         Assert.Multiple(() =>
         {
-            Assert.That(cache.TryGet("request-1", out _), Is.False);
-            Assert.That(cache.TryGet("request-2", out _), Is.True);
-            Assert.That(cache.TryGet("request-3", out _), Is.True);
+            Assert.That(cache.TryGet("request-1", out _, out _), Is.False);
+            Assert.That(cache.TryGet("request-2", out _, out _), Is.True);
+            Assert.That(cache.TryGet("request-3", out _, out _), Is.True);
             Assert.That(cache.Count, Is.EqualTo(2));
         });
     }
@@ -201,13 +201,13 @@ public partial class ServiceClientManagerTests
             Body = ByteString.CopyFrom(new byte[64])
         };
         var cache = new ServiceClientManager.TransientAcknowledgementCache();
-        cache.Set(response);
+        cache.Set(response, ByteString.CopyFrom(new byte[32]));
 
         cache.Remove(response.RequestId);
 
         Assert.Multiple(() =>
         {
-            Assert.That(cache.TryGet(response.RequestId, out _), Is.False);
+            Assert.That(cache.TryGet(response.RequestId, out _, out _), Is.False);
             Assert.That(cache.Count, Is.Zero);
             Assert.That(cache.RetainedBytes, Is.Zero);
         });

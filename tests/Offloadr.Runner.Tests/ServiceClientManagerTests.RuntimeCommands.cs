@@ -988,6 +988,7 @@ public partial class ServiceClientManagerTests
         await harness.DispatchAsync(request);
         var redelivery = request.Clone();
         redelivery.DeliveryId = "delivery-2";
+        redelivery.Attempt++;
         await harness.DispatchAsync(redelivery);
 
         Assert.Multiple(() =>
@@ -1010,6 +1011,7 @@ public partial class ServiceClientManagerTests
         var first = harness.DispatchAsync(request);
         var redelivery = request.Clone();
         redelivery.DeliveryId = "delivery-2";
+        redelivery.Attempt++;
         await harness.DispatchAsync(redelivery);
         await harness.DispatchAsync(redelivery.Clone());
         Assert.That(harness.Acknowledgements, Is.Empty);

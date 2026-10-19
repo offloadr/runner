@@ -18,6 +18,24 @@ The agent is the container's entry point and runs as root. It:
 6. Writes `/run/offloadr/status.json` so a local supervisor can tell whether a session is active.
 7. In sealed mode, keeps each session's user data under a root-owned directory on a memory-backed root (`/dev/shm/offloadr` by default), stages workspace seeds there, keeps editor output off the container log, makes session processes non-dumpable and evicts uploaded artifacts when the root runs low. Code, models and compiled caches stay in the disk-backed home. Transfers are sealed with per-session reader keys and the control plane's output recipient key (`docs/sealed-envelope.md`, `Offloadr.Runner.Core/Sealing`). See "Sealed Storage" in `hosting.md`.
 
+### Transient command redelivery
+
+Transient HTTP and client-message commands are admitted by request ID and an
+immutable SHA-256 fingerprint of the serialized command. Only delivery ID and
+attempt are excluded: transport redelivery can change those fields. A changed
+payload, destination, runtime identity, kind or deadline under an existing ID is
+rejected with 409 before joining an execution or replaying a response. Dispatch
+captures its command before asynchronous execution, and a conflict leaves the
+original operation and retained response intact.
+
+Completed replies and their 32-byte fingerprints share the existing 256-entry,
+64 MiB serialized-result budget. Eviction drops both together. Separate bounded
+executed markers still refuse execution when the reply has been evicted; these
+markers last until the original deadline. This is process-local protection, not
+persistent deduplication across a runner process replacement, nor proof that an
+uncertain native mutation did not execute. In-flight delivery lists, transport
+buffers and total process memory are separate resource boundaries.
+
 ## Projects
 
 | Project | Role | Platform |

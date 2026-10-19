@@ -6,6 +6,42 @@ using Offloadr.Runner.V1;
 
 public partial class ServiceClientManagerTests
 {
+    [Test]
+    public async Task TransientCommand_CapturesTheAdmittedIntentBeforeAsynchronousExecution()
+    {
+        var harness = new TransientRequestHarness();
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        harness.BeforeResult = release.Task;
+        var delivered = harness.Request("original-delivery");
+        var original = delivered.Clone();
+        var execution = harness.DispatchAsync(delivered);
+        try
+        {
+            delivered.RequestId = "changed-request";
+            delivered.SessionId = "changed-session";
+            delivered.DeliveryId = "changed-delivery";
+        }
+        finally
+        {
+            release.TrySetResult();
+            await execution.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+
+        original.DeliveryId = "matching-delivery";
+        original.Attempt++;
+        await harness.DispatchAsync(original);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(harness.Executions, Is.EqualTo(1));
+            Assert.That(harness.Acknowledgements.Select(ack => ack.RequestId), Is.All.EqualTo(original.RequestId));
+            Assert.That(harness.Acknowledgements.Select(ack => ack.SessionId), Is.All.EqualTo(original.SessionId));
+            Assert.That(harness.Acknowledgements.Select(ack => ack.DeliveryId), Is.EqualTo(new[] { "original-delivery", "matching-delivery" }));
+            Assert.That(harness.Deliveries.InFlightCount, Is.Zero);
+            Assert.That(harness.Cancellation.Count, Is.Zero);
+        });
+    }
+
     private static IEnumerable<TestCaseData> ConflictingTransientCommands()
     {
         var changes = new (string Name, Action<RelayEditorRuntimeRequestCommand> Change)[]
