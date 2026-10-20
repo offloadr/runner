@@ -56,12 +56,17 @@ public sealed partial class ComfyPromptEvidenceTests
                         return new() { Result = new() { Outcome = EditorRuntimeBridgeOutcome.Stale, ServerNowUtc = Timestamp.FromDateTime(now) } };
                     result = new()
                     {
-                        Outcome = EditorRuntimeBridgeOutcome.Accepted, ActivationFence = ++fence,
-                        ServerNowUtc = Timestamp.FromDateTime(now), Lease = new()
+                        Outcome = EditorRuntimeBridgeOutcome.Accepted,
+                        ActivationFence = ++fence,
+                        ServerNowUtc = Timestamp.FromDateTime(now),
+                        Lease = new()
                         {
-                            Target = request.Target.Clone(), ClientId = request.ClientId,
-                            BridgeConnectionId = request.BridgeConnectionId, LeaseRevision = fence,
-                            ReservedUtc = Timestamp.FromDateTime(now), ExpiresUtc = Timestamp.FromDateTime(now.AddSeconds(30)),
+                            Target = request.Target.Clone(),
+                            ClientId = request.ClientId,
+                            BridgeConnectionId = request.BridgeConnectionId,
+                            LeaseRevision = fence,
+                            ReservedUtc = Timestamp.FromDateTime(now),
+                            ExpiresUtc = Timestamp.FromDateTime(now.AddSeconds(30)),
                         },
                     };
                     reservations.Add(request.BridgeConnectionId, result.Clone());
@@ -156,10 +161,10 @@ public sealed partial class ComfyPromptEvidenceTests
         var received = await receive.WaitAsync(TimeSpan.FromSeconds(3));
         Assert.That(System.Text.Encoding.UTF8.GetString(buffer, 0, received.Count), Is.EqualTo("original features"));
         Assert.That(sink.Authority.ReserveCalls.Count, Is.EqualTo(loseReservation ? 2 : 1));
-        Assert.That(sink.Authority.ReserveCalls.Distinct(), Has.Count.EqualTo(1), "Reservation retry changed the captured request.");
+        Assert.That(sink.Authority.ReserveCalls.Distinct().ToArray(), Has.Length.EqualTo(1), "Reservation retry changed the captured request.");
         var active = sink.Authority.ReportCalls.Where(call => call.State == EditorRuntimeBridgeState.Active).ToArray();
         Assert.That(active, Has.Length.EqualTo(loseActive ? 2 : 1));
-        Assert.That(active.Distinct(), Has.Count.EqualTo(1), "Active retry changed UUID, sequence, profile or runtime.");
+        Assert.That(active.Distinct().ToArray(), Has.Length.EqualTo(1), "Active retry changed UUID, sequence, profile or runtime.");
         await relay.StopSessionAsync(command.SessionId).WaitAsync(TimeSpan.FromSeconds(3));
         Assert.That(BridgeCount(relay), Is.Zero);
         var inactive = sink.Authority.ReportCalls.Last();

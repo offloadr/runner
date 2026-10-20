@@ -70,8 +70,10 @@ internal sealed partial class ComfySessionEventRelay
                 throw new InvalidOperationException("The runtime cannot reserve another bridge connection.");
             var request = new ReserveEditorRuntimeBridgeRequest
             {
-                Target = connection.Target.Clone(), ClientId = _clientId,
-                BridgeConnectionId = connection.Id.ToString("n"), ExpectedActivationFence = cursor.Result.ActivationFence,
+                Target = connection.Target.Clone(),
+                ClientId = _clientId,
+                BridgeConnectionId = connection.Id.ToString("n"),
+                ExpectedActivationFence = cursor.Result.ActivationFence,
             };
             connection.Revision = request.ExpectedActivationFence + 1;
             var attemptStarted = Stopwatch.GetTimestamp();
@@ -103,10 +105,19 @@ internal sealed partial class ComfySessionEventRelay
             var sequence = ++connection.Sequence;
             var request = new ReportEditorRuntimeBridgeStateRequest
             {
-                RunnerId = _runnerId, SessionId = _sessionId, EditorSid = _editorSid, ClientId = _clientId,
-                LifecycleGeneration = _lifecycleGeneration, RuntimeEpoch = _runtimeEpoch, RuntimeInstanceId = _runtimeInstanceId,
-                BridgeConnectionId = connection.Id.ToString("n"), InstanceId = _owner._instanceId,
-                LeaseRevision = connection.Revision, ReportSequence = sequence, State = state, Sealing = connection.Profile.Clone(),
+                RunnerId = _runnerId,
+                SessionId = _sessionId,
+                EditorSid = _editorSid,
+                ClientId = _clientId,
+                LifecycleGeneration = _lifecycleGeneration,
+                RuntimeEpoch = _runtimeEpoch,
+                RuntimeInstanceId = _runtimeInstanceId,
+                BridgeConnectionId = connection.Id.ToString("n"),
+                InstanceId = _owner._instanceId,
+                LeaseRevision = connection.Revision,
+                ReportSequence = sequence,
+                State = state,
+                Sealing = connection.Profile.Clone(),
             };
             do
             {
@@ -156,9 +167,13 @@ internal sealed partial class ComfySessionEventRelay
                         ?? throw new InvalidOperationException("The runtime has no applied sealing profile.");
                     connection = new(Guid.NewGuid(), new()
                     {
-                        RunnerId = _runnerId, SessionId = _sessionId, EditorSid = _editorSid,
-                        LifecycleGeneration = _lifecycleGeneration, RuntimeEpoch = _runtimeEpoch,
-                        RuntimeInstanceId = _runtimeInstanceId, InstanceId = _owner._instanceId,
+                        RunnerId = _runnerId,
+                        SessionId = _sessionId,
+                        EditorSid = _editorSid,
+                        LifecycleGeneration = _lifecycleGeneration,
+                        RuntimeEpoch = _runtimeEpoch,
+                        RuntimeInstanceId = _runtimeInstanceId,
+                        InstanceId = _owner._instanceId,
                     }, profile, socket);
                     await ReserveAsync(connection, token).ConfigureAwait(false);
                     if (!RuntimeIsCurrent()) throw new InvalidOperationException("The bridge runtime retired before connect.");
