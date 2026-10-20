@@ -75,8 +75,9 @@ public sealed partial class ComfyPromptEvidenceTests
         Assert.That(BridgeCount(relay), Is.Zero);
     }
 
-    [Test]
-    public async Task LostHeartbeatResponseKeepsOnlyThePreviouslyAcceptedLeaseSendable()
+    [TestCase(StatusCode.Unavailable)]
+    [TestCase(StatusCode.Cancelled)]
+    public async Task LostHeartbeatResponseKeepsOnlyThePreviouslyAcceptedLeaseSendable(StatusCode failure)
     {
         using var portReservation = new TcpListener(IPAddress.Loopback, 0);
         portReservation.Start(); var port = ((IPEndPoint)portReservation.LocalEndpoint).Port; portReservation.Stop();
@@ -90,7 +91,10 @@ public sealed partial class ComfyPromptEvidenceTests
         {
             if (request.State != EditorRuntimeBridgeState.Heartbeat) return;
             if (Interlocked.Increment(ref heartbeatCalls) == 1)
-                throw new RpcException(new(StatusCode.Unavailable, "Controlled heartbeat response loss."));
+            {
+                if (failure == StatusCode.Cancelled) await CancelBridgeRpcLikeGrpcAsync(ct);
+                throw new RpcException(new(failure, "Controlled heartbeat response loss."));
+            }
             retryEntered.TrySetResult();
             await allowRetry.Task.WaitAsync(ct);
         };
@@ -125,6 +129,65 @@ public sealed partial class ComfyPromptEvidenceTests
         {
             allowRetry.TrySetResult();
             await relay.StopSessionAsync(command.SessionId).WaitAsync(TimeSpan.FromSeconds(3));
+        }
+    }
+
+    [Test]
+    public async Task TimedOutReservationRetriesTheSamePhysicalIdentityBeforeNativeConnect()
+    {
+        using var portReservation = new TcpListener(IPAddress.Loopback, 0);
+        portReservation.Start(); var port = ((IPEndPoint)portReservation.LocalEndpoint).Port; portReservation.Stop();
+        using var listener = new HttpListener(); listener.Prefixes.Add($"http://127.0.0.1:{port}/"); listener.Start();
+        var command = Command();
+        var sink = new EvidenceSink((_, _) => Task.CompletedTask);
+        var calls = 0;
+        var timedOut = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var retryEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var allowRetry = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        sink.Authority.BeforeReservationResponse = async (_, ct) =>
+        {
+            if (Interlocked.Increment(ref calls) == 1)
+            {
+                try { await CancelBridgeRpcLikeGrpcAsync(ct); }
+                finally { timedOut.TrySetResult(); }
+            }
+            retryEntered.TrySetResult();
+            await allowRetry.Task.WaitAsync(ct);
+        };
+        await using var relay = new ComfySessionEventRelay(command.Target.RunnerId, "127.0.0.1", port,
+            "test-process", _ => new SessionSealingStatus(), (_, _) => true);
+        relay.AttachSink(sink);
+        var accept = listener.GetContextAsync();
+        await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", command.Target.GpuGeneration,
+            command.Target.RuntimeEpoch, command.Target.RuntimeInstanceId, "after timeout"u8.ToArray(), CancellationToken.None);
+        try
+        {
+            await timedOut.Task.WaitAsync(TimeSpan.FromSeconds(4));
+            await retryEntered.Task.WaitAsync(TimeSpan.FromSeconds(4));
+            var claims = sink.Authority.ReserveCalls.ToArray();
+            Assert.That(claims, Has.Length.EqualTo(2));
+            Assert.That(claims[1], Is.EqualTo(claims[0]), "An internal gRPC timeout retries the original UUID and fence.");
+            Assert.That(accept.IsCompleted, Is.False, "A timed-out response grants no permission for native connect.");
+            allowRetry.TrySetResult();
+            var context = await accept.WaitAsync(TimeSpan.FromSeconds(3));
+            using var socket = (await context.AcceptWebSocketAsync(null)).WebSocket;
+            var buffer = new byte[1024];
+            var received = await socket.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(3));
+            Assert.That(System.Text.Encoding.UTF8.GetString(buffer, 0, received.Count), Is.EqualTo("after timeout"));
+        }
+        finally
+        {
+            allowRetry.TrySetResult();
+            await relay.StopSessionAsync(command.SessionId).WaitAsync(TimeSpan.FromSeconds(3));
+        }
+    }
+
+    private static async Task CancelBridgeRpcLikeGrpcAsync(CancellationToken token)
+    {
+        try { await Task.Delay(Timeout.InfiniteTimeSpan, token); }
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
+        {
+            throw new RpcException(new(StatusCode.Cancelled, "The local RPC cancellation token fired."));
         }
     }
 

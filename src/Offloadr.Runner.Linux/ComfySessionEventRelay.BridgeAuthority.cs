@@ -67,7 +67,7 @@ internal sealed partial class ComfySessionEventRelay
 
         private static bool Transient(Exception exception, CancellationToken token)
             => !token.IsCancellationRequested && (exception is OperationCanceledException
-                || exception is RpcException { StatusCode: StatusCode.Unavailable or StatusCode.DeadlineExceeded or StatusCode.Internal });
+                || exception is RpcException { StatusCode: StatusCode.Unavailable or StatusCode.DeadlineExceeded or StatusCode.Internal or StatusCode.Cancelled });
 
         private async Task ReserveAsync(PhysicalConnection connection, CancellationToken token)
         {

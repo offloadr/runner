@@ -27,7 +27,9 @@ comparison. The runner subtracts the whole monotonic RPC duration before using a
 lease. Reports have a two-second timeout, connects and sends have a five-second
 budget capped by the remaining lease, and heartbeats run every ten seconds.
 Transient renewal failures retain sendability only under the last accepted
-monotonic deadline; they cannot extend it. Definitive authority rejection, expiry
+monotonic deadline; they cannot extend it. The local RPC timer's gRPC Cancelled
+status retries the same reservation/report identity while the owning lifetime
+remains alive. Stop or shutdown cancellation does not retry. Definitive authority rejection, expiry
 or runtime retirement removes sendability and aborts the socket. A response's
 absolute deadline is computed before waiting for the native send lock; lock
 contention consumes that budget. Native I/O already in progress may have reached the peer before remote
