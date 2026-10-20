@@ -910,29 +910,54 @@ public partial class ServiceClientManagerTests
     [Test]
     public async Task TransientCancellation_StopRacingRequestsNeverThrowsAndReleasesEveryEntry()
     {
+        const int workerCount = 4;
+        const int iterations = 5000;
         using var shutdown = new CancellationTokenSource();
         var registry = new ServiceClientManager.TransientCancellationRegistry(shutdown.Token);
-        using var stopRacing = new CancellationTokenSource(TimeSpan.FromMilliseconds(500));
+        using var stopRacing = new CancellationTokenSource();
+        using var ready = new CountdownEvent(workerCount + 1);
+        using var start = new ManualResetEventSlim();
 
-        var requests = Enumerable.Range(0, 4).Select(worker => Task.Run(() =>
+        // Bounded dedicated workers keep this synchronous race independent of
+        // thread-pool timer scheduling. Every worker is joined during cleanup.
+        Task RunWorker(Action action) => Task.Factory.StartNew(() =>
         {
-            while (!stopRacing.IsCancellationRequested)
+            ready.Signal();
+            start.Wait();
+            action();
+        }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+
+        var requests = Enumerable.Range(0, workerCount).Select(worker => RunWorker(() =>
+        {
+            for (var iteration = 0; iteration < iterations && !stopRacing.IsCancellationRequested; iteration++)
             {
                 using var lease = registry.Acquire(CommandSessionId, 7, 3, InstanceA);
                 _ = lease.Token.IsCancellationRequested;
                 lease.Token.Register(static () => { }).Dispose();
             }
-        }));
-        var stops = Task.Run(() =>
+        })).ToArray();
+        var stops = RunWorker(() =>
         {
-            while (!stopRacing.IsCancellationRequested)
+            for (var iteration = 0; iteration < iterations && !stopRacing.IsCancellationRequested; iteration++)
             {
                 registry.CancelSession(CommandSessionId);
                 registry.CancelRuntime(CommandSessionId, new RuntimeIdentity(7, 3, InstanceA));
             }
         });
 
-        await Task.WhenAll(requests.Append(stops)).WaitAsync(TimeSpan.FromSeconds(10));
+        var racing = Task.WhenAll(requests.Append(stops));
+        try
+        {
+            Assert.That(ready.Wait(TimeSpan.FromSeconds(10)), Is.True, "Every race worker must start before the shared gate opens.");
+            start.Set();
+            await racing.WaitAsync(TimeSpan.FromSeconds(10));
+        }
+        finally
+        {
+            stopRacing.Cancel();
+            start.Set();
+            await racing.WaitAsync(TimeSpan.FromSeconds(10));
+        }
         Assert.That(registry.Count, Is.Zero, "Entries are removed with their last request.");
     }
 
