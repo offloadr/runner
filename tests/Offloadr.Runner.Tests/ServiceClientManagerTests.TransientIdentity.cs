@@ -104,6 +104,7 @@ public partial class ServiceClientManagerTests
                 Assert.That(rejection!.StatusCode, Is.EqualTo(409));
                 Assert.That(rejection.TransportSucceeded, Is.False);
                 Assert.That(rejection.Body.IsEmpty, Is.True, "Never return another command's response body.");
+                Assert.That(rejection.RunnerId, Is.EqualTo(conflict.RunnerId));
                 Assert.That(rejection.SessionId, Is.EqualTo(conflict.SessionId));
                 Assert.That(rejection.RuntimeInstanceId, Is.EqualTo(conflict.RuntimeInstanceId));
                 Assert.That(harness.Executions, Is.EqualTo(1));

@@ -27,6 +27,8 @@ payload, destination, runtime identity, kind or deadline under an existing ID is
 rejected with 409 before joining an execution or replaying a response. Dispatch
 captures its command before asynchronous execution, and a conflict leaves the
 original operation and retained response intact.
+Previously unseen requests addressed to another runner return 403 without
+reserving their request identity or reaching a local runtime.
 
 Completed replies and their 32-byte fingerprints share the existing 256-entry,
 64 MiB serialized-result budget. Eviction drops both together. Separate bounded

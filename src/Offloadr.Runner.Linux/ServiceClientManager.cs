@@ -123,6 +123,9 @@ internal static class ServiceClientManager
         /// <summary>The request already ran here, but its result is no longer retained.</summary>
         AlreadyExecuted,
 
+        /// <summary>A previously unseen request is addressed to another runner.</summary>
+        WrongRunner,
+
         /// <summary>The request had no deadline, or it passed before the request could run.</summary>
         Expired,
 
@@ -164,6 +167,7 @@ internal static class ServiceClientManager
 
         public TransientRequestAdmission Admit(
             RelayEditorRuntimeRequestCommand request,
+            string runnerId,
             out AcknowledgeEditorRuntimeRequestRequest? replay,
             DateTime? nowUtc = null)
         {
@@ -200,6 +204,13 @@ internal static class ServiceClientManager
                 {
                     // Never run a request twice, even when its result was evicted.
                     return TransientRequestAdmission.AlreadyExecuted;
+                }
+
+                // Existing identities are classified above, including destination
+                // conflicts. Never reserve or execute an unseen request addressed elsewhere.
+                if (!RunnerIdMatches(request.RunnerId, runnerId))
+                {
+                    return TransientRequestAdmission.WrongRunner;
                 }
 
                 if (IsExpired(request, now))
@@ -2946,18 +2957,7 @@ internal static class ServiceClientManager
         // Capture the command used for both identity admission and execution.
         request = request.Clone();
 
-        // A request for another runner must not reach this runner's editor, nor cancel its
-        // prompts before execution, even if it names a session that exists here.
-        if (!RunnerIdMatches(request.RunnerId, runnerId))
-        {
-            await AcknowledgeTransientRequestWithRetryAsync(
-                acknowledge,
-                TransientRequestFailure(request, 403, StaleRuntimeCommandMessage),
-                acknowledgementCancellationToken).ConfigureAwait(false);
-            return;
-        }
-
-        switch (deliveries.Admit(request, out var replay))
+        switch (deliveries.Admit(request, runnerId, out var replay))
         {
             case TransientRequestAdmission.Replay:
                 await AcknowledgeTransientRequestWithRetryAsync(acknowledge, replay!, acknowledgementCancellationToken).ConfigureAwait(false);
@@ -2974,6 +2974,12 @@ internal static class ServiceClientManager
                 await AcknowledgeTransientRequestWithRetryAsync(
                     acknowledge,
                     TransientRequestFailure(request, 409, "The request already ran on this runner; its result is no longer retained."),
+                    acknowledgementCancellationToken).ConfigureAwait(false);
+                return;
+            case TransientRequestAdmission.WrongRunner:
+                await AcknowledgeTransientRequestWithRetryAsync(
+                    acknowledge,
+                    TransientRequestFailure(request, 403, StaleRuntimeCommandMessage),
                     acknowledgementCancellationToken).ConfigureAwait(false);
                 return;
             case TransientRequestAdmission.Expired:
