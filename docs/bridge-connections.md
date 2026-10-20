@@ -12,8 +12,15 @@ accepted Active response matching that exact connection and runtime. Subsequent
 renewal uses Heartbeat, with one increasing sequence per new observation; response
 loss retries the same sequence and bytes. Client messages carry the selected
 connection UUID and lease revision, which enter the immutable command fingerprint.
+A client message arriving before the matching Active response is installed waits
+for that captured connection to finish activation and its initial feature send.
+The wait and send share one five-second budget and observe caller/session
+cancellation; rejected activation or retirement releases waiters without sending.
 The final native send lock rechecks those identities, the tracked runtime and the
 local lease budget. A delayed command cannot select a replacement connection.
+Session owner callbacks retain the received trimmed session key, including UUID
+format, so ordinal runtime and sealing lookups use the same key as the session
+manager.
 
 Database observation and expiry timestamps provide a duration, not a host-clock
 comparison. The runner subtracts the whole monotonic RPC duration before using a

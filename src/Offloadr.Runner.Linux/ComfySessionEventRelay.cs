@@ -690,7 +690,7 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
         {
             _owner = owner;
             _runnerId = Guid.Parse(runnerId).ToString("n");
-            _sessionId = Guid.Parse(sessionId).ToString("n");
+            _sessionId = sessionId.Trim();
             _editorSid = editorSid?.Trim() ?? string.Empty;
             _clientId = clientId;
             _lifecycleGeneration = lifecycleGeneration;
@@ -726,7 +726,13 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
             lock (_socketGate) connection = _connection;
             if (connection is null || connection.Id != parsed || connection.Revision != leaseRevision)
                 throw new InvalidOperationException("The client message's physical connection has retired.");
-            await SendPayloadAsync(connection, payload, cancellationToken).ConfigureAwait(false);
+            // The server may expose Active before its response is installed locally.
+            // Wait only for this captured connection; retirement never selects another.
+            using var wait = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _cts.Token);
+            wait.CancelAfter(ClientMessageConnectWait);
+            if (!await connection.SendReady.Task.WaitAsync(wait.Token).ConfigureAwait(false))
+                throw new InvalidOperationException("The client message's physical connection retired before activation.");
+            await SendPayloadAsync(connection, payload, wait.Token).ConfigureAwait(false);
         }
 
         public void RegisterSubmission(SubmitPromptCommand command)

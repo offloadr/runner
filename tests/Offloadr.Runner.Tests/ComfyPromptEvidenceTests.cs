@@ -237,21 +237,9 @@ public sealed partial class ComfyPromptEvidenceTests
         var first = await listener.GetContextAsync().WaitAsync(TimeSpan.FromSeconds(3));
         var firstSocket = (await first.AcceptWebSocketAsync(null)).WebSocket;
         var accepted = await sink.Authority.Activations.Reader.ReadAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(3));
-        // The response returns before the runner installs it locally. A native
-        // feature send is the independent observable barrier for later tests;
-        // here wait for the production send path to become available.
-        var sendDeadline = System.Diagnostics.Stopwatch.StartNew();
-        while (true)
-        {
-            try
-            {
-                await relay.SendClientMessageAsync(command.SessionId, command.EditorSid, "client", command.Target.GpuGeneration,
-                    command.Target.RuntimeEpoch, command.Target.RuntimeInstanceId, "{\"action\":\"once\"}"u8.ToArray(),
-                    accepted.BridgeConnectionId, accepted.LeaseRevision, CancellationToken.None);
-                break;
-            }
-            catch (InvalidOperationException) when (sendDeadline.Elapsed < TimeSpan.FromSeconds(3)) { await Task.Delay(10); }
-        }
+        await relay.SendClientMessageAsync(command.SessionId, command.EditorSid, "client", command.Target.GpuGeneration,
+            command.Target.RuntimeEpoch, command.Target.RuntimeInstanceId, "{\"action\":\"once\"}"u8.ToArray(),
+            accepted.BridgeConnectionId, accepted.LeaseRevision, CancellationToken.None);
         var buffer = new byte[1024];
         var received = await firstSocket.ReceiveAsync(buffer, CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(3));
         Assert.That(System.Text.Encoding.UTF8.GetString(buffer, 0, received.Count), Is.EqualTo("{\"action\":\"once\"}"));

@@ -37,6 +37,7 @@ internal sealed partial class ComfySessionEventRelay
             internal ulong Sequence;
             internal long Deadline;
             internal bool Active;
+            internal readonly TaskCompletionSource<bool> SendReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
         }
 
         private bool RuntimeIsCurrent()
@@ -189,6 +190,7 @@ internal sealed partial class ComfySessionEventRelay
                         throw new InvalidOperationException("The bridge activation was not accepted.");
                     delay = TimeSpan.FromSeconds(1);
                     if (features.Length > 0) await SendPayloadAsync(connection, features, token).ConfigureAwait(false);
+                    connection.SendReady.TrySetResult(true);
                     using var heartbeat = CancellationTokenSource.CreateLinkedTokenSource(token);
                     var heartbeatTask = RunHeartbeatAsync(connection, heartbeat.Token);
                     var expiryTask = GuardExpiryAsync(connection, heartbeat.Token);
@@ -211,7 +213,11 @@ internal sealed partial class ComfySessionEventRelay
                     await _sendLock.WaitAsync().ConfigureAwait(false);
                     try
                     {
-                        if (connection is not null) connection.Active = false;
+                        if (connection is not null)
+                        {
+                            connection.Active = false;
+                            connection.SendReady.TrySetResult(false);
+                        }
                         lock (_socketGate) if (ReferenceEquals(_connection, connection)) _connection = null;
                         socket.Abort();
                     }

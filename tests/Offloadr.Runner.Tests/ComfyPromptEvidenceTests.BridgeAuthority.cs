@@ -173,6 +173,111 @@ public sealed partial class ComfyPromptEvidenceTests
         Assert.That(inactive.ReportSequence, Is.EqualTo(active[0].ReportSequence + 1));
     }
 
+    [TestCase(false, "accept")]
+    [TestCase(true, "accept")]
+    [TestCase(false, "cancel")]
+    [TestCase(false, "stop")]
+    [TestCase(false, "reject")]
+    [TestCase(false, "timeout")]
+    public async Task ClientMessageWaitsForItsCapturedActivationWithoutRetryOrRebinding(bool hyphenatedSession, string outcome)
+    {
+        using var portReservation = new TcpListener(IPAddress.Loopback, 0);
+        portReservation.Start(); var port = ((IPEndPoint)portReservation.LocalEndpoint).Port; portReservation.Stop();
+        using var listener = new HttpListener(); listener.Prefixes.Add($"http://127.0.0.1:{port}/"); listener.Start();
+        var command = Command();
+        if (hyphenatedSession)
+        {
+            command.SessionId = Guid.Parse(command.SessionId).ToString("D");
+            command.Target.RunnerSessionId = command.SessionId;
+        }
+        var tracked = new Dictionary<string, RuntimeIdentity>(StringComparer.Ordinal)
+        {
+            [command.SessionId] = new(command.Target.GpuGeneration, command.Target.RuntimeEpoch, command.Target.RuntimeInstanceId),
+        };
+        var sealings = new Dictionary<string, SessionSealingStatus>(StringComparer.Ordinal) { [command.SessionId] = new() };
+        var allowActive = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var sink = new EvidenceSink((_, _) => Task.CompletedTask);
+        sink.Authority.BeforeReportResponse = async (request, ct) =>
+        {
+            if (request.State == EditorRuntimeBridgeState.Active) await allowActive.Task.WaitAsync(ct);
+        };
+        if (outcome == "reject")
+            sink.Authority.TransformReportResult = result => { result.Outcome = EditorRuntimeBridgeOutcome.Preempted; return result; };
+        await using var relay = new ComfySessionEventRelay(command.Target.RunnerId, "127.0.0.1", port,
+            "test-process", session => sealings.GetValueOrDefault(session),
+            (session, runtime) => tracked.TryGetValue(session, out var current) && current.SameRuntime(runtime));
+        relay.AttachSink(sink);
+        using var cancelSend = new CancellationTokenSource();
+        WebSocket? socket = null;
+        Task? send = null;
+        Task<WebSocketReceiveResult>? receive = null;
+        try
+        {
+            await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", command.Target.GpuGeneration,
+                command.Target.RuntimeEpoch, command.Target.RuntimeInstanceId, "initial features"u8.ToArray(), CancellationToken.None);
+            var context = await listener.GetContextAsync().WaitAsync(TimeSpan.FromSeconds(3));
+            socket = (await context.AcceptWebSocketAsync(null)).WebSocket;
+            // The protocol peer has committed Active but deliberately holds its response.
+            // Production may deliver a command carrying this exact authority already.
+            var accepted = await sink.Authority.Activations.Reader.ReadAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(3));
+            var buffer = new byte[1024];
+            receive = socket.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None);
+            send = relay.SendClientMessageAsync(command.SessionId, command.EditorSid, "client", command.Target.GpuGeneration,
+                command.Target.RuntimeEpoch, command.Target.RuntimeInstanceId, "one client message"u8.ToArray(),
+                accepted.BridgeConnectionId, accepted.LeaseRevision, cancelSend.Token);
+            await Task.Delay(100);
+            Assert.That(send.IsCompleted, Is.False, "A matching command must wait for its captured activation, without caller retry.");
+            Assert.That(receive.IsCompleted, Is.False, "Native bytes must wait for the accepted Active response.");
+            if (outcome == "accept")
+            {
+                allowActive.TrySetResult();
+                await send.WaitAsync(TimeSpan.FromSeconds(3));
+                var first = await receive.WaitAsync(TimeSpan.FromSeconds(3));
+                Assert.That(System.Text.Encoding.UTF8.GetString(buffer, 0, first.Count), Is.EqualTo("initial features"));
+                var second = await socket.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(3));
+                Assert.That(System.Text.Encoding.UTF8.GetString(buffer, 0, second.Count), Is.EqualTo("one client message"));
+                Assert.That(sink.Authority.ReserveCalls.Single().Target.SessionId, Is.EqualTo(command.SessionId));
+            }
+            else if (outcome == "cancel")
+            {
+                cancelSend.Cancel();
+                Assert.That(async () => await send.WaitAsync(TimeSpan.FromSeconds(3)), Throws.InstanceOf<OperationCanceledException>());
+            }
+            else if (outcome == "timeout")
+            {
+                Assert.That(async () => await send.WaitAsync(TimeSpan.FromSeconds(6)), Throws.InstanceOf<OperationCanceledException>());
+            }
+            else if (outcome == "stop")
+            {
+                await relay.StopSessionAsync(command.SessionId).WaitAsync(TimeSpan.FromSeconds(3));
+                Assert.That(async () => await send.WaitAsync(TimeSpan.FromSeconds(3)),
+                    Throws.InstanceOf<OperationCanceledException>().Or.InstanceOf<InvalidOperationException>());
+            }
+            else
+            {
+                allowActive.TrySetResult();
+                Assert.That(async () => await send.WaitAsync(TimeSpan.FromSeconds(3)), Throws.InstanceOf<InvalidOperationException>());
+            }
+        }
+        finally
+        {
+            allowActive.TrySetResult();
+            await relay.StopSessionAsync(command.SessionId).WaitAsync(TimeSpan.FromSeconds(3));
+            socket?.Abort(); socket?.Dispose();
+            if (send is not null)
+            {
+                try { await send.WaitAsync(TimeSpan.FromSeconds(3)); }
+                catch (Exception ex) when (ex is InvalidOperationException or OperationCanceledException) { }
+            }
+            if (receive is not null)
+            {
+                try { await receive.WaitAsync(TimeSpan.FromSeconds(3)); }
+                catch (Exception ex) when (ex is WebSocketException or OperationCanceledException) { }
+            }
+        }
+        Assert.That(BridgeCount(relay), Is.Zero);
+    }
+
     [Test]
     public async Task ClientIdentifierContainingSeparatorDoesNotRetireAnotherClientsBridge()
     {
