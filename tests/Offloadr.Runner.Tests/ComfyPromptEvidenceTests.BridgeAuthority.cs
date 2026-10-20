@@ -20,6 +20,7 @@ public sealed partial class ComfyPromptEvidenceTests
         private ulong fence;
         private readonly Dictionary<string, EditorRuntimeBridgeResult> reservations = [];
         private readonly Dictionary<string, EditorRuntimeBridgeResult> observations = [];
+        private readonly Dictionary<string, Timestamp> firstActive = [];
         internal readonly ConcurrentQueue<ReserveEditorRuntimeBridgeRequest> ReserveCalls = new();
         internal readonly ConcurrentQueue<ReportEditorRuntimeBridgeStateRequest> ReportCalls = new();
         internal readonly Channel<EditorRuntimeBridgeLease> Activations = Channel.CreateUnbounded<EditorRuntimeBridgeLease>();
@@ -27,6 +28,7 @@ public sealed partial class ComfyPromptEvidenceTests
         internal Func<ReportEditorRuntimeBridgeStateRequest, CancellationToken, Task>? BeforeReportResponse;
         internal EditorRuntimeBridgeOutcome ActiveOutcome = EditorRuntimeBridgeOutcome.Accepted;
         internal Func<EditorRuntimeBridgeResult, EditorRuntimeBridgeResult>? TransformReportResult;
+        internal Func<EditorRuntimeBridgeResult, EditorRuntimeBridgeResult>? TransformReservationResult;
 
         internal Task<ReadEditorRuntimeBridgeCursorResponse> CursorAsync(ReadEditorRuntimeBridgeCursorRequest request, CancellationToken token)
         {
@@ -73,7 +75,7 @@ public sealed partial class ComfyPromptEvidenceTests
                 }
             }
             if (BeforeReservationResponse is { } before) await before(request, token);
-            return new() { Result = result };
+            return new() { Result = TransformReservationResult?.Invoke(result) ?? result };
         }
 
         internal async Task<ReportEditorRuntimeBridgeStateResponse> ReportAsync(ReportEditorRuntimeBridgeStateRequest request, CancellationToken token)
@@ -98,9 +100,13 @@ public sealed partial class ComfyPromptEvidenceTests
                     result.Lease.LastObservedUtc = Timestamp.FromDateTime(now);
                     result.Lease.ExpiresUtc = Timestamp.FromDateTime(now.AddSeconds(30));
                     if (request.State == EditorRuntimeBridgeState.Active) result.Lease.FirstActiveUtc = Timestamp.FromDateTime(now);
+                    else if (firstActive.TryGetValue(request.BridgeConnectionId, out var activated)) result.Lease.FirstActiveUtc = activated.Clone();
                     observations.Add(key, result.Clone());
                     if (request.State == EditorRuntimeBridgeState.Active && result.Outcome == EditorRuntimeBridgeOutcome.Accepted)
+                    {
+                        firstActive[request.BridgeConnectionId] = result.Lease.FirstActiveUtc.Clone();
                         Activations.Writer.TryWrite(result.Lease.Clone());
+                    }
                 }
             }
             if (BeforeReportResponse is { } before) await before(request, token);

@@ -27,6 +27,12 @@ internal sealed partial class ComfySessionEventRelay
 
     private sealed partial class SessionBridge
     {
+        private sealed class BridgeRetiredException(string message) : Exception(message)
+        {
+        }
+
+        public bool IsRetired => !RuntimeIsCurrent() || _loopTask is { IsCompleted: true };
+
         private sealed class PhysicalConnection(Guid id, EditorRuntimeBridgeTarget target, SessionSealingStatus profile, ClientWebSocket socket)
         {
             internal readonly Guid Id = id;
@@ -68,7 +74,7 @@ internal sealed partial class ComfySessionEventRelay
             var cursor = await CallAsync((sink, ct) => sink.ReadEditorRuntimeBridgeCursorAsync(
                 new() { Target = connection.Target.Clone() }, ct), token).ConfigureAwait(false);
             if (cursor.Result?.Outcome != EditorRuntimeBridgeOutcome.Accepted || cursor.Result.ActivationFence >= long.MaxValue)
-                throw new InvalidOperationException("The runtime cannot reserve another bridge connection.");
+                throw new BridgeRetiredException("The runtime cannot reserve another bridge connection.");
             var request = new ReserveEditorRuntimeBridgeRequest
             {
                 Target = connection.Target.Clone(),
@@ -84,10 +90,21 @@ internal sealed partial class ComfySessionEventRelay
                 try
                 {
                     var response = await CallAsync((sink, ct) => sink.ReserveEditorRuntimeBridgeAsync(request.Clone(), ct), token).ConfigureAwait(false);
-                    var remaining = RemainingBridgeBudget(response.Result, Stopwatch.GetElapsedTime(started));
-                    if (!Accepted(response.Result) || !Matches(connection, response.Result) || remaining <= TimeSpan.Zero)
-                        throw new InvalidOperationException("The physical bridge reservation is no longer current.");
-                    connection.Deadline = Stopwatch.GetTimestamp() + (long)(remaining.TotalSeconds * Stopwatch.Frequency);
+                    var observed = Stopwatch.GetTimestamp();
+                    var remaining = RemainingBridgeBudget(response.Result, Stopwatch.GetElapsedTime(started, observed));
+                    if (!Accepted(response.Result))
+                    {
+                        // A shared-cursor race loses this physical attempt, not
+                        // the current runtime's permission to make a fresh claim.
+                        if (response.Result?.Outcome is EditorRuntimeBridgeOutcome.Stale)
+                            throw new InvalidOperationException("The physical bridge reservation lost its claim.");
+                        throw new BridgeRetiredException("The physical bridge reservation was rejected.");
+                    }
+                    if (!Matches(connection, response.Result))
+                        throw new BridgeRetiredException("The physical bridge reservation has incompatible authority.");
+                    if (remaining <= TimeSpan.Zero)
+                        throw new InvalidOperationException("The physical bridge reservation expired.");
+                    Interlocked.Exchange(ref connection.Deadline, observed + (long)(remaining.TotalSeconds * Stopwatch.Frequency));
                     return;
                 }
                 catch (Exception ex) when (Transient(ex, token))
@@ -126,15 +143,26 @@ internal sealed partial class ComfySessionEventRelay
                 try
                 {
                     var response = await CallAsync((sink, ct) => sink.ReportEditorRuntimeBridgeStateAsync(request.Clone(), ct), token).ConfigureAwait(false);
-                    var remaining = RemainingBridgeBudget(response.Result, Stopwatch.GetElapsedTime(started));
+                    var observed = Stopwatch.GetTimestamp();
+                    var remaining = RemainingBridgeBudget(response.Result, Stopwatch.GetElapsedTime(started, observed));
+                    // Lock contention consumes this absolute budget; it cannot
+                    // turn the received duration into a later lease deadline.
+                    var deadline = observed + (long)(remaining.TotalSeconds * Stopwatch.Frequency);
                     await _sendLock.WaitAsync(token).ConfigureAwait(false);
                     try
                     {
                         connection.Active = false;
-                        if (!Accepted(response.Result) || !Matches(connection, response.Result)) return false;
+                        if (!Accepted(response.Result))
+                        {
+                            if (response.Result?.Outcome is EditorRuntimeBridgeOutcome.Stale) return false;
+                            throw new BridgeRetiredException("The physical bridge observation was rejected.");
+                        }
+                        if (!Matches(connection, response.Result))
+                            throw new BridgeRetiredException("The physical bridge observation has incompatible authority.");
                         if (state == EditorRuntimeBridgeState.Inactive) return true;
-                        if (!RuntimeIsCurrent() || remaining <= TimeSpan.Zero || response.Result.Lease.FirstActiveUtc is null) return false;
-                        connection.Deadline = Stopwatch.GetTimestamp() + (long)(remaining.TotalSeconds * Stopwatch.Frequency);
+                        if (!RuntimeIsCurrent() || remaining <= TimeSpan.Zero || Stopwatch.GetTimestamp() >= deadline
+                            || connection.Socket.State != WebSocketState.Open || response.Result.Lease.FirstActiveUtc is null) return false;
+                        Interlocked.Exchange(ref connection.Deadline, deadline);
                         connection.Active = true;
                         return true;
                     }
@@ -142,9 +170,8 @@ internal sealed partial class ComfySessionEventRelay
                 }
                 catch (Exception ex) when (Transient(ex, token))
                 {
-                    await _sendLock.WaitAsync(token).ConfigureAwait(false);
-                    try { connection.Active = false; }
-                    finally { _sendLock.Release(); }
+                    // A transport failure neither revokes nor renews the last
+                    // accepted lease. Send and expiry guards retain its deadline.
                     if (!retry) return false;
                     await Task.Delay(TimeSpan.FromMilliseconds(250), token).ConfigureAwait(false);
                 }
@@ -201,6 +228,11 @@ internal sealed partial class ComfySessionEventRelay
                         try { await Task.WhenAll(heartbeatTask, expiryTask).ConfigureAwait(false); }
                         catch (OperationCanceledException) when (heartbeat.IsCancellationRequested) { }
                     }
+                }
+                catch (BridgeRetiredException)
+                {
+                    RunnerLog.Warning(nameof(SessionBridge), "Bridge connection authority retired.");
+                    break;
                 }
                 catch (OperationCanceledException) when (token.IsCancellationRequested) { break; }
                 catch (Exception ex) when (ShouldSuppressSessionBridgeError(ex, token.IsCancellationRequested)) { break; }

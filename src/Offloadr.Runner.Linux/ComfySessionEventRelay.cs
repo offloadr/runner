@@ -182,6 +182,13 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
         {
             if (_shutdown.IsCancellationRequested || !_isTrackedRuntime(sessionId.Trim(), runtime))
                 throw new InvalidOperationException("The bridge runtime has retired.");
+            // Reclaim only terminal or untracked actors. Joining before removal
+            // keeps their sockets and retries counted until cleanup finishes.
+            foreach (var retired in _bridges.Where(pair => pair.Value.IsRetired).ToArray())
+            {
+                await retired.Value.DisposeAsync().ConfigureAwait(false);
+                _bridges.TryRemove(retired.Key, out _);
+            }
             var key = BuildKey(sessionId, clientId, runtime);
             var prefix = BuildClientPrefix(sessionId, clientId);
             foreach (var other in _bridges.Where(pair => pair.Key.StartsWith(prefix, StringComparison.Ordinal) && pair.Key != key).ToArray())

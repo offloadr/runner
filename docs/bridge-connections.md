@@ -26,15 +26,22 @@ Database observation and expiry timestamps provide a duration, not a host-clock
 comparison. The runner subtracts the whole monotonic RPC duration before using a
 lease. Reports have a two-second timeout, connects and sends have a five-second
 budget capped by the remaining lease, and heartbeats run every ten seconds.
-Failure to renew removes sendability; expiry or runtime retirement aborts the
-socket. Native I/O already in progress may have reached the peer before remote
+Transient renewal failures retain sendability only under the last accepted
+monotonic deadline; they cannot extend it. Definitive authority rejection, expiry
+or runtime retirement removes sendability and aborts the socket. A response's
+absolute deadline is computed before waiting for the native send lock; lock
+contention consumes that budget. Native I/O already in progress may have reached the peer before remote
 revocation. Socket transport acceptance is not native applied-state evidence.
 
 A relay owns at most 32 bridge objects, including connecting and retrying objects.
 Client identifiers are exact UTF-8 strings of at most 128 bytes, with no NUL or
 outer whitespace. Registry creation is serialized; there are no speculative
 dictionary factories. Replacement joins the obsolete object before releasing its
-slot. Stop and host shutdown cancel and join owned tasks, with independent bounded
+slot. Before admission, completed or no-longer-tracked bridge actors are joined
+and removed, releasing their slots. Definite reservation rejection ends the actor;
+a stale or expired claim can retry a fresh UUID/cursor while its runtime remains
+current. Healthy owned bridges remain counted against the cap. Stop and host
+shutdown cancel and join owned tasks, with independent bounded
 best-effort Inactive reports. Retained client feature frames can be replayed on a
 new authorized connection; one-off client messages are never retained for replay.
 
