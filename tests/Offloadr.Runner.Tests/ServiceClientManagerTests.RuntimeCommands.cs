@@ -1550,6 +1550,10 @@ public partial class ServiceClientManagerTests
 
     private sealed class RuntimeCommandSink : IRunnerSessionSink
     {
+        public Task<ReadEditorRuntimeBridgeCursorResponse> ReadEditorRuntimeBridgeCursorAsync(ReadEditorRuntimeBridgeCursorRequest request, CancellationToken token) => throw new NotSupportedException();
+        public Task<ReserveEditorRuntimeBridgeResponse> ReserveEditorRuntimeBridgeAsync(ReserveEditorRuntimeBridgeRequest request, CancellationToken token) => throw new NotSupportedException();
+        public Task<ReportEditorRuntimeBridgeStateResponse> ReportEditorRuntimeBridgeStateAsync(ReportEditorRuntimeBridgeStateRequest request, CancellationToken token) => throw new NotSupportedException();
+
         private int _failuresRemaining;
 
         public ConcurrentQueue<AcknowledgeSessionStartRequest> StartAcks { get; } = new();

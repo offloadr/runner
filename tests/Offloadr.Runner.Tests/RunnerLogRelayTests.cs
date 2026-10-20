@@ -186,6 +186,10 @@ public class RunnerLogRelayTests
 
     private sealed class RecordingSink : IRunnerSessionSink
     {
+        public Task<ReadEditorRuntimeBridgeCursorResponse> ReadEditorRuntimeBridgeCursorAsync(ReadEditorRuntimeBridgeCursorRequest request, CancellationToken token) => throw new NotSupportedException();
+        public Task<ReserveEditorRuntimeBridgeResponse> ReserveEditorRuntimeBridgeAsync(ReserveEditorRuntimeBridgeRequest request, CancellationToken token) => throw new NotSupportedException();
+        public Task<ReportEditorRuntimeBridgeStateResponse> ReportEditorRuntimeBridgeStateAsync(ReportEditorRuntimeBridgeStateRequest request, CancellationToken token) => throw new NotSupportedException();
+
         public TaskCompletionSource<ReportRunnerLogsRequest> FirstRequest { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -222,6 +226,10 @@ public class RunnerLogRelayTests
 
     private sealed class RejectingSink : IRunnerSessionSink
     {
+        public Task<ReadEditorRuntimeBridgeCursorResponse> ReadEditorRuntimeBridgeCursorAsync(ReadEditorRuntimeBridgeCursorRequest request, CancellationToken token) => throw new NotSupportedException();
+        public Task<ReserveEditorRuntimeBridgeResponse> ReserveEditorRuntimeBridgeAsync(ReserveEditorRuntimeBridgeRequest request, CancellationToken token) => throw new NotSupportedException();
+        public Task<ReportEditorRuntimeBridgeStateResponse> ReportEditorRuntimeBridgeStateAsync(ReportEditorRuntimeBridgeStateRequest request, CancellationToken token) => throw new NotSupportedException();
+
         private readonly string _rejectedMessage;
         private int _rejectedCalls;
 
@@ -278,6 +286,10 @@ public class RunnerLogRelayTests
 
     private sealed class BlockingSink : IRunnerSessionSink
     {
+        public Task<ReadEditorRuntimeBridgeCursorResponse> ReadEditorRuntimeBridgeCursorAsync(ReadEditorRuntimeBridgeCursorRequest request, CancellationToken token) => throw new NotSupportedException();
+        public Task<ReserveEditorRuntimeBridgeResponse> ReserveEditorRuntimeBridgeAsync(ReserveEditorRuntimeBridgeRequest request, CancellationToken token) => throw new NotSupportedException();
+        public Task<ReportEditorRuntimeBridgeStateResponse> ReportEditorRuntimeBridgeStateAsync(ReportEditorRuntimeBridgeStateRequest request, CancellationToken token) => throw new NotSupportedException();
+
         public TaskCompletionSource<bool> InvocationStarted { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
 

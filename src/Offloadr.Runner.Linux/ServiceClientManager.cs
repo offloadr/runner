@@ -3110,6 +3110,8 @@ internal static class ServiceClientManager
                     command.RuntimeEpoch,
                     command.RuntimeInstanceId,
                     command.ClientMessage.ToByteArray(),
+                    command.BridgeConnectionId,
+                    command.BridgeLeaseRevision,
                     cancellationToken).ConfigureAwait(false);
                 response.TransportSucceeded = true;
                 response.StatusCode = 204;
