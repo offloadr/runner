@@ -46,6 +46,7 @@ public partial class ServiceClientManagerTests
     {
         var changes = new (string Name, Action<RelayEditorRuntimeRequestCommand> Change)[]
         {
+            ("runner", command => command.RunnerId = "99999999999949998999999999999999"),
             ("body", command => command.Body = ByteString.CopyFromUtf8("different body")),
             ("path", command => command.Path = "interrupt"),
             ("method", command => command.Method = "POST"),
