@@ -8,6 +8,8 @@ using System.Buffers;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
+using System.Diagnostics;
+using System.Text;
 using System.Linq;
 using System.Net.WebSockets;
 using System.Text.Json;
@@ -60,7 +62,19 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
     private readonly Task _senderTask;
     private readonly object _sinkLock = new();
     private readonly Func<string, Func<Task>>? _captureSessionArtifactRefresh;
-    private readonly Func<string, RuntimeIdentity, bool>? _isTrackedRuntime;
+    private readonly Func<string, RuntimeIdentity, bool> _isTrackedRuntime;
+    private readonly string _instanceId;
+    private readonly Func<string, SessionSealingStatus?> _getSessionSealing;
+    private readonly SemaphoreSlim _bridgeOwnership = new(1, 1);
+    internal const int MaxOwnedBridges = 32;
+    private static readonly UTF8Encoding ClientIdEncoding = new(false, true);
+
+    private static bool ValidClientId(string clientId)
+    {
+        if (string.IsNullOrWhiteSpace(clientId) || clientId != clientId.Trim() || clientId.Contains('\0')) return false;
+        try { return ClientIdEncoding.GetByteCount(clientId) <= 128; }
+        catch (EncoderFallbackException) { return false; }
+    }
     private readonly ConcurrentDictionary<string, DateTimeOffset> _lastArtifactRefreshUtc = new(StringComparer.Ordinal);
 
     internal static TimeSpan ArtifactRefreshDebounceInterval { get; set; } = TimeSpan.FromMilliseconds(500);
@@ -92,15 +106,19 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
         string runnerId,
         string comfyHost,
         int comfyPort,
+        string instanceId,
+        Func<string, SessionSealingStatus?> getSessionSealing,
+        Func<string, RuntimeIdentity, bool> isTrackedRuntime,
         Func<string, Func<Task>>? captureSessionArtifactRefresh = null,
-        int queueCapacity = DefaultQueueCapacity,
-        Func<string, RuntimeIdentity, bool>? isTrackedRuntime = null)
+        int queueCapacity = DefaultQueueCapacity)
     {
         _runnerId = runnerId ?? throw new ArgumentNullException(nameof(runnerId));
         _comfyHost = string.IsNullOrWhiteSpace(comfyHost) ? "127.0.0.1" : comfyHost.Trim();
         _comfyPort = comfyPort;
         _captureSessionArtifactRefresh = captureSessionArtifactRefresh;
-        _isTrackedRuntime = isTrackedRuntime;
+        _instanceId = string.IsNullOrWhiteSpace(instanceId) ? throw new ArgumentException("A registered process identity is required.", nameof(instanceId)) : instanceId;
+        _getSessionSealing = getSessionSealing ?? throw new ArgumentNullException(nameof(getSessionSealing));
+        _isTrackedRuntime = isTrackedRuntime ?? throw new ArgumentNullException(nameof(isTrackedRuntime));
         if (queueCapacity <= 0)
         {
             throw new ArgumentOutOfRangeException(nameof(queueCapacity), "Queue capacity must be positive.");
@@ -148,7 +166,7 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
         byte[] clientMessage,
         CancellationToken cancellationToken)
     {
-        if (string.IsNullOrWhiteSpace(sessionId) || string.IsNullOrWhiteSpace(clientId) || string.IsNullOrWhiteSpace(editorSid)
+        if (!Guid.TryParse(sessionId, out var session) || session == Guid.Empty || !ValidClientId(clientId) || string.IsNullOrWhiteSpace(editorSid)
             || lifecycleGeneration == 0 || runtimeEpoch == 0 || !Guid.TryParse(runtimeInstanceId, out var instance) || instance == Guid.Empty)
             throw new ArgumentException("A complete captured bridge identity is required.");
 
@@ -156,32 +174,41 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
 
         // Only the session's tracked child may receive a bridge: a delayed relay
         // for an old runtime would otherwise reconnect to its replacement.
-        if (_isTrackedRuntime is not null && !_isTrackedRuntime(sessionId.Trim(), runtime))
+        if (!_isTrackedRuntime(sessionId.Trim(), runtime))
             throw new InvalidOperationException("The bridge identity is not the session's tracked runtime.");
 
-        var key = BuildKey(sessionId, clientId, runtime);
-        await RetireOtherRuntimeBridgesAsync(sessionId, clientId, key).ConfigureAwait(false);
-        var bridge = _bridges.GetOrAdd(key, _ => new SessionBridge(this, _runnerId, sessionId, editorSid, clientId, lifecycleGeneration, runtimeEpoch, runtimeInstanceId, BuildWsUri(clientId)));
-        bridge.UpdateConnectionData(editorSid, lifecycleGeneration, runtimeEpoch, runtimeInstanceId, clientMessage);
-        await bridge.StartAsync(cancellationToken).ConfigureAwait(false);
-    }
-
-    private async Task RetireOtherRuntimeBridgesAsync(string sessionId, string clientId, string key)
-    {
-        var prefix = BuildClientPrefix(sessionId, clientId);
-        foreach (var other in _bridges.Keys.Where(candidate =>
-                     candidate.StartsWith(prefix, StringComparison.Ordinal) && !string.Equals(candidate, key, StringComparison.Ordinal)).ToArray())
+        await _bridgeOwnership.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
         {
-            // Without a runtime check this relay cannot tell which bridge is
-            // current, so an existing bridge is never rebound.
-            if (_isTrackedRuntime is null)
-                throw new InvalidOperationException("An existing bridge cannot be rebound to another runtime.");
-
-            if (_bridges.TryRemove(other, out var retired))
+            if (_shutdown.IsCancellationRequested || !_isTrackedRuntime(sessionId.Trim(), runtime))
+                throw new InvalidOperationException("The bridge runtime has retired.");
+            // Reclaim only terminal or untracked actors. Joining before removal
+            // keeps their sockets and retries counted until cleanup finishes.
+            foreach (var retired in _bridges.Where(pair => pair.Value.IsRetired).ToArray())
             {
-                await retired.DisposeAsync().ConfigureAwait(false);
+                await retired.Value.DisposeAsync().ConfigureAwait(false);
+                _bridges.TryRemove(retired.Key, out _);
             }
+            var key = BuildKey(sessionId, clientId, runtime);
+            var prefix = BuildClientPrefix(sessionId, clientId);
+            foreach (var other in _bridges.Where(pair => pair.Key.StartsWith(prefix, StringComparison.Ordinal) && pair.Key != key).ToArray())
+            {
+                // Keep the owned slot counted until every obsolete task has joined.
+                await other.Value.DisposeAsync().ConfigureAwait(false);
+                _bridges.TryRemove(other.Key, out _);
+            }
+            if (!_bridges.TryGetValue(key, out var bridge))
+            {
+                if (_bridges.Count >= MaxOwnedBridges)
+                    throw new InvalidOperationException("The runner WebSocket bridge capacity is exhausted.");
+                bridge = new SessionBridge(this, _runnerId, sessionId, editorSid, clientId, lifecycleGeneration,
+                    runtimeEpoch, runtimeInstanceId, BuildWsUri(clientId));
+                if (!_bridges.TryAdd(key, bridge)) throw new InvalidOperationException("Bridge ownership changed while locked.");
+            }
+            bridge.UpdateConnectionData(editorSid, lifecycleGeneration, runtimeEpoch, runtimeInstanceId, clientMessage);
+            await bridge.StartAsync(cancellationToken).ConfigureAwait(false);
         }
+        finally { _bridgeOwnership.Release(); }
     }
 
     public async Task SendClientMessageAsync(
@@ -192,17 +219,20 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
         ulong runtimeEpoch,
         string runtimeInstanceId,
         byte[] payload,
+        string bridgeConnectionId,
+        ulong bridgeLeaseRevision,
         CancellationToken cancellationToken)
     {
         // A browser-originated message is sent once. It is not the bridge's connection
         // handshake, so it must not be retained and replayed on later reconnects.
-        await EnsureBridgeAsync(sessionId, editorSid, clientId, lifecycleGeneration, runtimeEpoch, runtimeInstanceId, [], cancellationToken).ConfigureAwait(false);
         if (!TryGetBridge(sessionId, clientId, new RuntimeIdentity(lifecycleGeneration, runtimeEpoch, runtimeInstanceId), out var bridge))
         {
             throw new InvalidOperationException("The editor WebSocket bridge for this client is not available.");
         }
+        if (!bridge.MatchesEditor(editorSid))
+            throw new InvalidOperationException("The client message belongs to another editor.");
 
-        await bridge.SendClientMessageAsync(payload, cancellationToken).ConfigureAwait(false);
+        await bridge.SendClientMessageAsync(payload, bridgeConnectionId, bridgeLeaseRevision, cancellationToken).ConfigureAwait(false);
     }
 
     public void RegisterSubmission(string sessionId, string clientId, SubmitPromptCommand command)
@@ -252,16 +282,16 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
 
     public async Task StopSessionAsync(string sessionId)
     {
-        if (string.IsNullOrWhiteSpace(sessionId)) return;
-        var prefix = sessionId.Trim() + "|";
-        var matches = _bridges.Where(kvp => kvp.Key.StartsWith(prefix, StringComparison.Ordinal)).Select(kvp => kvp.Key).ToList();
-        foreach (var key in matches)
+        if (!Guid.TryParse(sessionId, out var session)) return;
+        await _bridgeOwnership.WaitAsync().ConfigureAwait(false);
+        try
         {
-            if (_bridges.TryRemove(key, out var bridge))
-            {
-                await bridge.DisposeAsync().ConfigureAwait(false);
-            }
+            var prefix = session.ToString("n") + "|";
+            var matches = _bridges.Where(pair => pair.Key.StartsWith(prefix, StringComparison.Ordinal)).ToArray();
+            await Task.WhenAll(matches.Select(pair => pair.Value.DisposeAsync().AsTask())).ConfigureAwait(false);
+            foreach (var pair in matches) _bridges.TryRemove(pair.Key, out _);
         }
+        finally { _bridgeOwnership.Release(); }
     }
 
     internal bool Enqueue(SessionStreamEvent evt)
@@ -319,41 +349,10 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
         return _bridges.TryGetValue(key, out bridge!);
     }
 
-    private async Task<bool> ReportBridgeStateAsync(
-        string sessionId,
-        string editorSid,
-        string clientId,
-        ulong lifecycleGeneration,
-        ulong runtimeEpoch,
-        string runtimeInstanceId,
-        string bridgeConnectionId,
-        EditorRuntimeBridgeState state,
-        CancellationToken cancellationToken)
+    private IRunnerSessionSink BridgeSink()
     {
-        IRunnerSessionSink? sink;
         lock (_sinkLock)
-        {
-            sink = _sink;
-        }
-        if (sink is null || string.IsNullOrWhiteSpace(editorSid) || lifecycleGeneration == 0)
-        {
-            return false;
-        }
-
-        await sink.ReportEditorRuntimeBridgeStateAsync(new ReportEditorRuntimeBridgeStateRequest
-        {
-            RunnerId = _runnerId,
-            SessionId = sessionId,
-            EditorSid = editorSid,
-            ClientId = clientId,
-            LifecycleGeneration = lifecycleGeneration,
-            RuntimeEpoch = runtimeEpoch,
-            RuntimeInstanceId = runtimeInstanceId,
-            BridgeConnectionId = bridgeConnectionId,
-            State = state,
-            ObservedUtc = Timestamp.FromDateTime(DateTime.UtcNow)
-        }, cancellationToken).ConfigureAwait(false);
-        return true;
+            return _sink ?? throw new BridgeControlUnavailableException();
     }
 
     // Bridges are keyed by session, client and exact runtime, so a lookup made
@@ -366,7 +365,7 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
             runtime.RuntimeInstanceId);
 
     private static string BuildClientPrefix(string sessionId, string clientId)
-        => string.Concat(sessionId.Trim(), "|", clientId.Trim(), "|");
+        => string.Concat(Guid.Parse(sessionId).ToString("n"), "|", Convert.ToBase64String(ClientIdEncoding.GetBytes(clientId)), "|");
 
     private Uri BuildWsUri(string clientId)
     {
@@ -567,13 +566,14 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
             _shutdown.Cancel();
         }
 
-        foreach (var kvp in _bridges.ToArray())
+        await _bridgeOwnership.WaitAsync().ConfigureAwait(false);
+        try
         {
-            if (_bridges.TryRemove(kvp.Key, out var bridge))
-            {
-                await bridge.DisposeAsync().ConfigureAwait(false);
-            }
+            var matches = _bridges.ToArray();
+            await Task.WhenAll(matches.Select(pair => pair.Value.DisposeAsync().AsTask())).ConfigureAwait(false);
+            foreach (var pair in matches) _bridges.TryRemove(pair.Key, out _);
         }
+        finally { _bridgeOwnership.Release(); }
 
         _queue.Writer.TryComplete();
 
@@ -615,10 +615,6 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
         return exception is WebSocketException webSocketException
             && webSocketException.WebSocketErrorCode == WebSocketError.ConnectionClosedPrematurely;
     }
-
-    internal static bool IsBridgeConnectionActivated(string? activatedConnectionId, string? currentConnectionId)
-        => !string.IsNullOrWhiteSpace(currentConnectionId) &&
-           string.Equals(activatedConnectionId, currentConnectionId, StringComparison.Ordinal);
 
     private void TriggerArtifactRefresh(string sessionId)
     {
@@ -664,7 +660,7 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
             CancellationToken.None);
     }
 
-    private sealed class SessionBridge : IAsyncDisposable
+    private sealed partial class SessionBridge : IAsyncDisposable
     {
         private readonly ComfySessionEventRelay _owner;
         private readonly string _runnerId;
@@ -675,8 +671,7 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
         private readonly ulong _lifecycleGeneration;
         private readonly ulong _runtimeEpoch;
         private readonly string _runtimeInstanceId;
-        private string _bridgeConnectionId = string.Empty;
-        private string _activatedBridgeConnectionId = string.Empty;
+        private PhysicalConnection? _connection;
         private byte[] _clientMessage = [];
         private readonly CancellationTokenSource _cts = new();
         private readonly ConcurrentDictionary<string, string> _promptMap = new(StringComparer.Ordinal);
@@ -686,7 +681,6 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
         private readonly SemaphoreSlim _startLock = new(1, 1);
         private readonly SemaphoreSlim _sendLock = new(1, 1);
         private readonly object _socketGate = new();
-        private ClientWebSocket? _activeSocket;
         private Task? _loopTask;
         private string? _latestSubmissionId;
 
@@ -702,13 +696,13 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
             Uri uri)
         {
             _owner = owner;
-            _runnerId = runnerId;
+            _runnerId = Guid.Parse(runnerId).ToString("n");
             _sessionId = sessionId.Trim();
             _editorSid = editorSid?.Trim() ?? string.Empty;
-            _clientId = clientId.Trim();
+            _clientId = clientId;
             _lifecycleGeneration = lifecycleGeneration;
             _runtimeEpoch = runtimeEpoch;
-            _runtimeInstanceId = runtimeInstanceId?.Trim() ?? string.Empty;
+            _runtimeInstanceId = Guid.Parse(runtimeInstanceId).ToString("n");
             _uri = uri;
         }
 
@@ -723,40 +717,29 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
             }
         }
 
+        public bool MatchesEditor(string editorSid) => string.Equals(editorSid, _editorSid, StringComparison.Ordinal);
+
         /// <summary>
         /// Sends a one-off client message on the current connection, waiting briefly for a new
         /// bridge to connect. It is never retained: if no connection opens in time the send
         /// fails, so its request is acknowledged as failed rather than replayed later.
         /// </summary>
-        public async Task SendClientMessageAsync(byte[] payload, CancellationToken cancellationToken)
+        public async Task SendClientMessageAsync(byte[] payload, string connectionId, ulong leaseRevision, CancellationToken cancellationToken)
         {
-            if (payload is not { Length: > 0 })
-            {
-                return;
-            }
-
-            var deadline = DateTime.UtcNow + ClientMessageConnectWait;
-            while (true)
-            {
-                ClientWebSocket? socket;
-                lock (_socketGate)
-                {
-                    socket = _activeSocket;
-                }
-
-                if (socket is { State: WebSocketState.Open })
-                {
-                    await SendPayloadAsync(socket, payload, cancellationToken).ConfigureAwait(false);
-                    return;
-                }
-
-                if (DateTime.UtcNow >= deadline)
-                {
-                    throw new InvalidOperationException("The editor WebSocket is not connected; the client message was not sent.");
-                }
-
-                await Task.Delay(TimeSpan.FromMilliseconds(50), cancellationToken).ConfigureAwait(false);
-            }
+            if (payload is not { Length: > 0 }) return;
+            if (!Guid.TryParse(connectionId, out var parsed) || parsed == Guid.Empty || leaseRevision == 0)
+                throw new InvalidOperationException("The client message has no physical connection authority.");
+            PhysicalConnection? connection;
+            lock (_socketGate) connection = _connection;
+            if (connection is null || connection.Id != parsed || connection.Revision != leaseRevision)
+                throw new InvalidOperationException("The client message's physical connection has retired.");
+            // The server may expose Active before its response is installed locally.
+            // Wait only for this captured connection; retirement never selects another.
+            using var wait = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _cts.Token);
+            wait.CancelAfter(ClientMessageConnectWait);
+            if (!await connection.SendReady.Task.WaitAsync(wait.Token).ConfigureAwait(false))
+                throw new InvalidOperationException("The client message's physical connection retired before activation.");
+            await SendPayloadAsync(connection, payload, wait.Token).ConfigureAwait(false);
         }
 
         public void RegisterSubmission(SubmitPromptCommand command)
@@ -839,158 +822,6 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
             finally
             {
                 _startLock.Release();
-            }
-        }
-
-        private async Task RunAsync()
-        {
-            var token = _cts.Token;
-            var delay = TimeSpan.FromSeconds(1);
-
-            while (!token.IsCancellationRequested)
-            {
-                using var socket = new ClientWebSocket();
-                socket.Options.KeepAliveInterval = TimeSpan.FromSeconds(20);
-
-                try
-                {
-                    await socket.ConnectAsync(_uri, token).ConfigureAwait(false);
-                    _bridgeConnectionId = Guid.NewGuid().ToString("n");
-                    RunnerLog.Info<SessionBridge>($"[{_sessionId}] Comfy websocket connected (client {_clientId})");
-                    delay = TimeSpan.FromSeconds(1);
-                    lock (_socketGate)
-                    {
-                        _activeSocket = socket;
-                    }
-                    if (_clientMessage.Length > 0)
-                    {
-                        await SendPayloadAsync(socket, _clientMessage, token).ConfigureAwait(false);
-                    }
-                    var bridgeConnectionId = Volatile.Read(ref _bridgeConnectionId);
-                    if (await TryReportBridgeStateAsync(EditorRuntimeBridgeState.Active, token).ConfigureAwait(false))
-                    {
-                        Volatile.Write(ref _activatedBridgeConnectionId, bridgeConnectionId);
-                    }
-                    using var heartbeatCts = CancellationTokenSource.CreateLinkedTokenSource(token);
-                    var heartbeatTask = RunHeartbeatAsync(heartbeatCts.Token);
-                    try
-                    {
-                        await ReceiveLoopAsync(socket, token).ConfigureAwait(false);
-                    }
-                    finally
-                    {
-                        await heartbeatCts.CancelAsync().ConfigureAwait(false);
-                        try { await heartbeatTask.ConfigureAwait(false); } catch { }
-                        lock (_socketGate)
-                        {
-                            if (ReferenceEquals(_activeSocket, socket))
-                            {
-                                _activeSocket = null;
-                            }
-                        }
-                        await TryReportBridgeStateAsync(EditorRuntimeBridgeState.Inactive, CancellationToken.None).ConfigureAwait(false);
-                    }
-                }
-                catch (OperationCanceledException) when (token.IsCancellationRequested)
-                {
-                    break;
-                }
-                catch (Exception ex) when (ShouldSuppressSessionBridgeError(ex, token.IsCancellationRequested))
-                {
-                    break;
-                }
-                catch (WebSocketException ex) when (ex.WebSocketErrorCode == WebSocketError.ConnectionClosedPrematurely)
-                {
-                    try
-                    {
-                        await Task.Delay(delay, token).ConfigureAwait(false);
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        break;
-                    }
-                    delay = TimeSpan.FromSeconds(Math.Min(delay.TotalSeconds * 2, 10));
-                }
-                catch (Exception ex)
-                {
-                    RunnerLog.Error<SessionBridge>(ex, $"[{_sessionId}] Websocket bridge error for client {_clientId}: {ex.Message}");
-                    try
-                    {
-                        await Task.Delay(delay, token).ConfigureAwait(false);
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        break;
-                    }
-                    delay = TimeSpan.FromSeconds(Math.Min(delay.TotalSeconds * 2, 10));
-                }
-            }
-        }
-
-        private async Task SendPayloadAsync(ClientWebSocket socket, byte[] payload, CancellationToken cancellationToken)
-        {
-            await _sendLock.WaitAsync(cancellationToken).ConfigureAwait(false);
-            try
-            {
-                if (socket.State == WebSocketState.Open)
-                {
-                    await socket.SendAsync(payload, WebSocketMessageType.Text, true, cancellationToken).ConfigureAwait(false);
-                }
-            }
-            finally
-            {
-                _sendLock.Release();
-            }
-        }
-
-        private async Task RunHeartbeatAsync(CancellationToken cancellationToken)
-        {
-            while (!cancellationToken.IsCancellationRequested)
-            {
-                try
-                {
-                    await Task.Delay(TimeSpan.FromSeconds(10), cancellationToken).ConfigureAwait(false);
-                    if (IsBridgeConnectionActivated(
-                        Volatile.Read(ref _activatedBridgeConnectionId),
-                        Volatile.Read(ref _bridgeConnectionId)))
-                    {
-                        await TryReportBridgeStateAsync(EditorRuntimeBridgeState.Heartbeat, cancellationToken).ConfigureAwait(false);
-                    }
-                    else
-                    {
-                        var bridgeConnectionId = Volatile.Read(ref _bridgeConnectionId);
-                        if (await TryReportBridgeStateAsync(EditorRuntimeBridgeState.Active, cancellationToken).ConfigureAwait(false))
-                        {
-                            Volatile.Write(ref _activatedBridgeConnectionId, bridgeConnectionId);
-                        }
-                    }
-                }
-                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-                {
-                    return;
-                }
-            }
-        }
-
-        private async Task<bool> TryReportBridgeStateAsync(EditorRuntimeBridgeState state, CancellationToken cancellationToken)
-        {
-            try
-            {
-                return await _owner.ReportBridgeStateAsync(
-                    _sessionId,
-                    _editorSid,
-                    _clientId,
-                    _lifecycleGeneration,
-                    _runtimeEpoch,
-                    _runtimeInstanceId,
-                    _bridgeConnectionId,
-                    state,
-                    cancellationToken).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                RunnerLog.Error<SessionBridge>(ex, $"[{_sessionId}] Failed reporting bridge state {state}: {ex.Message}");
-                return false;
             }
         }
 

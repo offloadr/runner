@@ -10,7 +10,7 @@ using System.Reflection;
 
 namespace Offloadr.Runner.Tests;
 
-public sealed class ComfyPromptEvidenceTests
+public sealed partial class ComfyPromptEvidenceTests
 {
     [Test]
     public async Task TerminalEvidenceCaptureRetriesOriginalBytesAfterLostAcknowledgement()
@@ -19,7 +19,7 @@ public sealed class ComfyPromptEvidenceTests
         var original = command.Clone();
         var frame = Frame(command);
         var payload = frame.Payload;
-        await using var relay = new ComfySessionEventRelay(command.Target.RunnerId, "127.0.0.1", 8188);
+        await using var relay = new ComfySessionEventRelay(command.Target.RunnerId, "127.0.0.1", 8188, "test-process", _ => new SessionSealingStatus(), isTrackedRuntime: (_, _) => true);
         var observed = new List<ReportPromptEvidenceRequest>();
         var retried = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var sink = new EvidenceSink((ReportPromptEvidenceRequest request, CancellationToken _) =>
@@ -62,7 +62,7 @@ public sealed class ComfyPromptEvidenceTests
         if (mismatch == "generation") frame.LifecycleGeneration++;
         if (mismatch == "submission") frame.SubmissionId = Guid.NewGuid().ToString("n");
         if (mismatch == "nonterminal") frame.EventType = "status";
-        await using var relay = new ComfySessionEventRelay(command.Target.RunnerId, "127.0.0.1", 8188);
+        await using var relay = new ComfySessionEventRelay(command.Target.RunnerId, "127.0.0.1", 8188, "test-process", _ => new SessionSealingStatus(), isTrackedRuntime: (_, _) => true);
         var sink = new EvidenceSink((_, _) => throw new AssertionException("Unmatched evidence reached the sink."));
         relay.AttachSink(sink);
         Assert.That(relay.CapturePromptEvidence(command, frame), Is.Null);
@@ -89,7 +89,7 @@ public sealed class ComfyPromptEvidenceTests
         var deliveredFrame = new TaskCompletionSource<SessionStreamEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
         CancellationToken evidenceToken = default;
         var refreshCaptureAttempts = 0;
-        await using var relay = new ComfySessionEventRelay(command.Target.RunnerId, "127.0.0.1", port,
+        await using var relay = new ComfySessionEventRelay(command.Target.RunnerId, "127.0.0.1", port, "test-process", _ => new SessionSealingStatus(), isTrackedRuntime: (_, _) => true,
             captureSessionArtifactRefresh: _ =>
             {
                 Interlocked.Increment(ref refreshCaptureAttempts);
@@ -186,7 +186,7 @@ public sealed class ComfyPromptEvidenceTests
         listener.Start();
         var command = Command();
         var delivered = new System.Collections.Concurrent.ConcurrentQueue<SessionStreamEvent>();
-        await using var relay = new ComfySessionEventRelay(command.Target.RunnerId, "127.0.0.1", port);
+        await using var relay = new ComfySessionEventRelay(command.Target.RunnerId, "127.0.0.1", port, "test-process", _ => new SessionSealingStatus(), isTrackedRuntime: (_, _) => true);
         relay.AttachSink(new EvidenceSink((_, _) => Task.CompletedTask, request =>
         {
             foreach (var frame in request.Events)
@@ -228,13 +228,18 @@ public sealed class ComfyPromptEvidenceTests
         listener.Prefixes.Add($"http://127.0.0.1:{port}/");
         listener.Start();
         var command = Command();
-        await using var relay = new ComfySessionEventRelay(command.Target.RunnerId, "127.0.0.1", port);
+        await using var relay = new ComfySessionEventRelay(command.Target.RunnerId, "127.0.0.1", port, "test-process", _ => new SessionSealingStatus(), isTrackedRuntime: (_, _) => true);
 
-        var send = relay.SendClientMessageAsync(command.SessionId, command.EditorSid, "client", command.Target.GpuGeneration,
-            command.Target.RuntimeEpoch, command.Target.RuntimeInstanceId, "{\"action\":\"once\"}"u8.ToArray(), CancellationToken.None);
+        var sink = new EvidenceSink((_, _) => Task.CompletedTask);
+        relay.AttachSink(sink);
+        await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", command.Target.GpuGeneration,
+            command.Target.RuntimeEpoch, command.Target.RuntimeInstanceId, [], CancellationToken.None);
         var first = await listener.GetContextAsync().WaitAsync(TimeSpan.FromSeconds(3));
         var firstSocket = (await first.AcceptWebSocketAsync(null)).WebSocket;
-        await send.WaitAsync(TimeSpan.FromSeconds(5));
+        var accepted = await sink.Authority.Activations.Reader.ReadAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(3));
+        await relay.SendClientMessageAsync(command.SessionId, command.EditorSid, "client", command.Target.GpuGeneration,
+            command.Target.RuntimeEpoch, command.Target.RuntimeInstanceId, "{\"action\":\"once\"}"u8.ToArray(),
+            accepted.BridgeConnectionId, accepted.LeaseRevision, CancellationToken.None);
         var buffer = new byte[1024];
         var received = await firstSocket.ReceiveAsync(buffer, CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(3));
         Assert.That(System.Text.Encoding.UTF8.GetString(buffer, 0, received.Count), Is.EqualTo("{\"action\":\"once\"}"));
@@ -244,6 +249,10 @@ public sealed class ComfyPromptEvidenceTests
         firstSocket.Dispose();
         var second = await listener.GetContextAsync().WaitAsync(TimeSpan.FromSeconds(10));
         using var secondSocket = (await second.AcceptWebSocketAsync(null)).WebSocket;
+        await sink.Authority.Activations.Reader.ReadAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(3));
+        Assert.ThrowsAsync<InvalidOperationException>(() => relay.SendClientMessageAsync(command.SessionId, command.EditorSid,
+            "client", command.Target.GpuGeneration, command.Target.RuntimeEpoch, command.Target.RuntimeInstanceId,
+            "stale"u8.ToArray(), accepted.BridgeConnectionId, accepted.LeaseRevision, CancellationToken.None));
         using var quiet = new CancellationTokenSource(TimeSpan.FromMilliseconds(750));
         Assert.That(
             async () => await secondSocket.ReceiveAsync(buffer, quiet.Token),
@@ -257,7 +266,7 @@ public sealed class ComfyPromptEvidenceTests
         command.PromptJson = new string('x', 1024 * 1024);
         command.PreflightRequests.Add(new PromptHttpRequest { Body = command.PromptJson });
         command.WebsocketClientMessage = ByteString.CopyFromUtf8(command.PromptJson);
-        await using var relay = new ComfySessionEventRelay(command.Target.RunnerId, "127.0.0.1", 1);
+        await using var relay = new ComfySessionEventRelay(command.Target.RunnerId, "127.0.0.1", 1, "test-process", _ => new SessionSealingStatus(), isTrackedRuntime: (_, _) => true);
         await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", command.Target.GpuGeneration,
             command.Target.RuntimeEpoch, command.Target.RuntimeInstanceId, [], CancellationToken.None);
         var oldest = command.Clone();
@@ -300,7 +309,7 @@ public sealed class ComfyPromptEvidenceTests
     public async Task ExistingBridgeCannotBeReboundToAnotherRuntime()
     {
         var command = Command();
-        await using var relay = new ComfySessionEventRelay(command.Target.RunnerId, "127.0.0.1", 1);
+        await using var relay = new ComfySessionEventRelay(command.Target.RunnerId, "127.0.0.1", 1, "test-process", _ => new SessionSealingStatus(), isTrackedRuntime: (_, runtime) => runtime.SameRuntime(new(command.Target.GpuGeneration, command.Target.RuntimeEpoch, command.Target.RuntimeInstanceId)));
         await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", command.Target.GpuGeneration,
             command.Target.RuntimeEpoch, command.Target.RuntimeInstanceId, [], CancellationToken.None);
         Assert.ThrowsAsync<InvalidOperationException>(() => relay.EnsureBridgeAsync(command.SessionId, command.EditorSid,
@@ -312,7 +321,7 @@ public sealed class ComfyPromptEvidenceTests
     {
         var command = Command();
         var checkedRuntimes = new List<(string Session, RuntimeIdentity Runtime)>();
-        await using var relay = new ComfySessionEventRelay(command.Target.RunnerId, "127.0.0.1", 1,
+        await using var relay = new ComfySessionEventRelay(command.Target.RunnerId, "127.0.0.1", 1, "test-process", _ => new SessionSealingStatus(),
             isTrackedRuntime: (session, runtime) =>
             {
                 checkedRuntimes.Add((session, runtime));
@@ -332,7 +341,7 @@ public sealed class ComfyPromptEvidenceTests
     public async Task BridgeLookupForAnotherRuntimeDoesNotReachTheBridge()
     {
         var command = Command();
-        await using var relay = new ComfySessionEventRelay(command.Target.RunnerId, "127.0.0.1", 1, isTrackedRuntime: (_, _) => true);
+        await using var relay = new ComfySessionEventRelay(command.Target.RunnerId, "127.0.0.1", 1, "test-process", _ => new SessionSealingStatus(), isTrackedRuntime: (_, _) => true);
         await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", command.Target.GpuGeneration,
             command.Target.RuntimeEpoch, command.Target.RuntimeInstanceId, [], CancellationToken.None);
 
@@ -350,7 +359,7 @@ public sealed class ComfyPromptEvidenceTests
     {
         var command = Command();
         var tracked = new RuntimeIdentity(command.Target.GpuGeneration, command.Target.RuntimeEpoch, command.Target.RuntimeInstanceId);
-        await using var relay = new ComfySessionEventRelay(command.Target.RunnerId, "127.0.0.1", 1,
+        await using var relay = new ComfySessionEventRelay(command.Target.RunnerId, "127.0.0.1", 1, "test-process", _ => new SessionSealingStatus(),
             isTrackedRuntime: (_, runtime) => runtime.SameRuntime(tracked));
         await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", command.Target.GpuGeneration,
             command.Target.RuntimeEpoch, command.Target.RuntimeInstanceId, [], CancellationToken.None);
@@ -377,7 +386,7 @@ public sealed class ComfyPromptEvidenceTests
     public async Task UninvokedPromptReleasesOnlyItsExactRetainedCommand()
     {
         var command = Command();
-        await using var relay = new ComfySessionEventRelay(command.Target.RunnerId, "127.0.0.1", 1);
+        await using var relay = new ComfySessionEventRelay(command.Target.RunnerId, "127.0.0.1", 1, "test-process", _ => new SessionSealingStatus(), isTrackedRuntime: (_, _) => true);
         await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", command.Target.GpuGeneration,
             command.Target.RuntimeEpoch, command.Target.RuntimeInstanceId, [], CancellationToken.None);
         relay.RegisterSubmission(command.SessionId, "client", command);
@@ -393,6 +402,11 @@ public sealed class ComfyPromptEvidenceTests
     private sealed class EvidenceSink(Func<ReportPromptEvidenceRequest, CancellationToken, Task> report,
         Func<ReportSessionEventsRequest, Task>? reportEvents = null) : IRunnerSessionSink
     {
+        public Task<ReadEditorRuntimeBridgeCursorResponse> ReadEditorRuntimeBridgeCursorAsync(ReadEditorRuntimeBridgeCursorRequest request, CancellationToken token) => Authority.CursorAsync(request, token);
+        public Task<ReserveEditorRuntimeBridgeResponse> ReserveEditorRuntimeBridgeAsync(ReserveEditorRuntimeBridgeRequest request, CancellationToken token) => Authority.ReserveAsync(request, token);
+        public Task<ReportEditorRuntimeBridgeStateResponse> ReportEditorRuntimeBridgeStateAsync(ReportEditorRuntimeBridgeStateRequest request, CancellationToken token) => Authority.ReportAsync(request, token);
+        public BridgeAuthority Authority { get; } = new();
+
         public Task ReportPromptEvidenceAsync(ReportPromptEvidenceRequest request, CancellationToken token) => report(request, token);
         public Task<RegisterRunnerResponse> RegisterRunnerAsync(RegisterRunnerRequest request, CancellationToken token) => throw new NotSupportedException();
         public Task<SyncLocalModelsResponse> SyncLocalModelsAsync(SyncLocalModelsRequest request, CancellationToken token) => throw new NotSupportedException();

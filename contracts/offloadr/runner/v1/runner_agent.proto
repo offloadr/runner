@@ -186,6 +186,8 @@ message RelayEditorRuntimeRequestCommand {
     bool urgent = 17;
     uint64 runtime_epoch = 18;
     string runtime_instance_id = 19;
+    string bridge_connection_id = 20;
+    uint64 bridge_lease_revision = 21;
 }
 
 message AcknowledgeEditorRuntimeRequestRequest {
@@ -211,8 +213,30 @@ enum EditorRuntimeBridgeState {
     EDITOR_RUNTIME_BRIDGE_STATE_INACTIVE = 3;
 }
 
+message ReadEditorRuntimeBridgeCursorRequest {
+    offloadr.editor_runtime.v1.EditorRuntimeBridgeTarget target = 1;
+}
+
+message ReadEditorRuntimeBridgeCursorResponse {
+    offloadr.editor_runtime.v1.EditorRuntimeBridgeResult result = 1;
+}
+
+// Reserve one immutable UUID before opening the native socket. Exact retries
+// return the original lease and deadline without renewal.
+message ReserveEditorRuntimeBridgeRequest {
+    offloadr.editor_runtime.v1.EditorRuntimeBridgeTarget target = 1;
+    string client_id = 2;
+    string bridge_connection_id = 3;
+    uint64 expected_activation_fence = 4;
+}
+
+message ReserveEditorRuntimeBridgeResponse {
+    offloadr.editor_runtime.v1.EditorRuntimeBridgeResult result = 1;
+}
+
 message ReportEditorRuntimeBridgeStateRequest {
-    reserved 11;
+    reserved 7, 8, 11;
+    reserved "observed_utc", "expires_utc";
 
     string runner_id = 1;
     string session_id = 2;
@@ -220,14 +244,18 @@ message ReportEditorRuntimeBridgeStateRequest {
     string client_id = 4;
     uint64 lifecycle_generation = 5;
     EditorRuntimeBridgeState state = 6;
-    google.protobuf.Timestamp observed_utc = 7;
-    google.protobuf.Timestamp expires_utc = 8;
     uint64 runtime_epoch = 9;
     string runtime_instance_id = 10;
     string bridge_connection_id = 12;
+    string instance_id = 13;
+    uint64 lease_revision = 14;
+    uint64 report_sequence = 15;
+    SessionSealingStatus sealing = 16;
 }
 
-message ReportEditorRuntimeBridgeStateResponse {}
+message ReportEditorRuntimeBridgeStateResponse {
+    offloadr.editor_runtime.v1.EditorRuntimeBridgeResult result = 1;
+}
 
 message ModelDownloadRequest {
     string model_id = 1;
@@ -762,6 +790,8 @@ service RunnerControlService {
     rpc ReportSessionLogs(ReportSessionLogsRequest) returns (ReportSessionLogsResponse);
     rpc ReportRunnerLogs(ReportRunnerLogsRequest) returns (ReportRunnerLogsResponse);
     rpc ReportRuntimeTelemetry(ReportRuntimeTelemetryRequest) returns (ReportRuntimeTelemetryResponse);
+    rpc ReadEditorRuntimeBridgeCursor(ReadEditorRuntimeBridgeCursorRequest) returns (ReadEditorRuntimeBridgeCursorResponse);
+    rpc ReserveEditorRuntimeBridge(ReserveEditorRuntimeBridgeRequest) returns (ReserveEditorRuntimeBridgeResponse);
     rpc ReportEditorRuntimeBridgeState(ReportEditorRuntimeBridgeStateRequest) returns (ReportEditorRuntimeBridgeStateResponse);
     // Which runner image a local supervisor (for example the desktop app) should run for the key's
     // owner. A catalog query only: it must not count as a heartbeat or change runner liveness,

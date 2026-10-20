@@ -192,7 +192,7 @@ Runtime restart notes:
 - An authenticated CPU ComfyUI-Manager v2 reboot can cause Offloadr to issue durable `QUIESCE` and `LAUNCH` commands without restarting the runner container or releasing its GPU.
 - `QUIESCE` cancels startup, prompt preparation, transient work, downloads, artifact work, workspace mirrors, websocket bridges, and the managed child, then removes the session's ephemeral runtime home while retaining runner caches and logical registration.
 - `LAUNCH` uses control-plane-generated command/runtime identities and fresh CPU `user` and `custom_nodes` archives. Retries are separate durable commands; RunnerAgent does not mint retry identities.
-- Every child-originated event, log, download update, telemetry sample, artifact, and bridge report carries lifecycle generation, runtime epoch, and runtime instance. A bridge connection also has its own reconnect identity.
+- Every child-originated event, log, download update, telemetry sample, artifact, and bridge report carries lifecycle generation, runtime epoch, and runtime instance. A bridge connection also has a reserved physical UUID, revision and sequenced observations; see [connection authority](bridge-connections.md).
 - A failed child remains unavailable while the runner and allocation stay active. Another Manager reboot retries; allocation Stop always wins.
 
 ## Sealed Storage
