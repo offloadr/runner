@@ -988,6 +988,7 @@ public partial class ServiceClientManagerTests
         await harness.DispatchAsync(request);
         var redelivery = request.Clone();
         redelivery.DeliveryId = "delivery-2";
+        redelivery.Attempt++;
         await harness.DispatchAsync(redelivery);
 
         Assert.Multiple(() =>
@@ -1010,6 +1011,7 @@ public partial class ServiceClientManagerTests
         var first = harness.DispatchAsync(request);
         var redelivery = request.Clone();
         redelivery.DeliveryId = "delivery-2";
+        redelivery.Attempt++;
         await harness.DispatchAsync(redelivery);
         await harness.DispatchAsync(redelivery.Clone());
         Assert.That(harness.Acknowledgements, Is.Empty);
@@ -1125,6 +1127,18 @@ public partial class ServiceClientManagerTests
             Assert.That(harness.Executions, Is.Zero);
             Assert.That(harness.Acknowledgements.Single().StatusCode, Is.EqualTo(403));
             Assert.That(harness.Deliveries.InFlightCount, Is.Zero);
+            Assert.That(harness.Deliveries.ExecutedMarkerCount, Is.Zero);
+            Assert.That(harness.Cancellation.Count, Is.Zero);
+        });
+
+        // Refusing an unseen destination must not reserve its request identity.
+        request.RunnerId = CommandRunnerId;
+        request.DeliveryId = "correct-destination";
+        await harness.DispatchAsync(request);
+        Assert.Multiple(() =>
+        {
+            Assert.That(harness.Executions, Is.EqualTo(1));
+            Assert.That(harness.Acknowledgements.Single(ack => ack.DeliveryId == "correct-destination").StatusCode, Is.EqualTo(200));
         });
     }
 

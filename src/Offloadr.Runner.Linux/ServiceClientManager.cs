@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Runtime.ExceptionServices;
+using System.Security.Cryptography;
 using Offloadr.Runner.V1;
 using Offloadr.Common.V1;
 using Offloadr.EditorRuntime.V1;
@@ -22,6 +23,7 @@ internal static class ServiceClientManager
     {
         private sealed record CacheEntry(
             AcknowledgeEditorRuntimeRequestRequest Response,
+            ByteString Fingerprint,
             long SizeBytes,
             LinkedListNode<string> InsertionNode);
 
@@ -42,10 +44,10 @@ internal static class ServiceClientManager
             get { lock (_gate) return _retainedBytes; }
         }
 
-        public void Set(AcknowledgeEditorRuntimeRequestRequest response)
+        public void Set(AcknowledgeEditorRuntimeRequestRequest response, ByteString fingerprint)
         {
             var cached = response;
-            var sizeBytes = cached.CalculateSize();
+            var sizeBytes = (long)cached.CalculateSize() + fingerprint.Length;
             lock (_gate)
             {
                 if (sizeBytes > _maxBytes)
@@ -74,23 +76,25 @@ internal static class ServiceClientManager
                 }
 
                 var insertionNode = _insertionOrder.AddLast(cached.RequestId);
-                _entries[cached.RequestId] = new CacheEntry(cached, sizeBytes, insertionNode);
+                _entries[cached.RequestId] = new CacheEntry(cached, fingerprint, sizeBytes, insertionNode);
                 _retainedBytes += sizeBytes;
             }
         }
 
-        public bool TryGet(string requestId, out AcknowledgeEditorRuntimeRequestRequest response)
+        public bool TryGet(string requestId, out AcknowledgeEditorRuntimeRequestRequest response, out ByteString fingerprint)
         {
             lock (_gate)
             {
                 if (_entries.TryGetValue(requestId, out var cached))
                 {
                     response = cached.Response.Clone();
+                    fingerprint = cached.Fingerprint;
                     return true;
                 }
             }
 
             response = null!;
+            fingerprint = ByteString.Empty;
             return false;
         }
 
@@ -113,8 +117,14 @@ internal static class ServiceClientManager
         Joined,
         Replay,
 
+        /// <summary>The same request ID was used for different immutable command content.</summary>
+        IdentityMismatch,
+
         /// <summary>The request already ran here, but its result is no longer retained.</summary>
         AlreadyExecuted,
+
+        /// <summary>A previously unseen request is addressed to another runner.</summary>
+        WrongRunner,
 
         /// <summary>The request had no deadline, or it passed before the request could run.</summary>
         Expired,
@@ -139,10 +149,11 @@ internal static class ServiceClientManager
         internal static int MaxExecutedMarkers { get; set; } = 16_384;
 
         private readonly object _gate = new();
-        private readonly Dictionary<string, List<string>> _inFlight = new(StringComparer.Ordinal);
+        private sealed record InFlightRequest(ByteString Fingerprint, DateTime DeadlineUtc, List<string> Deliveries);
+
+        private readonly Dictionary<string, InFlightRequest> _inFlight = new(StringComparer.Ordinal);
         private readonly Dictionary<string, DateTime> _executedUntil = new(StringComparer.Ordinal);
         private readonly PriorityQueue<string, DateTime> _executedByDeadline = new();
-        private readonly Dictionary<string, DateTime> _deadlines = new(StringComparer.Ordinal);
 
         public int InFlightCount
         {
@@ -156,25 +167,33 @@ internal static class ServiceClientManager
 
         public TransientRequestAdmission Admit(
             RelayEditorRuntimeRequestCommand request,
+            string runnerId,
             out AcknowledgeEditorRuntimeRequestRequest? replay,
             DateTime? nowUtc = null)
         {
             var now = nowUtc ?? DateTime.UtcNow;
+            var fingerprint = Fingerprint(request);
+            replay = null;
             lock (_gate)
             {
-                if (completed.TryGet(request.RequestId, out var cached))
+                if (completed.TryGet(request.RequestId, out var cached, out var cachedFingerprint))
                 {
+                    if (!fingerprint.Equals(cachedFingerprint))
+                        return TransientRequestAdmission.IdentityMismatch;
+
                     cached.DeliveryId = request.DeliveryId;
                     replay = cached;
                     return TransientRequestAdmission.Replay;
                 }
 
-                replay = null;
-                if (_inFlight.TryGetValue(request.RequestId, out var deliveries))
+                if (_inFlight.TryGetValue(request.RequestId, out var inFlight))
                 {
-                    if (!deliveries.Contains(request.DeliveryId, StringComparer.Ordinal))
+                    if (!fingerprint.Equals(inFlight.Fingerprint))
+                        return TransientRequestAdmission.IdentityMismatch;
+
+                    if (!inFlight.Deliveries.Contains(request.DeliveryId, StringComparer.Ordinal))
                     {
-                        deliveries.Add(request.DeliveryId);
+                        inFlight.Deliveries.Add(request.DeliveryId);
                     }
 
                     return TransientRequestAdmission.Joined;
@@ -187,6 +206,13 @@ internal static class ServiceClientManager
                     return TransientRequestAdmission.AlreadyExecuted;
                 }
 
+                // Existing identities are classified above, including destination
+                // conflicts. Never reserve or execute an unseen request addressed elsewhere.
+                if (!RunnerIdMatches(request.RunnerId, runnerId))
+                {
+                    return TransientRequestAdmission.WrongRunner;
+                }
+
                 if (IsExpired(request, now))
                 {
                     return TransientRequestAdmission.Expired;
@@ -197,10 +223,20 @@ internal static class ServiceClientManager
                     return TransientRequestAdmission.Saturated;
                 }
 
-                _inFlight.Add(request.RequestId, [request.DeliveryId]);
-                _deadlines[request.RequestId] = request.ExpiresUtc.ToDateTime();
+                _inFlight.Add(request.RequestId, new InFlightRequest(
+                    fingerprint, request.ExpiresUtc.ToDateTime(), [request.DeliveryId]));
                 return TransientRequestAdmission.Execute;
             }
+        }
+
+        private static ByteString Fingerprint(RelayEditorRuntimeRequestCommand request)
+        {
+            // Redelivery may change transport metadata, but every other command field
+            // must still describe the original operation, including its deadline.
+            var intent = request.Clone();
+            intent.DeliveryId = string.Empty;
+            intent.Attempt = 0;
+            return ByteString.CopyFrom(SHA256.HashData(intent.ToByteArray()));
         }
 
         /// <summary>
@@ -237,17 +273,14 @@ internal static class ServiceClientManager
         {
             lock (_gate)
             {
-                completed.Set(result);
-                if (_deadlines.Remove(result.RequestId, out var deadline))
+                if (!_inFlight.Remove(result.RequestId, out var inFlight))
                 {
-                    RememberExecuted(result.RequestId, deadline);
-                }
-                if (!_inFlight.Remove(result.RequestId, out var deliveries))
-                {
-                    deliveries = [result.DeliveryId];
+                    return [];
                 }
 
-                return deliveries
+                completed.Set(result, inFlight.Fingerprint);
+                RememberExecuted(result.RequestId, inFlight.DeadlineUtc);
+                return inFlight.Deliveries
                     .Select(deliveryId =>
                     {
                         var acknowledgement = result.Clone();
@@ -2921,28 +2954,32 @@ internal static class ServiceClientManager
         Func<AcknowledgeEditorRuntimeRequestRequest, CancellationToken, Task> acknowledge,
         CancellationToken acknowledgementCancellationToken)
     {
-        // A request for another runner must not reach this runner's editor, nor cancel its
-        // prompts before execution, even if it names a session that exists here.
-        if (!RunnerIdMatches(request.RunnerId, runnerId))
-        {
-            await AcknowledgeTransientRequestWithRetryAsync(
-                acknowledge,
-                TransientRequestFailure(request, 403, StaleRuntimeCommandMessage),
-                acknowledgementCancellationToken).ConfigureAwait(false);
-            return;
-        }
+        // Capture the command used for both identity admission and execution.
+        request = request.Clone();
 
-        switch (deliveries.Admit(request, out var replay))
+        switch (deliveries.Admit(request, runnerId, out var replay))
         {
             case TransientRequestAdmission.Replay:
                 await AcknowledgeTransientRequestWithRetryAsync(acknowledge, replay!, acknowledgementCancellationToken).ConfigureAwait(false);
                 return;
             case TransientRequestAdmission.Joined:
                 return;
+            case TransientRequestAdmission.IdentityMismatch:
+                await AcknowledgeTransientRequestWithRetryAsync(
+                    acknowledge,
+                    TransientRequestFailure(request, 409, "The request ID was already used for a different command."),
+                    acknowledgementCancellationToken).ConfigureAwait(false);
+                return;
             case TransientRequestAdmission.AlreadyExecuted:
                 await AcknowledgeTransientRequestWithRetryAsync(
                     acknowledge,
                     TransientRequestFailure(request, 409, "The request already ran on this runner; its result is no longer retained."),
+                    acknowledgementCancellationToken).ConfigureAwait(false);
+                return;
+            case TransientRequestAdmission.WrongRunner:
+                await AcknowledgeTransientRequestWithRetryAsync(
+                    acknowledge,
+                    TransientRequestFailure(request, 403, StaleRuntimeCommandMessage),
                     acknowledgementCancellationToken).ConfigureAwait(false);
                 return;
             case TransientRequestAdmission.Expired:
