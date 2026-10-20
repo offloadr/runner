@@ -352,7 +352,7 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
     private IRunnerSessionSink BridgeSink()
     {
         lock (_sinkLock)
-            return _sink ?? throw new InvalidOperationException("The runner control lane is disconnected.");
+            return _sink ?? throw new BridgeControlUnavailableException();
     }
 
     // Bridges are keyed by session, client and exact runtime, so a lookup made

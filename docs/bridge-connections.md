@@ -29,8 +29,12 @@ budget capped by the remaining lease, and heartbeats run every ten seconds.
 Transient renewal failures retain sendability only under the last accepted
 monotonic deadline; they cannot extend it. The local RPC timer's gRPC Cancelled
 status retries the same reservation/report identity while the owning lifetime
-remains alive. Stop or shutdown cancellation does not retry. Definitive authority rejection, expiry
-or runtime retirement removes sendability and aborts the socket. A response's
+remains alive. A detached control sink is likewise transient: reattachment retries
+under the same accepted deadline without opening another native connection.
+Stop or shutdown cancellation does not retry. A definitive rejected or mismatched
+response publishes irreversible revocation for that physical connection before
+waiting for the native send lock; already queued sends check it before writing.
+Authority expiry or runtime retirement also removes sendability and aborts the socket. A response's
 absolute deadline is computed before waiting for the native send lock; lock
 contention consumes that budget. Native I/O already in progress may have reached the peer before remote
 revocation. Socket transport acceptance is not native applied-state evidence.
@@ -49,6 +53,7 @@ new authorized connection; one-off client messages are never retained for replay
 
 These protocol changes require a coordinated control-plane/runner release and
 regenerated consumers. Mixed old/new operation is unsupported. Controlled native
-WebSocket tests cover ordering, response loss, exact retries, stale sends and
+WebSocket tests cover ordering, response loss, exact retries, detached control
+reattachment, queued sends after received rejection or mismatch, stale sends and
 cleanup. They do not qualify actual GPU runtimes, fleet resource use, outages or
 image deployment; those remain release checks.

@@ -12,6 +12,10 @@ internal sealed partial class ComfySessionEventRelay
     private static readonly TimeSpan BridgeRpcTimeout = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan ReservationTimeout = TimeSpan.FromSeconds(30);
 
+    private sealed class BridgeControlUnavailableException() : InvalidOperationException("The runner control lane is disconnected.")
+    {
+    }
+
     internal static TimeSpan RemainingBridgeBudget(EditorRuntimeBridgeResult? result, TimeSpan rpcDuration)
     {
         if (result?.ServerNowUtc is null || result.Lease?.ExpiresUtc is null || rpcDuration < TimeSpan.Zero)
@@ -43,6 +47,7 @@ internal sealed partial class ComfySessionEventRelay
             internal ulong Sequence;
             internal long Deadline;
             internal bool Active;
+            internal int Revoked;
             internal readonly TaskCompletionSource<bool> SendReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
         }
 
@@ -66,7 +71,7 @@ internal sealed partial class ComfySessionEventRelay
         }
 
         private static bool Transient(Exception exception, CancellationToken token)
-            => !token.IsCancellationRequested && (exception is OperationCanceledException
+            => !token.IsCancellationRequested && (exception is OperationCanceledException or BridgeControlUnavailableException
                 || exception is RpcException { StatusCode: StatusCode.Unavailable or StatusCode.DeadlineExceeded or StatusCode.Internal or StatusCode.Cancelled });
 
         private async Task ReserveAsync(PhysicalConnection connection, CancellationToken token)
@@ -148,19 +153,28 @@ internal sealed partial class ComfySessionEventRelay
                     // Lock contention consumes this absolute budget; it cannot
                     // turn the received duration into a later lease deadline.
                     var deadline = observed + (long)(remaining.TotalSeconds * Stopwatch.Frequency);
+                    var accepted = Accepted(response.Result);
+                    var matches = accepted && Matches(connection, response.Result);
+                    // A queued sender can precede this report on the semaphore.
+                    // Publish definitive revocation before waiting behind it;
+                    // this physical attempt can never regain send authority.
+                    if (!matches || state == EditorRuntimeBridgeState.Inactive || remaining <= TimeSpan.Zero
+                        || response.Result.Lease.FirstActiveUtc is null)
+                        Interlocked.Exchange(ref connection.Revoked, 1);
                     await _sendLock.WaitAsync(token).ConfigureAwait(false);
                     try
                     {
                         connection.Active = false;
-                        if (!Accepted(response.Result))
+                        if (!accepted)
                         {
                             if (response.Result?.Outcome is EditorRuntimeBridgeOutcome.Stale) return false;
                             throw new BridgeRetiredException("The physical bridge observation was rejected.");
                         }
-                        if (!Matches(connection, response.Result))
+                        if (!matches)
                             throw new BridgeRetiredException("The physical bridge observation has incompatible authority.");
                         if (state == EditorRuntimeBridgeState.Inactive) return true;
-                        if (!RuntimeIsCurrent() || remaining <= TimeSpan.Zero || Stopwatch.GetTimestamp() >= deadline
+                        if (Volatile.Read(ref connection.Revoked) != 0 || !RuntimeIsCurrent()
+                            || remaining <= TimeSpan.Zero || Stopwatch.GetTimestamp() >= deadline
                             || connection.Socket.State != WebSocketState.Open || response.Result.Lease.FirstActiveUtc is null) return false;
                         Interlocked.Exchange(ref connection.Deadline, deadline);
                         connection.Active = true;
@@ -304,7 +318,8 @@ internal sealed partial class ComfySessionEventRelay
             {
                 lock (_socketGate)
                     if (!ReferenceEquals(_connection, connection)) throw new InvalidOperationException("The physical bridge has retired.");
-                if (!connection.Active || !RuntimeIsCurrent() || Stopwatch.GetTimestamp() >= connection.Deadline
+                if (Volatile.Read(ref connection.Revoked) != 0 || !connection.Active
+                    || !RuntimeIsCurrent() || Stopwatch.GetTimestamp() >= connection.Deadline
                     || connection.Socket.State != WebSocketState.Open)
                     throw new InvalidOperationException("The physical bridge is not authorized to send.");
                 using var send = CancellationTokenSource.CreateLinkedTokenSource(token, _cts.Token);
