@@ -2300,10 +2300,14 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         // Rejection never proves that these bytes reached durable storage.
                         return null;
                     }
+                    // Catalog keys ignore case and can retain an older version's spelling.
+                    // The echoed upload ID still binds the result to this exact snapshot.
                     if (response.Outcome != RunnerArtifactUploadOutcome.Committed || response.UploadId != metadata.UploadId
                         || response.Artifact is null
-                        || response.Artifact.EditorSid != _editorSid || response.Artifact.Type != type
-                        || response.Artifact.Subfolder != subfolder || response.Artifact.Filename != fileName
+                        || response.Artifact.EditorSid != _editorSid
+                        || !string.Equals(response.Artifact.Type, type, StringComparison.OrdinalIgnoreCase)
+                        || !string.Equals(response.Artifact.Subfolder, subfolder, StringComparison.OrdinalIgnoreCase)
+                        || !string.Equals(response.Artifact.Filename, fileName, StringComparison.OrdinalIgnoreCase)
                         || response.Artifact.SizeBytes != sizeBytes)
                     {
                         throw new InvalidOperationException(string.IsNullOrWhiteSpace(response.Message) ? "upload failed" : response.Message);

@@ -1897,6 +1897,8 @@ public partial class ArtifactUploadServiceTests
 
         public bool ReturnWrongUploadId { get; set; }
 
+        public Func<EditorArtifactMetadata, EditorArtifactMetadata>? RewriteUploadArtifact { get; set; }
+
         /// <summary>Runs when an upload's metadata frame is written, before any chunk.</summary>
         public Action? AfterUploadMetadata { get; set; }
 
@@ -1957,18 +1959,19 @@ public partial class ArtifactUploadServiceTests
                     return;
                 }
 
+                var artifact = new EditorArtifactMetadata
+                {
+                    EditorSid = captured.Metadata!.EditorSid,
+                    Filename = captured.Metadata.Filename,
+                    Type = captured.Metadata.Type,
+                    Subfolder = captured.Metadata.Subfolder,
+                    SizeBytes = captured.Metadata.SizeBytes
+                };
                 response.TrySetResult(new RunnerArtifactServiceUploadArtifactResponse
                 {
                     Outcome = RejectUploads ? RunnerArtifactUploadOutcome.Unspecified : RunnerArtifactUploadOutcome.Committed,
                     UploadId = ReturnWrongUploadId ? Guid.NewGuid().ToString("N") : captured.Metadata!.UploadId,
-                    Artifact = RejectUploads ? null : new()
-                    {
-                        EditorSid = captured.Metadata!.EditorSid,
-                        Filename = captured.Metadata.Filename,
-                        Type = captured.Metadata.Type,
-                        Subfolder = captured.Metadata.Subfolder,
-                        SizeBytes = captured.Metadata.SizeBytes
-                    },
+                    Artifact = RejectUploads ? null : RewriteUploadArtifact?.Invoke(artifact) ?? artifact,
                     Message = RejectUploads ? "rejected" : string.Empty
                 });
             });

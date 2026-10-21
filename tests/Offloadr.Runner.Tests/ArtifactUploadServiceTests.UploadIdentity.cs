@@ -104,6 +104,50 @@ public partial class ArtifactUploadServiceTests
         }
     }
 
+    [TestCase("filename", true, 0)]
+    [TestCase("subfolder", true, 0)]
+    [TestCase("type", true, 0)]
+    [TestCase("filename", false, 1)]
+    [TestCase("subfolder", false, 1)]
+    [TestCase("type", false, 1)]
+    public async Task CommittedReceiptMatchesCatalogPathIdentity(string field, bool caseOnly, int expectedUnsaved)
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = UploadIdentityPaths(root);
+            var directory = Path.Combine(paths.OutputDirectory, "nested");
+            Directory.CreateDirectory(directory);
+            var client = new FakeRunnerArtifactClient(new())
+            {
+                RewriteUploadArtifact = artifact =>
+                {
+                    string Rewrite(string value) => caseOnly ? value.ToUpperInvariant() : value + "-different";
+                    switch (field)
+                    {
+                        case "filename": artifact.Filename = Rewrite(artifact.Filename); break;
+                        case "subfolder": artifact.Subfolder = Rewrite(artifact.Subfolder); break;
+                        case "type": artifact.Type = Rewrite(artifact.Type); break;
+                    }
+                    return artifact;
+                }
+            };
+            await using var service = new ArtifactUploadService("secret", client,
+                NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            await File.WriteAllBytesAsync(Path.Combine(directory, "receipt.txt"), [1, 2, 3]);
+            var captured = await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            Assert.That(Guid.TryParseExact(captured.Metadata!.UploadId, "N", out _), Is.True);
+            await WaitForIdentityUploadsToFinishAsync(service);
+            Assert.That(await service.StopSessionAsync("session-1"), Is.EqualTo(expectedUnsaved));
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
     private static async Task WaitForIdentityUploadsToFinishAsync(ArtifactUploadService service)
     {
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
