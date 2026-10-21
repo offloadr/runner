@@ -1892,6 +1892,11 @@ public partial class ArtifactUploadServiceTests
         /// <summary>Answers every upload as from a runtime whose authority retired.</summary>
         public bool RejectAsStaleRuntime { get; set; }
 
+        /// <summary>Fails after a complete request, as when a committed reply is lost.</summary>
+        public Func<CapturedUpload, Exception?>? UploadResponseFailure { get; set; }
+
+        public bool ReturnWrongUploadId { get; set; }
+
         /// <summary>Runs when an upload's metadata frame is written, before any chunk.</summary>
         public Action? AfterUploadMetadata { get; set; }
 
@@ -1941,6 +1946,11 @@ public partial class ArtifactUploadServiceTests
             {
                 _uploads.Enqueue(captured);
                 _uploadSignals.Writer.TryWrite(captured);
+                if (UploadResponseFailure?.Invoke(captured) is { } failure)
+                {
+                    response.TrySetException(failure);
+                    return;
+                }
                 if (RejectAsStaleRuntime)
                 {
                     response.TrySetResult(new RunnerArtifactServiceUploadArtifactResponse { Outcome = RunnerArtifactUploadOutcome.RejectedStaleRuntime });
@@ -1950,6 +1960,7 @@ public partial class ArtifactUploadServiceTests
                 response.TrySetResult(new RunnerArtifactServiceUploadArtifactResponse
                 {
                     Outcome = RejectUploads ? RunnerArtifactUploadOutcome.Unspecified : RunnerArtifactUploadOutcome.Committed,
+                    UploadId = ReturnWrongUploadId ? Guid.NewGuid().ToString("N") : captured.Metadata!.UploadId,
                     Artifact = RejectUploads ? null : new()
                     {
                         EditorSid = captured.Metadata!.EditorSid,

@@ -673,6 +673,9 @@ message RunnerArtifactUploadMetadata {
     // would reveal when two uploads carry equal content.
     SealedEnvelope envelope = 15;
     string instance_id = 16; // Captured registered process; never read from mutable session state.
+    // One opaque producer file snapshot, retained across retries and later rescans.
+    // A changed file/target gets a new ID. Not a plaintext digest or authorization.
+    string upload_id = 17;
 }
 
 message RunnerArtifactServiceUploadArtifactRequest {
@@ -692,6 +695,7 @@ message RunnerArtifactServiceUploadArtifactResponse {
     RunnerArtifactUploadOutcome outcome = 1;
     string message = 2;
     offloadr.editor_runtime.v1.EditorArtifactMetadata artifact = 3;
+    string upload_id = 4; // Echo of the committed logical upload, never a new publication ID.
 }
 
 message RunnerArtifactServiceRegisterMetadataRequest {

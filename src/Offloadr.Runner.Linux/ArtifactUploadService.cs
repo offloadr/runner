@@ -489,6 +489,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         private readonly RuntimeIdentityRegistry? _runtimeIdentities;
         private readonly string _runnerId;
         private readonly Channel<UploadRequest> _queue;
+        private readonly ArtifactUploadOperationIdentity _uploadOperationIdentity = new();
         private readonly CancellationTokenSource _cts = new();
         private readonly ConcurrentDictionary<string, byte> _pending = new(StringComparer.Ordinal);
         private readonly ConcurrentDictionary<string, RemoteArtifactState> _catalog = new(StringComparer.Ordinal);
@@ -2183,7 +2184,8 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     await using var stream = opened;
                     var sizeBytes = stream.Length;
                     var snapshotWriteUtc = LinuxSecureDirectoryRoot.GetOpenFileStatus(stream.SafeFileHandle, relPath).LastWriteTimeUtc;
-                    var snapshotVersion = LinuxSecureDirectoryRoot.GetOpenFileVersion(stream.SafeFileHandle, relPath);
+                    var snapshotVersion = LinuxSecureDirectoryRoot.GetOpenFileVersion(stream.SafeFileHandle, relPath)
+                        ?? throw new IOException("Cannot capture the opened artifact file version.");
                     if (sizeBytes > MaxUploadBytes)
                     {
                         _logger.LogWarning(
@@ -2210,18 +2212,6 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         SizeBytes = sizeBytes
                     };
 
-                    // Every attempt seals afresh: a new data key and encapsulation, never a resend.
-                    using var writer = _paths.TransferSealing?.OutputRecipient is { } recipient
-                        ? SealedEnvelopeWriter.Create(
-                            recipient,
-                            new SealedArtifactIdentity(_sessionId, _editorSid, type, subfolder, fileName),
-                            sizeBytes)
-                        : null;
-                    if (writer is not null)
-                    {
-                        metadata.Envelope = SessionTransferSealing.ToMessage(writer.Envelope);
-                    }
-
                     if (!string.IsNullOrWhiteSpace(_owner))
                     {
                         metadata.Owner = _owner;
@@ -2237,6 +2227,23 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         metadata.LifecycleGeneration = queuedFor.LifecycleGeneration;
                         metadata.RuntimeEpoch = queuedFor.RuntimeEpoch;
                         metadata.RuntimeInstanceId = queuedFor.RuntimeInstanceId;
+                    }
+
+                    // Stable through transport/I/O retries and later rescans of this same
+                    // secure file version, even after the queue's retry budget is exhausted.
+                    metadata.UploadId = _uploadOperationIdentity.ForSnapshot(metadata, snapshotVersion);
+
+                    // Every attempt seals afresh; a fresh envelope is still the same logical
+                    // snapshot. No plaintext hash is exposed as its operation identity.
+                    using var writer = _paths.TransferSealing?.OutputRecipient is { } recipient
+                        ? SealedEnvelopeWriter.Create(
+                            recipient,
+                            new SealedArtifactIdentity(_sessionId, _editorSid, type, subfolder, fileName),
+                            sizeBytes)
+                        : null;
+                    if (writer is not null)
+                    {
+                        metadata.Envelope = SessionTransferSealing.ToMessage(writer.Envelope);
                     }
 
                     _logger.LogInformation(
@@ -2293,7 +2300,8 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         // Rejection never proves that these bytes reached durable storage.
                         return null;
                     }
-                    if (response.Outcome != RunnerArtifactUploadOutcome.Committed || response.Artifact is null
+                    if (response.Outcome != RunnerArtifactUploadOutcome.Committed || response.UploadId != metadata.UploadId
+                        || response.Artifact is null
                         || response.Artifact.EditorSid != _editorSid || response.Artifact.Type != type
                         || response.Artifact.Subfolder != subfolder || response.Artifact.Filename != fileName
                         || response.Artifact.SizeBytes != sizeBytes)
