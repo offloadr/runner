@@ -57,6 +57,7 @@ public static class GrpcChannelManager
         return GrpcChannel.ForAddress(offloadrApiUrl, new GrpcChannelOptions
         {
             HttpHandler = handler,
+            DisposeHttpClient = true,
             MaxReceiveMessageSize = MaxGrpcMessageSizeBytes,
             MaxSendMessageSize = MaxGrpcMessageSizeBytes
         });
