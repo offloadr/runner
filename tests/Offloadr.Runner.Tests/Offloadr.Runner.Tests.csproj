@@ -24,6 +24,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
     <Using Include="NUnit.Framework" />
     <Using Include="Offloadr.Runner.Core" />
     <Using Include="Offloadr.Runner.Linux" />

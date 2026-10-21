@@ -18,6 +18,14 @@ The agent is the container's entry point and runs as root. It:
 6. Writes `/run/offloadr/status.json` so a local supervisor can tell whether a session is active.
 7. In sealed mode, keeps each session's user data under a root-owned directory on a memory-backed root (`/dev/shm/offloadr` by default), stages workspace seeds there, keeps editor output off the container log, makes session processes non-dumpable and evicts uploaded artifacts when the root runs low. Code, models and compiled caches stay in the disk-backed home. Transfers are sealed with per-session reader keys and the control plane's output recipient key (`docs/sealed-envelope.md`, `Offloadr.Runner.Core/Sealing`). See "Sealed Storage" in `hosting.md`.
 
+### gRPC channel lifetime
+
+Each channel created by `GrpcChannelManager` owns its HTTP handler and pooled
+connections, including the optional tracing wrapper. Disposing the channel
+disposes that handler chain and closes its connections. A successful RPC leaves
+the connection pooled until channel disposal or another transport lifetime event;
+channel callers must retain and dispose their channels at the owning lifetime.
+
 ### Transient command redelivery
 
 Transient HTTP and client-message commands are admitted by request ID and an
