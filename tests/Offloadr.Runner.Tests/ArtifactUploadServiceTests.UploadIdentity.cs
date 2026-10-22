@@ -378,6 +378,78 @@ public partial class ArtifactUploadServiceTests
         finally { TryDelete(root); }
     }
 
+    [Test]
+    public async Task RemoteDeletionOfAnEvictedUploadDoesNotCountItsPlaceholderAsSaved()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = CreateEvictionPaths(root, sealedSession: true);
+            var path = Path.Combine(paths.OutputDirectory, "evicted.bin");
+            // The upload succeeds, but the next authoritative listing is empty.
+            var client = new FakeRunnerArtifactClient(new());
+            await using var service = new ArtifactUploadService("secret", client, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            await File.WriteAllBytesAsync(path, [1, 2, 3]);
+            await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            await WaitForIdentityUploadsToFinishAsync(service);
+            Assert.That(await EvictWhenRecordedAsync(service, "session-1"), Is.EqualTo(3));
+            Assert.That(new FileInfo(path).Length, Is.Zero);
+            // This current-session snapshot refresh reloads the catalog without
+            // starting a new output scan that could replace the lost evidence.
+            await service.SeedSessionAsync("session-1", "editor-1", "owner-1", null, CancellationToken.None);
+            Assert.That(client.UploadCount, Is.EqualTo(1));
+            Assert.That(await service.StopSessionAsync("session-1"), Is.EqualTo(1),
+                "the placeholder no longer stands for bytes held by the control plane");
+        }
+        finally { TryDelete(root); }
+    }
+
+    [TestCase("issued-sequence:42", true)]
+    [TestCase("01ARZ3NDEKTSV4RRFFQ69G5FAV", true)]
+    [TestCase("6d6a1e13-f5ea-4ec6-99e4-3db5983ac487", true)]
+    [TestCase("", false)]
+    [TestCase("   ", false)]
+    public async Task ServerIssuedUploadIdentityIsOpaqueAndNonWhitespace(string uploadId, bool valid)
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = UploadIdentityPaths(root);
+            var replies = 0;
+            var client = new FakeRunnerArtifactClient(new())
+            {
+                IssuedUploadId = uploadId,
+                UploadResponseFailure = _ => Interlocked.Increment(ref replies) == 1
+                    ? new RpcException(new Status(StatusCode.Internal, "First response lost")) : null,
+            };
+            var logger = new ListLogger<ArtifactUploadService>();
+            await using var service = new ArtifactUploadService("secret", client, logger);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            await File.WriteAllBytesAsync(Path.Combine(paths.OutputDirectory, "opaque.bin"), [1, 2, 3]);
+            if (valid)
+            {
+                var original = await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+                var retry = await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+                Assert.That(original.Metadata!.UploadId, Is.EqualTo(uploadId));
+                Assert.That(retry.Metadata!.UploadId, Is.EqualTo(uploadId));
+                await WaitForIdentityUploadsToFinishAsync(service);
+                Assert.That(client.IssuedIdentityCount, Is.EqualTo(1));
+                Assert.That(await service.StopSessionAsync("session-1"), Is.Zero);
+            }
+            else
+            {
+                await WaitForUploadLogAsync(logger, "Failed to upload artifact");
+                await WaitForIdentityUploadsToFinishAsync(service);
+                Assert.That(client.UploadCount, Is.Zero);
+                Assert.That(await service.StopSessionAsync("session-1"), Is.EqualTo(1));
+            }
+        }
+        finally { TryDelete(root); }
+    }
+
     private static async Task WaitForUploadLogAsync(ListLogger<ArtifactUploadService> logger, string text)
     {
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));

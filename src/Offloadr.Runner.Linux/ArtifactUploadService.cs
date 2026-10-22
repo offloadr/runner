@@ -1251,7 +1251,8 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     {
                         // Remote deletion is not local modification. Preserve this
                         // live file's last issued ID, without promising readback.
-                        if (state.UploadSnapshot is not null && IsLiveRegularFile(state.Type, path))
+                        if (state.UploadSnapshot is not null && state.Downloaded && state.LocalVersion is { } localVersion
+                            && IsLiveRegularFile(state.Type, path, localVersion))
                             state.HasRemoteArtifact = false;
                         else
                             _catalog.TryRemove(path, out _);
@@ -2530,8 +2531,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 EditorSid = metadata.EditorSid,
                 Requester = _readRequester.Clone()
             }, headers: _authHeaders, cancellationToken: ct).ConfigureAwait(false);
-            if (!Guid.TryParseExact(response.UploadId, "N", out var id) || id == Guid.Empty
-                || response.UploadId != id.ToString("N"))
+            if (string.IsNullOrWhiteSpace(response.UploadId))
                 throw new InvalidOperationException("Invalid issued artifact upload identity.");
             var snapshot = new UploadSnapshotIdentity(fingerprint, response.UploadId, version);
             // The single upload reader owns insertion. Store before any upload RPC:
@@ -2540,13 +2540,15 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             return snapshot;
         }
 
-        private bool IsLiveRegularFile(string type, string path)
+        private bool IsLiveRegularFile(string type, string path, SecureFileVersion? expectedVersion = null)
         {
             if (!TryResolveSecureLocation(type, path, out var root, out var relative)) return false;
             try
             {
                 using var directory = new LinuxSecureDirectoryRoot(root);
-                return directory.GetStatus(relative).IsRegularFile;
+                return expectedVersion is { } expected
+                    ? directory.GetVersion(relative) == expected
+                    : directory.GetStatus(relative).IsRegularFile;
             }
             catch (Exception error) when (error is IOException or UnauthorizedAccessException)
             {

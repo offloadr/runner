@@ -4,7 +4,8 @@ Before sending a new securely opened output snapshot, the runner calls
 `RunnerArtifactService.IssueUploadIdentity` with its captured process/session/runtime
 identity. Issuance has no artifact effect. If its response is lost before an upload
 starts, an unused sequence may be skipped. The returned ID is correlation, not a
-capability, content digest, successful save or execution grant.
+capability, content digest, successful save or execution grant. The runner keeps
+this non-whitespace opaque string verbatim; it does not parse its representation.
 
 The uploader stores that issued ID with a local fingerprint of the secure inode,
 length, modification/change times and immutable upload metadata. The fingerprint
@@ -16,7 +17,10 @@ limit of 4,096 and no eviction of live uncertainty to admit new files. At capaci
 new snapshots wait for rescans. A deleted local file can release its binding;
 inspection errors do not prove deletion. Acknowledged bindings use the existing
 one-entry-per-current-file catalog, rather than retaining version history. Remote
-catalog refresh/deletion cannot erase that local binding while the file survives.
+catalog refresh/deletion cannot erase that local binding while the exact
+acknowledged local version survives. An evicted placeholder is not that version;
+if its remote artifact disappears, its catalog entry is removed and Stop cannot
+count the placeholder as saved.
 A remotely deleted artifact is not eligible for eviction into a download placeholder.
 The existing catalog's total size is a separate resource constraint; this does not
 establish a global runner memory bound.

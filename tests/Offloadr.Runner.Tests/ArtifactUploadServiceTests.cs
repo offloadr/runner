@@ -1893,6 +1893,7 @@ public partial class ArtifactUploadServiceTests
         /// <summary>Answers every upload as from a runtime whose authority retired.</summary>
         public bool RejectAsStaleRuntime { get; set; }
         public bool RejectAsRetiredUpload { get; set; }
+        public string? IssuedUploadId { get; init; }
         private int _issuedIdentities;
         public int IssuedIdentityCount => Volatile.Read(ref _issuedIdentities);
 
@@ -1931,7 +1932,7 @@ public partial class ArtifactUploadServiceTests
             RunnerArtifactServiceIssueUploadIdentityRequest request, CallOptions options)
         {
             Interlocked.Increment(ref _issuedIdentities);
-            return new(Task.FromResult(new RunnerArtifactServiceIssueUploadIdentityResponse { UploadId = Guid.NewGuid().ToString("N") }),
+            return new(Task.FromResult(new RunnerArtifactServiceIssueUploadIdentityResponse { UploadId = IssuedUploadId ?? Guid.NewGuid().ToString("N") }),
                 Task.FromResult(new Metadata()), () => Status.DefaultSuccess, () => new Metadata(), () => { });
         }
 
