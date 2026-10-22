@@ -127,7 +127,7 @@ public sealed class ArtifactUploadBudgetTests
         MinimumBytesPerSecond = 1000
     };
 
-    private sealed class UploadClock : TimeProvider
+    internal sealed class UploadClock : TimeProvider
     {
         private long _ticks;
         private readonly List<UploadTimer> _timers = [];

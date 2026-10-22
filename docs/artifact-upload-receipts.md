@@ -20,7 +20,9 @@ one-entry-per-current-file catalog, rather than retaining version history. Remot
 catalog refresh/deletion cannot erase that local binding while the exact
 acknowledged local version survives. An evicted placeholder is not that version;
 if its remote artifact disappears, its catalog entry is removed and Stop cannot
-count the placeholder as saved.
+count the placeholder as saved. A retained binding for live local bytes also
+counts as unsaved after remote deletion; retaining identity is not proof that the
+control plane still holds those bytes.
 A remotely deleted artifact is not eligible for eviction into a download placeholder.
 The existing catalog's total size is a separate resource constraint; this does not
 establish a global runner memory bound.
@@ -35,7 +37,11 @@ can free capacity for waiting files. Unchanged retired versions stay out of the
 queue; rescanning them cannot save them or release their binding. A file rewritten
 while a retired reply is pending is rechecked and queued under its new version.
 New versions receive their own retry count even after the old snapshot exhausted
-its retries, while retaining the pending path's original total elapsed allowance.
+its retries. Requeues within a pending entry retain its original elapsed allowance.
+After the old entry finishes, including a terminal timeout, the runner rechecks
+the secure version after releasing it. Only a changed current file starts a new
+pending entry with its own allowance; an unchanged failed snapshot does not
+automatically renew its exhausted budget.
 Committed receipts must match filename and subfolder casing exactly; artifact type
 names remain case-insensitive.
 

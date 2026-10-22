@@ -1911,8 +1911,11 @@ public partial class ArtifactUploadServiceTests
 
         public int UploadCallsDisposed => Volatile.Read(ref _uploadCallsDisposed);
 
+        public int UploadCallsCancelled => Volatile.Read(ref _uploadCallsCancelled);
+
         private int _uploadCallsStarted;
         private int _uploadCallsDisposed;
+        private int _uploadCallsCancelled;
 
         private static async Task<RunnerArtifactServiceUploadArtifactResponse> WaitForGateAsync(
             Task gate,
@@ -1999,11 +2002,16 @@ public partial class ArtifactUploadServiceTests
 
             return new AsyncClientStreamingCall<RunnerArtifactServiceUploadArtifactRequest, RunnerArtifactServiceUploadArtifactResponse>(
                 writer,
-                gate is null ? response.Task : WaitForGateAsync(gate, response.Task),
+                (gate is null ? response.Task : WaitForGateAsync(gate, response.Task)).WaitAsync(options.CancellationToken),
                 Task.FromResult(new Metadata()),
                 () => Status.DefaultSuccess,
                 () => new Metadata(),
-                () => Interlocked.Increment(ref _uploadCallsDisposed));
+                () =>
+                {
+                    if (options.CancellationToken.IsCancellationRequested)
+                        Interlocked.Increment(ref _uploadCallsCancelled);
+                    Interlocked.Increment(ref _uploadCallsDisposed);
+                });
         }
 
         public override AsyncServerStreamingCall<RunnerArtifactServiceReadArtifactResponse> ReadArtifact(RunnerArtifactServiceReadArtifactRequest request, CallOptions options)

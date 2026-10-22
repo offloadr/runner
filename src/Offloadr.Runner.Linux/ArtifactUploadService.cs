@@ -493,7 +493,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         private readonly Channel<UploadRequest> _queue;
         private readonly ArtifactUploadOperationIdentity _uploadOperationIdentity = new();
         private readonly CancellationTokenSource _cts = new();
-        private readonly ConcurrentDictionary<string, ArtifactUploadBudget> _pending = new(StringComparer.Ordinal);
+        private readonly ConcurrentDictionary<string, PendingUpload> _pending = new(StringComparer.Ordinal);
         private readonly ConcurrentDictionary<string, UploadSnapshotIdentity> _uncertainUploads = new(StringComparer.Ordinal);
         private readonly ArtifactUploadPolicy _uploadPolicy;
         private readonly ConcurrentDictionary<string, RemoteArtifactState> _catalog = new(StringComparer.Ordinal);
@@ -1807,7 +1807,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     return;
                 }
 
-                if (!_pending.TryAdd(fullPath, new ArtifactUploadBudget(_uploadPolicy)))
+                if (!_pending.TryAdd(fullPath, new PendingUpload(_uploadPolicy, version)))
                 {
                     _logger.LogDebug("Artifact change coalesced with pending upload bytes={Bytes} session={SessionId} path={Path}", status.Length, _sessionId, fullPath);
                     return;
@@ -2135,7 +2135,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         }
                         catch (Exception ex)
                         {
-                            if (item.Attempt < 3 && !_pending[item.FullPath].IsExpired)
+                            if (item.Attempt < 3 && !_pending[item.FullPath].Budget.IsExpired)
                             {
                                 retry = item with { Attempt = item.Attempt + 1 };
                                 _logger.LogDebug(ex, "Retrying artifact upload {Path} attempt {Attempt}", item.FullPath, item.Attempt + 1);
@@ -2150,7 +2150,11 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         {
                             if (retry is not { } next || !_queue.Writer.TryWrite(next))
                             {
-                                _pending.TryRemove(item.FullPath, out _);
+                                // Release before checking: a watcher event coalesced with
+                                // the old entry must not strand a genuinely changed file.
+                                if (_pending.TryRemove(item.FullPath, out var finished) && !_cts.IsCancellationRequested
+                                    && HasChangedUploadVersion(item, finished.SnapshotVersion))
+                                    OnFileEvent(item.Type, item.FullPath, "changed-after-upload");
                             }
                         }
 
@@ -2163,9 +2167,25 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             }
         }
 
+        private bool HasChangedUploadVersion(UploadRequest request, SecureFileVersion? snapshot)
+        {
+            if (snapshot is not { } previous ||
+                !TryResolveSecureLocation(request.Type, request.FullPath, out var root, out var relative)) return false;
+            try
+            {
+                using var directory = new LinuxSecureDirectoryRoot(root);
+                return directory.GetVersion(relative) is { } current && current != previous;
+            }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+            {
+                // Failed inspection cannot establish a new version to retry.
+                return false;
+            }
+        }
+
         private async Task<UploadRequest?> UploadAsync(UploadRequest request)
         {
-            using var budget = _pending[request.FullPath].BeginAttempt(_cts.Token);
+            using var budget = _pending[request.FullPath].Budget.BeginAttempt(_cts.Token);
             try
             {
                 return await UploadWithinBudgetAsync(request, budget).ConfigureAwait(false);
@@ -2228,6 +2248,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     var snapshotWriteUtc = LinuxSecureDirectoryRoot.GetOpenFileStatus(stream.SafeFileHandle, relPath).LastWriteTimeUtc;
                     var snapshotVersion = LinuxSecureDirectoryRoot.GetOpenFileVersion(stream.SafeFileHandle, relPath)
                         ?? throw new IOException("Cannot capture the opened artifact file version.");
+                    _pending[fullPath].SnapshotVersion = snapshotVersion;
                     if (sizeBytes > MaxUploadBytes)
                     {
                         _logger.LogWarning(
@@ -2495,6 +2516,12 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             return "application/octet-stream";
         }
 
+        private sealed class PendingUpload(ArtifactUploadPolicy policy, SecureFileVersion? version)
+        {
+            public ArtifactUploadBudget Budget { get; } = new(policy);
+            public SecureFileVersion? SnapshotVersion { get; set; } = version;
+        }
+
         private sealed class UploadSnapshotIdentity(string fingerprint, string uploadId, SecureFileVersion version)
         {
             private bool _retired;
@@ -2647,7 +2674,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             /// itself, or the remote artifact behind the agent's own empty placeholder.
             /// </summary>
             public bool AccountsFor(SecureFileVersion version)
-                => MatchesLocalFile(version) || PlaceholderVersion == version;
+                => HasRemoteArtifact && (MatchesLocalFile(version) || PlaceholderVersion == version);
 
             /// <summary>When the VFS last told a reader the local file is ready.</summary>
             public DateTimeOffset LastServedUtc { get; private set; }

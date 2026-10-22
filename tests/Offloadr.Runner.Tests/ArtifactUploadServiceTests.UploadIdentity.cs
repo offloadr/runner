@@ -450,6 +450,92 @@ public partial class ArtifactUploadServiceTests
         finally { TryDelete(root); }
     }
 
+    [Test]
+    public async Task RemoteDeletionOfLiveUploadedBytesRetainsIdentityButCountsThemUnsaved()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = UploadIdentityPaths(root);
+            var path = Path.Combine(paths.OutputDirectory, "deleted-remotely.bin");
+            var client = new FakeRunnerArtifactClient(new());
+            await using var service = new ArtifactUploadService("secret", client, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            await File.WriteAllBytesAsync(path, [1, 2, 3]);
+            await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            await WaitForIdentityUploadsToFinishAsync(service);
+            await service.RefreshSessionAsync("session-1");
+            await WaitForIdentityUploadsToFinishAsync(service);
+            Assert.That(client.IssuedIdentityCount, Is.EqualTo(1), "remote deletion cannot reissue an unchanged snapshot");
+            Assert.That(client.UploadCount, Is.EqualTo(1));
+            Assert.That(await File.ReadAllBytesAsync(path), Is.EqualTo(new byte[] { 1, 2, 3 }));
+            Assert.That(await service.StopSessionAsync("session-1"), Is.EqualTo(1),
+                "retaining the old ID does not prove remote bytes still exist");
+            Assert.That(service.TakeUnsavedUploads("session-1"), Is.EqualTo(new UnsavedUploads(1, false)));
+        }
+        finally { TryDelete(root); }
+    }
+
+    [TestCase(false)]
+    [TestCase(true)]
+    public async Task ChangedSnapshotSurvivesTheFinalAttemptTimeout(bool expireTotalAllowance)
+    {
+        var root = CreateTempDirectory();
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
+        {
+            var paths = UploadIdentityPaths(root);
+            var path = Path.Combine(paths.OutputDirectory, "timeout-rewrite.bin");
+            var clock = new ArtifactUploadBudgetTests.UploadClock();
+            var policy = new ArtifactUploadPolicy
+            {
+                Clock = clock,
+                MetadataTimeout = TimeSpan.FromSeconds(2),
+                NoProgressTimeout = TimeSpan.FromSeconds(2),
+                ReceiptTimeout = TimeSpan.FromSeconds(2)
+            };
+            var replies = 0;
+            var client = new FakeRunnerArtifactClient(new());
+            client.UploadResponseFailure = _ =>
+            {
+                var reply = Interlocked.Increment(ref replies);
+                if (reply == 3) client.UploadGate = release.Task;
+                return reply <= 3
+                    ? new RpcException(new Status(StatusCode.Internal, "Response lost")) : null;
+            };
+            var logger = new ListLogger<ArtifactUploadService>();
+            await using var service = new ArtifactUploadService("secret", client, logger, uploadPolicy: policy);
+            try
+            {
+                await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+                await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+                await File.WriteAllBytesAsync(path, [1, 2, 3]);
+                var original = await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+                for (var n = 0; n < 3; n++)
+                {
+                    var retry = await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+                    Assert.That(retry.Metadata!.UploadId, Is.EqualTo(original.Metadata!.UploadId));
+                }
+                await client.LastPreparedUploadResponse!.WaitAsync(TimeSpan.FromSeconds(5));
+                await File.WriteAllBytesAsync(path, [9, 8, 7, 6, 5]);
+                await WaitForUploadLogAsync(logger, "Artifact change coalesced with pending upload bytes=5");
+                client.UploadGate = null; // Only the old fourth call retains its stalled response.
+                clock.Advance(TimeSpan.FromSeconds(expireTotalAllowance ? 6 : 3));
+                var replacement = await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+                Assert.That(replacement.Metadata!.UploadId, Is.Not.EqualTo(original.Metadata!.UploadId));
+                Assert.That(replacement.ChunkBytes, Is.EqualTo(5));
+                await WaitForIdentityUploadsToFinishAsync(service);
+                Assert.That(client.IssuedIdentityCount, Is.EqualTo(2));
+                Assert.That(client.UploadCallsCancelled, Is.EqualTo(1), "the actual fourth call token must expire");
+                Assert.That(client.UploadCallsDisposed, Is.EqualTo(client.UploadCallsStarted));
+                Assert.That(await service.StopSessionAsync("session-1"), Is.Zero);
+            }
+            finally { release.TrySetResult(); }
+        }
+        finally { TryDelete(root); }
+    }
+
     private static async Task WaitForUploadLogAsync(ListLogger<ArtifactUploadService> logger, string text)
     {
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
