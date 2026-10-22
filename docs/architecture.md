@@ -26,6 +26,16 @@ disposes that handler chain and closes its connections. A successful RPC leaves
 the connection pooled until channel disposal or another transport lifetime event;
 channel callers must retain and dispose their channels at the owning lifetime.
 
+### Command-stream reconnection
+
+Failed reads and empty stream closures retain the reconnect failure streak across
+calls. The first received message, including a keepalive, resets that streak;
+constructing a call alone does not. Reconnect delays keep the configured minimum,
+maximum and jitter from `RegistrationPolicy`, independently of the status lane.
+Host shutdown cancels reads and backoff without opening another stream. A
+received message establishes this retry reset, not native execution or sustained
+connection health.
+
 ### Transient command redelivery
 
 Transient HTTP and client-message commands are admitted by request ID and an

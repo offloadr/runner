@@ -1447,10 +1447,12 @@ internal static class ServiceClientManager
                     },
                     cancellationToken: shutdown);
                 RunnerLog.Info(nameof(ServiceClientManager), "Runner commands stream (grpc) connected.");
-                attempt = 0;
 
                 while (await call.ResponseStream.MoveNext(shutdown).ConfigureAwait(false))
                 {
+                    // A call can be created while every read fails. Only received
+                    // data resets the reconnect streak, including keepalives.
+                    attempt = 0;
                     var evt = call.ResponseStream.Current;
                     if (evt.Keepalive is not null)
                     {
