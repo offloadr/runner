@@ -1885,7 +1885,8 @@ public partial class ArtifactUploadServiceTests
         public RpcException? ReadArtifactException { get; init; }
         public IAsyncStreamReader<RunnerArtifactServiceReadArtifactResponse>? BlockingReadArtifactReader { get; init; }
         /// <summary>When set, upload responses wait for this task, as on a stalled artifact API.</summary>
-        public Task? UploadGate { get; init; }
+        public Task? UploadGate { get; set; }
+        public Task<RunnerArtifactServiceUploadArtifactResponse>? LastPreparedUploadResponse { get; private set; }
         /// <summary>Answers every upload with success=false, as a control plane refusing it would.</summary>
         public bool RejectUploads { get; set; }
 
@@ -1955,6 +1956,7 @@ public partial class ArtifactUploadServiceTests
             LastUploadHeaders = options.Headers;
             Interlocked.Increment(ref _uploadCallsStarted);
             var response = new TaskCompletionSource<RunnerArtifactServiceUploadArtifactResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
+            LastPreparedUploadResponse = response.Task;
             var writer = new CaptureUploadStreamWriter(AfterUploadMetadata, captured =>
             {
                 _uploads.Enqueue(captured);

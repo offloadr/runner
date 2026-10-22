@@ -26,6 +26,15 @@ pending queue does not invalidate the default uncertainty allowance; retained
 bindings may outlive their queue entries. The uncertainty policy may lower its
 own limit but cannot raise it above 4,096.
 
+An owed rescan still retries uncertain paths at that limit, so successful replies
+can free capacity for waiting files. Unchanged retired versions stay out of the
+queue; rescanning them cannot save them or release their binding. A file rewritten
+while a retired reply is pending is rechecked and queued under its new version.
+New versions receive their own retry count even after the old snapshot exhausted
+its retries, while retaining the pending path's original total elapsed allowance.
+Committed receipts must match filename and subfolder casing exactly; artifact type
+names remain case-insensitive.
+
 The control plane may collect resolved receipts from an active assignment only
 with a durable sequence retirement fence. `RejectedRetiredUpload` is distinct from
 runtime retirement and commitment. The same local snapshot keeps its retired ID,

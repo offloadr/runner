@@ -1751,9 +1751,11 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 // Inspect without following symlinks: only plain regular files in the
                 // session tree are uploaded; links, FIFOs, devices and directories are not.
                 SecureFileStatus status;
+                SecureFileVersion? version;
                 using (var secureRoot = new LinuxSecureDirectoryRoot(root))
                 {
                     status = secureRoot.GetStatus(relativePath);
+                    version = secureRoot.GetVersion(relativePath);
                 }
 
                 if (status.Kind == SecureEntryKind.Missing)
@@ -1772,6 +1774,13 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 }
 
                 if (TryGetCatalogEntry(fullPath, out var knownState) && ShouldSkipCatalogBackedUpload(status, knownState))
+                {
+                    return;
+                }
+
+                // A retired unchanged snapshot cannot be saved by another attempt.
+                // Leave it out of rescans without hiding a newer version of its path.
+                if (_uncertainUploads.TryGetValue(fullPath, out var uncertain) && uncertain.Retired && version == uncertain.Version)
                 {
                     return;
                 }
@@ -1799,6 +1808,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
                 if (!_pending.TryAdd(fullPath, new ArtifactUploadBudget(_uploadPolicy)))
                 {
+                    _logger.LogDebug("Artifact change coalesced with pending upload bytes={Bytes} session={SessionId} path={Path}", status.Length, _sessionId, fullPath);
                     return;
                 }
 
@@ -2042,7 +2052,6 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         {
             if (Volatile.Read(ref _rescanOwed) == 0 ||
                 _pending.Count > MaxPendingUploads / 2 ||
-                _uncertainUploads.Count >= _uploadPolicy.MaximumUnacknowledgedSnapshots ||
                 Interlocked.Exchange(ref _rescanOwed, 0) == 0)
             {
                 return;
@@ -2334,27 +2343,27 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     var response = await call.ResponseAsync.ConfigureAwait(false);
                     budget.Token.ThrowIfCancellationRequested();
 
-                    if (response.Outcome == RunnerArtifactUploadOutcome.RejectedRetiredUpload)
+                    var retired = response.Outcome == RunnerArtifactUploadOutcome.RejectedRetiredUpload;
+                    if (retired)
                     {
                         // Retirement proves no saving outcome. Keep this exact binding
                         // for rescans; never acquire fresh authority for the old file.
                         snapshot.Retired = true;
-                        return null;
                     }
                     if (response.Outcome == RunnerArtifactUploadOutcome.RejectedStaleRuntime)
                     {
                         // Rejection never proves that these bytes reached durable storage.
                         return null;
                     }
-                    // Catalog keys ignore case and can retain an older version's spelling.
-                    // The echoed upload ID still binds the result to this exact snapshot.
-                    if (response.Outcome != RunnerArtifactUploadOutcome.Committed || response.UploadId != metadata.UploadId
+                    // Types are semantic names; filesystem components must retain
+                    // their exact spelling on the Linux workspace.
+                    if (!retired && (response.Outcome != RunnerArtifactUploadOutcome.Committed || response.UploadId != metadata.UploadId
                         || response.Artifact is null
                         || response.Artifact.EditorSid != _editorSid
                         || !string.Equals(response.Artifact.Type, type, StringComparison.OrdinalIgnoreCase)
-                        || !string.Equals(response.Artifact.Subfolder, subfolder, StringComparison.OrdinalIgnoreCase)
-                        || !string.Equals(response.Artifact.Filename, fileName, StringComparison.OrdinalIgnoreCase)
-                        || response.Artifact.SizeBytes != sizeBytes)
+                        || !string.Equals(response.Artifact.Subfolder, subfolder, StringComparison.Ordinal)
+                        || !string.Equals(response.Artifact.Filename, fileName, StringComparison.Ordinal)
+                        || response.Artifact.SizeBytes != sizeBytes))
                     {
                         throw new InvalidOperationException(string.IsNullOrWhiteSpace(response.Message) ? "upload failed" : response.Message);
                     }
@@ -2375,6 +2384,15 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                                               afterVersion is null ||
                                               afterVersion != snapshotVersion;
 
+                    if (retired)
+                    {
+                        // The watcher coalesces changes while this path is pending.
+                        // Only a genuinely newer snapshot may acquire another ID.
+                        return changedDuringUpload && after.IsRegularFile
+                            ? request with { Attempt = 0 }
+                            : null;
+                    }
+
                     // When it changed, record the snapshot's time so a later scan sees a newer file.
                     var createdUtc = changedDuringUpload
                         ? new DateTimeOffset(snapshotWriteUtc, TimeSpan.Zero)
@@ -2391,14 +2409,16 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     }
 
                     _logger.LogInformation("Uploaded artifact session={SessionId} type={Type} path={Relative}", _sessionId, type, relPath);
-                    if (changedDuringUpload && after.IsRegularFile && request.Attempt < 3)
+                    if (changedDuringUpload && after.IsRegularFile)
                     {
                         _logger.LogInformation(
                             "Artifact changed during upload; uploading it again session={SessionId} type={Type} path={Relative}",
                             _sessionId,
                             type,
                             relPath);
-                        return request with { Attempt = request.Attempt + 1 };
+                        // A new snapshot has its own retry count; the pending path
+                        // keeps its original elapsed allowance across all versions.
+                        return request with { Attempt = 0 };
                     }
 
                     return null;
@@ -2474,11 +2494,13 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             return "application/octet-stream";
         }
 
-        private sealed class UploadSnapshotIdentity(string fingerprint, string uploadId)
+        private sealed class UploadSnapshotIdentity(string fingerprint, string uploadId, SecureFileVersion version)
         {
+            private bool _retired;
             public string Fingerprint { get; } = fingerprint;
             public string UploadId { get; } = uploadId;
-            public bool Retired { get; set; }
+            public SecureFileVersion Version { get; } = version;
+            public bool Retired { get => Volatile.Read(ref _retired); set => Volatile.Write(ref _retired, value); }
         }
 
         private async Task<UploadSnapshotIdentity> GetUploadSnapshotIdentityAsync(
@@ -2511,7 +2533,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             if (!Guid.TryParseExact(response.UploadId, "N", out var id) || id == Guid.Empty
                 || response.UploadId != id.ToString("N"))
                 throw new InvalidOperationException("Invalid issued artifact upload identity.");
-            var snapshot = new UploadSnapshotIdentity(fingerprint, response.UploadId);
+            var snapshot = new UploadSnapshotIdentity(fingerprint, response.UploadId, version);
             // The single upload reader owns insertion. Store before any upload RPC:
             // losing its response or exhausting its queue budget cannot erase identity.
             _uncertainUploads[path] = snapshot;
