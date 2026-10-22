@@ -1,5 +1,7 @@
+using Google.Protobuf.WellKnownTypes;
 using Grpc.Core;
 using Microsoft.Extensions.Logging.Abstractions;
+using Offloadr.EditorRuntime.V1;
 using Offloadr.Runner.V1;
 
 namespace Offloadr.Runner.Tests;
@@ -106,8 +108,8 @@ public partial class ArtifactUploadServiceTests
         }
     }
 
-    [TestCase("filename", true, 1)]
-    [TestCase("subfolder", true, 1)]
+    [TestCase("filename", true, 0)]
+    [TestCase("subfolder", true, 0)]
     [TestCase("type", true, 0)]
     [TestCase("filename", false, 1)]
     [TestCase("subfolder", false, 1)]
@@ -148,6 +150,59 @@ public partial class ArtifactUploadServiceTests
         {
             TryDelete(root);
         }
+    }
+
+    [TestCase(false, false, 1)]
+    [TestCase(false, true, 0)]
+    [TestCase(true, false, 1)]
+    [TestCase(true, true, 0)]
+    public async Task CatalogSpellingAcknowledgesOnlyItsCapturedLocalFile(
+        bool refresh, bool removeUnacknowledgedFile, int expectedUnsaved)
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = UploadIdentityPaths(root);
+            var acknowledged = Path.Combine(paths.OutputDirectory, "receipt.bin");
+            var unacknowledged = Path.Combine(paths.OutputDirectory, "RECEIPT.BIN");
+            Directory.CreateDirectory(paths.OutputDirectory);
+            await File.WriteAllBytesAsync(acknowledged, [1, 2, 3]);
+            await File.WriteAllBytesAsync(unacknowledged, [4, 5, 6, 7, 8]);
+            var catalog = new RunnerArtifactServiceListArtifactsResponse();
+            EditorArtifactMetadata? committed = null;
+            var client = new FakeRunnerArtifactClient(catalog)
+            {
+                UploadResponseFailure = upload => upload.Metadata!.Filename == "RECEIPT.BIN"
+                    ? new RpcException(new Status(StatusCode.FailedPrecondition, "Unacknowledged other local file"))
+                    : null,
+                RewriteUploadArtifact = artifact =>
+                {
+                    artifact.Filename = "RECEIPT.BIN";
+                    artifact.CreatedUtc = Timestamp.FromDateTime(DateTime.UtcNow);
+                    committed = artifact.Clone();
+                    return artifact;
+                }
+            };
+            await using var service = new ArtifactUploadService("secret", client,
+                NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            for (var i = 0; i < 5; i++) await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            await WaitForIdentityUploadsToFinishAsync(service);
+            Assert.That(committed, Is.Not.Null);
+            if (refresh)
+            {
+                catalog.Artifacts.Add(committed!.Clone());
+                await service.RefreshSessionAsync("session-1");
+                await WaitForIdentityUploadsToFinishAsync(service);
+            }
+            Assert.That(await File.ReadAllBytesAsync(acknowledged), Is.EqualTo(new byte[] { 1, 2, 3 }));
+            Assert.That(await File.ReadAllBytesAsync(unacknowledged), Is.EqualTo(new byte[] { 4, 5, 6, 7, 8 }));
+            File.Delete(removeUnacknowledgedFile ? unacknowledged : acknowledged);
+            Assert.That(await service.StopSessionAsync("session-1"), Is.EqualTo(expectedUnsaved),
+                "catalog spelling must never acknowledge the other case-distinct local file");
+        }
+        finally { TryDelete(root); }
     }
 
     [Test]

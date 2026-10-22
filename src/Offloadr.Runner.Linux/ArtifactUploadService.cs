@@ -1123,18 +1123,20 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
                 var response = await _artifactClient.ListArtifactsAsync(request, headers: _authHeaders, cancellationToken: token).ConfigureAwait(false);
                 var currentPaths = new HashSet<string>(StringComparer.Ordinal);
+                var currentArtifacts = new HashSet<EditorArtifactMetadata>();
                 foreach (var item in response.Artifacts)
                 {
                     var appliedPath = ApplyCatalogEntry(item, editorSid);
                     if (!string.IsNullOrWhiteSpace(appliedPath))
                     {
                         currentPaths.Add(appliedPath);
+                        currentArtifacts.Add(item);
                     }
                 }
 
                 if (pruneMissing)
                 {
-                    PruneCatalogEntries(currentPaths);
+                    PruneCatalogEntries(currentPaths, currentArtifacts);
                 }
                 _catalogLoaded = true;
                 return true;
@@ -1171,12 +1173,14 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             }
 
             var currentPaths = new HashSet<string>(StringComparer.Ordinal);
+            var currentArtifacts = new HashSet<EditorArtifactMetadata>();
             foreach (var item in artifacts)
             {
                 var appliedPath = ApplyCatalogEntry(item, editorSid);
                 if (!string.IsNullOrWhiteSpace(appliedPath))
                 {
                     currentPaths.Add(appliedPath);
+                    currentArtifacts.Add(item);
                 }
             }
 
@@ -1185,7 +1189,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 return false;
             }
 
-            PruneCatalogEntries(currentPaths);
+            PruneCatalogEntries(currentPaths, currentArtifacts);
             return true;
         }
 
@@ -1224,6 +1228,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     item.Sha256,
                     createdUtc);
                 state.UploadSnapshot = previousState?.UploadSnapshot;
+                state.CommittedArtifact = previousState?.CommittedArtifact;
                 _catalog[normalized] = state;
 
                 try
@@ -1239,7 +1244,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             return normalized;
         }
 
-        private void PruneCatalogEntries(HashSet<string> currentPaths)
+        private void PruneCatalogEntries(HashSet<string> currentPaths, HashSet<EditorArtifactMetadata> currentArtifacts)
         {
             // Under the eviction gate, as every catalog replacement: a pass must not empty a file
             // whose entry, the only way to download it again, is being removed.
@@ -1253,7 +1258,13 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         // live file's last issued ID, without promising readback.
                         if (state.UploadSnapshot is not null && state.Downloaded && state.LocalVersion is { } localVersion
                             && IsLiveRegularFile(state.Type, path, localVersion))
-                            state.HasRemoteArtifact = false;
+                        {
+                            // A receipt can retain an older catalog spelling. Only
+                            // identical committed metadata keeps that exact local
+                            // snapshot saved; another file is never selected by it.
+                            state.HasRemoteArtifact = state.CommittedArtifact is { } committed
+                                && currentArtifacts.Contains(committed);
+                        }
                         else
                             _catalog.TryRemove(path, out _);
                     }
@@ -2377,14 +2388,15 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         // Rejection never proves that these bytes reached durable storage.
                         return null;
                     }
-                    // Types are semantic names; filesystem components must retain
-                    // their exact spelling on the Linux workspace.
+                    // These are case-insensitive catalog keys, not local paths.
+                    // Local saving below always uses the captured request path and
+                    // secure version, never a path selected by the response.
                     if (!retired && (response.Outcome != RunnerArtifactUploadOutcome.Committed || response.UploadId != metadata.UploadId
                         || response.Artifact is null
                         || response.Artifact.EditorSid != _editorSid
                         || !string.Equals(response.Artifact.Type, type, StringComparison.OrdinalIgnoreCase)
-                        || !string.Equals(response.Artifact.Subfolder, subfolder, StringComparison.Ordinal)
-                        || !string.Equals(response.Artifact.Filename, fileName, StringComparison.Ordinal)
+                        || !string.Equals(response.Artifact.Subfolder, subfolder, StringComparison.OrdinalIgnoreCase)
+                        || !string.Equals(response.Artifact.Filename, fileName, StringComparison.OrdinalIgnoreCase)
                         || response.Artifact.SizeBytes != sizeBytes))
                     {
                         throw new InvalidOperationException(string.IsNullOrWhiteSpace(response.Message) ? "upload failed" : response.Message);
@@ -2424,6 +2436,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     lock (_evictionGate)
                     {
                         remote.UploadSnapshot = snapshot;
+                        remote.CommittedArtifact = response.Artifact.Clone();
                         _catalog[remote.LocalPath] = remote;
                         _uncertainUploads.TryRemove(fullPath, out _);
                         // A file that changed while it was sent matches no uploaded version yet.
@@ -2619,6 +2632,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             public bool Downloaded { get; private set; }
             public bool HasRemoteArtifact { get; set; } = true;
             public UploadSnapshotIdentity? UploadSnapshot { get; set; }
+            public EditorArtifactMetadata? CommittedArtifact { get; set; }
 
             public void UpdateMetadata(long? sizeBytes, string? sha256, DateTimeOffset createdUtc)
             {

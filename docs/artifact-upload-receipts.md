@@ -45,8 +45,13 @@ After the old entry finishes, including a terminal timeout, the runner rechecks
 the secure version after releasing it. Only a changed current file starts a new
 pending entry with its own allowance; an unchanged failed snapshot does not
 automatically renew its exhausted budget.
-Committed receipts must match filename and subfolder casing exactly; artifact type
-names remain case-insensitive.
+Committed receipt paths follow the server catalog's case-insensitive key identity;
+the catalog may retain an older spelling. Upload ID, editor and size remain exact.
+Saved accounting always uses the request's captured local path and secure version,
+never a path selected by the response. Acknowledged entries retain the committed
+metadata alongside that binding. A refresh containing identical committed metadata
+preserves the binding even when catalog spelling differs; deletion or changed
+metadata cannot mark that alias saved. No per-version catalog history is retained.
 
 The control plane may collect resolved receipts from an active assignment only
 with a durable sequence retirement fence. `RejectedRetiredUpload` is distinct from
