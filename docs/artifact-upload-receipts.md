@@ -29,7 +29,10 @@ establish a global runner memory bound.
 
 The pending queue and retained uncertainty have separate limits. Lowering the
 pending queue does not invalidate the default uncertainty allowance; retained
-bindings may outlive their queue entries. The uncertainty policy may lower its
+bindings may outlive their queue entries. If uncertainty fills after a file was
+admitted to the pending queue, that file releases its pending entry immediately
+and leaves an owed rescan. Capacity is not retried as a file-lock failure on the
+single upload reader. The uncertainty policy may lower its
 own limit but cannot raise it above 4,096.
 
 An owed rescan still retries uncertain paths at that limit, so successful replies

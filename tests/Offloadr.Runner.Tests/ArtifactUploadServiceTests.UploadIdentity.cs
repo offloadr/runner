@@ -536,6 +536,58 @@ public partial class ArtifactUploadServiceTests
         finally { TryDelete(root); }
     }
 
+    [Test]
+    public async Task CapacityExhaustionReleasesExcessPendingWorkBeforeRetryingUncertainUploads()
+    {
+        var root = CreateTempDirectory();
+        var issue = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
+        {
+            var paths = UploadIdentityPaths(root);
+            var client = new FakeRunnerArtifactClient(new()) { IssueIdentityGate = issue.Task };
+            var replies = 0;
+            client.UploadResponseFailure = _ =>
+            {
+                if (Interlocked.Increment(ref replies) != 1) return null;
+                client.UploadGate = release.Task; // Hold the retry that can free capacity.
+                return new RpcException(new Status(StatusCode.Internal, "First response lost"));
+            };
+            var policy = new ArtifactUploadPolicy { MaximumUnacknowledgedSnapshots = 1 };
+            await using var service = new ArtifactUploadService("secret", client,
+                NullLogger<ArtifactUploadService>.Instance, uploadPolicy: policy);
+            try
+            {
+                await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+                await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+                await File.WriteAllBytesAsync(Path.Combine(paths.OutputDirectory, "uncertain.bin"), [1, 2, 3]);
+                await client.IssueIdentityEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                // Both files enter the pending queue before the first issued
+                // identity is bound, so admission cannot yet see the full set.
+                await File.WriteAllBytesAsync(Path.Combine(paths.OutputDirectory, "excess.bin"), [4, 5, 6]);
+                using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                while (service.GetPendingUploadCount("session-1") != 2)
+                    await Task.Delay(10, timeout.Token);
+                issue.TrySetResult();
+                var original = await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+                var retry = await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+                Assert.That(retry.Metadata!.UploadId, Is.EqualTo(original.Metadata!.UploadId));
+                await client.LastPreparedUploadResponse!.WaitAsync(TimeSpan.FromSeconds(5));
+                Assert.That(service.GetPendingUploadCount("session-1"), Is.EqualTo(1),
+                    "excess capacity work must release its pending entry instead of requeuing an I/O retry");
+                release.TrySetResult();
+                var admitted = await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+                Assert.That(admitted.Metadata!.Filename, Is.EqualTo("excess.bin"));
+                Assert.That(admitted.Metadata.UploadId, Is.Not.EqualTo(original.Metadata.UploadId));
+                await WaitForIdentityUploadsToFinishAsync(service);
+                Assert.That(client.IssuedIdentityCount, Is.EqualTo(2));
+                Assert.That(await service.StopSessionAsync("session-1"), Is.Zero);
+            }
+            finally { issue.TrySetResult(); release.TrySetResult(); }
+        }
+        finally { TryDelete(root); }
+    }
+
     private static async Task WaitForUploadLogAsync(ListLogger<ArtifactUploadService> logger, string text)
     {
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));

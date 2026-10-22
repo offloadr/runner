@@ -1894,6 +1894,8 @@ public partial class ArtifactUploadServiceTests
         public bool RejectAsStaleRuntime { get; set; }
         public bool RejectAsRetiredUpload { get; set; }
         public string? IssuedUploadId { get; init; }
+        public Task? IssueIdentityGate { get; init; }
+        public TaskCompletionSource IssueIdentityEntered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private int _issuedIdentities;
         public int IssuedIdentityCount => Volatile.Read(ref _issuedIdentities);
 
@@ -1917,9 +1919,9 @@ public partial class ArtifactUploadServiceTests
         private int _uploadCallsDisposed;
         private int _uploadCallsCancelled;
 
-        private static async Task<RunnerArtifactServiceUploadArtifactResponse> WaitForGateAsync(
+        private static async Task<T> WaitForGateAsync<T>(
             Task gate,
-            Task<RunnerArtifactServiceUploadArtifactResponse> response)
+            Task<T> response)
         {
             await gate.ConfigureAwait(false);
             return await response.ConfigureAwait(false);
@@ -1935,8 +1937,12 @@ public partial class ArtifactUploadServiceTests
             RunnerArtifactServiceIssueUploadIdentityRequest request, CallOptions options)
         {
             Interlocked.Increment(ref _issuedIdentities);
-            return new(Task.FromResult(new RunnerArtifactServiceIssueUploadIdentityResponse { UploadId = IssuedUploadId ?? Guid.NewGuid().ToString("N") }),
-                Task.FromResult(new Metadata()), () => Status.DefaultSuccess, () => new Metadata(), () => { });
+            var response = Task.FromResult(new RunnerArtifactServiceIssueUploadIdentityResponse
+            { UploadId = IssuedUploadId ?? Guid.NewGuid().ToString("N") });
+            if (IssueIdentityGate is { } gate)
+                response = WaitForGateAsync(gate, response).WaitAsync(options.CancellationToken);
+            IssueIdentityEntered.TrySetResult();
+            return new(response, Task.FromResult(new Metadata()), () => Status.DefaultSuccess, () => new Metadata(), () => { });
         }
 
         public override AsyncUnaryCall<RunnerArtifactServiceListArtifactsResponse> ListArtifactsAsync(RunnerArtifactServiceListArtifactsRequest request, CallOptions options)

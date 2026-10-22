@@ -2294,7 +2294,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
                     var snapshot = await GetUploadSnapshotIdentityAsync(metadata, snapshotVersion,
                         fullPath, budget.Token).ConfigureAwait(false);
-                    if (snapshot.Retired) return null;
+                    if (snapshot is null || snapshot.Retired) return null;
                     metadata.UploadId = snapshot.UploadId;
 
                     // Every attempt seals afresh; a fresh envelope is still the same logical
@@ -2531,7 +2531,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             public bool Retired { get => Volatile.Read(ref _retired); set => Volatile.Write(ref _retired, value); }
         }
 
-        private async Task<UploadSnapshotIdentity> GetUploadSnapshotIdentityAsync(
+        private async Task<UploadSnapshotIdentity?> GetUploadSnapshotIdentityAsync(
             RunnerArtifactUploadMetadata metadata, SecureFileVersion version, string path, CancellationToken ct)
         {
             var fingerprint = _uploadOperationIdentity.ForSnapshot(metadata, version);
@@ -2551,7 +2551,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             if (_uncertainUploads.Count >= _uploadPolicy.MaximumUnacknowledgedSnapshots)
             {
                 NoteDroppedUpload(path);
-                throw new IOException("Unacknowledged artifact snapshot capacity is exhausted.");
+                return null;
             }
             var response = await _artifactClient.IssueUploadIdentityAsync(new()
             {
