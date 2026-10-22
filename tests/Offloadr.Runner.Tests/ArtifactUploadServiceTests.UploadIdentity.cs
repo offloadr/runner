@@ -66,11 +66,13 @@ public partial class ArtifactUploadServiceTests
                 ids.Add((await client.WaitForUploadAsync(TimeSpan.FromSeconds(5))).Metadata!.UploadId);
             await WaitForIdentityUploadsToFinishAsync(service);
             Assert.That(ids.Distinct().Count(), Is.EqualTo(1));
+            Assert.That(client.IssuedIdentityCount, Is.EqualTo(1));
 
             client.UploadResponseFailure = null;
             await service.RefreshSessionAsync("session-1");
             var rescanned = await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
             Assert.That(rescanned.Metadata!.UploadId, Is.EqualTo(ids[0]));
+            Assert.That(client.IssuedIdentityCount, Is.EqualTo(1));
             await WaitForIdentityUploadsToFinishAsync(service);
             Assert.That(await service.StopSessionAsync("session-1"), Is.Zero);
         }
@@ -146,6 +148,96 @@ public partial class ArtifactUploadServiceTests
         {
             TryDelete(root);
         }
+    }
+
+    [Test]
+    public async Task RetiredUploadRemainsUnsavedWithoutReissuingIdentityOnRescan()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = UploadIdentityPaths(root);
+            var client = new FakeRunnerArtifactClient(new()) { RejectAsRetiredUpload = true };
+            await using var service = new ArtifactUploadService("secret", client, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            await File.WriteAllBytesAsync(Path.Combine(paths.OutputDirectory, "retired.bin"), [1, 2, 3]);
+            await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            await WaitForIdentityUploadsToFinishAsync(service);
+            await service.RefreshSessionAsync("session-1");
+            await WaitForIdentityUploadsToFinishAsync(service);
+            Assert.That(client.IssuedIdentityCount, Is.EqualTo(1));
+            Assert.That(client.UploadCount, Is.EqualTo(1));
+            Assert.That(await service.StopSessionAsync("session-1"), Is.EqualTo(1));
+            Assert.That(service.TakeUnsavedUploads("session-1"), Is.EqualTo(new UnsavedUploads(1, false)));
+        }
+        finally { TryDelete(root); }
+    }
+
+    [Test]
+    public async Task RemoteDeletionPreservesLiveAcknowledgedSnapshotIdentityUntilLocalChange()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = UploadIdentityPaths(root);
+            var path = Path.Combine(paths.OutputDirectory, "kept.bin");
+            var client = new FakeRunnerArtifactClient(new()); // Refreshed remote catalog stays empty.
+            await using var service = new ArtifactUploadService("secret", client, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            await File.WriteAllBytesAsync(path, [1, 2, 3]);
+            var original = await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            await WaitForIdentityUploadsToFinishAsync(service);
+            await service.RefreshSessionAsync("session-1");
+            await WaitForIdentityUploadsToFinishAsync(service);
+            Assert.That(client.IssuedIdentityCount, Is.EqualTo(1));
+            Assert.That(client.UploadCount, Is.EqualTo(1));
+            Assert.That(await File.ReadAllBytesAsync(path), Is.EqualTo(new byte[] { 1, 2, 3 }));
+            await File.WriteAllBytesAsync(path, [4, 5, 6, 7]);
+            var changed = await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            Assert.That(changed.Metadata!.UploadId, Is.Not.EqualTo(original.Metadata!.UploadId));
+            Assert.That(client.IssuedIdentityCount, Is.EqualTo(2));
+            await WaitForIdentityUploadsToFinishAsync(service);
+            Assert.That(await service.StopSessionAsync("session-1"), Is.Zero);
+        }
+        finally { TryDelete(root); }
+    }
+
+    [Test]
+    public async Task UncertainSnapshotLimitBackpressuresNewFilesAndReclaimsOnlyMissingBindings()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = UploadIdentityPaths(root);
+            var client = new FakeRunnerArtifactClient(new()) { RejectAsRetiredUpload = true };
+            var policy = new ArtifactUploadPolicy { MaximumUnacknowledgedSnapshots = 2 };
+            await using var service = new ArtifactUploadService("secret", client,
+                NullLogger<ArtifactUploadService>.Instance, uploadPolicy: policy);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            for (var n = 0; n < 2; n++)
+            {
+                await File.WriteAllBytesAsync(Path.Combine(paths.OutputDirectory, $"uncertain-{n}.bin"), [1, 2, 3]);
+                await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+                await WaitForIdentityUploadsToFinishAsync(service);
+            }
+            var next = Path.Combine(paths.OutputDirectory, "next.bin");
+            await File.WriteAllBytesAsync(next, [4, 5, 6]);
+            await service.RefreshSessionAsync("session-1");
+            await WaitForIdentityUploadsToFinishAsync(service);
+            Assert.That(client.IssuedIdentityCount, Is.EqualTo(2), "live uncertainty must not be evicted to admit another snapshot");
+            File.Delete(Path.Combine(paths.OutputDirectory, "uncertain-0.bin"));
+            client.RejectAsRetiredUpload = false;
+            await service.RefreshSessionAsync("session-1");
+            var admitted = await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            Assert.That(admitted.Metadata!.Filename, Is.EqualTo("next.bin"));
+            await WaitForIdentityUploadsToFinishAsync(service);
+            Assert.That(client.IssuedIdentityCount, Is.EqualTo(3));
+            Assert.That(await service.StopSessionAsync("session-1"), Is.EqualTo(1));
+        }
+        finally { TryDelete(root); }
     }
 
     private static async Task WaitForIdentityUploadsToFinishAsync(ArtifactUploadService service)

@@ -6,9 +6,9 @@ using Offloadr.Runner.V1;
 namespace Offloadr.Runner.Linux;
 
 /// <summary>
-/// Names an opened file snapshot for one uploader lifetime without retaining a map of every
-/// file it has seen. The random namespace prevents a replacement uploader from adopting it.
-/// This is a correlation token, never a content digest or an authorization credential.
+/// Fingerprints an opened snapshot locally so it keeps its server-issued upload ID.
+/// The fingerprint never crosses the wire and contains no plaintext content digest.
+/// Its uploader namespace prevents a replacement from adopting the old binding.
 /// </summary>
 internal sealed class ArtifactUploadOperationIdentity
 {

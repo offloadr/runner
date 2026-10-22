@@ -3,9 +3,12 @@ namespace Offloadr.Runner.Linux;
 /// <summary>Upload-specific allowances; established editor streams use their own policy.</summary>
 internal sealed record ArtifactUploadPolicy
 {
+    public const int UnacknowledgedSnapshotLimit = 4096;
+
     public TimeSpan MetadataTimeout { get; init; } = TimeSpan.FromMinutes(2);
     public TimeSpan NoProgressTimeout { get; init; } = TimeSpan.FromMinutes(2);
     public TimeSpan ReceiptTimeout { get; init; } = TimeSpan.FromMinutes(2);
+    public int MaximumUnacknowledgedSnapshots { get; init; } = UnacknowledgedSnapshotLimit;
     public long MinimumBytesPerSecond { get; init; } = 256 * 1024;
     public TimeProvider Clock { get; init; } = TimeProvider.System;
 

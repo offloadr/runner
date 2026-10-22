@@ -1891,6 +1891,9 @@ public partial class ArtifactUploadServiceTests
 
         /// <summary>Answers every upload as from a runtime whose authority retired.</summary>
         public bool RejectAsStaleRuntime { get; set; }
+        public bool RejectAsRetiredUpload { get; set; }
+        private int _issuedIdentities;
+        public int IssuedIdentityCount => Volatile.Read(ref _issuedIdentities);
 
         /// <summary>Fails after a complete request, as when a committed reply is lost.</summary>
         public Func<CapturedUpload, Exception?>? UploadResponseFailure { get; set; }
@@ -1923,6 +1926,14 @@ public partial class ArtifactUploadServiceTests
         /// <summary>When set, the frames every read answers with, in place of one metadata frame and one chunk.</summary>
         public RunnerArtifactServiceReadArtifactResponse[]? ReadArtifactFrames { get; set; }
 
+        public override AsyncUnaryCall<RunnerArtifactServiceIssueUploadIdentityResponse> IssueUploadIdentityAsync(
+            RunnerArtifactServiceIssueUploadIdentityRequest request, CallOptions options)
+        {
+            Interlocked.Increment(ref _issuedIdentities);
+            return new(Task.FromResult(new RunnerArtifactServiceIssueUploadIdentityResponse { UploadId = Guid.NewGuid().ToString("N") }),
+                Task.FromResult(new Metadata()), () => Status.DefaultSuccess, () => new Metadata(), () => { });
+        }
+
         public override AsyncUnaryCall<RunnerArtifactServiceListArtifactsResponse> ListArtifactsAsync(RunnerArtifactServiceListArtifactsRequest request, CallOptions options)
         {
             ListCallCount++;
@@ -1951,6 +1962,12 @@ public partial class ArtifactUploadServiceTests
                 if (UploadResponseFailure?.Invoke(captured) is { } failure)
                 {
                     response.TrySetException(failure);
+                    return;
+                }
+                if (RejectAsRetiredUpload)
+                {
+                    response.TrySetResult(new RunnerArtifactServiceUploadArtifactResponse
+                    { Outcome = RunnerArtifactUploadOutcome.RejectedRetiredUpload, UploadId = captured.Metadata!.UploadId });
                     return;
                 }
                 if (RejectAsStaleRuntime)

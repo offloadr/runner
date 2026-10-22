@@ -95,6 +95,14 @@ The split follows today's dependency graph. These services sit in Linux only bec
 
 The desktop app is a MAUI Blazor Hybrid window around `Offloadr.Runner.UI`, following the structure of a shared Razor UI with thin hosts. MAUI does not run hosted services, so `DesktopRuntime` starts them in order: a single-instance lock first, then the supervisor. The runner key is encrypted with ASP.NET Core Data Protection, whose key ring is protected with DPAPI. Settings, keys and logs live in `%LOCALAPPDATA%\OffloadrRunner`, or in `OFFLOADR_RUNNER_DATA_DIRECTORY` when set. The app lives in the Windows notification area: closing the window hides it, and the tray menu opens it, starts or stops the runner, or quits. `--minimized` starts it hidden; the Settings switch for starting at sign-in registers exactly that in the person's own Run key, and the app re-points the registration at itself if it has moved. The tray icon carries a dot for the runner state: green while running, amber while starting, downloading or restarting, red when it needs attention. Shortly after start and then daily, the app reads the latest release of this repository from the GitHub API and shows a banner with a download link when it is newer; it never downloads or installs anything itself. Quitting stops the runner container; the app asks first when the runner is active, and warns when a session would be interrupted. The tray icon uses `Shell_NotifyIcon` directly, with the app window subclassed to receive its messages.
 
+## Artifact upload identity
+
+Upload IDs are issued by the control plane and retained with the securely opened
+snapshot through retries, queue removal and catalog refresh. The bounded uncertain
+snapshot set applies visible backpressure rather than forgetting an old ID. Remote
+deletion preserves the live file's last acknowledged binding while disabling its
+eviction/readback promise. See [upload identity and retirement](artifact-upload-receipts.md).
+
 ## Origin
 
 The agent was developed alongside the Offloadr control plane and moved here without its earlier history. Its behavior is unchanged apart from three additions: it reports its own version instead of the .NET runtime's, logs where its source is at startup, and writes the status file.

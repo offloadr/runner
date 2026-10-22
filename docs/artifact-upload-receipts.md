@@ -1,0 +1,38 @@
+# Artifact upload identity and retirement
+
+Before sending a new securely opened output snapshot, the runner calls
+`RunnerArtifactService.IssueUploadIdentity` with its captured process/session/runtime
+identity. Issuance has no artifact effect. If its response is lost before an upload
+starts, an unused sequence may be skipped. The returned ID is correlation, not a
+capability, content digest, successful save or execution grant.
+
+The uploader stores that issued ID with a local fingerprint of the secure inode,
+length, modification/change times and immutable upload metadata. The fingerprint
+stays local. Retries, rescans, fresh sealing envelopes and removal from the retry
+queue preserve the ID. A changed file version or target obtains a new ID.
+
+Unacknowledged snapshots retain their bindings in a bounded set, with a default
+limit of 4,096 and no eviction of live uncertainty to admit new files. At capacity,
+new snapshots wait for rescans. A deleted local file can release its binding;
+inspection errors do not prove deletion. Acknowledged bindings use the existing
+one-entry-per-current-file catalog, rather than retaining version history. Remote
+catalog refresh/deletion cannot erase that local binding while the file survives.
+A remotely deleted artifact is not eligible for eviction into a download placeholder.
+The existing catalog's total size is a separate resource constraint; this does not
+establish a global runner memory bound.
+
+The pending queue and retained uncertainty have separate limits. Lowering the
+pending queue does not invalidate the default uncertainty allowance; retained
+bindings may outlive their queue entries. The uncertainty policy may lower its
+own limit but cannot raise it above 4,096.
+
+The control plane may collect resolved receipts from an active assignment only
+with a durable sequence retirement fence. `RejectedRetiredUpload` is distinct from
+runtime retirement and commitment. The same local snapshot keeps its retired ID,
+is not saved or evictable, and contributes to Stop loss reporting. It cannot acquire
+another issued ID merely because its original receipt is gone. Actual saving still
+requires a matching committed receipt and secure post-upload file-version check.
+
+The original pending-upload timing allowances remain in effect. These protocol
+and bookkeeping changes require a coordinated server release; declarations alone
+do not establish server enforcement or runtime qualification.

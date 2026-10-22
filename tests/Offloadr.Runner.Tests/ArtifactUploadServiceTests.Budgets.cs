@@ -139,6 +139,11 @@ public partial class ArtifactUploadServiceTests
         public TaskCompletionSource Entered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource OtherSaved { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
+        public override AsyncUnaryCall<RunnerArtifactServiceIssueUploadIdentityResponse> IssueUploadIdentityAsync(
+            RunnerArtifactServiceIssueUploadIdentityRequest request, CallOptions options)
+            => new(Task.FromResult(new RunnerArtifactServiceIssueUploadIdentityResponse { UploadId = Guid.NewGuid().ToString("N") }),
+                Task.FromResult(new Metadata()), () => Status.DefaultSuccess, () => new Metadata(), () => { });
+
         public override AsyncUnaryCall<RunnerArtifactServiceListArtifactsResponse> ListArtifactsAsync(
             RunnerArtifactServiceListArtifactsRequest request, CallOptions options) => new(
                 Task.FromResult(new RunnerArtifactServiceListArtifactsResponse()), Task.FromResult(new Metadata()),
