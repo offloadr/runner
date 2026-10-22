@@ -20,6 +20,7 @@
   <ItemGroup>
     <InternalsVisibleTo Include="RunnerAgent" />
     <InternalsVisibleTo Include="Offloadr.Runner.Tests" />
+    <InternalsVisibleTo Include="Offloadr.Runner.Command.Tests" />
   </ItemGroup>
 
 </Project>

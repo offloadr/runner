@@ -16,7 +16,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Offloadr.Runner.V1;
 
-namespace Offloadr.Runner.Tests;
+namespace Offloadr.Runner.Command.Tests;
 
 [NonParallelizable]
 public sealed class CommandStreamReconnectTests
