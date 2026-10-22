@@ -52,6 +52,14 @@ never a path selected by the response. Acknowledged entries retain the committed
 metadata alongside that binding. A refresh containing identical committed metadata
 preserves the binding even when catalog spelling differs; deletion or changed
 metadata cannot mark that alias saved. No per-version catalog history is retained.
+This also preserves readback for the exact empty placeholder left by eviction.
+If the remote metadata disappears or changes, that placeholder remains recognizable
+as unsaved; its old upload binding is cleared. A late watcher event or another
+output scan cannot upload the agent's empty placeholder as new user data. A
+replaced local file does not inherit that placeholder's saving status.
+The uploader rechecks the securely opened version before issuing an upload ID,
+under the same gate that publishes and records a completed download, so a watcher
+event queued during readback cannot republish the downloaded file.
 
 The control plane may collect resolved receipts from an active assignment only
 with a durable sequence retirement fence. `RejectedRetiredUpload` is distinct from

@@ -205,6 +205,83 @@ public partial class ArtifactUploadServiceTests
         finally { TryDelete(root); }
     }
 
+    [TestCase("unchanged", false, 0)]
+    [TestCase("unchanged", true, 0)]
+    [TestCase("deleted", false, 1)]
+    [TestCase("changed", false, 1)]
+    [TestCase("replaced-placeholder", false, 1)]
+    public async Task CatalogSpellingRetainsOnlyItsExactEvictedPlaceholder(
+        string change, bool readBack, int expectedUnsaved)
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = CreateEvictionPaths(root, sealedSession: true);
+            var path = Path.Combine(paths.OutputDirectory, "receipt.bin");
+            byte[] content = [1, 2, 3];
+            var catalog = new RunnerArtifactServiceListArtifactsResponse();
+            EditorArtifactMetadata? committed = null;
+            var client = new FakeRunnerArtifactClient(catalog)
+            {
+                ReadArtifactContent = content,
+                RewriteUploadArtifact = artifact =>
+                {
+                    artifact.Filename = "RECEIPT.BIN";
+                    artifact.CreatedUtc = Timestamp.FromDateTime(DateTime.UtcNow);
+                    committed = artifact.Clone();
+                    return artifact;
+                }
+            };
+            var logger = new ListLogger<ArtifactUploadService>();
+            await using var service = new ArtifactUploadService("secret", client, logger);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            await File.WriteAllBytesAsync(path, content);
+            await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            await WaitForIdentityUploadsToFinishAsync(service);
+            Assert.That(await EvictWhenRecordedAsync(service, "session-1"), Is.EqualTo(content.Length));
+            Assert.That(new FileInfo(path).Length, Is.Zero);
+            Assert.That(committed, Is.Not.Null);
+
+            if (change != "deleted")
+            {
+                var current = committed!.Clone();
+                if (change == "changed") current.CreatedUtc.Seconds++;
+                catalog.Artifacts.Add(current);
+            }
+            if (change == "replaced-placeholder")
+            {
+                client.RejectAsStaleRuntime = true; // A new user file receives no saving acknowledgement.
+                File.Delete(path);
+                await File.WriteAllBytesAsync(path, []);
+            }
+            await service.SeedSessionAsync("session-1", "editor-1", "owner-1", null, CancellationToken.None);
+            if (change is "deleted" or "changed")
+            {
+                // Force another catalog refresh and output scan. Neither a scan nor
+                // a late watcher event may publish our old empty placeholder.
+                await service.RefreshSessionAsync("session-1");
+            }
+            if (readBack)
+            {
+                var listings = client.ListCallCount;
+                Assert.That(await service.TryEnsureArtifactAvailableAsync(path, highPriority: true, CancellationToken.None), Is.True);
+                Assert.That(await File.ReadAllBytesAsync(path), Is.EqualTo(content));
+                Assert.That(client.ReadArtifactCallCount, Is.EqualTo(1));
+                Assert.That(client.ListCallCount, Is.EqualTo(listings), "the recorded alias retains its readback entry");
+            }
+            await WaitForIdentityUploadsToFinishAsync(service);
+            var unsaved = await service.StopSessionAsync("session-1");
+            foreach (var entry in logger.Snapshot()) TestContext.Out.WriteLine(entry.Message);
+            TestContext.Out.WriteLine($"Uploads after Stop: {client.UploadCount}; files: {string.Join(",", Directory.GetFiles(paths.OutputDirectory).Select(file => Path.GetFileName(file) + ":" + new FileInfo(file).Length))}");
+            if (change != "replaced-placeholder")
+                Assert.That(client.UploadCount, Is.EqualTo(1), "Stop must not republish an evicted placeholder as new bytes");
+            Assert.That(unsaved, Is.EqualTo(expectedUnsaved),
+                "only an unchanged remote receipt and the agent's exact placeholder remain saved");
+        }
+        finally { TryDelete(root); }
+    }
+
     [Test]
     public async Task RetiredUploadRemainsUnsavedWithoutReissuingIdentityOnRescan()
     {

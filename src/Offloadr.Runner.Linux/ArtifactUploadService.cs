@@ -1265,6 +1265,20 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                             state.HasRemoteArtifact = state.CommittedArtifact is { } committed
                                 && currentArtifacts.Contains(committed);
                         }
+                        else if (state.PlaceholderVersion is { } placeholder
+                            && IsLiveRegularFile(state.Type, path, placeholder))
+                        {
+                            // Keep our exact empty placeholder recognizable: a late
+                            // watcher event must not publish it as new user data.
+                            // It is saved only while its committed receipt remains.
+                            state.HasRemoteArtifact = state.CommittedArtifact is { } committed
+                                && currentArtifacts.Contains(committed);
+                            if (!state.HasRemoteArtifact)
+                            {
+                                state.UploadSnapshot = null;
+                                state.CommittedArtifact = null;
+                            }
+                        }
                         else
                             _catalog.TryRemove(path, out _);
                     }
@@ -1601,12 +1615,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     headers: _authHeaders,
                     cancellationToken: token);
 
-                var published = await FetchToFileAsync(state, call.ResponseStream, token).ConfigureAwait(false);
-                lock (_evictionGate)
-                {
-                    state.MarkDownloaded(published);
-                    state.MarkServed(DateTimeOffset.UtcNow);
-                }
+                await FetchToFileAsync(state, call.ResponseStream, token).ConfigureAwait(false);
             }
             catch (RpcException ex) when (!token.IsCancellationRequested)
             {
@@ -1732,22 +1741,32 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 // replaced only while no process has it open: a writer that opened it before its
                 // first write would otherwise go on with an inode nobody can reach. The shim asks
                 // for the download before it opens the file itself.
-                if (!(replacing is { } expected ? publication.CommitReplacing(expected, whileUnopened: true) : publication.CommitIfAbsent()))
+                lock (_evictionGate)
                 {
-                    // Still the placeholder, only open elsewhere: not downloaded, so a later open
-                    // asks again.
-                    if (replacing is { } placeholder && secureRoot.GetVersion(relativePath) is { } current && current.IsSameFileAs(placeholder))
+                    // Publish and record together: a queued watcher upload rechecks
+                    // under this same gate before it can acquire another upload ID.
+                    if (!(replacing is { } expected ? publication.CommitReplacing(expected, whileUnopened: true) : publication.CommitIfAbsent()))
                     {
-                        throw new PlaceholderInUseException();
+                        // Still the placeholder, only open elsewhere: not downloaded, so a later open
+                        // asks again.
+                        if (replacing is { } placeholder && secureRoot.GetVersion(relativePath) is { } current && current.IsSameFileAs(placeholder))
+                        {
+                            throw new PlaceholderInUseException();
+                        }
+
+                        // The session wrote or created the file meanwhile: it stays, and its watcher
+                        // uploads it. Serving it is not proof that its bytes are saved.
+                        state.MarkDownloaded(null);
+                        state.MarkServed(DateTimeOffset.UtcNow);
+                        return null;
                     }
 
-                    // The session wrote or created the file meanwhile: it stays, and its watcher
-                    // uploads it.
-                    return null;
+                    var published = secureRoot.GetVersion(relativePath);
+                    state.MarkDownloaded(published);
+                    state.MarkServed(DateTimeOffset.UtcNow);
+                    return published;
                 }
             }
-
-            return secureRoot.GetVersion(relativePath);
         }
 
         private void OnFileEvent(string type, string fullPath, string source)
@@ -2260,6 +2279,15 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     var snapshotVersion = LinuxSecureDirectoryRoot.GetOpenFileVersion(stream.SafeFileHandle, relPath)
                         ?? throw new IOException("Cannot capture the opened artifact file version.");
                     _pending[fullPath].SnapshotVersion = snapshotVersion;
+                    // A download can queue its watcher event before recording the
+                    // published version. Recheck the opened file before issuance:
+                    // readback is not a new upload, nor is our empty placeholder.
+                    lock (_evictionGate)
+                    {
+                        if (_catalog.TryGetValue(fullPath, out var known)
+                            && (known.AccountsFor(snapshotVersion) || known.PlaceholderVersion == snapshotVersion))
+                            return null;
+                    }
                     if (sizeBytes > MaxUploadBytes)
                     {
                         _logger.LogWarning(
