@@ -46,6 +46,14 @@ persistent deduplication across a runner process replacement, nor proof that an
 uncertain native mutation did not execute. In-flight delivery lists, transport
 buffers and total process memory are separate resource boundaries.
 
+## Artifact upload progress
+
+Artifact uploads use a size-aware elapsed allowance across retries, with separate
+metadata, body-progress and completion/receipt windows. Expiry cancels the actual
+call without claiming rollback or a saved file; unchanged snapshots retain their
+opaque upload ID. See [artifact upload budgets](artifact-upload-budgets.md) for
+clocks, limits, Stop accounting and the remaining qualification boundary.
+
 ## Projects
 
 | Project | Role | Platform |

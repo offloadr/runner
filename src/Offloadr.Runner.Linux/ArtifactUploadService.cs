@@ -61,6 +61,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
     private readonly ILogger<ArtifactUploadService> _logger;
     private readonly RuntimeIdentityRegistry? _runtimeIdentities;
     private readonly string _runnerId;
+    private readonly ArtifactUploadPolicy _uploadPolicy;
     private readonly ConcurrentDictionary<string, SessionUploader> _sessions = new(StringComparer.Ordinal);
     // Unsaved artifacts per logical session, summed over its runtimes: a restart removes the old
     // runtime's data too, and the session's Stop must still report what was lost then.
@@ -80,7 +81,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
     private readonly RunnerReadRequesterIdentity _requester;
 
-    public ArtifactUploadService(string? runnerSecret, RunnerArtifactService.RunnerArtifactServiceClient artifactClient, ILogger<ArtifactUploadService> logger, RuntimeIdentityRegistry? runtimeIdentities = null, string? runnerId = null, string? instanceId = null)
+    public ArtifactUploadService(string? runnerSecret, RunnerArtifactService.RunnerArtifactServiceClient artifactClient, ILogger<ArtifactUploadService> logger, RuntimeIdentityRegistry? runtimeIdentities = null, string? runnerId = null, string? instanceId = null, ArtifactUploadPolicy? uploadPolicy = null)
     {
         _requester = new RunnerReadRequesterIdentity(runnerId, instanceId, runtimeIdentities);
         _runnerSecret = string.IsNullOrWhiteSpace(runnerSecret) ? null : runnerSecret.Trim();
@@ -89,6 +90,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         _logger = logger;
         _runtimeIdentities = runtimeIdentities;
         _runnerId = runnerId?.Trim() ?? string.Empty;
+        _uploadPolicy = uploadPolicy ?? new ArtifactUploadPolicy();
     }
 
     private static Metadata? BuildAuthHeaders(string? runnerSecret)
@@ -125,7 +127,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
         // A sealed session's artifact names stay out of the console, which reaches the host's disk.
         ILogger logger = paths.IsSealed ? new SealedSessionLogger(_logger) : _logger;
-        var uploader = new SessionUploader(_runnerSecret, _artifactClient, _authHeaders, sessionId, paths, logger, _runtimeIdentities, _runnerId, _requester);
+        var uploader = new SessionUploader(_runnerSecret, _artifactClient, _authHeaders, sessionId, paths, logger, _runtimeIdentities, _runnerId, _requester, _uploadPolicy);
         if (!_sessions.TryAdd(sessionId, uploader))
         {
             await uploader.DisposeAsync().ConfigureAwait(false);
@@ -491,7 +493,8 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         private readonly Channel<UploadRequest> _queue;
         private readonly ArtifactUploadOperationIdentity _uploadOperationIdentity = new();
         private readonly CancellationTokenSource _cts = new();
-        private readonly ConcurrentDictionary<string, byte> _pending = new(StringComparer.Ordinal);
+        private readonly ConcurrentDictionary<string, ArtifactUploadBudget> _pending = new(StringComparer.Ordinal);
+        private readonly ArtifactUploadPolicy _uploadPolicy;
         private readonly ConcurrentDictionary<string, RemoteArtifactState> _catalog = new(StringComparer.Ordinal);
         private readonly ConcurrentDictionary<string, Task> _downloadTasks = new(StringComparer.Ordinal);
         private readonly ConcurrentDictionary<string, byte> _inputSeeds = new(StringComparer.Ordinal);
@@ -508,7 +511,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
         private readonly RunnerReadRequester _readRequester;
 
-        public SessionUploader(string? runnerSecret, RunnerArtifactService.RunnerArtifactServiceClient artifactClient, Metadata? authHeaders, string sessionId, SessionProcessManager.SessionPaths paths, ILogger logger, RuntimeIdentityRegistry? runtimeIdentities = null, string? runnerId = null, RunnerReadRequesterIdentity? requester = null)
+        public SessionUploader(string? runnerSecret, RunnerArtifactService.RunnerArtifactServiceClient artifactClient, Metadata? authHeaders, string sessionId, SessionProcessManager.SessionPaths paths, ILogger logger, RuntimeIdentityRegistry? runtimeIdentities = null, string? runnerId = null, RunnerReadRequesterIdentity? requester = null, ArtifactUploadPolicy? uploadPolicy = null)
         {
             _readRequester = (requester ?? new RunnerReadRequesterIdentity(runnerId, null, runtimeIdentities)).For(sessionId);
             CreatedFor = runtimeIdentities?.TryGet(sessionId, out var createdFor) == true ? createdFor : null;
@@ -521,6 +524,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             _runtimeIdentities = runtimeIdentities;
             LifecycleGeneration = _readRequester.LifecycleGeneration;
             _runnerId = runnerId?.Trim() ?? string.Empty;
+            _uploadPolicy = uploadPolicy ?? new ArtifactUploadPolicy();
             _queue = Channel.CreateUnbounded<UploadRequest>(new UnboundedChannelOptions
             {
                 SingleReader = true,
@@ -1782,7 +1786,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     return;
                 }
 
-                if (!_pending.TryAdd(fullPath, 0))
+                if (!_pending.TryAdd(fullPath, new ArtifactUploadBudget(_uploadPolicy)))
                 {
                     return;
                 }
@@ -2109,7 +2113,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         }
                         catch (Exception ex)
                         {
-                            if (item.Attempt < 3)
+                            if (item.Attempt < 3 && !_pending[item.FullPath].IsExpired)
                             {
                                 retry = item with { Attempt = item.Attempt + 1 };
                                 _logger.LogDebug(ex, "Retrying artifact upload {Path} attempt {Attempt}", item.FullPath, item.Attempt + 1);
@@ -2139,6 +2143,21 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
         private async Task<UploadRequest?> UploadAsync(UploadRequest request)
         {
+            using var budget = _pending[request.FullPath].BeginAttempt(_cts.Token);
+            try
+            {
+                return await UploadWithinBudgetAsync(request, budget).ConfigureAwait(false);
+            }
+            catch (Exception error) when (!_cts.IsCancellationRequested && budget.IsTimedOut)
+            {
+                // An expired observation cannot tell whether the server committed. A later
+                // retry/rescan keeps the unchanged snapshot ID and Stop still counts it.
+                throw new TimeoutException($"Artifact upload exceeded its {budget.ExpiredAllowance} allowance.", error);
+            }
+        }
+
+        private async Task<UploadRequest?> UploadWithinBudgetAsync(UploadRequest request, ArtifactUploadAttempt budget)
+        {
             var (type, fullPath, attempt, runtime) = request;
             if (!type.Equals("output", StringComparison.OrdinalIgnoreCase) &&
                 !type.Equals("temp", StringComparison.OrdinalIgnoreCase))
@@ -2151,7 +2170,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 return null;
             }
 
-            await WaitForFileStableAsync(root, relPath, _cts.Token).ConfigureAwait(false);
+            await WaitForFileStableAsync(root, relPath, budget.Token).ConfigureAwait(false);
 
             var separatorIndex = relPath.LastIndexOf('/');
             var fileName = separatorIndex < 0 ? relPath : relPath[(separatorIndex + 1)..];
@@ -2159,13 +2178,14 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
             for (var tries = 0; tries < 5; tries++)
             {
-                _cts.Token.ThrowIfCancellationRequested();
+                budget.Token.ThrowIfCancellationRequested();
+                budget.BeginMetadata();
                 try
                 {
                     if (string.IsNullOrWhiteSpace(_editorSid))
                     {
-                        await Task.Delay(InitialRetryDelay * (tries + 1), _cts.Token).ConfigureAwait(false);
-                        return request with { Attempt = request.Attempt + 1 };
+                        await Task.Delay(InitialRetryDelay * (tries + 1), budget.Token).ConfigureAwait(false);
+                        return request.Attempt < 3 ? request with { Attempt = request.Attempt + 1 } : null;
                     }
 
                     // Open without following symlinks or blocking on FIFOs; the agent
@@ -2245,6 +2265,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     {
                         metadata.Envelope = SessionTransferSealing.ToMessage(writer.Envelope);
                     }
+                    budget.BindSnapshot(writer?.CiphertextSize ?? sizeBytes);
 
                     _logger.LogInformation(
                         "Uploading artifact session={SessionId} editor={EditorSid} type={Type} path={Relative} bytes={Size}",
@@ -2255,19 +2276,21 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         sizeBytes);
 
                     // Disposed on every path, so an upload that fails midway (a sealed file that shrank) cancels its RPC.
-                    using var call = _artifactClient.UploadArtifact(headers: _authHeaders, cancellationToken: _cts.Token);
+                    using var call = _artifactClient.UploadArtifact(headers: _authHeaders, cancellationToken: budget.Token);
                     await call.RequestStream.WriteAsync(new RunnerArtifactServiceUploadArtifactRequest { Metadata = metadata }).ConfigureAwait(false);
+                    budget.BeginBody();
 
                     if (writer is not null)
                     {
                         // Seal exactly the size declared in the header, even if the file grows.
                         await using var limited = new LengthLimitedReadStream(stream, sizeBytes);
-                        await foreach (var sealedChunk in writer.EncryptChunksAsync(limited, _cts.Token).ConfigureAwait(false))
+                        await foreach (var sealedChunk in writer.EncryptChunksAsync(limited, budget.Token).ConfigureAwait(false))
                         {
                             await call.RequestStream.WriteAsync(new RunnerArtifactServiceUploadArtifactRequest
                             {
                                 Chunk = Google.Protobuf.ByteString.CopyFrom(sealedChunk.Span)
                             }).ConfigureAwait(false);
+                            budget.BodyWritten(sealedChunk.Length);
                         }
                     }
 
@@ -2278,13 +2301,14 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         var remaining = writer is null ? sizeBytes : 0;
                         int read;
                         while (remaining > 0 &&
-                               (read = await stream.ReadAsync(buffer.AsMemory(0, (int)Math.Min(buffer.Length, remaining)), _cts.Token).ConfigureAwait(false)) > 0)
+                               (read = await stream.ReadAsync(buffer.AsMemory(0, (int)Math.Min(buffer.Length, remaining)), budget.Token).ConfigureAwait(false)) > 0)
                         {
                             remaining -= read;
                             await call.RequestStream.WriteAsync(new RunnerArtifactServiceUploadArtifactRequest
                             {
                                 Chunk = Google.Protobuf.ByteString.CopyFrom(buffer, 0, read)
                             }).ConfigureAwait(false);
+                            budget.BodyWritten(read);
                         }
                     }
                     finally
@@ -2292,8 +2316,10 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         ArrayPool<byte>.Shared.Return(buffer);
                     }
 
+                    budget.BeginReceipt();
                     await call.RequestStream.CompleteAsync().ConfigureAwait(false);
                     var response = await call.ResponseAsync.ConfigureAwait(false);
+                    budget.Token.ThrowIfCancellationRequested();
 
                     if (response.Outcome == RunnerArtifactUploadOutcome.RejectedStaleRuntime)
                     {
@@ -2364,7 +2390,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 catch (IOException ex) when (tries < 4)
                 {
                     _logger.LogDebug(ex, "File locked during upload, retrying {Path}", fullPath);
-                    await Task.Delay(InitialRetryDelay * (tries + 1), _cts.Token).ConfigureAwait(false);
+                    await Task.Delay(InitialRetryDelay * (tries + 1), budget.Token).ConfigureAwait(false);
                 }
             }
 
