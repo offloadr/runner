@@ -108,6 +108,14 @@ enum PromptArtifactPublication {
   PROMPT_ARTIFACT_PUBLICATION_COMMITTED = 3;
 }
 
+// Recovery expiry is independent of the known execution outcome. An expired
+// receipt never authorizes another invocation or recreation of its original ID.
+enum PromptContentAvailability {
+  PROMPT_CONTENT_AVAILABILITY_UNSPECIFIED = 0;
+  PROMPT_CONTENT_AVAILABILITY_AVAILABLE = 1;
+  PROMPT_CONTENT_AVAILABILITY_EXPIRED = 2;
+}
+
 // Offloadr acceptance, native invocation and generation/artifact evidence are
 // separate facts. This owner-authenticated receipt survives login replacement
 // and runtime teardown. It omits stored request bodies and credentials; an actual
@@ -123,7 +131,7 @@ message PromptSubmissionSnapshot {
   PromptNativeIdentifiers native_identifiers = 8;
   PromptExecutionStatus execution_status = 9;
   PromptArtifactPublication artifact_publication = 10;
-  // Only the newest terminal native fact; all evidence remains in durable storage.
+  // Newest still-recoverable terminal native fact; payloads have finite expiry.
   PromptExecutionEvidence latest_terminal_evidence = 11;
   google.protobuf.Timestamp last_observed_utc = 12;
   bool recovery_unknown = 13;
@@ -132,6 +140,8 @@ message PromptSubmissionSnapshot {
   // Newest terminal native progress, selected by kind: a completed progress
   // payload stays readable even when latest_terminal_evidence is an SSE frame.
   PromptExecutionEvidence latest_terminal_progress = 16;
+  PromptContentAvailability content_availability = 17;
+  google.protobuf.Timestamp content_expires_utc = 18;
 }
 
 // Bounded discovery record. Read GetPromptSubmission for the original native
@@ -149,6 +159,8 @@ message PromptSubmissionSummary {
   google.protobuf.Timestamp last_observed_utc = 10;
   bool recovery_unknown = 11;
   string diagnostic_code = 12;
+  PromptContentAvailability content_availability = 13;
+  google.protobuf.Timestamp content_expires_utc = 14;
 }
 
 message PromptHttpRequest {

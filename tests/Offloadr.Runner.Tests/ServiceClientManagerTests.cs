@@ -39,6 +39,7 @@ public partial class ServiceClientManagerTests
             {
                 SubmissionId = request.SubmissionId,
                 Target = request.Target.Clone(),
+                ContentAvailability = Offloadr.Common.V1.PromptContentAvailability.Available,
                 ExecutionPermissionUtc = Google.Protobuf.WellKnownTypes.Timestamp.FromDateTime(DateTime.UtcNow)
             },
         });
@@ -1834,6 +1835,7 @@ public partial class ServiceClientManagerTests
                     {
                         SubmissionId = request.SubmissionId,
                         Target = request.Target.Clone(),
+                        ContentAvailability = Offloadr.Common.V1.PromptContentAvailability.Available,
                         ExecutionPermissionUtc = Google.Protobuf.WellKnownTypes.Timestamp.FromDateTime(DateTime.UtcNow)
                     }
                 });
