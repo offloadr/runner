@@ -1805,7 +1805,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     return;
                 }
 
-                if (TryGetCatalogEntry(fullPath, out var knownState) && ShouldSkipCatalogBackedUpload(status, knownState))
+                if (TryGetCatalogEntry(fullPath, out var knownState) && ShouldSkipCatalogBackedUpload(status, version, knownState))
                 {
                     return;
                 }
@@ -2124,7 +2124,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 fullPath);
         }
 
-        private static bool ShouldSkipCatalogBackedUpload(SecureFileStatus status, RemoteArtifactState? knownState)
+        private static bool ShouldSkipCatalogBackedUpload(SecureFileStatus status, SecureFileVersion? version, RemoteArtifactState? knownState)
         {
             if (knownState is null)
             {
@@ -2137,19 +2137,10 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 return true;
             }
 
-            if (!knownState.Downloaded)
-            {
-                return false;
-            }
-
-            var knownSize = knownState.SizeBytes;
-            if (!knownSize.HasValue || knownSize.Value != status.Length)
-            {
-                return false;
-            }
-
-            // If size and mtime still match catalog metadata, nothing changed locally.
-            return status.LastWriteTimeUtc <= knownState.CreatedUtc.UtcDateTime;
+            // Size and mtime can survive an atomic replacement or an in-place
+            // rewrite. Only the recorded secure version is the same local file,
+            // including when its remote receipt has since disappeared.
+            return version is { } current && knownState.MatchesLocalFile(current);
         }
 
         private async Task ProcessQueueAsync()

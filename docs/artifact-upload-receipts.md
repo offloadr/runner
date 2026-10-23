@@ -76,3 +76,9 @@ requires a matching committed receipt and secure post-upload file-version check.
 The original pending-upload timing allowances remain in effect. These protocol
 and bookkeeping changes require a coordinated server release; declarations alone
 do not establish server enforcement or runtime qualification.
+
+Watcher events suppress an unchanged local file only when its recorded secure
+version still matches. File length and modification time alone cannot prove
+that identity: an atomic replacement may preserve both. A retained receipt,
+including one deleted from the remote catalog, cannot hide the replacement's
+new bytes or give it the old upload identity.

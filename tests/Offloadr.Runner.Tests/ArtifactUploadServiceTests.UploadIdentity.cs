@@ -306,6 +306,50 @@ public partial class ArtifactUploadServiceTests
         finally { TryDelete(root); }
     }
 
+    [TestCase(false, 0)]
+    [TestCase(false, -60)]
+    [TestCase(true, 0)]
+    [TestCase(true, -60)]
+    public async Task CatalogReceiptNeverSuppressesAnAtomicReplacementWithPreservedMetadata(bool deletedRemotely, int modifiedSeconds)
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = UploadIdentityPaths(root);
+            var path = Path.Combine(paths.OutputDirectory, "preserved.bin");
+            await File.WriteAllBytesAsync(path, [1, 2, 3]);
+            File.SetLastWriteTimeUtc(path, DateTime.UtcNow.AddDays(-1));
+            var originalModified = File.GetLastWriteTimeUtc(path);
+            var catalog = new RunnerArtifactServiceListArtifactsResponse();
+            var client = new FakeRunnerArtifactClient(catalog);
+            await using var service = new ArtifactUploadService("secret", client, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            var original = await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            await WaitForIdentityUploadsToFinishAsync(service);
+            if (!deletedRemotely)
+                catalog.Artifacts.Add((await client.LastPreparedUploadResponse!).Artifact.Clone());
+            await service.RefreshSessionAsync("session-1");
+            await WaitForIdentityUploadsToFinishAsync(service);
+            Assert.That(client.UploadCount, Is.EqualTo(1), "an unchanged acknowledged file must not acquire another upload identity");
+            var replacement = Path.Combine(root, "replacement.bin");
+            await File.WriteAllBytesAsync(replacement, [4, 5, 6]);
+            File.SetLastWriteTimeUtc(replacement, originalModified.AddSeconds(modifiedSeconds));
+            File.Move(replacement, path, overwrite: true);
+
+            var changed = await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            await WaitForIdentityUploadsToFinishAsync(service);
+            Assert.Multiple(() =>
+            {
+                Assert.That(changed.Payload, Is.EqualTo(new byte[] { 4, 5, 6 }));
+                Assert.That(changed.Metadata!.UploadId, Is.Not.EqualTo(original.Metadata!.UploadId));
+                Assert.That(client.IssuedIdentityCount, Is.EqualTo(2));
+            });
+            Assert.That(await service.StopSessionAsync("session-1"), Is.Zero);
+        }
+        finally { TryDelete(root); }
+    }
+
     [Test]
     public async Task RemoteDeletionPreservesLiveAcknowledgedSnapshotIdentityUntilLocalChange()
     {
