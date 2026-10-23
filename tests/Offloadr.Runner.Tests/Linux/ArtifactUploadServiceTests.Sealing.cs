@@ -99,13 +99,12 @@ public partial class ArtifactUploadServiceTests
 
             await File.WriteAllBytesAsync(outputPath, new byte[100_000]);
 
-            var deadline = DateTime.UtcNow.AddSeconds(10);
-            while (artifactClient.UploadCallsStarted == 0 && DateTime.UtcNow < deadline)
-            {
-                await Task.Delay(50);
-            }
-
-            await Task.Delay(1000);
+            await artifactClient.FirstUploadCallDisposed.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.That(artifactClient.FirstUploadCallCompleted.Task.IsCompleted, Is.False,
+                "the truncated first upload failed before completing its request");
+            // The watcher can immediately retry the changed file. Quiesce that
+            // worker before comparing the counters for all of its calls.
+            await service.StopSessionAsync("session-1");
             Assert.That(artifactClient.UploadCallsStarted, Is.GreaterThan(0));
             Assert.That(artifactClient.UploadCallsDisposed, Is.EqualTo(artifactClient.UploadCallsStarted), "no upload call is left open");
         }

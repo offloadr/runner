@@ -1909,6 +1909,9 @@ public partial class ArtifactUploadServiceTests
         /// <summary>Runs when an upload's metadata frame is written, before any chunk.</summary>
         public Action? AfterUploadMetadata { get; set; }
 
+        public TaskCompletionSource FirstUploadCallDisposed { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource FirstUploadCallCompleted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
         public int UploadCallsStarted => Volatile.Read(ref _uploadCallsStarted);
 
         public int UploadCallsDisposed => Volatile.Read(ref _uploadCallsDisposed);
@@ -1964,11 +1967,12 @@ public partial class ArtifactUploadServiceTests
         public override AsyncClientStreamingCall<RunnerArtifactServiceUploadArtifactRequest, RunnerArtifactServiceUploadArtifactResponse> UploadArtifact(CallOptions options)
         {
             LastUploadHeaders = options.Headers;
-            Interlocked.Increment(ref _uploadCallsStarted);
+            var callNumber = Interlocked.Increment(ref _uploadCallsStarted);
             var response = new TaskCompletionSource<RunnerArtifactServiceUploadArtifactResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
             LastPreparedUploadResponse = response.Task;
             var writer = new CaptureUploadStreamWriter(AfterUploadMetadata, captured =>
             {
+                if (callNumber == 1) FirstUploadCallCompleted.TrySetResult();
                 _uploads.Enqueue(captured);
                 _uploadSignals.Writer.TryWrite(captured);
                 if (UploadResponseFailure?.Invoke(captured) is { } failure)
@@ -2017,6 +2021,7 @@ public partial class ArtifactUploadServiceTests
                     if (options.CancellationToken.IsCancellationRequested)
                         Interlocked.Increment(ref _uploadCallsCancelled);
                     Interlocked.Increment(ref _uploadCallsDisposed);
+                    if (callNumber == 1) FirstUploadCallDisposed.TrySetResult();
                 });
         }
 
