@@ -1,5 +1,15 @@
 # Architecture
 
+## Expired prompt receipts
+
+Prompt execution permission includes explicit content availability. An expired
+or unspecified receipt cannot start generation, probe native recovery, prepare
+artifacts or create another acknowledgement, even if its permission flag is
+contradictory. Recorded permission and outcome facts remain distinct from access
+to the original content. Recovery-only command lifetimes, local memory and spool
+cleanup still require their own finite retention enforcement; this check alone
+does not establish complete data deletion.
+
 ## Purpose
 
 The runner executes GPU work for the Offloadr control plane. It connects out to the control plane over gRPC, authenticated by a runner key, and never exposes an inbound port. One runner serves one editor session at a time.

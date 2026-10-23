@@ -3386,6 +3386,10 @@ internal static class ServiceClientManager
         if (permission.Submission is null || permission.Submission.SubmissionId != prompt.SubmissionId
             || !prompt.Target.Equals(permission.Submission.Target))
             throw new InvalidOperationException("Prompt permission returned a different submission identity.");
+        // An expired receipt retains outcome and permission facts only. It does
+        // not authorize native recovery, downloads, new invocation or another ACK.
+        if (permission.Submission.ContentAvailability != PromptContentAvailability.Available)
+            return;
         if (!permission.MayExecute)
         {
             await recover(prompt, cancellationToken).ConfigureAwait(false);
