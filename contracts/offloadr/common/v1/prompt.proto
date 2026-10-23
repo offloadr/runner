@@ -116,6 +116,16 @@ enum PromptContentAvailability {
   PROMPT_CONTENT_AVAILABILITY_EXPIRED = 2;
 }
 
+// Timing selected by the durable store for an authenticated recovery read.
+// It is separate from immutable receipt/evidence identity. Observer clocks and
+// client-supplied values never grant a recovery lifetime or execution authority.
+message PromptRecoveryTiming {
+  google.protobuf.Timestamp read_utc = 1;
+  google.protobuf.Timestamp metadata_expires_utc = 2;
+  google.protobuf.Timestamp terminal_evidence_expires_utc = 3;
+  google.protobuf.Timestamp terminal_progress_expires_utc = 4;
+}
+
 // Offloadr acceptance, native invocation and generation/artifact evidence are
 // separate facts. This owner-authenticated receipt survives login replacement
 // and runtime teardown. It omits stored request bodies and credentials; an actual
