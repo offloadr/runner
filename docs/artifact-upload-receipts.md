@@ -19,10 +19,15 @@ inspection errors do not prove deletion. Acknowledged bindings use the existing
 one-entry-per-current-file catalog, rather than retaining version history. Remote
 catalog refresh/deletion cannot erase that local binding while the exact
 acknowledged local version survives. An evicted placeholder is not that version;
-if its remote artifact disappears, its catalog entry is removed and Stop cannot
-count the placeholder as saved. A retained binding for live local bytes also
+if its remote artifact disappears, the exact placeholder remains recognizable
+but Stop cannot count it as saved. A retained binding for live local bytes also
 counts as unsaved after remote deletion; retaining identity is not proof that the
 control plane still holds those bytes.
+When catalog casing leaves an additional agent-created placeholder, Stop counts
+one lost artifact for the exact retained catalog record shared with its uploaded
+snapshot or evicted placeholder. A rewritten file, replaced placeholder or other
+unacknowledged local file remains independent unsaved data. Counting does not
+delete or rewrite either local path and never turns a lost artifact into a saved one.
 A remotely deleted artifact is not eligible for eviction into a download placeholder.
 The existing catalog's total size is a separate resource constraint; this does not
 establish a global runner memory bound.

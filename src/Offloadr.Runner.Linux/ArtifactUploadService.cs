@@ -1229,6 +1229,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     createdUtc);
                 state.UploadSnapshot = previousState?.UploadSnapshot;
                 state.CommittedArtifact = previousState?.CommittedArtifact;
+                state.CatalogArtifact = item.Clone();
                 _catalog[normalized] = state;
 
                 try
@@ -1878,6 +1879,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         {
             var unsaved = 0;
             var unsendable = new HashSet<(ulong Device, ulong Inode)>();
+            var lostArtifacts = new HashSet<EditorArtifactMetadata>();
             foreach (var (type, root) in new[] { ("output", _paths.OutputDirectory), ("temp", _paths.TempDirectory) })
             {
                 if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root))
@@ -1914,7 +1916,13 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         // editor is neither.
                         if (!_catalog.TryGetValue(NormalizePath(file), out var state) || !state.AccountsFor(version))
                         {
-                            unsaved++;
+                            // Catalog spelling can leave a second, agent-created
+                            // placeholder for one uploaded snapshot. Count that
+                            // lost artifact once, while an editor rewrite remains
+                            // independent unsaved data even at the same path.
+                            var artifact = state is not null && state.PlaceholderVersion == version ? state.CatalogArtifact
+                                : state is not null && state.UploadSnapshot is not null && state.MatchesLocalFile(version) ? state.CommittedArtifact : null;
+                            if (artifact is null || lostArtifacts.Add(artifact)) unsaved++;
                         }
                     }
                 }
@@ -2465,6 +2473,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     {
                         remote.UploadSnapshot = snapshot;
                         remote.CommittedArtifact = response.Artifact.Clone();
+                        remote.CatalogArtifact = remote.CommittedArtifact;
                         _catalog[remote.LocalPath] = remote;
                         _uncertainUploads.TryRemove(fullPath, out _);
                         // A file that changed while it was sent matches no uploaded version yet.
@@ -2661,6 +2670,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             public bool HasRemoteArtifact { get; set; } = true;
             public UploadSnapshotIdentity? UploadSnapshot { get; set; }
             public EditorArtifactMetadata? CommittedArtifact { get; set; }
+            public EditorArtifactMetadata? CatalogArtifact { get; set; }
 
             public void UpdateMetadata(long? sizeBytes, string? sha256, DateTimeOffset createdUtc)
             {

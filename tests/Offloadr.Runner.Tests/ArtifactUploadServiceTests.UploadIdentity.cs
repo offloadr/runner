@@ -510,6 +510,66 @@ public partial class ArtifactUploadServiceTests
         finally { TryDelete(root); }
     }
 
+    [TestCase("live", 1)]
+    [TestCase("deleted", 1)]
+    [TestCase("rewritten", 2)]
+    [TestCase("evicted", 1)]
+    [TestCase("replaced-placeholder", 2)]
+    public async Task RemoteDeletionCountsOnlyExactCatalogAliasesOnce(string change, int expectedUnsaved)
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = CreateEvictionPaths(root, sealedSession: true);
+            var path = Path.Combine(paths.OutputDirectory, "receipt.bin");
+            var canonical = Path.Combine(paths.OutputDirectory, "RECEIPT.BIN");
+            var catalog = new RunnerArtifactServiceListArtifactsResponse();
+            EditorArtifactMetadata? committed = null;
+            var client = new FakeRunnerArtifactClient(catalog)
+            {
+                RewriteUploadArtifact = artifact =>
+                {
+                    artifact.Filename = "RECEIPT.BIN";
+                    artifact.CreatedUtc = Timestamp.FromDateTime(DateTime.UtcNow);
+                    committed = artifact.Clone();
+                    return artifact;
+                },
+            };
+            await using var service = new ArtifactUploadService("secret", client, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            await File.WriteAllBytesAsync(path, [1, 2, 3]);
+            await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            await WaitForIdentityUploadsToFinishAsync(service);
+            catalog.Artifacts.Add(committed!.Clone());
+            await service.SeedSessionAsync("session-1", "editor-1", "owner-1", null, CancellationToken.None);
+            await WaitForIdentityUploadsToFinishAsync(service);
+            Assert.That(new FileInfo(canonical).Length, Is.Zero);
+            if (change == "evicted")
+                Assert.That(await EvictWhenRecordedAsync(service, "session-1"), Is.EqualTo(3));
+            // Keep changed user data unacknowledged; the original unchanged
+            // snapshot must not acquire another upload identity on this reload.
+            client.RejectAsRetiredUpload = true;
+            if (change == "deleted") File.Delete(path);
+            else if (change == "rewritten") await File.WriteAllBytesAsync(path, [9, 8, 7, 6]);
+            else if (change == "replaced-placeholder")
+            {
+                File.Delete(canonical);
+                await File.WriteAllBytesAsync(canonical, []);
+            }
+            await WaitForIdentityUploadsToFinishAsync(service);
+            catalog.Artifacts.Clear();
+            await service.SeedSessionAsync("session-1", "editor-1", "owner-1", null, CancellationToken.None);
+            await WaitForIdentityUploadsToFinishAsync(service);
+            Assert.That(await service.StopSessionAsync("session-1"), Is.EqualTo(expectedUnsaved),
+                "Only the agent's exact placeholder and captured upload may share one lost artifact; new user bytes remain separate.");
+            Assert.That(service.TakeUnsavedUploads("session-1"), Is.EqualTo(new UnsavedUploads(expectedUnsaved, false)));
+            if (change == "live")
+                Assert.That(await File.ReadAllBytesAsync(path), Is.EqualTo(new byte[] { 1, 2, 3 }), "Counting must not remove or rewrite the live alias.");
+        }
+        finally { TryDelete(root); }
+    }
+
     [Test]
     public async Task RemoteDeletionOfAnEvictedUploadDoesNotCountItsPlaceholderAsSaved()
     {
