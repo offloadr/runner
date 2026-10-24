@@ -6,6 +6,47 @@ namespace Offloadr.Runner.Tests;
 
 public partial class ArtifactUploadServiceTests
 {
+    [Test]
+    public async Task GrowthBeforeTheFirstOpenKeepsItsOriginalQueuePosition()
+    {
+        var root = CreateTempDirectory();
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
+        {
+            var paths = UploadIdentityPaths(root);
+            var growing = Path.Combine(paths.OutputDirectory, "growing.bin");
+            var following = Path.Combine(paths.OutputDirectory, "following.bin");
+            var client = new FakeRunnerArtifactClient(new()) { IssueIdentityGate = release.Task };
+            var logger = new ListLogger<ArtifactUploadService>();
+            await using var service = new ArtifactUploadService("secret", client, logger);
+            try
+            {
+                await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+                await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+                await File.WriteAllBytesAsync(Path.Combine(paths.OutputDirectory, "blocker.bin"), [1]);
+                await client.IssueIdentityEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                await File.WriteAllBytesAsync(growing, []);
+                await WaitForUploadLogAsync(logger, $"path={growing} bytes=0");
+                await File.WriteAllBytesAsync(growing, [2, 3, 4]);
+                await File.WriteAllBytesAsync(following, [5]);
+                await WaitForUploadLogAsync(logger, $"path={following} bytes=1");
+                release.TrySetResult();
+
+                var filenames = new List<string>();
+                for (var i = 0; i < 3; i++)
+                    filenames.Add((await client.WaitForUploadAsync(TimeSpan.FromSeconds(5))).Metadata!.Filename);
+                await WaitForIdentityUploadsToFinishAsync(service);
+                TestContext.Out.WriteLine("Observed upload order: " + string.Join(",", filenames));
+                Assert.That(filenames, Is.EqualTo(new[] { "blocker.bin", "growing.bin", "following.bin" }));
+                Assert.That(logger.Snapshot().Count(entry => entry.Message.StartsWith("Queued artifact upload", StringComparison.Ordinal)
+                    && entry.Message.Contains($"path={growing} ", StringComparison.Ordinal)), Is.EqualTo(1));
+                Assert.That(await service.StopSessionAsync("session-1"), Is.Zero);
+            }
+            finally { release.TrySetResult(); }
+        }
+        finally { TryDelete(root); }
+    }
+
     [TestCase(false)]
     [TestCase(true)]
     public async Task AReplacementAfterAFailedAttemptReceivesItsOwnElapsedAllowance(bool ioFailure)
