@@ -6,6 +6,55 @@ namespace Offloadr.Runner.Tests;
 
 public partial class ArtifactUploadServiceTests
 {
+    [TestCase(false)]
+    [TestCase(true)]
+    public async Task AChangedLargerSnapshotReceivesItsOwnElapsedUploadAllowance(bool firstRetired)
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = UploadIdentityPaths(root);
+            var path = Path.Combine(paths.OutputDirectory, "growing.bin");
+            var clock = new ArtifactUploadBudgetTests.UploadClock();
+            var client = new FakeRunnerArtifactClient(new()) { RejectAsRetiredUpload = firstRetired };
+            byte[] final = new byte[512 * 1024];
+            var uploads = 0;
+            client.AfterUploadMetadata = () =>
+            {
+                if (Interlocked.Increment(ref uploads) == 1) File.WriteAllBytes(path, final);
+                else client.RejectAsRetiredUpload = false;
+            };
+            client.AfterUploadChunk = _ =>
+            {
+                if (Volatile.Read(ref uploads) > 1) clock.Advance(TimeSpan.FromSeconds(2));
+            };
+            await using var service = new ArtifactUploadService("secret", client,
+                uploadPolicy: new ArtifactUploadPolicy
+                {
+                    Clock = clock,
+                    MetadataTimeout = TimeSpan.FromSeconds(3),
+                    NoProgressTimeout = TimeSpan.FromSeconds(3),
+                    ReceiptTimeout = TimeSpan.FromSeconds(3),
+                    MinimumBytesPerSecond = 64 * 1024
+                });
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            await File.WriteAllBytesAsync(path, new byte[3]);
+
+            var first = await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            var second = await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            await WaitForIdentityUploadsToFinishAsync(service);
+            Assert.That(first.Metadata!.SizeBytes, Is.EqualTo(3));
+            Assert.That(second.Metadata!.SizeBytes, Is.EqualTo(final.Length));
+            Assert.That(second.Metadata.UploadId, Is.Not.EqualTo(first.Metadata.UploadId));
+            Assert.That(second.Payload, Is.EqualTo(final));
+            Assert.That(client.IssuedIdentityCount, Is.EqualTo(2));
+            Assert.That(client.UploadCount, Is.EqualTo(2));
+            Assert.That(await service.StopSessionAsync("session-1"), Is.Zero);
+        }
+        finally { TryDelete(root); }
+    }
+
     [Test, NonParallelizable]
     public async Task CatalogRecognitionReclaimsExhaustedPreIdentityBudgets()
     {

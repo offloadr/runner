@@ -45,6 +45,22 @@ public sealed class PromptExecutionPermissionTests
         Assert.That(observations, Is.EqualTo(1));
     }
 
+    [TestCase(false)]
+    [TestCase(true)]
+    public void UnspecifiedReceiptContentReportsAProtocolErrorWithoutNativeEffects(bool mayExecute)
+    {
+        var command = Command();
+        var permission = Permission(command, mayExecute);
+        permission.Submission.ContentAvailability = PromptContentAvailability.Unspecified;
+        var error = Assert.ThrowsAsync<InvalidOperationException>(() => Execute(command,
+            (_, _) => Task.FromResult(permission),
+            (_, _) => throw new AssertionException("Unspecified content invoked the runtime"),
+            (_, _) => throw new AssertionException("Unspecified content probed the runtime"),
+            (_, _) => throw new AssertionException("Unspecified content invented an acknowledgement"),
+            captureRefresh: _ => throw new AssertionException("Unspecified content prepared artifacts")));
+        Assert.That(error!.Message, Does.Contain("content availability"));
+    }
+
     [TestCase(PromptContentAvailability.Expired, false)]
     [TestCase(PromptContentAvailability.Expired, true)]
     [TestCase(PromptContentAvailability.Unspecified, false)]

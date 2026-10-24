@@ -1909,6 +1909,8 @@ public partial class ArtifactUploadServiceTests
         /// <summary>Runs when an upload's metadata frame is written, before any chunk.</summary>
         public Action? AfterUploadMetadata { get; set; }
 
+        public Action<int>? AfterUploadChunk { get; set; }
+
         public TaskCompletionSource FirstUploadCallDisposed { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource FirstUploadCallCompleted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -2007,7 +2009,7 @@ public partial class ArtifactUploadServiceTests
                     Artifact = RejectUploads ? null : RewriteUploadArtifact?.Invoke(artifact) ?? artifact,
                     Message = RejectUploads ? "rejected" : string.Empty
                 });
-            });
+            }, AfterUploadChunk);
             var gate = UploadGate;
 
             return new AsyncClientStreamingCall<RunnerArtifactServiceUploadArtifactRequest, RunnerArtifactServiceUploadArtifactResponse>(
@@ -2080,7 +2082,7 @@ public partial class ArtifactUploadServiceTests
         }
     }
 
-    private sealed class CaptureUploadStreamWriter(Action? afterMetadata, Action<CapturedUpload> onComplete) : IClientStreamWriter<RunnerArtifactServiceUploadArtifactRequest>
+    private sealed class CaptureUploadStreamWriter(Action? afterMetadata, Action<CapturedUpload> onComplete, Action<int>? afterChunk = null) : IClientStreamWriter<RunnerArtifactServiceUploadArtifactRequest>
     {
         private readonly Action<CapturedUpload> _onComplete = onComplete;
         private readonly object _gate = new();
@@ -2098,6 +2100,10 @@ public partial class ArtifactUploadServiceTests
             if (message.PayloadCase == RunnerArtifactServiceUploadArtifactRequest.PayloadOneofCase.Metadata)
             {
                 afterMetadata?.Invoke();
+            }
+            else if (message.PayloadCase == RunnerArtifactServiceUploadArtifactRequest.PayloadOneofCase.Chunk)
+            {
+                afterChunk?.Invoke(message.Chunk.Length);
             }
 
             return Task.CompletedTask;
