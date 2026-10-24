@@ -74,8 +74,12 @@ public partial class ArtifactUploadServiceTests
                 await client.LastPreparedUploadResponse!.WaitAsync(TimeSpan.FromSeconds(5));
                 await File.WriteAllBytesAsync(Path.Combine(paths.OutputDirectory, "waiting.bin"), [4, 5, 6]);
                 await WaitForUploadLogAsync(logger, "Artifact upload queue is full");
+                var completedScans = logger.Snapshot().Count(entry => entry.Message.StartsWith("Artifact scan completed", StringComparison.Ordinal));
                 clock.Advance(TimeSpan.FromSeconds(6));
                 await WaitForUploadLogAsync(logger, "Rescanning artifacts after the upload queue drained");
+                using (var scanned = new CancellationTokenSource(TimeSpan.FromSeconds(5)))
+                    while (logger.Snapshot().Count(entry => entry.Message.StartsWith("Artifact scan completed", StringComparison.Ordinal)) < completedScans + 2)
+                        await Task.Delay(10, scanned.Token);
                 await WaitForIdentityUploadsToFinishAsync(service);
                 Assert.That(client.UploadCount, Is.EqualTo(1), "An automatic scan cannot renew the original snapshot's elapsed allowance.");
                 Assert.That(client.IssuedIdentityCount, Is.EqualTo(1));
