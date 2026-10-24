@@ -112,7 +112,7 @@ Upload IDs are issued by the control plane and retained with the securely opened
 snapshot through retries, queue removal and catalog refresh. The bounded uncertain
 snapshot set applies visible backpressure rather than forgetting an old ID. Remote
 deletion preserves the live file's last acknowledged binding while disabling its
-eviction/readback promise. Missing-path watcher events release retained capacity
+eviction/readback promise. A returning catalog entry reuses a saved local version only when the full catalog receipt still matches, including its object key. A digest match independently proves the current bytes; a different receipt never grants eviction authority over old local bytes. Missing-path watcher events release retained capacity
 and wake owed scans, including replacement of an entire output/temp root. Only
 bindings beneath the event path receive filesystem inspection. Catalog readbacks
 release their queued or inactive pre-ID budgets when no uncertain binding remains.

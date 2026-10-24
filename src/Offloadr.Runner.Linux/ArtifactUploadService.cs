@@ -1553,7 +1553,9 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 // digest) counts as saved or may be evicted.
                 var version = secureRoot.GetVersion(relativePath);
                 var knownRemote = version is { } current &&
-                                  (previousState?.MatchesLocalFile(current) == true ||
+                                  ((previousState is not null &&
+                                    previousState.CatalogArtifact?.Equals(state.CatalogArtifact) == true &&
+                                    previousState.MatchesLocalFile(current)) ||
                                    (!string.IsNullOrWhiteSpace(state.Sha256) &&
                                     ExistingFileMatchesCatalogMetadata(state, status.Length, secureRoot, relativePath)));
                 state.MarkDownloaded(knownRemote ? version : null);
