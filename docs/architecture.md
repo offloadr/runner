@@ -7,8 +7,8 @@ or unspecified receipt cannot start generation, probe native recovery, prepare
 artifacts or create another acknowledgement, even if its permission flag is
 contradictory. Recorded permission and outcome facts remain distinct from access
 to the original content. Unspecified or unknown availability is an explicit
-protocol error, rather than a silent successful return. Recovery-only command lifetimes, local memory and spool
-cleanup still require their own finite retention enforcement; this check alone
+protocol error, rather than a silent successful return. Recovery-only command
+lifetimes, local memory and spool cleanup still require their own finite retention enforcement; this check alone
 does not establish complete data deletion.
 
 ## Purpose
@@ -112,7 +112,11 @@ Upload IDs are issued by the control plane and retained with the securely opened
 snapshot through retries, queue removal and catalog refresh. The bounded uncertain
 snapshot set applies visible backpressure rather than forgetting an old ID. Remote
 deletion preserves the live file's last acknowledged binding while disabling its
-eviction/readback promise. A returning catalog entry reuses a saved local version only when the full catalog receipt still matches, including its object key. A digest match independently proves the current bytes; a different receipt never grants eviction authority over old local bytes. Missing-path watcher events release retained capacity
+eviction/readback promise. A returning catalog entry reuses a saved local version
+only when the full catalog receipt still matches, including its object key. A
+digest match independently proves the current bytes; a different receipt never
+grants eviction authority over old local bytes. Missing-path watcher events
+release retained capacity
 and wake owed scans, including replacement of an entire output/temp root. Only
 bindings beneath the event path receive filesystem inspection. Catalog readbacks
 release their queued or inactive pre-ID budgets when no uncertain binding remains.

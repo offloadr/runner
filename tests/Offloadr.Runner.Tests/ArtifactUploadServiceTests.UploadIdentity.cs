@@ -301,7 +301,7 @@ public partial class ArtifactUploadServiceTests
                 RewriteUploadArtifact = artifact =>
                 {
                     artifact.ObjectKey = "original-object";
-                    artifact.CreatedUtc = Timestamp.FromDateTime(DateTime.UtcNow);
+                    artifact.CreatedUtc = Timestamp.FromDateTime(DateTime.UtcNow.AddMinutes(-2));
                     committed = artifact.Clone();
                     return artifact;
                 }
