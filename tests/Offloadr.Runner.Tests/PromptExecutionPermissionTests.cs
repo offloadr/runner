@@ -45,6 +45,43 @@ public sealed class PromptExecutionPermissionTests
         Assert.That(observations, Is.EqualTo(1));
     }
 
+    [TestCase(false)]
+    [TestCase(true)]
+    public void UnspecifiedReceiptContentReportsAProtocolErrorWithoutNativeEffects(bool mayExecute)
+    {
+        var command = Command();
+        var permission = Permission(command, mayExecute);
+        permission.Submission.ContentAvailability = PromptContentAvailability.Unspecified;
+        var error = Assert.ThrowsAsync<InvalidOperationException>(() => Execute(command,
+            (_, _) => Task.FromResult(permission),
+            (_, _) => throw new AssertionException("Unspecified content invoked the runtime"),
+            (_, _) => throw new AssertionException("Unspecified content probed the runtime"),
+            (_, _) => throw new AssertionException("Unspecified content invented an acknowledgement"),
+            captureRefresh: _ => throw new AssertionException("Unspecified content prepared artifacts")));
+        Assert.That(error!.Message, Does.Contain("content availability"));
+    }
+
+    [TestCase(PromptContentAvailability.Expired, false)]
+    [TestCase(PromptContentAvailability.Expired, true)]
+    [TestCase(PromptContentAvailability.Unspecified, false)]
+    [TestCase(PromptContentAvailability.Unspecified, true)]
+    public async Task UnavailableReceiptCannotReachNativeWorkEvenWithContradictoryPermission(
+        PromptContentAvailability availability, bool mayExecute)
+    {
+        var command = Command();
+        var permission = Permission(command, mayExecute);
+        permission.Submission.ContentAvailability = availability;
+        Task Attempt() => Execute(command, (_, _) => Task.FromResult(permission),
+            (_, _) => throw new AssertionException("Unavailable content invoked the runtime"),
+            (_, _) => throw new AssertionException("Unavailable content probed the runtime"),
+            (_, _) => throw new AssertionException("Unavailable content invented an acknowledgement"),
+            captureRefresh: _ => throw new AssertionException("Unavailable content prepared artifacts"));
+        if (availability == PromptContentAvailability.Unspecified)
+            Assert.ThrowsAsync<InvalidOperationException>(Attempt);
+        else
+            await Attempt();
+    }
+
     [TestCase("generation")]
     [TestCase("runner")]
     [TestCase("command")]
@@ -207,6 +244,7 @@ public sealed class PromptExecutionPermissionTests
         {
             SubmissionId = command.SubmissionId,
             Target = command.Target.Clone(),
+            ContentAvailability = PromptContentAvailability.Available,
             ExecutionPermissionUtc = Timestamp.FromDateTime(DateTime.UtcNow)
         },
     };

@@ -61,6 +61,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
     private readonly ILogger<ArtifactUploadService> _logger;
     private readonly RuntimeIdentityRegistry? _runtimeIdentities;
     private readonly string _runnerId;
+    private readonly ArtifactUploadPolicy _uploadPolicy;
     private readonly ConcurrentDictionary<string, SessionUploader> _sessions = new(StringComparer.Ordinal);
     // Unsaved artifacts per logical session, summed over its runtimes: a restart removes the old
     // runtime's data too, and the session's Stop must still report what was lost then.
@@ -80,7 +81,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
     private readonly RunnerReadRequesterIdentity _requester;
 
-    public ArtifactUploadService(string? runnerSecret, RunnerArtifactService.RunnerArtifactServiceClient artifactClient, ILogger<ArtifactUploadService> logger, RuntimeIdentityRegistry? runtimeIdentities = null, string? runnerId = null, string? instanceId = null)
+    public ArtifactUploadService(string? runnerSecret, RunnerArtifactService.RunnerArtifactServiceClient artifactClient, ILogger<ArtifactUploadService> logger, RuntimeIdentityRegistry? runtimeIdentities = null, string? runnerId = null, string? instanceId = null, ArtifactUploadPolicy? uploadPolicy = null)
     {
         _requester = new RunnerReadRequesterIdentity(runnerId, instanceId, runtimeIdentities);
         _runnerSecret = string.IsNullOrWhiteSpace(runnerSecret) ? null : runnerSecret.Trim();
@@ -89,6 +90,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         _logger = logger;
         _runtimeIdentities = runtimeIdentities;
         _runnerId = runnerId?.Trim() ?? string.Empty;
+        _uploadPolicy = uploadPolicy ?? new ArtifactUploadPolicy();
     }
 
     private static Metadata? BuildAuthHeaders(string? runnerSecret)
@@ -125,7 +127,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
         // A sealed session's artifact names stay out of the console, which reaches the host's disk.
         ILogger logger = paths.IsSealed ? new SealedSessionLogger(_logger) : _logger;
-        var uploader = new SessionUploader(_runnerSecret, _artifactClient, _authHeaders, sessionId, paths, logger, _runtimeIdentities, _runnerId, _requester);
+        var uploader = new SessionUploader(_runnerSecret, _artifactClient, _authHeaders, sessionId, paths, logger, _runtimeIdentities, _runnerId, _requester, _uploadPolicy);
         if (!_sessions.TryAdd(sessionId, uploader))
         {
             await uploader.DisposeAsync().ConfigureAwait(false);
@@ -489,8 +491,16 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         private readonly RuntimeIdentityRegistry? _runtimeIdentities;
         private readonly string _runnerId;
         private readonly Channel<UploadRequest> _queue;
+        private readonly ArtifactUploadOperationIdentity _uploadOperationIdentity = new();
         private readonly CancellationTokenSource _cts = new();
-        private readonly ConcurrentDictionary<string, byte> _pending = new(StringComparer.Ordinal);
+        private readonly ConcurrentDictionary<string, PendingUpload> _pending = new(StringComparer.Ordinal);
+        // Queue removal does not renew a failed file version's elapsed allowance.
+        // Keep one bounded budget per current path, including failures before ID issuance.
+        private readonly ConcurrentDictionary<string, PendingUpload> _uploadBudgets = new(StringComparer.Ordinal);
+        private readonly object _uploadBudgetGate = new();
+        private readonly int _maximumRetainedUploadBudgets;
+        private readonly ConcurrentDictionary<string, UploadSnapshotIdentity> _uncertainUploads = new(StringComparer.Ordinal);
+        private readonly ArtifactUploadPolicy _uploadPolicy;
         private readonly ConcurrentDictionary<string, RemoteArtifactState> _catalog = new(StringComparer.Ordinal);
         private readonly ConcurrentDictionary<string, Task> _downloadTasks = new(StringComparer.Ordinal);
         private readonly ConcurrentDictionary<string, byte> _inputSeeds = new(StringComparer.Ordinal);
@@ -507,7 +517,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
         private readonly RunnerReadRequester _readRequester;
 
-        public SessionUploader(string? runnerSecret, RunnerArtifactService.RunnerArtifactServiceClient artifactClient, Metadata? authHeaders, string sessionId, SessionProcessManager.SessionPaths paths, ILogger logger, RuntimeIdentityRegistry? runtimeIdentities = null, string? runnerId = null, RunnerReadRequesterIdentity? requester = null)
+        public SessionUploader(string? runnerSecret, RunnerArtifactService.RunnerArtifactServiceClient artifactClient, Metadata? authHeaders, string sessionId, SessionProcessManager.SessionPaths paths, ILogger logger, RuntimeIdentityRegistry? runtimeIdentities = null, string? runnerId = null, RunnerReadRequesterIdentity? requester = null, ArtifactUploadPolicy? uploadPolicy = null)
         {
             _readRequester = (requester ?? new RunnerReadRequesterIdentity(runnerId, null, runtimeIdentities)).For(sessionId);
             CreatedFor = runtimeIdentities?.TryGet(sessionId, out var createdFor) == true ? createdFor : null;
@@ -520,6 +530,10 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             _runtimeIdentities = runtimeIdentities;
             LifecycleGeneration = _readRequester.LifecycleGeneration;
             _runnerId = runnerId?.Trim() ?? string.Empty;
+            _uploadPolicy = uploadPolicy ?? new ArtifactUploadPolicy();
+            ArgumentOutOfRangeException.ThrowIfNegativeOrZero(_uploadPolicy.MaximumUnacknowledgedSnapshots);
+            ArgumentOutOfRangeException.ThrowIfGreaterThan(_uploadPolicy.MaximumUnacknowledgedSnapshots, ArtifactUploadPolicy.UnacknowledgedSnapshotLimit);
+            _maximumRetainedUploadBudgets = checked(MaxPendingUploads + _uploadPolicy.MaximumUnacknowledgedSnapshots);
             _queue = Channel.CreateUnbounded<UploadRequest>(new UnboundedChannelOptions
             {
                 SingleReader = true,
@@ -557,9 +571,10 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 return;
             }
 
+            PruneMissingUploadBindings();
             await EnsureCatalogAsync(CancellationToken.None, forceReload: true).ConfigureAwait(false);
-            EnqueueExistingFiles(_paths.OutputDirectory, "output");
-            EnqueueExistingFiles(_paths.TempDirectory, "temp");
+            EnqueueExistingFiles(_paths.OutputDirectory, "output", restartElapsedBudget: true);
+            EnqueueExistingFiles(_paths.TempDirectory, "temp", restartElapsedBudget: true);
         }
 
         public async Task SeedSnapshotAsync(
@@ -808,6 +823,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             RenamedEventHandler renameHandler = (sender, args) => OnArtifactWatcherEvent(type, root, WatcherChangeTypes.Renamed, args.FullPath, args.OldFullPath);
             watcher.Created += handler;
             watcher.Changed += handler;
+            watcher.Deleted += handler;
             watcher.Renamed += renameHandler;
             watcher.Error += (_, ex) => _logger.LogWarning(
                 ex.GetException() ?? new Exception("unknown"),
@@ -852,6 +868,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         {
                             UnregisterArtifactWatcher(deletedType, "root-deleted");
                         }
+                        if (PruneMissingUploadBindings(fullPath)) RescanIfOwed();
                     }
                     return;
                 }
@@ -860,8 +877,10 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 {
                     if (TryGetArtifactRootType(fullPath, out var createdType))
                     {
+                        PruneMissingUploadBindings(fullPath);
                         RegisterArtifactWatcher(GetArtifactRootPath(createdType), createdType);
                         EnqueueExistingFiles(GetArtifactRootPath(createdType), createdType);
+                        RescanIfOwed();
                     }
                     return;
                 }
@@ -874,12 +893,15 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         {
                             UnregisterArtifactWatcher(oldType, "root-moved-or-deleted");
                         }
+                        if (PruneMissingUploadBindings(oldFullPath)) RescanIfOwed();
                     }
 
                     if (TryGetArtifactRootType(fullPath, out var newType))
                     {
+                        PruneMissingUploadBindings(fullPath);
                         RegisterArtifactWatcher(GetArtifactRootPath(newType), newType);
                         EnqueueExistingFiles(GetArtifactRootPath(newType), newType);
+                        RescanIfOwed();
                     }
                 }
             }
@@ -929,7 +951,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 reason);
         }
 
-        private void EnqueueExistingFiles(string? root, string type)
+        private void EnqueueExistingFiles(string? root, string type, bool restartElapsedBudget = false)
         {
             if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root))
             {
@@ -947,7 +969,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 foreach (var file in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories))
                 {
                     discovered++;
-                    OnFileEvent(type, file, "scan");
+                    OnFileEvent(type, file, "scan", restartElapsedBudget);
                 }
 
                 _logger.LogDebug(
@@ -965,6 +987,12 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
         private void OnArtifactWatcherEvent(string type, string root, WatcherChangeTypes changeType, string fullPath, string? oldFullPath = null)
         {
+            // Inspect only bindings beneath this event's old path. Unrelated
+            // snapshots do not incur secure filesystem opens on each callback.
+            if (changeType is WatcherChangeTypes.Deleted or WatcherChangeTypes.Renamed
+                && PruneMissingUploadBindings(changeType == WatcherChangeTypes.Renamed ? oldFullPath ?? fullPath : fullPath))
+                RescanIfOwed();
+
             try
             {
                 long? bytes = null;
@@ -1114,18 +1142,20 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
                 var response = await _artifactClient.ListArtifactsAsync(request, headers: _authHeaders, cancellationToken: token).ConfigureAwait(false);
                 var currentPaths = new HashSet<string>(StringComparer.Ordinal);
+                var currentArtifacts = new HashSet<EditorArtifactMetadata>();
                 foreach (var item in response.Artifacts)
                 {
                     var appliedPath = ApplyCatalogEntry(item, editorSid);
                     if (!string.IsNullOrWhiteSpace(appliedPath))
                     {
                         currentPaths.Add(appliedPath);
+                        currentArtifacts.Add(item);
                     }
                 }
 
                 if (pruneMissing)
                 {
-                    PruneCatalogEntries(currentPaths);
+                    PruneCatalogEntries(currentPaths, currentArtifacts);
                 }
                 _catalogLoaded = true;
                 return true;
@@ -1162,12 +1192,14 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             }
 
             var currentPaths = new HashSet<string>(StringComparer.Ordinal);
+            var currentArtifacts = new HashSet<EditorArtifactMetadata>();
             foreach (var item in artifacts)
             {
                 var appliedPath = ApplyCatalogEntry(item, editorSid);
                 if (!string.IsNullOrWhiteSpace(appliedPath))
                 {
                     currentPaths.Add(appliedPath);
+                    currentArtifacts.Add(item);
                 }
             }
 
@@ -1176,7 +1208,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 return false;
             }
 
-            PruneCatalogEntries(currentPaths);
+            PruneCatalogEntries(currentPaths, currentArtifacts);
             return true;
         }
 
@@ -1214,6 +1246,9 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     item.SizeBytes,
                     item.Sha256,
                     createdUtc);
+                state.UploadSnapshot = previousState?.UploadSnapshot;
+                state.CommittedArtifact = previousState?.CommittedArtifact;
+                state.CatalogArtifact = item.Clone();
                 _catalog[normalized] = state;
 
                 try
@@ -1229,17 +1264,43 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             return normalized;
         }
 
-        private void PruneCatalogEntries(HashSet<string> currentPaths)
+        private void PruneCatalogEntries(HashSet<string> currentPaths, HashSet<EditorArtifactMetadata> currentArtifacts)
         {
             // Under the eviction gate, as every catalog replacement: a pass must not empty a file
             // whose entry, the only way to download it again, is being removed.
             lock (_evictionGate)
             {
-                foreach (var (path, _) in _catalog)
+                foreach (var (path, state) in _catalog)
                 {
                     if (!currentPaths.Contains(path))
                     {
-                        _catalog.TryRemove(path, out _);
+                        // Remote deletion is not local modification. Preserve this
+                        // live file's last issued ID, without promising readback.
+                        if (state.UploadSnapshot is not null && state.Downloaded && state.LocalVersion is { } localVersion
+                            && IsLiveRegularFile(state.Type, path, localVersion))
+                        {
+                            // A receipt can retain an older catalog spelling. Only
+                            // identical committed metadata keeps that exact local
+                            // snapshot saved; another file is never selected by it.
+                            state.HasRemoteArtifact = state.CommittedArtifact is { } committed
+                                && currentArtifacts.Contains(committed);
+                        }
+                        else if (state.PlaceholderVersion is { } placeholder
+                            && IsLiveRegularFile(state.Type, path, placeholder))
+                        {
+                            // Keep our exact empty placeholder recognizable: a late
+                            // watcher event must not publish it as new user data.
+                            // It is saved only while its committed receipt remains.
+                            state.HasRemoteArtifact = state.CommittedArtifact is { } committed
+                                && currentArtifacts.Contains(committed);
+                            if (!state.HasRemoteArtifact)
+                            {
+                                state.UploadSnapshot = null;
+                                state.CommittedArtifact = null;
+                            }
+                        }
+                        else
+                            _catalog.TryRemove(path, out _);
                     }
                 }
             }
@@ -1492,10 +1553,15 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 // digest) counts as saved or may be evicted.
                 var version = secureRoot.GetVersion(relativePath);
                 var knownRemote = version is { } current &&
-                                  (previousState?.MatchesLocalFile(current) == true ||
+                                  ((previousState is not null &&
+                                    previousState.CatalogArtifact?.Equals(state.CatalogArtifact) == true &&
+                                    previousState.MatchesLocalFile(current)) ||
                                    (!string.IsNullOrWhiteSpace(state.Sha256) &&
                                     ExistingFileMatchesCatalogMetadata(state, status.Length, secureRoot, relativePath)));
                 state.MarkDownloaded(knownRemote ? version : null);
+                // Reclaim recognized inactive budgets before either folder is
+                // scanned, so traversal order cannot strand a waiting file.
+                if (knownRemote) RetainCurrentUploadUncertainty(state.LocalPath, version);
                 return;
             }
 
@@ -1574,12 +1640,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     headers: _authHeaders,
                     cancellationToken: token);
 
-                var published = await FetchToFileAsync(state, call.ResponseStream, token).ConfigureAwait(false);
-                lock (_evictionGate)
-                {
-                    state.MarkDownloaded(published);
-                    state.MarkServed(DateTimeOffset.UtcNow);
-                }
+                await FetchToFileAsync(state, call.ResponseStream, token).ConfigureAwait(false);
             }
             catch (RpcException ex) when (!token.IsCancellationRequested)
             {
@@ -1705,25 +1766,35 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 // replaced only while no process has it open: a writer that opened it before its
                 // first write would otherwise go on with an inode nobody can reach. The shim asks
                 // for the download before it opens the file itself.
-                if (!(replacing is { } expected ? publication.CommitReplacing(expected, whileUnopened: true) : publication.CommitIfAbsent()))
+                lock (_evictionGate)
                 {
-                    // Still the placeholder, only open elsewhere: not downloaded, so a later open
-                    // asks again.
-                    if (replacing is { } placeholder && secureRoot.GetVersion(relativePath) is { } current && current.IsSameFileAs(placeholder))
+                    // Publish and record together: a queued watcher upload rechecks
+                    // under this same gate before it can acquire another upload ID.
+                    if (!(replacing is { } expected ? publication.CommitReplacing(expected, whileUnopened: true) : publication.CommitIfAbsent()))
                     {
-                        throw new PlaceholderInUseException();
+                        // Still the placeholder, only open elsewhere: not downloaded, so a later open
+                        // asks again.
+                        if (replacing is { } placeholder && secureRoot.GetVersion(relativePath) is { } current && current.IsSameFileAs(placeholder))
+                        {
+                            throw new PlaceholderInUseException();
+                        }
+
+                        // The session wrote or created the file meanwhile: it stays, and its watcher
+                        // uploads it. Serving it is not proof that its bytes are saved.
+                        state.MarkDownloaded(null);
+                        state.MarkServed(DateTimeOffset.UtcNow);
+                        return null;
                     }
 
-                    // The session wrote or created the file meanwhile: it stays, and its watcher
-                    // uploads it.
-                    return null;
+                    var published = secureRoot.GetVersion(relativePath);
+                    state.MarkDownloaded(published);
+                    state.MarkServed(DateTimeOffset.UtcNow);
+                    return published;
                 }
             }
-
-            return secureRoot.GetVersion(relativePath);
         }
 
-        private void OnFileEvent(string type, string fullPath, string source)
+        private void OnFileEvent(string type, string fullPath, string source, bool restartElapsedBudget = false)
         {
             if (string.IsNullOrWhiteSpace(fullPath)) return;
             try
@@ -1736,9 +1807,11 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 // Inspect without following symlinks: only plain regular files in the
                 // session tree are uploaded; links, FIFOs, devices and directories are not.
                 SecureFileStatus status;
+                SecureFileVersion? version;
                 using (var secureRoot = new LinuxSecureDirectoryRoot(root))
                 {
                     status = secureRoot.GetStatus(relativePath);
+                    version = secureRoot.GetVersion(relativePath);
                 }
 
                 if (status.Kind == SecureEntryKind.Missing)
@@ -1756,13 +1829,25 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     return;
                 }
 
-                if (TryGetCatalogEntry(fullPath, out var knownState) && ShouldSkipCatalogBackedUpload(status, knownState))
+                if (TryGetCatalogEntry(fullPath, out var knownState) && ShouldSkipCatalogBackedUpload(status, version, knownState)
+                    && !RetainCurrentUploadUncertainty(fullPath, version))
+                {
+                    return;
+                }
+
+                // A retired unchanged snapshot cannot be saved by another attempt.
+                // Leave it out of rescans without hiding a newer version of its path.
+                if (_uncertainUploads.TryGetValue(fullPath, out var uncertain) && uncertain.Retired && version == uncertain.Version)
                 {
                     return;
                 }
 
                 if (status.Length > MaxUploadBytes)
                 {
+                    // A formerly eligible snapshot may have changed beyond the
+                    // limit after its last failed attempt. Reclaim only versions
+                    // that no longer exist, without issuing an oversized upload.
+                    if (PruneMissingUploadBindings(fullPath, includeReplacedVersions: true)) RescanIfOwed();
                     _logger.LogWarning(
                         "Skipping artifact larger than the upload limit session={SessionId} type={Type} path={Path} bytes={Bytes} limit={Limit}",
                         _sessionId,
@@ -1773,16 +1858,39 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     return;
                 }
 
-                // Session code decides how many files appear; past the cap new files wait
-                // for the next refresh scan instead of growing the agent's memory.
-                if (_pending.Count >= MaxPendingUploads)
+                var coalesced = false;
+                var capacityFull = false;
+                lock (_uploadBudgetGate)
+                {
+                    if (_pending.ContainsKey(fullPath)) coalesced = true;
+                    else
+                    {
+                        _uploadBudgets.TryGetValue(fullPath, out var retained);
+                        var unchanged = retained is not null && retained.SnapshotVersion == version;
+                        if (unchanged && !restartElapsedBudget && retained!.Budget.IsExpired) return;
+                        // Pending work and retained uncertainty keep their separate
+                        // limits. Budgets include both, with no unbounded history
+                        // or eviction of a live failed version to admit a new path.
+                        capacityFull = _pending.Count >= MaxPendingUploads
+                            || (_uncertainUploads.Count >= _uploadPolicy.MaximumUnacknowledgedSnapshots && !_uncertainUploads.ContainsKey(fullPath))
+                            || (_uploadBudgets.Count >= _maximumRetainedUploadBudgets && retained is null);
+                        if (!capacityFull)
+                        {
+                            var pending = unchanged && !restartElapsedBudget ? retained! : new PendingUpload(_uploadPolicy, version);
+                            coalesced = !_pending.TryAdd(fullPath, pending);
+                            if (!coalesced) _uploadBudgets[fullPath] = pending;
+                        }
+                    }
+                }
+                if (capacityFull)
                 {
                     NoteDroppedUpload(fullPath);
                     return;
                 }
 
-                if (!_pending.TryAdd(fullPath, 0))
+                if (coalesced)
                 {
+                    _logger.LogDebug("Artifact change coalesced with pending upload bytes={Bytes} session={SessionId} path={Path}", status.Length, _sessionId, fullPath);
                     return;
                 }
 
@@ -1821,6 +1929,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         {
             var unsaved = 0;
             var unsendable = new HashSet<(ulong Device, ulong Inode)>();
+            var lostArtifacts = new HashSet<EditorArtifactMetadata>();
             foreach (var (type, root) in new[] { ("output", _paths.OutputDirectory), ("temp", _paths.TempDirectory) })
             {
                 if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root))
@@ -1857,7 +1966,13 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         // editor is neither.
                         if (!_catalog.TryGetValue(NormalizePath(file), out var state) || !state.AccountsFor(version))
                         {
-                            unsaved++;
+                            // Catalog spelling can leave a second, agent-created
+                            // placeholder for one uploaded snapshot. Count that
+                            // lost artifact once, while an editor rewrite remains
+                            // independent unsaved data even at the same path.
+                            var artifact = state is not null && state.PlaceholderVersion == version ? state.CatalogArtifact
+                                : state is not null && state.UploadSnapshot is not null && state.MatchesLocalFile(version) ? state.CommittedArtifact : null;
+                            if (artifact is null || lostArtifacts.Add(artifact)) unsaved++;
                         }
                     }
                 }
@@ -1938,7 +2053,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             // The pass stops on the space that actually came back, not on the lengths it replaced.
             var freeBefore = ReadSealedFreeBytes();
             var candidates = _catalog.Values
-                .Where(state => state.LocalVersion is { Status.Length: > 0 } &&
+                .Where(state => state.HasRemoteArtifact && state.LocalVersion is { Status.Length: > 0 } &&
                                 state.IdleSince(now) >= minimumIdle &&
                                 RunnerVfsEnvironmentBuilder.IsArtifactReadbackPath(state.LocalPath))
                 .OrderBy(static state => state.CreatedUtc)
@@ -1964,7 +2079,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     using var gate = new EvictionGateScope(_evictionGate);
                     // A refresh or upload may have replaced this entry since the pass began: the
                     // current one then decides, and judged the file itself.
-                    if (!_catalog.TryGetValue(state.LocalPath, out var current) || !ReferenceEquals(current, state) ||
+                    if (!_catalog.TryGetValue(state.LocalPath, out var current) || !ReferenceEquals(current, state) || !state.HasRemoteArtifact ||
                         state.IdleSince(DateTimeOffset.UtcNow) < minimumIdle)
                     {
                         continue;
@@ -2059,7 +2174,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 fullPath);
         }
 
-        private static bool ShouldSkipCatalogBackedUpload(SecureFileStatus status, RemoteArtifactState? knownState)
+        private static bool ShouldSkipCatalogBackedUpload(SecureFileStatus status, SecureFileVersion? version, RemoteArtifactState? knownState)
         {
             if (knownState is null)
             {
@@ -2072,19 +2187,31 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 return true;
             }
 
-            if (!knownState.Downloaded)
+            // Size and mtime can survive an atomic replacement or an in-place
+            // rewrite. Only the recorded secure version is the same local file,
+            // including when its remote receipt has since disappeared.
+            return version is { } current && knownState.MatchesLocalFile(current);
+        }
+
+        private bool RetainCurrentUploadUncertainty(string path, SecureFileVersion? version)
+        {
+            if (_uncertainUploads.TryGetValue(path, out var uncertain))
             {
-                return false;
+                // A catalog hash match is not the receipt for this operation.
+                // Keep the same ID eligible for recovery while its file survives.
+                if (version is null || version == uncertain.Version) return true;
+                if (!((ICollection<KeyValuePair<string, UploadSnapshotIdentity>>)_uncertainUploads).Remove(new(path, uncertain)))
+                    return true;
             }
 
-            var knownSize = knownState.SizeBytes;
-            if (!knownSize.HasValue || knownSize.Value != status.Length)
+            lock (_uploadBudgetGate)
             {
-                return false;
+                // Recognition also releases an exhausted pre-ID budget. Never
+                // detach an active attempt: it may still acquire an uncertain ID.
+                if (!_pending.ContainsKey(path) && _uploadBudgets.TryGetValue(path, out var retained))
+                    ((ICollection<KeyValuePair<string, PendingUpload>>)_uploadBudgets).Remove(new(path, retained));
             }
-
-            // If size and mtime still match catalog metadata, nothing changed locally.
-            return status.LastWriteTimeUtc <= knownState.CreatedUtc.UtcDateTime;
+            return false;
         }
 
         private async Task ProcessQueueAsync()
@@ -2108,7 +2235,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         }
                         catch (Exception ex)
                         {
-                            if (item.Attempt < 3)
+                            if (item.Attempt < 3 && !_pending[item.FullPath].Budget.IsExpired)
                             {
                                 retry = item with { Attempt = item.Attempt + 1 };
                                 _logger.LogDebug(ex, "Retrying artifact upload {Path} attempt {Attempt}", item.FullPath, item.Attempt + 1);
@@ -2121,9 +2248,28 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         }
                         finally
                         {
+                            // A replacement is a new delivery, not another attempt
+                            // against the old snapshot's retry and elapsed limits.
+                            if (retry is not null && _pending.TryGetValue(item.FullPath, out var pending)
+                                && HasChangedUploadVersion(item, pending.SnapshotVersion))
+                                retry = null;
                             if (retry is not { } next || !_queue.Writer.TryWrite(next))
                             {
-                                _pending.TryRemove(item.FullPath, out _);
+                                // Release before checking: a watcher event coalesced with
+                                // the old entry must not strand a genuinely changed file.
+                                if (_pending.TryRemove(item.FullPath, out var finished))
+                                {
+                                    if (finished.Completed)
+                                        ((ICollection<KeyValuePair<string, PendingUpload>>)_uploadBudgets).Remove(new(item.FullPath, finished));
+                                    if (!_cts.IsCancellationRequested)
+                                    {
+                                        // A deletion may precede a late failed ID/RPC
+                                        // observation; do not strand its capacity then.
+                                        if (!IsLiveRegularFile(item.Type, item.FullPath)) PruneMissingUploadBindings(item.FullPath);
+                                        else if (HasChangedUploadVersion(item, finished.SnapshotVersion))
+                                            OnFileEvent(item.Type, item.FullPath, "changed-after-upload");
+                                    }
+                                }
                             }
                         }
 
@@ -2136,7 +2282,38 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             }
         }
 
+        private bool HasChangedUploadVersion(UploadRequest request, SecureFileVersion? snapshot)
+        {
+            if (snapshot is not { } previous ||
+                !TryResolveSecureLocation(request.Type, request.FullPath, out var root, out var relative)) return false;
+            try
+            {
+                using var directory = new LinuxSecureDirectoryRoot(root);
+                return directory.GetVersion(relative) is { } current && current != previous;
+            }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+            {
+                // Failed inspection cannot establish a new version to retry.
+                return false;
+            }
+        }
+
         private async Task<UploadRequest?> UploadAsync(UploadRequest request)
+        {
+            using var budget = _pending[request.FullPath].Budget.BeginAttempt(_cts.Token);
+            try
+            {
+                return await UploadWithinBudgetAsync(request, budget).ConfigureAwait(false);
+            }
+            catch (Exception error) when (!_cts.IsCancellationRequested && budget.IsTimedOut)
+            {
+                // An expired observation cannot tell whether the server committed. A later
+                // retry/rescan keeps the unchanged snapshot ID and Stop still counts it.
+                throw new TimeoutException($"Artifact upload exceeded its {budget.ExpiredAllowance} allowance.", error);
+            }
+        }
+
+        private async Task<UploadRequest?> UploadWithinBudgetAsync(UploadRequest request, ArtifactUploadAttempt budget)
         {
             var (type, fullPath, attempt, runtime) = request;
             if (!type.Equals("output", StringComparison.OrdinalIgnoreCase) &&
@@ -2150,7 +2327,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 return null;
             }
 
-            await WaitForFileStableAsync(root, relPath, _cts.Token).ConfigureAwait(false);
+            await WaitForFileStableAsync(root, relPath, budget.Token).ConfigureAwait(false);
 
             var separatorIndex = relPath.LastIndexOf('/');
             var fileName = separatorIndex < 0 ? relPath : relPath[(separatorIndex + 1)..];
@@ -2158,13 +2335,14 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
             for (var tries = 0; tries < 5; tries++)
             {
-                _cts.Token.ThrowIfCancellationRequested();
+                budget.Token.ThrowIfCancellationRequested();
+                budget.BeginMetadata();
                 try
                 {
                     if (string.IsNullOrWhiteSpace(_editorSid))
                     {
-                        await Task.Delay(InitialRetryDelay * (tries + 1), _cts.Token).ConfigureAwait(false);
-                        return request with { Attempt = request.Attempt + 1 };
+                        await Task.Delay(InitialRetryDelay * (tries + 1), budget.Token).ConfigureAwait(false);
+                        return request.Attempt < 3 ? request with { Attempt = request.Attempt + 1 } : null;
                     }
 
                     // Open without following symlinks or blocking on FIFOs; the agent
@@ -2183,9 +2361,38 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     await using var stream = opened;
                     var sizeBytes = stream.Length;
                     var snapshotWriteUtc = LinuxSecureDirectoryRoot.GetOpenFileStatus(stream.SafeFileHandle, relPath).LastWriteTimeUtc;
-                    var snapshotVersion = LinuxSecureDirectoryRoot.GetOpenFileVersion(stream.SafeFileHandle, relPath);
+                    var snapshotVersion = LinuxSecureDirectoryRoot.GetOpenFileVersion(stream.SafeFileHandle, relPath)
+                        ?? throw new IOException("Cannot capture the opened artifact file version.");
+                    var pending = _pending[fullPath];
+                    // Created can arrive before the editor finishes writing. Bind
+                    // the first opened snapshot without moving it behind queued files.
+                    // Later replacements must receive a fresh delivery allowance.
+                    if (pending.HasOpenedSnapshot
+                        && pending.SnapshotVersion is { } expected && expected != snapshotVersion)
+                        return null;
+                    pending.SnapshotVersion = snapshotVersion;
+                    pending.HasOpenedSnapshot = true;
+                    // A download can queue its watcher event before recording the
+                    // published version. Recheck the opened file before issuance:
+                    // readback is not a new upload, nor is our empty placeholder.
+                    lock (_evictionGate)
+                    {
+                        if (_catalog.TryGetValue(fullPath, out var known)
+                            && (known.AccountsFor(snapshotVersion) || known.PlaceholderVersion == snapshotVersion)
+                            && !RetainCurrentUploadUncertainty(fullPath, snapshotVersion))
+                        {
+                            // No uncertain receipt remains for this version.
+                            // Release its queued budget without issuing another ID.
+                            _pending[fullPath].Completed = true;
+                            return null;
+                        }
+                    }
                     if (sizeBytes > MaxUploadBytes)
                     {
+                        // This snapshot cannot be uploaded. It must not occupy a
+                        // retained elapsed-budget slot after its pending work ends.
+                        pending.Completed = true;
+                        PruneMissingUploadBindings(fullPath, includeReplacedVersions: true);
                         _logger.LogWarning(
                             "Skipping artifact larger than the upload limit session={SessionId} type={Type} path={Relative} bytes={Bytes} limit={Limit}",
                             _sessionId,
@@ -2210,18 +2417,6 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         SizeBytes = sizeBytes
                     };
 
-                    // Every attempt seals afresh: a new data key and encapsulation, never a resend.
-                    using var writer = _paths.TransferSealing?.OutputRecipient is { } recipient
-                        ? SealedEnvelopeWriter.Create(
-                            recipient,
-                            new SealedArtifactIdentity(_sessionId, _editorSid, type, subfolder, fileName),
-                            sizeBytes)
-                        : null;
-                    if (writer is not null)
-                    {
-                        metadata.Envelope = SessionTransferSealing.ToMessage(writer.Envelope);
-                    }
-
                     if (!string.IsNullOrWhiteSpace(_owner))
                     {
                         metadata.Owner = _owner;
@@ -2239,6 +2434,25 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         metadata.RuntimeInstanceId = queuedFor.RuntimeInstanceId;
                     }
 
+                    var snapshot = await GetUploadSnapshotIdentityAsync(metadata, snapshotVersion,
+                        fullPath, budget.Token).ConfigureAwait(false);
+                    if (snapshot is null || snapshot.Retired) return null;
+                    metadata.UploadId = snapshot.UploadId;
+
+                    // Every attempt seals afresh; a fresh envelope is still the same logical
+                    // snapshot. No plaintext hash is exposed as its operation identity.
+                    using var writer = _paths.TransferSealing?.OutputRecipient is { } recipient
+                        ? SealedEnvelopeWriter.Create(
+                            recipient,
+                            new SealedArtifactIdentity(_sessionId, _editorSid, type, subfolder, fileName),
+                            sizeBytes)
+                        : null;
+                    if (writer is not null)
+                    {
+                        metadata.Envelope = SessionTransferSealing.ToMessage(writer.Envelope);
+                    }
+                    budget.BindSnapshot(writer?.CiphertextSize ?? sizeBytes);
+
                     _logger.LogInformation(
                         "Uploading artifact session={SessionId} editor={EditorSid} type={Type} path={Relative} bytes={Size}",
                         _sessionId,
@@ -2248,19 +2462,21 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         sizeBytes);
 
                     // Disposed on every path, so an upload that fails midway (a sealed file that shrank) cancels its RPC.
-                    using var call = _artifactClient.UploadArtifact(headers: _authHeaders, cancellationToken: _cts.Token);
+                    using var call = _artifactClient.UploadArtifact(headers: _authHeaders, cancellationToken: budget.Token);
                     await call.RequestStream.WriteAsync(new RunnerArtifactServiceUploadArtifactRequest { Metadata = metadata }).ConfigureAwait(false);
+                    budget.BeginBody();
 
                     if (writer is not null)
                     {
                         // Seal exactly the size declared in the header, even if the file grows.
                         await using var limited = new LengthLimitedReadStream(stream, sizeBytes);
-                        await foreach (var sealedChunk in writer.EncryptChunksAsync(limited, _cts.Token).ConfigureAwait(false))
+                        await foreach (var sealedChunk in writer.EncryptChunksAsync(limited, budget.Token).ConfigureAwait(false))
                         {
                             await call.RequestStream.WriteAsync(new RunnerArtifactServiceUploadArtifactRequest
                             {
                                 Chunk = Google.Protobuf.ByteString.CopyFrom(sealedChunk.Span)
                             }).ConfigureAwait(false);
+                            budget.BodyWritten(sealedChunk.Length);
                         }
                     }
 
@@ -2271,13 +2487,14 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         var remaining = writer is null ? sizeBytes : 0;
                         int read;
                         while (remaining > 0 &&
-                               (read = await stream.ReadAsync(buffer.AsMemory(0, (int)Math.Min(buffer.Length, remaining)), _cts.Token).ConfigureAwait(false)) > 0)
+                               (read = await stream.ReadAsync(buffer.AsMemory(0, (int)Math.Min(buffer.Length, remaining)), budget.Token).ConfigureAwait(false)) > 0)
                         {
                             remaining -= read;
                             await call.RequestStream.WriteAsync(new RunnerArtifactServiceUploadArtifactRequest
                             {
                                 Chunk = Google.Protobuf.ByteString.CopyFrom(buffer, 0, read)
                             }).ConfigureAwait(false);
+                            budget.BodyWritten(read);
                         }
                     }
                     finally
@@ -2285,18 +2502,33 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         ArrayPool<byte>.Shared.Return(buffer);
                     }
 
+                    budget.BeginReceipt();
                     await call.RequestStream.CompleteAsync().ConfigureAwait(false);
                     var response = await call.ResponseAsync.ConfigureAwait(false);
+                    budget.Token.ThrowIfCancellationRequested();
 
+                    var retired = response.Outcome == RunnerArtifactUploadOutcome.RejectedRetiredUpload;
+                    if (retired)
+                    {
+                        // Retirement proves no saving outcome. Keep this exact binding
+                        // for rescans; never acquire fresh authority for the old file.
+                        snapshot.Retired = true;
+                    }
                     if (response.Outcome == RunnerArtifactUploadOutcome.RejectedStaleRuntime)
                     {
                         // Rejection never proves that these bytes reached durable storage.
                         return null;
                     }
-                    if (response.Outcome != RunnerArtifactUploadOutcome.Committed || response.Artifact is null
-                        || response.Artifact.EditorSid != _editorSid || response.Artifact.Type != type
-                        || response.Artifact.Subfolder != subfolder || response.Artifact.Filename != fileName
-                        || response.Artifact.SizeBytes != sizeBytes)
+                    // These are case-insensitive catalog keys, not local paths.
+                    // Local saving below always uses the captured request path and
+                    // secure version, never a path selected by the response.
+                    if (!retired && (response.Outcome != RunnerArtifactUploadOutcome.Committed || response.UploadId != metadata.UploadId
+                        || response.Artifact is null
+                        || response.Artifact.EditorSid != _editorSid
+                        || !string.Equals(response.Artifact.Type, type, StringComparison.OrdinalIgnoreCase)
+                        || !string.Equals(response.Artifact.Subfolder, subfolder, StringComparison.OrdinalIgnoreCase)
+                        || !string.Equals(response.Artifact.Filename, fileName, StringComparison.OrdinalIgnoreCase)
+                        || response.Artifact.SizeBytes != sizeBytes))
                     {
                         throw new InvalidOperationException(string.IsNullOrWhiteSpace(response.Message) ? "upload failed" : response.Message);
                     }
@@ -2317,6 +2549,15 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                                               afterVersion is null ||
                                               afterVersion != snapshotVersion;
 
+                    if (retired)
+                    {
+                        // The watcher coalesces changes while this path is pending.
+                        // Only a genuinely newer snapshot may acquire another ID.
+                        // The worker releases this pending snapshot before admitting
+                        // a changed secure version with its own elapsed allowance.
+                        return null;
+                    }
+
                     // When it changed, record the snapshot's time so a later scan sees a newer file.
                     var createdUtc = changedDuringUpload
                         ? new DateTimeOffset(snapshotWriteUtc, TimeSpan.Zero)
@@ -2325,20 +2566,27 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     var remote = new RemoteArtifactState(_editorSid, type, subfolder, fileName, localPath, sizeBytes, null, createdUtc);
                     lock (_evictionGate)
                     {
+                        remote.UploadSnapshot = snapshot;
+                        remote.CommittedArtifact = response.Artifact.Clone();
+                        remote.CatalogArtifact = remote.CommittedArtifact;
                         _catalog[remote.LocalPath] = remote;
+                        _uncertainUploads.TryRemove(fullPath, out _);
+                        _pending[fullPath].Completed = !changedDuringUpload;
                         // A file that changed while it was sent matches no uploaded version yet.
                         remote.MarkDownloaded(changedDuringUpload ? null : afterVersion);
                     }
 
                     _logger.LogInformation("Uploaded artifact session={SessionId} type={Type} path={Relative}", _sessionId, type, relPath);
-                    if (changedDuringUpload && after.IsRegularFile && request.Attempt < 3)
+                    if (changedDuringUpload && after.IsRegularFile)
                     {
                         _logger.LogInformation(
                             "Artifact changed during upload; uploading it again session={SessionId} type={Type} path={Relative}",
                             _sessionId,
                             type,
                             relPath);
-                        return request with { Attempt = request.Attempt + 1 };
+                        // The worker rechecks the secure version after releasing
+                        // this entry. A changed snapshot gets a fresh finite budget;
+                        // retries of the unchanged version keep its original one.
                     }
 
                     return null;
@@ -2352,7 +2600,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 catch (IOException ex) when (tries < 4)
                 {
                     _logger.LogDebug(ex, "File locked during upload, retrying {Path}", fullPath);
-                    await Task.Delay(InitialRetryDelay * (tries + 1), _cts.Token).ConfigureAwait(false);
+                    await Task.Delay(InitialRetryDelay * (tries + 1), budget.Token).ConfigureAwait(false);
                 }
             }
 
@@ -2414,6 +2662,120 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             return "application/octet-stream";
         }
 
+        private sealed class PendingUpload(ArtifactUploadPolicy policy, SecureFileVersion? version)
+        {
+            public ArtifactUploadBudget Budget { get; } = new(policy);
+            public SecureFileVersion? SnapshotVersion { get; set; } = version;
+            public bool HasOpenedSnapshot { get; set; }
+            public bool Completed { get; set; }
+        }
+
+        private sealed class UploadSnapshotIdentity(string fingerprint, string uploadId, SecureFileVersion version)
+        {
+            private bool _retired;
+            public string Fingerprint { get; } = fingerprint;
+            public string UploadId { get; } = uploadId;
+            public SecureFileVersion Version { get; } = version;
+            public bool Retired { get => Volatile.Read(ref _retired); set => Volatile.Write(ref _retired, value); }
+        }
+
+        private async Task<UploadSnapshotIdentity?> GetUploadSnapshotIdentityAsync(
+            RunnerArtifactUploadMetadata metadata, SecureFileVersion version, string path, CancellationToken ct)
+        {
+            var fingerprint = _uploadOperationIdentity.ForSnapshot(metadata, version);
+            if (_uncertainUploads.TryGetValue(path, out var uncertain))
+            {
+                if (uncertain.Fingerprint == fingerprint) return uncertain;
+                // The secure file/target has changed. Its previous current version
+                // can no longer be rescanned under this path.
+                _uncertainUploads.TryRemove(path, out _);
+            }
+            lock (_evictionGate)
+            {
+                if (TryGetCatalogEntry(path, out var known) && known is { UploadSnapshot: { } saved }
+                    && saved.Fingerprint == fingerprint)
+                {
+                    if (known.HasRemoteArtifact && known.CommittedArtifact?.Equals(known.CatalogArtifact) == true)
+                        return saved;
+                    // The unchanged local snapshot keeps its historical ID, but
+                    // replaying its old acknowledgement cannot make replacement
+                    // catalog bytes safe to read back after evicting this file.
+                    _pending[path].Completed = true;
+                    return null;
+                }
+            }
+            if (_uncertainUploads.Count >= _uploadPolicy.MaximumUnacknowledgedSnapshots)
+            {
+                NoteDroppedUpload(path);
+                return null;
+            }
+            var response = await _artifactClient.IssueUploadIdentityAsync(new()
+            {
+                EditorSid = metadata.EditorSid,
+                Requester = _readRequester.Clone()
+            }, headers: _authHeaders, cancellationToken: ct).ConfigureAwait(false);
+            if (string.IsNullOrWhiteSpace(response.UploadId))
+                throw new InvalidOperationException("Invalid issued artifact upload identity.");
+            var snapshot = new UploadSnapshotIdentity(fingerprint, response.UploadId, version);
+            // The single upload reader owns insertion. Store before any upload RPC:
+            // losing its response or exhausting its queue budget cannot erase identity.
+            _uncertainUploads[path] = snapshot;
+            return snapshot;
+        }
+
+        private bool IsLiveRegularFile(string type, string path, SecureFileVersion? expectedVersion = null)
+        {
+            if (!TryResolveSecureLocation(type, path, out var root, out _)) return false;
+            try
+            {
+                // Open the trusted parent so a missing output/temp root is an
+                // inspectable missing component, rather than an ambiguous open
+                // failure. All descendants remain descriptor-relative/no-follow.
+                var parent = Path.GetDirectoryName(root);
+                if (string.IsNullOrEmpty(parent)) return true;
+                using var directory = new LinuxSecureDirectoryRoot(parent);
+                var fromParent = Path.GetRelativePath(parent, path);
+                return expectedVersion is { } expected
+                    ? directory.GetVersion(fromParent) == expected
+                    : directory.GetStatus(fromParent).IsRegularFile;
+            }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+            {
+                // Failure to inspect does not prove the old snapshot disappeared.
+                return true;
+            }
+        }
+
+        private bool PruneMissingUploadBindings(string? affectedPath = null, bool includeReplacedVersions = false)
+        {
+            var normalized = affectedPath is null ? null : NormalizePath(affectedPath).TrimEnd(Path.DirectorySeparatorChar);
+            var prefix = normalized + Path.DirectorySeparatorChar;
+            bool Affected(string path) => normalized is null || path.Equals(normalized, StringComparison.Ordinal)
+                || path.StartsWith(prefix, StringComparison.Ordinal);
+            var removed = false;
+            foreach (var pair in _uncertainUploads)
+            {
+                if (Affected(pair.Key) && TryResolveArtifactPath(pair.Key, out var type, out _, out _)
+                    && !IsLiveRegularFile(type, pair.Key, includeReplacedVersions ? pair.Value.Version : null))
+                    removed |= ((ICollection<KeyValuePair<string, UploadSnapshotIdentity>>)_uncertainUploads).Remove(pair);
+            }
+            foreach (var pair in _uploadBudgets)
+            {
+                if (Affected(pair.Key) && TryResolveArtifactPath(pair.Key, out var type, out _, out _)
+                    && !IsLiveRegularFile(type, pair.Key, includeReplacedVersions ? pair.Value.SnapshotVersion : null))
+                {
+                    lock (_uploadBudgetGate)
+                    {
+                        // An active attempt owns its budget until queue completion.
+                        // Only an inactive replaced version may release it early.
+                        if (!includeReplacedVersions || !_pending.ContainsKey(pair.Key))
+                            removed |= ((ICollection<KeyValuePair<string, PendingUpload>>)_uploadBudgets).Remove(pair);
+                    }
+                }
+            }
+            return removed;
+        }
+
         private sealed class RemoteArtifactState
         {
             public RemoteArtifactState(string editorSid, string type, string subfolder, string filename, string localPath, long? sizeBytes, string? sha256, DateTimeOffset createdUtc)
@@ -2437,6 +2799,10 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             public string? Sha256 { get; private set; }
             public DateTimeOffset CreatedUtc { get; private set; }
             public bool Downloaded { get; private set; }
+            public bool HasRemoteArtifact { get; set; } = true;
+            public UploadSnapshotIdentity? UploadSnapshot { get; set; }
+            public EditorArtifactMetadata? CommittedArtifact { get; set; }
+            public EditorArtifactMetadata? CatalogArtifact { get; set; }
 
             public void UpdateMetadata(long? sizeBytes, string? sha256, DateTimeOffset createdUtc)
             {
@@ -2492,7 +2858,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             /// itself, or the remote artifact behind the agent's own empty placeholder.
             /// </summary>
             public bool AccountsFor(SecureFileVersion version)
-                => MatchesLocalFile(version) || PlaceholderVersion == version;
+                => HasRemoteArtifact && (MatchesLocalFile(version) || PlaceholderVersion == version);
 
             /// <summary>When the VFS last told a reader the local file is ready.</summary>
             public DateTimeOffset LastServedUtc { get; private set; }

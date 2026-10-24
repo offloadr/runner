@@ -1,5 +1,16 @@
 # Architecture
 
+## Expired prompt receipts
+
+Prompt execution permission includes explicit content availability. An expired
+or unspecified receipt cannot start generation, probe native recovery, prepare
+artifacts or create another acknowledgement, even if its permission flag is
+contradictory. Recorded permission and outcome facts remain distinct from access
+to the original content. Unspecified or unknown availability is an explicit
+protocol error, rather than a silent successful return. Recovery-only command
+lifetimes, local memory and spool cleanup still require their own finite retention enforcement; this check alone
+does not establish complete data deletion.
+
 ## Purpose
 
 The runner executes GPU work for the Offloadr control plane. It connects out to the control plane over gRPC, authenticated by a runner key, and never exposes an inbound port. One runner serves one editor session at a time.
@@ -46,6 +57,14 @@ persistent deduplication across a runner process replacement, nor proof that an
 uncertain native mutation did not execute. In-flight delivery lists, transport
 buffers and total process memory are separate resource boundaries.
 
+## Artifact upload progress
+
+Artifact uploads use a size-aware elapsed allowance across retries, with separate
+metadata, body-progress and completion/receipt windows. Expiry cancels the actual
+call without claiming rollback or a saved file; unchanged snapshots retain their
+opaque upload ID. See [artifact upload budgets](artifact-upload-budgets.md) for
+clocks, limits, Stop accounting and the remaining qualification boundary.
+
 ## Projects
 
 | Project | Role | Platform |
@@ -86,6 +105,26 @@ The split follows today's dependency graph. These services sit in Linux only bec
 ## Desktop app
 
 The desktop app is a MAUI Blazor Hybrid window around `Offloadr.Runner.UI`, following the structure of a shared Razor UI with thin hosts. MAUI does not run hosted services, so `DesktopRuntime` starts them in order: a single-instance lock first, then the supervisor. The runner key is encrypted with ASP.NET Core Data Protection, whose key ring is protected with DPAPI. Settings, keys and logs live in `%LOCALAPPDATA%\OffloadrRunner`, or in `OFFLOADR_RUNNER_DATA_DIRECTORY` when set. The app lives in the Windows notification area: closing the window hides it, and the tray menu opens it, starts or stops the runner, or quits. `--minimized` starts it hidden; the Settings switch for starting at sign-in registers exactly that in the person's own Run key, and the app re-points the registration at itself if it has moved. The tray icon carries a dot for the runner state: green while running, amber while starting, downloading or restarting, red when it needs attention. Shortly after start and then daily, the app reads the latest release of this repository from the GitHub API and shows a banner with a download link when it is newer; it never downloads or installs anything itself. Quitting stops the runner container; the app asks first when the runner is active, and warns when a session would be interrupted. The tray icon uses `Shell_NotifyIcon` directly, with the app window subclassed to receive its messages.
+
+## Artifact upload identity
+
+Upload IDs are issued by the control plane and retained with the securely opened
+snapshot through retries, queue removal and catalog refresh. The bounded uncertain
+snapshot set applies visible backpressure rather than forgetting an old ID. Remote
+deletion preserves the live file's last acknowledged binding while disabling its
+eviction/readback promise. A returning catalog entry reuses a saved local version
+only when the full catalog receipt still matches, including its object key. A
+digest match independently proves the current bytes; a different receipt never
+grants eviction authority over old local bytes. Missing-path watcher events
+release retained capacity
+and wake owed scans, including replacement of an entire output/temp root. Only
+bindings beneath the event path receive filesystem inspection. Catalog readbacks
+release their queued or inactive pre-ID budgets when no uncertain binding remains.
+Catalog recognition preserves same-ID receipt recovery for uncertain unchanged
+snapshots; a hash match cannot substitute for the operation receipt. A separate
+bounded set keeps elapsed budgets across automatic
+rescans, including failures before ID issuance; only a changed version or explicit
+later refresh starts a new allowance. See [upload identity and retirement](artifact-upload-receipts.md).
 
 ## Origin
 

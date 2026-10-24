@@ -1885,26 +1885,48 @@ public partial class ArtifactUploadServiceTests
         public RpcException? ReadArtifactException { get; init; }
         public IAsyncStreamReader<RunnerArtifactServiceReadArtifactResponse>? BlockingReadArtifactReader { get; init; }
         /// <summary>When set, upload responses wait for this task, as on a stalled artifact API.</summary>
-        public Task? UploadGate { get; init; }
+        public Task? UploadGate { get; set; }
+        public Task<RunnerArtifactServiceUploadArtifactResponse>? LastPreparedUploadResponse { get; private set; }
         /// <summary>Answers every upload with success=false, as a control plane refusing it would.</summary>
         public bool RejectUploads { get; set; }
 
         /// <summary>Answers every upload as from a runtime whose authority retired.</summary>
         public bool RejectAsStaleRuntime { get; set; }
+        public bool RejectAsRetiredUpload { get; set; }
+        public string? IssuedUploadId { get; init; }
+        public Task? IssueIdentityGate { get; init; }
+        public TaskCompletionSource IssueIdentityEntered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _issuedIdentities;
+        public int IssuedIdentityCount => Volatile.Read(ref _issuedIdentities);
+
+        /// <summary>Fails after a complete request, as when a committed reply is lost.</summary>
+        public Func<CapturedUpload, Exception?>? UploadResponseFailure { get; set; }
+
+        public bool ReturnWrongUploadId { get; set; }
+
+        public Func<EditorArtifactMetadata, EditorArtifactMetadata>? RewriteUploadArtifact { get; set; }
 
         /// <summary>Runs when an upload's metadata frame is written, before any chunk.</summary>
         public Action? AfterUploadMetadata { get; set; }
+
+        public Action<int>? AfterUploadChunk { get; set; }
+
+        public TaskCompletionSource FirstUploadCallDisposed { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource FirstUploadCallCompleted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public int UploadCallsStarted => Volatile.Read(ref _uploadCallsStarted);
 
         public int UploadCallsDisposed => Volatile.Read(ref _uploadCallsDisposed);
 
+        public int UploadCallsCancelled => Volatile.Read(ref _uploadCallsCancelled);
+
         private int _uploadCallsStarted;
         private int _uploadCallsDisposed;
+        private int _uploadCallsCancelled;
 
-        private static async Task<RunnerArtifactServiceUploadArtifactResponse> WaitForGateAsync(
+        private static async Task<T> WaitForGateAsync<T>(
             Task gate,
-            Task<RunnerArtifactServiceUploadArtifactResponse> response)
+            Task<T> response)
         {
             await gate.ConfigureAwait(false);
             return await response.ConfigureAwait(false);
@@ -1915,6 +1937,18 @@ public partial class ArtifactUploadServiceTests
 
         /// <summary>When set, the frames every read answers with, in place of one metadata frame and one chunk.</summary>
         public RunnerArtifactServiceReadArtifactResponse[]? ReadArtifactFrames { get; set; }
+
+        public override AsyncUnaryCall<RunnerArtifactServiceIssueUploadIdentityResponse> IssueUploadIdentityAsync(
+            RunnerArtifactServiceIssueUploadIdentityRequest request, CallOptions options)
+        {
+            Interlocked.Increment(ref _issuedIdentities);
+            var response = Task.FromResult(new RunnerArtifactServiceIssueUploadIdentityResponse
+            { UploadId = IssuedUploadId ?? Guid.NewGuid().ToString("N") });
+            if (IssueIdentityGate is { } gate)
+                response = WaitForGateAsync(gate, response).WaitAsync(options.CancellationToken);
+            IssueIdentityEntered.TrySetResult();
+            return new(response, Task.FromResult(new Metadata()), () => Status.DefaultSuccess, () => new Metadata(), () => { });
+        }
 
         public override AsyncUnaryCall<RunnerArtifactServiceListArtifactsResponse> ListArtifactsAsync(RunnerArtifactServiceListArtifactsRequest request, CallOptions options)
         {
@@ -1935,41 +1969,62 @@ public partial class ArtifactUploadServiceTests
         public override AsyncClientStreamingCall<RunnerArtifactServiceUploadArtifactRequest, RunnerArtifactServiceUploadArtifactResponse> UploadArtifact(CallOptions options)
         {
             LastUploadHeaders = options.Headers;
-            Interlocked.Increment(ref _uploadCallsStarted);
+            var callNumber = Interlocked.Increment(ref _uploadCallsStarted);
             var response = new TaskCompletionSource<RunnerArtifactServiceUploadArtifactResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
+            LastPreparedUploadResponse = response.Task;
             var writer = new CaptureUploadStreamWriter(AfterUploadMetadata, captured =>
             {
+                if (callNumber == 1) FirstUploadCallCompleted.TrySetResult();
                 _uploads.Enqueue(captured);
                 _uploadSignals.Writer.TryWrite(captured);
+                if (UploadResponseFailure?.Invoke(captured) is { } failure)
+                {
+                    response.TrySetException(failure);
+                    return;
+                }
+                if (RejectAsRetiredUpload)
+                {
+                    response.TrySetResult(new RunnerArtifactServiceUploadArtifactResponse
+                    { Outcome = RunnerArtifactUploadOutcome.RejectedRetiredUpload, UploadId = captured.Metadata!.UploadId });
+                    return;
+                }
                 if (RejectAsStaleRuntime)
                 {
                     response.TrySetResult(new RunnerArtifactServiceUploadArtifactResponse { Outcome = RunnerArtifactUploadOutcome.RejectedStaleRuntime });
                     return;
                 }
 
+                var artifact = new EditorArtifactMetadata
+                {
+                    EditorSid = captured.Metadata!.EditorSid,
+                    Filename = captured.Metadata.Filename,
+                    Type = captured.Metadata.Type,
+                    Subfolder = captured.Metadata.Subfolder,
+                    SizeBytes = captured.Metadata.SizeBytes
+                };
                 response.TrySetResult(new RunnerArtifactServiceUploadArtifactResponse
                 {
                     Outcome = RejectUploads ? RunnerArtifactUploadOutcome.Unspecified : RunnerArtifactUploadOutcome.Committed,
-                    Artifact = RejectUploads ? null : new()
-                    {
-                        EditorSid = captured.Metadata!.EditorSid,
-                        Filename = captured.Metadata.Filename,
-                        Type = captured.Metadata.Type,
-                        Subfolder = captured.Metadata.Subfolder,
-                        SizeBytes = captured.Metadata.SizeBytes
-                    },
+                    UploadId = ReturnWrongUploadId ? Guid.NewGuid().ToString("N") : captured.Metadata!.UploadId,
+                    Artifact = RejectUploads ? null : RewriteUploadArtifact?.Invoke(artifact) ?? artifact,
                     Message = RejectUploads ? "rejected" : string.Empty
                 });
-            });
+            }, AfterUploadChunk);
             var gate = UploadGate;
 
             return new AsyncClientStreamingCall<RunnerArtifactServiceUploadArtifactRequest, RunnerArtifactServiceUploadArtifactResponse>(
                 writer,
-                gate is null ? response.Task : WaitForGateAsync(gate, response.Task),
+                (gate is null ? response.Task : WaitForGateAsync(gate, response.Task)).WaitAsync(options.CancellationToken),
                 Task.FromResult(new Metadata()),
                 () => Status.DefaultSuccess,
                 () => new Metadata(),
-                () => Interlocked.Increment(ref _uploadCallsDisposed));
+                () =>
+                {
+                    if (options.CancellationToken.IsCancellationRequested)
+                        Interlocked.Increment(ref _uploadCallsCancelled);
+                    Interlocked.Increment(ref _uploadCallsDisposed);
+                    if (callNumber == 1) FirstUploadCallDisposed.TrySetResult();
+                });
         }
 
         public override AsyncServerStreamingCall<RunnerArtifactServiceReadArtifactResponse> ReadArtifact(RunnerArtifactServiceReadArtifactRequest request, CallOptions options)
@@ -2027,7 +2082,7 @@ public partial class ArtifactUploadServiceTests
         }
     }
 
-    private sealed class CaptureUploadStreamWriter(Action? afterMetadata, Action<CapturedUpload> onComplete) : IClientStreamWriter<RunnerArtifactServiceUploadArtifactRequest>
+    private sealed class CaptureUploadStreamWriter(Action? afterMetadata, Action<CapturedUpload> onComplete, Action<int>? afterChunk = null) : IClientStreamWriter<RunnerArtifactServiceUploadArtifactRequest>
     {
         private readonly Action<CapturedUpload> _onComplete = onComplete;
         private readonly object _gate = new();
@@ -2045,6 +2100,10 @@ public partial class ArtifactUploadServiceTests
             if (message.PayloadCase == RunnerArtifactServiceUploadArtifactRequest.PayloadOneofCase.Metadata)
             {
                 afterMetadata?.Invoke();
+            }
+            else if (message.PayloadCase == RunnerArtifactServiceUploadArtifactRequest.PayloadOneofCase.Chunk)
+            {
+                afterChunk?.Invoke(message.Chunk.Length);
             }
 
             return Task.CompletedTask;

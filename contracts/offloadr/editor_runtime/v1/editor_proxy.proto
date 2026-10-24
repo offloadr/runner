@@ -33,6 +33,7 @@ message GetEditorActionRequest {
 
 message GetEditorActionResponse {
   offloadr.common.v1.PromptSubmissionSnapshot submission = 1;
+  offloadr.common.v1.PromptRecoveryTiming recovery_timing = 2;
 }
 
 message ListEditorActionsRequest {
@@ -44,6 +45,7 @@ message ListEditorActionsRequest {
 
 message ListEditorActionsResponse {
   repeated offloadr.common.v1.PromptSubmissionSummary submissions = 1;
+  map<string, offloadr.common.v1.PromptRecoveryTiming> recovery_timings = 2;
 }
 
 message WaitEditorActionResultRequest {
@@ -65,11 +67,22 @@ message FindForgeEditorActionsRequest {
   string cpu_runtime_instance_id = 6;
   string session_hash = 7;
   string task_id = 8;
+  // Return the bounded progress projection, without full invocation or SSE bodies.
+  bool progress_only = 9;
 }
 
 message FindForgeEditorActionsResponse {
   offloadr.common.v1.PromptSubmissionSnapshot generation = 1;
   offloadr.common.v1.PromptSubmissionSnapshot event_reader = 2;
+  ForgeProgressRecovery progress_recovery = 3;
+}
+
+// The selected encrypted fact retains its original lifetime. Reads do not renew it.
+message ForgeProgressRecovery {
+  offloadr.common.v1.PromptSubmissionSummary submission = 1;
+  offloadr.common.v1.PromptRecoveryTiming recovery_timing = 2;
+  offloadr.common.v1.PromptExecutionEvidence progress = 3;
+  google.protobuf.Timestamp progress_expires_utc = 4;
 }
 
 enum EditorExecutionAuthorityState {

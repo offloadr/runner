@@ -673,6 +673,9 @@ message RunnerArtifactUploadMetadata {
     // would reveal when two uploads carry equal content.
     SealedEnvelope envelope = 15;
     string instance_id = 16; // Captured registered process; never read from mutable session state.
+    // Server-issued ID bound to one producer file snapshot across retries and rescans.
+    // A changed file/target obtains a new ID. Not a plaintext digest or authorization.
+    string upload_id = 17;
 }
 
 message RunnerArtifactServiceUploadArtifactRequest {
@@ -686,12 +689,24 @@ enum RunnerArtifactUploadOutcome {
     RUNNER_ARTIFACT_UPLOAD_OUTCOME_UNSPECIFIED = 0;
     RUNNER_ARTIFACT_UPLOAD_OUTCOME_COMMITTED = 1;
     RUNNER_ARTIFACT_UPLOAD_OUTCOME_REJECTED_STALE_RUNTIME = 2;
+    RUNNER_ARTIFACT_UPLOAD_OUTCOME_REJECTED_RETIRED_UPLOAD = 3;
 }
 
 message RunnerArtifactServiceUploadArtifactResponse {
     RunnerArtifactUploadOutcome outcome = 1;
     string message = 2;
     offloadr.editor_runtime.v1.EditorArtifactMetadata artifact = 3;
+    string upload_id = 4; // Echo of the committed logical upload, never a new publication ID.
+}
+
+// Issuance has no artifact effect. A lost response may safely waste a number.
+message RunnerArtifactServiceIssueUploadIdentityRequest {
+    string editor_sid = 1;
+    RunnerReadRequester requester = 2;
+}
+
+message RunnerArtifactServiceIssueUploadIdentityResponse {
+    string upload_id = 1;
 }
 
 message RunnerArtifactServiceRegisterMetadataRequest {
@@ -801,6 +816,7 @@ service RunnerControlService {
 
 // Runner-scoped artifact APIs authenticated via runner secret.
 service RunnerArtifactService {
+    rpc IssueUploadIdentity(RunnerArtifactServiceIssueUploadIdentityRequest) returns (RunnerArtifactServiceIssueUploadIdentityResponse);
     rpc ListArtifacts(RunnerArtifactServiceListArtifactsRequest) returns (RunnerArtifactServiceListArtifactsResponse);
     rpc ReadArtifact(RunnerArtifactServiceReadArtifactRequest) returns (stream RunnerArtifactServiceReadArtifactResponse);
     rpc UploadArtifact(stream RunnerArtifactServiceUploadArtifactRequest) returns (RunnerArtifactServiceUploadArtifactResponse);

@@ -19,6 +19,23 @@ The Offloadr control plane implements the server side of these services, so a co
 2. Keep the seven shared protobuf definitions identical on both sides and regenerate every affected consumer. The platform is pre-deployment: change the current protocol directly, without legacy layouts or compatibility shims.
 3. Release the coordinated runner and control-plane changes together. Schema declarations alone do not mean the corresponding behavior is implemented.
 
+## Prompt content availability
+
+A prompt execution permission must state its recovery-content availability.
+`Available` permits only the matching committed execution or recovery path;
+`Expired` permits no native action or invented acknowledgement. `Unspecified`
+and unknown values fail with a protocol error. Server and runner implementations
+must be coordinated; no missing-field fallback grants execution.
+
+## Progress recovery projection
+
+`FindForgeEditorActionsRequest.progress_only` selects a bounded progress read.
+Its response uses `ForgeProgressRecovery`, with status facts, database read timing,
+the selected native progress evidence and its original expiry. This projection
+omits full invocation and SSE bodies. It does not grant execution, renew retention
+or turn HTTP acceptance into generation completion. The runner declares the shared
+schema; these editor-facing reads are served by the control plane.
+
 ## Current Stop identity
 
 Every Stop requires a nonempty UUID `command_id` (field 3). Its acknowledgement echoes the captured nonce and the registered runner process in string `instance_id` (field 4). Acknowledgement fields 5–7 echo lifecycle generation, runtime epoch and runtime instance when supplied. Invalid command or missing process identity never enters cleanup. Acknowledgements retry the captured result after cleanup; failed cleanup or host shutdown never acknowledges success.
@@ -38,6 +55,8 @@ These declarations are shared, but the server behavior below remains pending. Th
 | `RunnerReadRequester`, as `requester` on `ListArtifacts` (4), `ReadArtifact` (6), `ReadWorkspaceFile` (5) and `ReadWorkspaceSeedArchive` (4) requests | Authorizes catalog metadata and each read against exactly the named runner, registered process (`instance_id`) and session runtime, together with the runner's current assignment; allows a runtime that is starting or relaunching to read before it is ready; refuses a retired process or runtime; takes `session_id` for a sealed response's envelope identity | Names itself, its process and the session runtime that each catalog query or read is for (fixed when that runtime's uploader or mirror started, never a newer runtime's) |
 | Upload `instance_id` (16), Start acknowledgement `instance_id` (9), Launch acknowledgement `instance_id` (15) | Binds delivery and acceptance to the registered process and exact runtime assignment | Retains the uploader/mirror process and runtime snapshot for queueing and retries; echoes its process in readiness acknowledgements |
 | `RunnerArtifactServiceUploadArtifactResponse.outcome` (1) | Returns `Committed` only with committed artifact metadata; returns `RejectedStaleRuntime` when authority retired | Marks a matching local version saved or eligible for eviction only for `Committed` with matching metadata |
+| Upload `upload_id` (17), upload response `upload_id` (4) | Binds one producer snapshot to its original durable publication result; exact duplicate recovery must not publish another version | Obtains an issued ID for each new secure opened-file snapshot; retains it through retries, queue removal and catalog refresh, and requires the committed response to echo it |
+| `RunnerArtifactService.IssueUploadIdentity`, retired-upload outcome | Issues ordered IDs under exact assignment authority and rejects collected IDs before new publication | Keeps the issued ID for the same snapshot; retirement never marks it saved or permits a fresh ID for that snapshot |
 | `AcknowledgeSessionStopRequest.cleanup_disposition` (10) | Separates cleanup completion from first explicit saving evidence; unspecified/superseded remain unknown; validates performed cleanup's echoed runtime | Reports Performed only after actual cleanup, Superseded with unknown evidence otherwise; replays the original result |
 | `RunnerArtifactUploadMetadata.envelope` (15) | Opens the transfer with the output recipient private key and streams plaintext in memory into independent Vault-backed artifact encryption | Seals every upload of a session with an output recipient, with a fresh data key per upload and retry; omits `sha256` |
 | `AcknowledgeSessionStopRequest.unsaved_artifact_count` (8) | Preserves known losses across processes; complete zero means no unsaved artifacts reported | Counts the artifacts that failed or were still uploading when the session's data was removed |
