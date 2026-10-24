@@ -1557,6 +1557,9 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                                    (!string.IsNullOrWhiteSpace(state.Sha256) &&
                                     ExistingFileMatchesCatalogMetadata(state, status.Length, secureRoot, relativePath)));
                 state.MarkDownloaded(knownRemote ? version : null);
+                // Reclaim recognized inactive budgets before either folder is
+                // scanned, so traversal order cannot strand a waiting file.
+                if (knownRemote) RetainCurrentUploadUncertainty(state.LocalPath, version);
                 return;
             }
 
