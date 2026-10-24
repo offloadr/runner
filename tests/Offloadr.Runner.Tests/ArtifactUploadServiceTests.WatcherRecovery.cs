@@ -73,6 +73,73 @@ public partial class ArtifactUploadServiceTests
         }
     }
 
+    [Test, NonParallelizable]
+    public async Task CatalogRecognitionReleasesTempBudgetsBeforeScanningWaitingOutput()
+    {
+        var root = CreateTempDirectory();
+        var previousLimit = ArtifactUploadService.MaxPendingUploads;
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
+        {
+            ArtifactUploadService.MaxPendingUploads = 1;
+            var paths = UploadIdentityPaths(root);
+            var listing = new RunnerArtifactServiceListArtifactsResponse();
+            var client = new FakeRunnerArtifactClient(listing) { IssueIdentityGate = release.Task };
+            var logger = new ListLogger<ArtifactUploadService>();
+            var clock = new ArtifactUploadBudgetTests.UploadClock();
+            var policy = new ArtifactUploadPolicy
+            {
+                Clock = clock,
+                MaximumUnacknowledgedSnapshots = 1,
+                MetadataTimeout = TimeSpan.FromSeconds(2),
+                NoProgressTimeout = TimeSpan.FromSeconds(2),
+                ReceiptTimeout = TimeSpan.FromSeconds(2)
+            };
+            await using var service = new ArtifactUploadService("secret", client, logger, uploadPolicy: policy);
+            try
+            {
+                await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+                await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+                byte[] bytes = [1, 2, 3];
+                var filenames = new[] { "first.bin", "second.bin" };
+                for (var i = 0; i < filenames.Length; i++)
+                {
+                    await File.WriteAllBytesAsync(Path.Combine(paths.TempDirectory, filenames[i]), bytes);
+                    using (var entered = new CancellationTokenSource(TimeSpan.FromSeconds(5)))
+                        while (client.IssuedIdentityCount != i + 1) await Task.Delay(10, entered.Token);
+                    clock.Advance(TimeSpan.FromSeconds(6));
+                    await WaitForIdentityUploadsToFinishAsync(service);
+                }
+                await File.WriteAllBytesAsync(Path.Combine(paths.OutputDirectory, "third.bin"), [4, 5, 6]);
+                await WaitForUploadLogAsync(logger, "Artifact upload queue is full");
+                Assert.That(client.UploadCount, Is.Zero);
+                foreach (var filename in filenames)
+                    listing.Artifacts.Add(new EditorArtifactMetadata
+                    {
+                        EditorSid = "editor-1",
+                        Type = "temp",
+                        Filename = filename,
+                        SizeBytes = bytes.Length,
+                        Sha256 = Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(bytes))
+                    });
+                release.TrySetResult();
+                await service.RefreshSessionAsync("session-1");
+                var uploaded = await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+                Assert.That(uploaded.Metadata!.Filename, Is.EqualTo("third.bin"));
+                await WaitForIdentityUploadsToFinishAsync(service);
+                Assert.That(client.IssuedIdentityCount, Is.EqualTo(3));
+                Assert.That(client.UploadCount, Is.EqualTo(1));
+                Assert.That(await service.StopSessionAsync("session-1"), Is.Zero);
+            }
+            finally { release.TrySetResult(); }
+        }
+        finally
+        {
+            ArtifactUploadService.MaxPendingUploads = previousLimit;
+            TryDelete(root);
+        }
+    }
+
     [Test]
     public async Task CatalogRecognitionPreservesReceiptRecoveryForAnUncertainSnapshot()
     {
