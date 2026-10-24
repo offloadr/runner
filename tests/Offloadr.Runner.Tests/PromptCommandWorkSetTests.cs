@@ -1,9 +1,56 @@
+using System.Runtime.CompilerServices;
 using Offloadr.Runner.V1;
 
 namespace Offloadr.Runner.Tests;
 
 public sealed class PromptCommandWorkSetTests
 {
+    [Test]
+    public async Task HeldModelDemandDoesNotRetainCompletedCommandOrPromptBody()
+    {
+        var work = new PromptCommandWorkSet(CancellationToken.None);
+        var settling = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var (command, body, demand) = StartHeldDemand(work, settling.Task);
+        try
+        {
+            Assert.That(demand.IsCancellationRequested, Is.False);
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+            Assert.Multiple(() =>
+            {
+                Assert.That(command.TryGetTarget(out _), Is.False, "Settling model demand must release the completed command.");
+                Assert.That(body.TryGetTarget(out _), Is.False, "Settling model demand must release the prompt body.");
+            });
+            work.WithdrawDemand(identity => identity.CommandId == "held-body");
+            Assert.That(demand.IsCancellationRequested, Is.True, "Identity still permits terminal withdrawal.");
+        }
+        finally
+        {
+            settling.TrySetResult();
+            await work.CancelAndWaitAsync(_ => true).WaitAsync(TimeSpan.FromSeconds(2));
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static (WeakReference<SubmitPromptCommand>, WeakReference<string>, CancellationToken) StartHeldDemand(
+        PromptCommandWorkSet work, Task settling)
+    {
+        WeakReference<SubmitPromptCommand>? command = null;
+        WeakReference<string>? body = null;
+        CancellationToken demand = default;
+        Assert.That(work.Start(new() { CommandId = "held-body", SessionId = "synthetic-session", PromptJson = new string('x', 65536) },
+            (captured, _, token) =>
+            {
+                command = new(captured);
+                body = new(captured.PromptJson);
+                demand = token;
+                work.HoldDemand(captured.CommandId, settling);
+                return Task.CompletedTask;
+            }), Is.True);
+        return (command!, body!, demand);
+    }
+
     [Test]
     public async Task RepeatedDeliveryCannotStartASecondPhysicalRequest()
     {
