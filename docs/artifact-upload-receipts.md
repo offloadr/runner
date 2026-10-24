@@ -93,3 +93,9 @@ version still matches. File length and modification time alone cannot prove
 that identity: an atomic replacement may preserve both. A retained receipt,
 including one deleted from the remote catalog, cannot hide the replacement's
 new bytes or give it the old upload identity.
+
+A rescan cannot replay a retained committed upload ID to restore saving authority
+when the current catalog names a different receipt. The unchanged local file
+keeps its historical identity and remains unsaved and ineligible for eviction;
+it does not receive a fresh ID to overwrite the replacement remotely. A genuinely
+changed local snapshot can obtain its own ID through normal admission.

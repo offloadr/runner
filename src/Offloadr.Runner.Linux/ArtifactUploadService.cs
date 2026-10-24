@@ -1844,6 +1844,10 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
                 if (status.Length > MaxUploadBytes)
                 {
+                    // A formerly eligible snapshot may have changed beyond the
+                    // limit after its last failed attempt. Reclaim only versions
+                    // that no longer exist, without issuing an oversized upload.
+                    if (PruneMissingUploadBindings(fullPath)) RescanIfOwed();
                     _logger.LogWarning(
                         "Skipping artifact larger than the upload limit session={SessionId} type={Type} path={Path} bytes={Bytes} limit={Limit}",
                         _sessionId,
@@ -2385,6 +2389,10 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     }
                     if (sizeBytes > MaxUploadBytes)
                     {
+                        // This snapshot cannot be uploaded. It must not occupy a
+                        // retained elapsed-budget slot after its pending work ends.
+                        pending.Completed = true;
+                        PruneMissingUploadBindings(fullPath);
                         _logger.LogWarning(
                             "Skipping artifact larger than the upload limit session={SessionId} type={Type} path={Relative} bytes={Bytes} limit={Limit}",
                             _sessionId,
@@ -2684,9 +2692,17 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             }
             lock (_evictionGate)
             {
-                if (TryGetCatalogEntry(path, out var known) && known?.UploadSnapshot is { } saved
+                if (TryGetCatalogEntry(path, out var known) && known is { UploadSnapshot: { } saved }
                     && saved.Fingerprint == fingerprint)
-                    return saved;
+                {
+                    if (known.HasRemoteArtifact && known.CommittedArtifact?.Equals(known.CatalogArtifact) == true)
+                        return saved;
+                    // The unchanged local snapshot keeps its historical ID, but
+                    // replaying its old acknowledgement cannot make replacement
+                    // catalog bytes safe to read back after evicting this file.
+                    _pending[path].Completed = true;
+                    return null;
+                }
             }
             if (_uncertainUploads.Count >= _uploadPolicy.MaximumUnacknowledgedSnapshots)
             {

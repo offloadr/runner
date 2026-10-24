@@ -76,3 +76,8 @@ count and elapsed allowance.
 The opened version is checked again before upload identity issuance, covering
 replacement after that queue check and during an inner I/O retry. Unchanged
 versions retain their original upload ID, retry count and elapsed deadline.
+
+A file that grows beyond the upload limit before its first secure open releases
+its pending elapsed budget when rejected. Oversized watcher observations also
+prune bindings whose recorded secure version no longer exists. Rejected files do
+not retain budget slots that prevent unrelated eligible outputs from uploading.
