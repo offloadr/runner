@@ -24,8 +24,8 @@ internal sealed record ArtifactUploadPolicy
 }
 
 /// <summary>
-/// One pending entry's elapsed allowance. Starts at its first dequeue, survives every
-/// requeue and I/O attempt, and keeps no timer while the entry waits behind another file.
+/// One delivery's elapsed allowance. Starts at its first dequeue, survives requeues,
+/// I/O attempts and automatic rescans, and keeps no timer while waiting behind another file.
 /// </summary>
 internal sealed class ArtifactUploadBudget(ArtifactUploadPolicy policy)
 {

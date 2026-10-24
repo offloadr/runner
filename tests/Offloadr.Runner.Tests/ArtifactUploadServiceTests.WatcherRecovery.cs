@@ -101,4 +101,66 @@ public partial class ArtifactUploadServiceTests
         }
         finally { TryDelete(root); }
     }
+
+    [Test, NonParallelizable]
+    public async Task ExhaustionBeforeIdentityIssuanceRemainsBoundedAndMissingFilesReleaseItsCapacity()
+    {
+        var root = CreateTempDirectory();
+        var previousLimit = ArtifactUploadService.MaxPendingUploads;
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
+        {
+            ArtifactUploadService.MaxPendingUploads = 1;
+            var paths = UploadIdentityPaths(root);
+            var path = Path.Combine(paths.OutputDirectory, "first.bin");
+            var client = new FakeRunnerArtifactClient(new()) { IssueIdentityGate = release.Task };
+            var logger = new ListLogger<ArtifactUploadService>();
+            var clock = new ArtifactUploadBudgetTests.UploadClock();
+            var policy = new ArtifactUploadPolicy
+            {
+                Clock = clock,
+                MaximumUnacknowledgedSnapshots = 1,
+                MetadataTimeout = TimeSpan.FromSeconds(2),
+                NoProgressTimeout = TimeSpan.FromSeconds(2),
+                ReceiptTimeout = TimeSpan.FromSeconds(2)
+            };
+            await using var service = new ArtifactUploadService("secret", client, logger, uploadPolicy: policy);
+            try
+            {
+                await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+                await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+                await File.WriteAllBytesAsync(path, [1, 2, 3]);
+                await client.IssueIdentityEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                await File.WriteAllBytesAsync(Path.Combine(paths.OutputDirectory, "waiting.bin"), [4, 5, 6]);
+                await File.WriteAllBytesAsync(Path.Combine(paths.OutputDirectory, "excess.bin"), [7, 8, 9]);
+                await WaitForUploadLogAsync(logger, "Artifact upload queue is full");
+                clock.Advance(TimeSpan.FromSeconds(6));
+                using (var admitted = new CancellationTokenSource(TimeSpan.FromSeconds(5)))
+                    while (client.IssuedIdentityCount < 2) await Task.Delay(10, admitted.Token);
+                var completedScans = logger.Snapshot().Count(entry => entry.Message.StartsWith("Artifact scan completed", StringComparison.Ordinal));
+                clock.Advance(TimeSpan.FromSeconds(6));
+                using (var scanned = new CancellationTokenSource(TimeSpan.FromSeconds(5)))
+                    while (logger.Snapshot().Count(entry => entry.Message.StartsWith("Artifact scan completed", StringComparison.Ordinal)) < completedScans + 2)
+                        await Task.Delay(10, scanned.Token);
+                await WaitForIdentityUploadsToFinishAsync(service);
+                Assert.That(client.IssuedIdentityCount, Is.EqualTo(2), "Two retained budgets fill the pending plus uncertainty allowance.");
+                Assert.That(client.UploadCount, Is.Zero, "No issuance response or upload has completed.");
+
+                release.TrySetResult();
+                File.Delete(path);
+                var recovered = await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+                Assert.That(recovered.Metadata!.Filename, Is.AnyOf("waiting.bin", "excess.bin"));
+                await WaitForIdentityUploadsToFinishAsync(service);
+                Assert.That(client.IssuedIdentityCount, Is.EqualTo(3));
+                Assert.That(client.UploadCount, Is.EqualTo(1));
+                Assert.That(await service.StopSessionAsync("session-1"), Is.EqualTo(1));
+            }
+            finally { release.TrySetResult(); }
+        }
+        finally
+        {
+            ArtifactUploadService.MaxPendingUploads = previousLimit;
+            TryDelete(root);
+        }
+    }
 }

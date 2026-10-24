@@ -494,6 +494,11 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         private readonly ArtifactUploadOperationIdentity _uploadOperationIdentity = new();
         private readonly CancellationTokenSource _cts = new();
         private readonly ConcurrentDictionary<string, PendingUpload> _pending = new(StringComparer.Ordinal);
+        // Queue removal does not renew a failed file version's elapsed allowance.
+        // Keep one bounded budget per current path, including failures before ID issuance.
+        private readonly ConcurrentDictionary<string, PendingUpload> _uploadBudgets = new(StringComparer.Ordinal);
+        private readonly object _uploadBudgetGate = new();
+        private readonly int _maximumRetainedUploadBudgets;
         private readonly ConcurrentDictionary<string, UploadSnapshotIdentity> _uncertainUploads = new(StringComparer.Ordinal);
         private readonly ArtifactUploadPolicy _uploadPolicy;
         private readonly ConcurrentDictionary<string, RemoteArtifactState> _catalog = new(StringComparer.Ordinal);
@@ -528,6 +533,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             _uploadPolicy = uploadPolicy ?? new ArtifactUploadPolicy();
             ArgumentOutOfRangeException.ThrowIfNegativeOrZero(_uploadPolicy.MaximumUnacknowledgedSnapshots);
             ArgumentOutOfRangeException.ThrowIfGreaterThan(_uploadPolicy.MaximumUnacknowledgedSnapshots, ArtifactUploadPolicy.UnacknowledgedSnapshotLimit);
+            _maximumRetainedUploadBudgets = checked(MaxPendingUploads + _uploadPolicy.MaximumUnacknowledgedSnapshots);
             _queue = Channel.CreateUnbounded<UploadRequest>(new UnboundedChannelOptions
             {
                 SingleReader = true,
@@ -567,8 +573,8 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
             PruneMissingUploadBindings();
             await EnsureCatalogAsync(CancellationToken.None, forceReload: true).ConfigureAwait(false);
-            EnqueueExistingFiles(_paths.OutputDirectory, "output");
-            EnqueueExistingFiles(_paths.TempDirectory, "temp");
+            EnqueueExistingFiles(_paths.OutputDirectory, "output", restartElapsedBudget: true);
+            EnqueueExistingFiles(_paths.TempDirectory, "temp", restartElapsedBudget: true);
         }
 
         public async Task SeedSnapshotAsync(
@@ -938,7 +944,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 reason);
         }
 
-        private void EnqueueExistingFiles(string? root, string type)
+        private void EnqueueExistingFiles(string? root, string type, bool restartElapsedBudget = false)
         {
             if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root))
             {
@@ -956,7 +962,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 foreach (var file in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories))
                 {
                     discovered++;
-                    OnFileEvent(type, file, "scan");
+                    OnFileEvent(type, file, "scan", restartElapsedBudget);
                 }
 
                 _logger.LogDebug(
@@ -974,6 +980,12 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
         private void OnArtifactWatcherEvent(string type, string root, WatcherChangeTypes changeType, string fullPath, string? oldFullPath = null)
         {
+            // A directory event can retire several exact old paths. Inspect the
+            // bounded sets securely; a failed inspection never proves removal.
+            if (changeType is WatcherChangeTypes.Deleted or WatcherChangeTypes.Renamed
+                && PruneMissingUploadBindings())
+                RescanIfOwed();
+
             try
             {
                 long? bytes = null;
@@ -1770,7 +1782,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             }
         }
 
-        private void OnFileEvent(string type, string fullPath, string source)
+        private void OnFileEvent(string type, string fullPath, string source, bool restartElapsedBudget = false)
         {
             if (string.IsNullOrWhiteSpace(fullPath)) return;
             try
@@ -1829,16 +1841,37 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     return;
                 }
 
-                // Session code decides how many files appear; past the cap new files wait
-                // for the next refresh scan instead of growing the agent's memory.
-                if (_pending.Count >= MaxPendingUploads ||
-                    (_uncertainUploads.Count >= _uploadPolicy.MaximumUnacknowledgedSnapshots && !_uncertainUploads.ContainsKey(fullPath)))
+                var coalesced = false;
+                var capacityFull = false;
+                lock (_uploadBudgetGate)
+                {
+                    if (_pending.ContainsKey(fullPath)) coalesced = true;
+                    else
+                    {
+                        _uploadBudgets.TryGetValue(fullPath, out var retained);
+                        var unchanged = retained is not null && retained.SnapshotVersion == version;
+                        if (unchanged && !restartElapsedBudget && retained!.Budget.IsExpired) return;
+                        // Pending work and retained uncertainty keep their separate
+                        // limits. Budgets include both, with no unbounded history
+                        // or eviction of a live failed version to admit a new path.
+                        capacityFull = _pending.Count >= MaxPendingUploads
+                            || (_uncertainUploads.Count >= _uploadPolicy.MaximumUnacknowledgedSnapshots && !_uncertainUploads.ContainsKey(fullPath))
+                            || (_uploadBudgets.Count >= _maximumRetainedUploadBudgets && retained is null);
+                        if (!capacityFull)
+                        {
+                            var pending = unchanged && !restartElapsedBudget ? retained! : new PendingUpload(_uploadPolicy, version);
+                            coalesced = !_pending.TryAdd(fullPath, pending);
+                            if (!coalesced) _uploadBudgets[fullPath] = pending;
+                        }
+                    }
+                }
+                if (capacityFull)
                 {
                     NoteDroppedUpload(fullPath);
                     return;
                 }
 
-                if (!_pending.TryAdd(fullPath, new PendingUpload(_uploadPolicy, version)))
+                if (coalesced)
                 {
                     _logger.LogDebug("Artifact change coalesced with pending upload bytes={Bytes} session={SessionId} path={Path}", status.Length, _sessionId, fullPath);
                     return;
@@ -2181,9 +2214,19 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                             {
                                 // Release before checking: a watcher event coalesced with
                                 // the old entry must not strand a genuinely changed file.
-                                if (_pending.TryRemove(item.FullPath, out var finished) && !_cts.IsCancellationRequested
-                                    && HasChangedUploadVersion(item, finished.SnapshotVersion))
-                                    OnFileEvent(item.Type, item.FullPath, "changed-after-upload");
+                                if (_pending.TryRemove(item.FullPath, out var finished))
+                                {
+                                    if (finished.Completed)
+                                        ((ICollection<KeyValuePair<string, PendingUpload>>)_uploadBudgets).Remove(new(item.FullPath, finished));
+                                    if (!_cts.IsCancellationRequested)
+                                    {
+                                        // A deletion may precede a late failed ID/RPC
+                                        // observation; do not strand its capacity then.
+                                        if (!IsLiveRegularFile(item.Type, item.FullPath)) PruneMissingUploadBindings();
+                                        else if (HasChangedUploadVersion(item, finished.SnapshotVersion))
+                                            OnFileEvent(item.Type, item.FullPath, "changed-after-upload");
+                                    }
+                                }
                             }
                         }
 
@@ -2467,6 +2510,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         remote.CatalogArtifact = remote.CommittedArtifact;
                         _catalog[remote.LocalPath] = remote;
                         _uncertainUploads.TryRemove(fullPath, out _);
+                        _pending[fullPath].Completed = !changedDuringUpload;
                         // A file that changed while it was sent matches no uploaded version yet.
                         remote.MarkDownloaded(changedDuringUpload ? null : afterVersion);
                     }
@@ -2561,6 +2605,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         {
             public ArtifactUploadBudget Budget { get; } = new(policy);
             public SecureFileVersion? SnapshotVersion { get; set; } = version;
+            public bool Completed { get; set; }
         }
 
         private sealed class UploadSnapshotIdentity(string fingerprint, string uploadId, SecureFileVersion version)
@@ -2625,14 +2670,22 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             }
         }
 
-        private void PruneMissingUploadBindings()
+        private bool PruneMissingUploadBindings()
         {
+            var removed = false;
             foreach (var pair in _uncertainUploads)
             {
                 if (TryResolveArtifactPath(pair.Key, out var type, out _, out _)
                     && !IsLiveRegularFile(type, pair.Key))
-                    ((ICollection<KeyValuePair<string, UploadSnapshotIdentity>>)_uncertainUploads).Remove(pair);
+                    removed |= ((ICollection<KeyValuePair<string, UploadSnapshotIdentity>>)_uncertainUploads).Remove(pair);
             }
+            foreach (var pair in _uploadBudgets)
+            {
+                if (TryResolveArtifactPath(pair.Key, out var type, out _, out _)
+                    && !IsLiveRegularFile(type, pair.Key))
+                    removed |= ((ICollection<KeyValuePair<string, PendingUpload>>)_uploadBudgets).Remove(pair);
+            }
+            return removed;
         }
 
         private sealed class RemoteArtifactState

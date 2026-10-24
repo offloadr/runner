@@ -7,15 +7,16 @@ saved or rolled back a file.
 Each pending entry starts with a bounded setup allowance. Its elapsed clock
 starts at the first dequeue and continues through file checks, metadata, body,
 completion, response observation, I/O retries, requeue delay and time waiting
-behind other files after a retry. Initial queue wait is outside this delivery
-clock. Pending admission and Stop have separate bounds.
+behind other files after a retry. Automatic rescans of the unchanged version keep
+that same budget after its pending entry is removed. Initial queue wait is outside
+this delivery clock. Pending admission and Stop have separate bounds.
 
 | Boundary | Allowance | What renews it |
 | --- | --- | --- |
 | Metadata/setup for an attempt | Two minutes | A new attempt may start this phase; the elapsed ceiling stays fixed |
 | Body without progress | Two minutes | Completion of a positive-byte body write |
 | Stream completion and committed response | Two minutes together | Nothing within that phase |
-| Entire pending entry after first dequeue | Four minutes plus wire bytes divided by 256 KiB/s, rounded up to whole seconds | Nothing, including retries or progress |
+| Pending entry and automatic rescans of its unchanged version after first dequeue | Four minutes plus wire bytes divided by 256 KiB/s, rounded up to whole seconds | Nothing, including retries or progress |
 
 Size is bound once to the first securely opened snapshot, before its RPC. A
 watcher's initial empty or growing file length cannot size that transfer. For
@@ -37,6 +38,15 @@ Transient failures and changed-file retries retain their capped attempt count;
 all nested I/O attempts share the original elapsed ceiling. A later refresh can
 queue an unsaved file again, but an unchanged secure file snapshot retains its
 original opaque upload ID.
+
+Retained budgets have a separate bounded set of one entry per current path,
+including a timeout before upload-ID issuance. Its limit is the pending allowance
+plus the unacknowledged-snapshot allowance: 8,192 by default. New paths wait when
+that set is full; live failed versions are not evicted to admit them. Committed
+unchanged files release their budget. Deletion or rename notifications securely
+prune missing bindings and wake an owed scan. Inspection failures retain the
+binding. An explicit refresh may start a new elapsed allowance, while preserving
+an unchanged snapshot's issued ID and any permanent retirement result.
 
 An upload is recorded as saved only after a matching committed receipt. Expiry
 does not prove rollback: retry can recover an existing server publication. Stop
