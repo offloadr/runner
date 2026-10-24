@@ -67,3 +67,9 @@ Deterministic timer tests and token-aware controlled clients cover local policy
 semantics. Real TLS cancellation/backpressure, large ordinary/sealed transfer
 measurements, native runtime behavior and the complete release checklist require
 their own evidence.
+
+A failed attempt rechecks the secure file version before requeueing. A replacement
+gets a fresh pending delivery with its own retry count and elapsed allowance.
+The opened version is checked again before upload identity issuance, covering
+replacement after that queue check and during an inner I/O retry. Unchanged
+versions retain their original upload ID, retry count and elapsed deadline.

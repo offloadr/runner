@@ -2244,6 +2244,11 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         }
                         finally
                         {
+                            // A replacement is a new delivery, not another attempt
+                            // against the old snapshot's retry and elapsed limits.
+                            if (retry is not null && _pending.TryGetValue(item.FullPath, out var pending)
+                                && HasChangedUploadVersion(item, pending.SnapshotVersion))
+                                retry = null;
                             if (retry is not { } next || !_queue.Writer.TryWrite(next))
                             {
                                 // Release before checking: a watcher event coalesced with
@@ -2354,7 +2359,12 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     var snapshotWriteUtc = LinuxSecureDirectoryRoot.GetOpenFileStatus(stream.SafeFileHandle, relPath).LastWriteTimeUtc;
                     var snapshotVersion = LinuxSecureDirectoryRoot.GetOpenFileVersion(stream.SafeFileHandle, relPath)
                         ?? throw new IOException("Cannot capture the opened artifact file version.");
-                    _pending[fullPath].SnapshotVersion = snapshotVersion;
+                    var pending = _pending[fullPath];
+                    // A replacement can race the queue check or an inner I/O retry.
+                    // Keep the previous version so the worker admits it afresh.
+                    if (pending.SnapshotVersion is { } expected && expected != snapshotVersion)
+                        return null;
+                    pending.SnapshotVersion = snapshotVersion;
                     // A download can queue its watcher event before recording the
                     // published version. Recheck the opened file before issuance:
                     // readback is not a new upload, nor is our empty placeholder.
