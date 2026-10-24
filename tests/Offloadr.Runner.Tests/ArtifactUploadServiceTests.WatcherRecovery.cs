@@ -86,7 +86,7 @@ public partial class ArtifactUploadServiceTests
                     byte[] bytes = [4, 5, 6];
                     await File.WriteAllBytesAsync(Path.Combine(paths.OutputDirectory, filename), bytes);
                     using (var queued = new CancellationTokenSource(TimeSpan.FromSeconds(5)))
-                        while (service.PendingUploadCount != 2) await Task.Delay(10, queued.Token);
+                        while (service.GetPendingUploadCount("session-1") != 2) await Task.Delay(10, queued.Token);
                     listing.Artifacts.Add(new EditorArtifactMetadata
                     {
                         EditorSid = "editor-1", Type = "output", Filename = filename, SizeBytes = bytes.Length,
