@@ -2360,11 +2360,14 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     var snapshotVersion = LinuxSecureDirectoryRoot.GetOpenFileVersion(stream.SafeFileHandle, relPath)
                         ?? throw new IOException("Cannot capture the opened artifact file version.");
                     var pending = _pending[fullPath];
-                    // A replacement can race the queue check or an inner I/O retry.
-                    // Keep the previous version so the worker admits it afresh.
-                    if (pending.SnapshotVersion is { } expected && expected != snapshotVersion)
+                    // Created can arrive before the editor finishes writing. Bind
+                    // the first opened snapshot without moving it behind queued files.
+                    // Later replacements must receive a fresh delivery allowance.
+                    if (pending.HasOpenedSnapshot
+                        && pending.SnapshotVersion is { } expected && expected != snapshotVersion)
                         return null;
                     pending.SnapshotVersion = snapshotVersion;
+                    pending.HasOpenedSnapshot = true;
                     // A download can queue its watcher event before recording the
                     // published version. Recheck the opened file before issuance:
                     // readback is not a new upload, nor is our empty placeholder.
@@ -2655,6 +2658,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         {
             public ArtifactUploadBudget Budget { get; } = new(policy);
             public SecureFileVersion? SnapshotVersion { get; set; } = version;
+            public bool HasOpenedSnapshot { get; set; }
             public bool Completed { get; set; }
         }
 
