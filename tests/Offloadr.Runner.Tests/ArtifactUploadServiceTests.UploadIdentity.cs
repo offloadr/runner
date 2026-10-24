@@ -282,6 +282,59 @@ public partial class ArtifactUploadServiceTests
         finally { TryDelete(root); }
     }
 
+    [TestCase("object-key", 0)]
+    [TestCase("created", 0)]
+    [TestCase("digest", 0)]
+    [TestCase("unchanged", 3)]
+    public async Task ReturningCatalogEntryMustMatchTheSavedGenerationBeforeEviction(string change, long expectedReleased)
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = CreateEvictionPaths(root, sealedSession: true);
+            var path = Path.Combine(paths.OutputDirectory, "returning.bin");
+            byte[] content = [1, 2, 3];
+            var catalog = new RunnerArtifactServiceListArtifactsResponse();
+            EditorArtifactMetadata? committed = null;
+            var client = new FakeRunnerArtifactClient(catalog)
+            {
+                RewriteUploadArtifact = artifact =>
+                {
+                    artifact.ObjectKey = "original-object";
+                    artifact.CreatedUtc = Timestamp.FromDateTime(DateTime.UtcNow);
+                    committed = artifact.Clone();
+                    return artifact;
+                }
+            };
+            await using var service = new ArtifactUploadService("secret", client, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            await File.WriteAllBytesAsync(path, content);
+            await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            await WaitForIdentityUploadsToFinishAsync(service);
+            Assert.That(committed, Is.Not.Null);
+
+            // A temporarily missing catalog entry retains the local upload identity.
+            await service.SeedSessionAsync("session-1", "editor-1", "owner-1", null, CancellationToken.None);
+            Assert.That(client.IssuedIdentityCount, Is.EqualTo(1));
+            var returning = committed!.Clone();
+            switch (change)
+            {
+                case "object-key": returning.ObjectKey = "different-object"; break;
+                case "created": returning.CreatedUtc.Seconds++; break;
+                case "digest": returning.Sha256 = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(new byte[] { 4, 5, 6 })); break;
+            }
+            catalog.Artifacts.Add(returning);
+            await service.SeedSessionAsync("session-1", "editor-1", "owner-1", null, CancellationToken.None);
+            Assert.That(client.UploadCount, Is.EqualTo(1), "catalog refresh must not create a new upload");
+            Assert.That(service.EvictUploadedArtifacts("session-1", long.MaxValue, TimeSpan.Zero), Is.EqualTo(expectedReleased),
+                "old local bytes may be evicted only while their matching remote receipt is available");
+            if (expectedReleased == 0)
+                Assert.That(await File.ReadAllBytesAsync(path), Is.EqualTo(content));
+        }
+        finally { TryDelete(root); }
+    }
+
     [Test]
     public async Task RetiredUploadRemainsUnsavedWithoutReissuingIdentityOnRescan()
     {
