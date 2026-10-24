@@ -9,9 +9,10 @@ namespace Offloadr.Runner.Core;
 /// </summary>
 internal sealed class PromptCommandWorkSet(CancellationToken shutdown)
 {
-    private sealed class Work(SubmitPromptCommand command, CancellationToken shutdown)
+    private sealed class Work(SubmitPromptCommand command, bool streamsHttpResponse, CancellationToken shutdown)
     {
         public SubmitPromptCommand Command { get; } = command.Clone();
+        public PromptWorkIdentity Identity { get; } = PromptWorkIdentity.Capture(command, streamsHttpResponse);
         public CancellationTokenSource Cancellation { get; } = CancellationTokenSource.CreateLinkedTokenSource(shutdown);
         public CancellationTokenSource Demand { get; } = CancellationTokenSource.CreateLinkedTokenSource(shutdown);
         public TaskCompletionSource Completion { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -19,14 +20,14 @@ internal sealed class PromptCommandWorkSet(CancellationToken shutdown)
     }
 
     /// <summary>The model demand of an accepted prompt after its work ended.</summary>
-    private sealed record HeldDemand(SubmitPromptCommand Command, CancellationTokenSource Demand, Task Settling);
+    private sealed record HeldDemand(PromptWorkIdentity Identity, CancellationTokenSource Demand, Task Settling);
 
     private readonly object gate = new();
     private readonly Dictionary<string, Work> active = new(StringComparer.Ordinal);
     private readonly Dictionary<string, HeldDemand> held = new(StringComparer.Ordinal);
 
-    public bool Start(SubmitPromptCommand command, Func<SubmitPromptCommand, CancellationToken, Task> execute)
-        => Start(command, (captured, physical, _) => execute(captured, physical));
+    public bool Start(SubmitPromptCommand command, bool streamsHttpResponse, Func<SubmitPromptCommand, CancellationToken, Task> execute)
+        => Start(command, streamsHttpResponse, (captured, physical, _) => execute(captured, physical));
 
     /// <summary>
     /// Starts prompt work with two tokens: the physical one, cancelled by
@@ -34,14 +35,14 @@ internal sealed class PromptCommandWorkSet(CancellationToken shutdown)
     /// the demand one for the prompt's model demand once the runtime accepted it,
     /// cancelled only by <see cref="CancelAndWaitAsync"/> and <see cref="WithdrawDemand"/>.
     /// </summary>
-    public bool Start(SubmitPromptCommand command, Func<SubmitPromptCommand, CancellationToken, CancellationToken, Task> execute)
+    public bool Start(SubmitPromptCommand command, bool streamsHttpResponse, Func<SubmitPromptCommand, CancellationToken, CancellationToken, Task> execute)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(command.CommandId);
         Work work;
         lock (gate)
         {
             if (active.ContainsKey(command.CommandId)) return false;
-            work = new(command, shutdown);
+            work = new(command, streamsHttpResponse, shutdown);
             active.Add(command.CommandId, work);
         }
         _ = RunAsync(work, execute);
@@ -66,31 +67,31 @@ internal sealed class PromptCommandWorkSet(CancellationToken shutdown)
     /// Cancels physical work. A runtime interrupt stops only the prompt it is
     /// executing, so accepted prompts that wait in its queue keep their demand.
     /// </summary>
-    public void Cancel(Func<SubmitPromptCommand, bool> matches)
+    public void Cancel(Func<PromptWorkIdentity, bool> matches)
     {
         lock (gate)
-            foreach (var work in active.Values.Where(work => matches(work.Command)).ToArray())
+            foreach (var work in active.Values.Where(work => matches(work.Identity)).ToArray())
                 work.Cancellation.Cancel();
     }
 
-    public void WithdrawDemand(Func<SubmitPromptCommand, bool> matches)
+    public void WithdrawDemand(Func<PromptWorkIdentity, bool> matches)
     {
         CancellationTokenSource[] demands;
         lock (gate)
-            demands = active.Values.Where(work => matches(work.Command)).Select(work => work.Demand)
-                .Concat(held.Values.Where(demand => matches(demand.Command)).Select(demand => demand.Demand))
+            demands = active.Values.Where(work => matches(work.Identity)).Select(work => work.Demand)
+                .Concat(held.Values.Where(demand => matches(demand.Identity)).Select(demand => demand.Demand))
                 .ToArray();
         CancelDemands(demands);
     }
 
-    public Task CancelAndWaitAsync(Func<SubmitPromptCommand, bool> matches)
+    public Task CancelAndWaitAsync(Func<PromptWorkIdentity, bool> matches)
     {
         Task[] tasks;
         CancellationTokenSource[] heldDemands;
         lock (gate)
         {
-            var matching = active.Values.Where(work => matches(work.Command)).ToArray();
-            var matchingHeld = held.Values.Where(demand => matches(demand.Command)).ToArray();
+            var matching = active.Values.Where(work => matches(work.Identity)).ToArray();
+            var matchingHeld = held.Values.Where(demand => matches(demand.Identity)).ToArray();
             tasks = matching.Select(work => work.Completion.Task)
                 .Concat(matchingHeld.Select(demand => demand.Settling))
                 .ToArray();
@@ -129,7 +130,7 @@ internal sealed class PromptCommandWorkSet(CancellationToken shutdown)
         {
             // Native payloads and transport exceptions can contain protected data.
             // The durable receipt retains uncertainty; logs need only a diagnostic.
-            RunnerLog.Warning(nameof(PromptCommandWorkSet), $"Prompt work {work.Command.CommandId} ended with {ex.GetType().Name}; recover its retained receipt.");
+            RunnerLog.Warning(nameof(PromptCommandWorkSet), $"Prompt work {work.Identity.CommandId} ended with {ex.GetType().Name}; recover its retained receipt.");
         }
         finally
         {
@@ -137,13 +138,13 @@ internal sealed class PromptCommandWorkSet(CancellationToken shutdown)
             HeldDemand? replaced = null;
             lock (gate)
             {
-                active.Remove(work.Command.CommandId);
+                active.Remove(work.Identity.CommandId);
                 work.Cancellation.Dispose();
                 if (work.HeldDemand is { IsCompleted: false } settling)
                 {
-                    holding = new(work.Command, work.Demand, settling);
-                    held.Remove(work.Command.CommandId, out replaced);
-                    held.Add(work.Command.CommandId, holding);
+                    holding = new(work.Identity, work.Demand, settling);
+                    held.Remove(work.Identity.CommandId, out replaced);
+                    held.Add(work.Identity.CommandId, holding);
                 }
                 else
                 {
@@ -166,8 +167,8 @@ internal sealed class PromptCommandWorkSet(CancellationToken shutdown)
     {
         lock (gate)
         {
-            if (held.TryGetValue(demand.Command.CommandId, out var current) && ReferenceEquals(current, demand))
-                held.Remove(demand.Command.CommandId);
+            if (held.TryGetValue(demand.Identity.CommandId, out var current) && ReferenceEquals(current, demand))
+                held.Remove(demand.Identity.CommandId);
         }
         demand.Demand.Dispose();
     }

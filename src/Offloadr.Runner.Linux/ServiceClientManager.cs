@@ -1530,7 +1530,7 @@ internal static class ServiceClientManager
                                         ComfyRuntimeRoutes.IsGlobalInterrupt(request.Path, request.Body.Span))
                                     {
                                         commandWorkState.Prompts.Cancel(prompt =>
-                                            TargetsPromptRuntime(request, prompt) && !ShouldStreamHttpResponse(prompt));
+                                            TargetsPromptRuntime(request, prompt) && !prompt.StreamsHttpResponse);
                                     }
                                 },
                                 token,
@@ -1548,7 +1548,7 @@ internal static class ServiceClientManager
                     if (evt.SubmitPrompt != null && !string.IsNullOrWhiteSpace(evt.SubmitPrompt.SessionId))
                     {
                         var prompt = evt.SubmitPrompt;
-                        commandWorkState.Prompts.Start(prompt, (captured, physicalCancellation, demandCancellation) =>
+                        commandWorkState.Prompts.Start(prompt, ShouldStreamHttpResponse(prompt), (captured, physicalCancellation, demandCancellation) =>
                         {
                             return HandleSubmitEditorActionAsync(
                             (ack, acknowledgementCancellation) =>
@@ -1589,10 +1589,8 @@ internal static class ServiceClientManager
                             shutdown,
                             sessionEventRelay.UnregisterUninvokedSubmission,
                             demandCancellation,
-                            async (promptId, token) => (await sessionManager.ReadComfyPromptQueueAsync(
-                                captured.SessionId,
-                                new RuntimeIdentity(captured.Target.GpuGeneration, captured.Target.RuntimeEpoch, captured.Target.RuntimeInstanceId),
-                                token).ConfigureAwait(false))?.Contains(promptId),
+                            CreatePromptQueueProbe(sessionManager.ReadComfyPromptQueueAsync, captured.SessionId,
+                                new RuntimeIdentity(captured.Target.GpuGeneration, captured.Target.RuntimeEpoch, captured.Target.RuntimeInstanceId)),
                             settling => commandWorkState.Prompts.HoldDemand(captured.CommandId, settling));
                         });
                     }
@@ -2586,10 +2584,9 @@ internal static class ServiceClientManager
         return deps.GetTrackedRuntime(command.SessionId) is not { } tracked || tracked.SameRuntime(target);
     }
 
-    private static bool PromptTargetsRuntime(SubmitPromptCommand prompt, string sessionId, RuntimeIdentity runtimeIdentity)
+    private static bool PromptTargetsRuntime(PromptWorkIdentity prompt, string sessionId, RuntimeIdentity runtimeIdentity)
         => string.Equals(prompt.SessionId, sessionId, StringComparison.Ordinal) &&
-           prompt.Target is { } target &&
-           new RuntimeIdentity(target.GpuGeneration, target.RuntimeEpoch, target.RuntimeInstanceId).SameRuntime(runtimeIdentity);
+           prompt.Runtime is { } runtime && runtime.SameRuntime(runtimeIdentity);
 
     /// <summary>
     /// Stops and cleans up a session only while its tracked child is the expected
@@ -3603,7 +3600,7 @@ internal static class ServiceClientManager
             keepPromptDemand,
             promptDemandLifetime,
             isPromptQueued is not null && !string.IsNullOrWhiteSpace(acceptedPromptId)
-                ? token => isPromptQueued(acceptedPromptId!, token)
+                ? BindPromptQueueProbe(isPromptQueued, acceptedPromptId!)
                 : null);
         if (holdPromptDemand is not null && !settling.IsCompleted)
         {
@@ -3615,6 +3612,16 @@ internal static class ServiceClientManager
 
         await settling.ConfigureAwait(false);
     }
+
+    // These factories isolate the settling callbacks from the full command closure.
+    private static Func<string, CancellationToken, Task<bool?>> CreatePromptQueueProbe(
+        Func<string, RuntimeIdentity, CancellationToken, Task<ComfyPromptQueue?>> readQueue,
+        string sessionId, RuntimeIdentity runtime)
+        => async (promptId, token) => (await readQueue(sessionId, runtime, token).ConfigureAwait(false))?.Contains(promptId);
+
+    private static Func<CancellationToken, Task<bool?>> BindPromptQueueProbe(
+        Func<string, CancellationToken, Task<bool?>> probe, string promptId)
+        => token => probe(promptId, token);
 
     private static async Task SettleAndReleasePromptDemandAsync(
         Task? demand,
@@ -3753,18 +3760,18 @@ internal static class ServiceClientManager
         }
     }
 
-    internal static bool IsFinishedPrompt(SubmitPromptCommand prompt, ComfySessionEventRelay.PromptTerminalEvent finished)
+    internal static bool IsFinishedPrompt(PromptWorkIdentity prompt, ComfySessionEventRelay.PromptTerminalEvent finished)
         => PromptTargetsRuntime(prompt, finished.SessionId, finished.Runtime)
            && (!string.IsNullOrEmpty(finished.PromptId)
-               && string.Equals(prompt.NativeIdentifiers?.PromptId, finished.PromptId, StringComparison.Ordinal)
+               && string.Equals(prompt.NativePromptId, finished.PromptId, StringComparison.Ordinal)
                || finished.SubmissionId is not null
                && string.Equals(prompt.SubmissionId, finished.SubmissionId, StringComparison.Ordinal));
 
-    internal static bool TargetsPromptRuntime(RelayEditorRuntimeRequestCommand request, SubmitPromptCommand prompt)
-        => prompt.Target is { } target && request.LifecycleGeneration > 0 && request.RuntimeEpoch > 0
+    internal static bool TargetsPromptRuntime(RelayEditorRuntimeRequestCommand request, PromptWorkIdentity prompt)
+        => prompt.Runtime is { } target && request.LifecycleGeneration > 0 && request.RuntimeEpoch > 0
             && Guid.TryParse(request.SessionId, out var session) && session != Guid.Empty
             && Guid.TryParse(prompt.SessionId, out var promptSession) && session == promptSession
-            && request.LifecycleGeneration == target.GpuGeneration && request.RuntimeEpoch == target.RuntimeEpoch
+            && request.LifecycleGeneration == target.LifecycleGeneration && request.RuntimeEpoch == target.RuntimeEpoch
             && Guid.TryParse(request.RuntimeInstanceId, out var instance) && instance != Guid.Empty
             && Guid.TryParse(target.RuntimeInstanceId, out var promptInstance) && instance == promptInstance;
 

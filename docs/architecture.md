@@ -11,6 +11,22 @@ protocol error, rather than a silent successful return. Recovery-only command
 lifetimes, local memory and spool cleanup still require their own finite retention enforcement; this check alone
 does not establish complete data deletion.
 
+## Prompt model-demand identity
+
+Physical prompt execution owns a cloned command. Cancellation and model-demand
+tracking use a separate immutable identity: command, session, submission, native
+prompt and exact GPU runtime, plus the response-stream classification. Once
+execution hands off its acknowledgement, held demand retains that identity and
+its cancellation/settling tasks. It does not retain the command or prompt body.
+Queue probes capture only the queue reader, session/runtime and accepted prompt
+ID, independently from the command callback's closure.
+
+An accepted prompt keeps model demand while queued or while its queue cannot be
+read. Terminal withdrawal, Stop, replacement and shutdown keep their existing
+ownership and joining rules. This change releases these runner-owned references;
+it does not erase native queues/history, framework buffers or operating-system
+memory, or establish a retention policy for every other copy.
+
 ## Purpose
 
 The runner executes GPU work for the Offloadr control plane. It connects out to the control plane over gRPC, authenticated by a runner key, and never exposes an inbound port. One runner serves one editor session at a time.

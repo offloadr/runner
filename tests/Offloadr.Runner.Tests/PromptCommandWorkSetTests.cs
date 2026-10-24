@@ -1,9 +1,95 @@
+using System.Runtime.CompilerServices;
 using Offloadr.Runner.V1;
 
 namespace Offloadr.Runner.Tests;
 
 public sealed class PromptCommandWorkSetTests
 {
+    [Test]
+    public async Task HeldModelDemandDoesNotRetainCompletedCommandOrPromptBody()
+    {
+        var work = new PromptCommandWorkSet(CancellationToken.None);
+        var settling = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var (command, body, demand) = StartHeldDemand(work, settling.Task);
+        try
+        {
+            Assert.That(demand.IsCancellationRequested, Is.False);
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+            Assert.Multiple(() =>
+            {
+                Assert.That(command.TryGetTarget(out _), Is.False, "Settling model demand must release the completed command.");
+                Assert.That(body.TryGetTarget(out _), Is.False, "Settling model demand must release the prompt body.");
+            });
+            work.WithdrawDemand(identity => identity.CommandId == "held-body");
+            Assert.That(demand.IsCancellationRequested, Is.True, "Identity still permits terminal withdrawal.");
+        }
+        finally
+        {
+            settling.TrySetResult();
+            await work.CancelAndWaitAsync(_ => true).WaitAsync(TimeSpan.FromSeconds(2));
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static (WeakReference<SubmitPromptCommand>, WeakReference<string>, CancellationToken) StartHeldDemand(
+        PromptCommandWorkSet work, Task settling)
+    {
+        WeakReference<SubmitPromptCommand>? command = null;
+        WeakReference<string>? body = null;
+        CancellationToken demand = default;
+        Assert.That(work.Start(new() { CommandId = "held-body", SessionId = "synthetic-session", PromptJson = new string('x', 65536) }, false,
+            (captured, _, token) =>
+            {
+                command = new(captured);
+                body = new(captured.PromptJson);
+                demand = token;
+                work.HoldDemand(captured.CommandId, settling);
+                return Task.CompletedTask;
+            }), Is.True);
+        return (command!, body!, demand);
+    }
+
+    [Test]
+    public async Task HeldDemandWithdrawalPreservesTheOtherRuntime()
+    {
+        var work = new PromptCommandWorkSet(CancellationToken.None);
+        var tokens = new Dictionary<ulong, CancellationToken>();
+        var instance = Guid.NewGuid().ToString("n");
+        try
+        {
+            foreach (var epoch in new ulong[] { 1, 2 })
+            {
+                var command = new SubmitPromptCommand
+                {
+                    CommandId = "command-" + epoch,
+                    SessionId = "session",
+                    SubmissionId = "submission-" + epoch,
+                    Target = new() { GpuGeneration = 1, RuntimeEpoch = epoch, RuntimeInstanceId = instance },
+                };
+                Assert.That(work.Start(command, false, (captured, _, demand) =>
+                {
+                    tokens[epoch] = demand;
+                    work.HoldDemand(captured.CommandId, Task.Delay(Timeout.Infinite, demand).ContinueWith(_ => { }));
+                    return Task.CompletedTask;
+                }), Is.True);
+                command.Target.RuntimeEpoch = 99;
+            }
+
+            await work.CancelAndWaitAsync(identity => identity.SessionId == "session"
+                && identity.Runtime is { RuntimeEpoch: 1 }).WaitAsync(TimeSpan.FromSeconds(2));
+            Assert.That(tokens[1].IsCancellationRequested, Is.True);
+            Assert.That(tokens[2].IsCancellationRequested, Is.False);
+            work.WithdrawDemand(identity => identity.SubmissionId == "submission-2");
+            Assert.That(tokens[2].IsCancellationRequested, Is.True);
+        }
+        finally
+        {
+            await work.CancelAndWaitAsync(_ => true).WaitAsync(TimeSpan.FromSeconds(2));
+        }
+    }
+
     [Test]
     public async Task RepeatedDeliveryCannotStartASecondPhysicalRequest()
     {
@@ -13,7 +99,7 @@ public sealed class PromptCommandWorkSetTests
         var command = new SubmitPromptCommand { CommandId = Guid.NewGuid().ToString("n"), SessionId = "original" };
         var calls = 0;
         string? capturedSession = null;
-        Assert.That(work.Start(command, async (captured, _) =>
+        Assert.That(work.Start(command, false, async (captured, _) =>
         {
             calls++;
             started.SetResult();
@@ -21,7 +107,7 @@ public sealed class PromptCommandWorkSetTests
             capturedSession = captured.SessionId;
         }), Is.True);
         await started.Task.WaitAsync(TimeSpan.FromSeconds(2));
-        Assert.That(work.Start(command, (_, _) => { calls++; return Task.CompletedTask; }), Is.False);
+        Assert.That(work.Start(command, false, (_, _) => { calls++; return Task.CompletedTask; }), Is.False);
         command.SessionId = "replacement";
         release.SetResult();
         await work.CancelAndWaitAsync(_ => true);
@@ -40,7 +126,7 @@ public sealed class PromptCommandWorkSetTests
         CancellationToken demandToken = default;
         var settled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var commandEnded = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        Assert.That(work.Start(command, (captured, _, demand) =>
+        Assert.That(work.Start(command, false, (captured, _, demand) =>
         {
             demandToken = demand;
             var settling = Task.Delay(Timeout.Infinite, demand).ContinueWith(_ => settled.SetResult());
@@ -51,7 +137,7 @@ public sealed class PromptCommandWorkSetTests
         await commandEnded.Task.WaitAsync(TimeSpan.FromSeconds(2));
 
         var recovered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        await WaitUntilStartedAsync(() => work.Start(command, (_, _) =>
+        await WaitUntilStartedAsync(() => work.Start(command, false, (_, _) =>
         {
             recovered.TrySetResult();
             return Task.CompletedTask;
@@ -86,7 +172,7 @@ public sealed class PromptCommandWorkSetTests
         var tokens = new Dictionary<string, (CancellationToken Physical, CancellationToken Demand)>();
         var entered = new CountdownEvent(2);
         foreach (var name in new[] { "queued", "finished" })
-            Assert.That(work.Start(new() { CommandId = name, SessionId = "session" }, async (_, physical, demand) =>
+            Assert.That(work.Start(new() { CommandId = name, SessionId = "session" }, false, async (_, physical, demand) =>
             {
                 lock (tokens) tokens[name] = (physical, demand);
                 entered.Signal();
@@ -124,7 +210,7 @@ public sealed class PromptCommandWorkSetTests
         var entered = new CountdownEvent(2);
         var cancelled = new CountdownEvent(2);
         foreach (var name in new[] { "generation", "stream-reader" })
-            Assert.That(work.Start(new() { CommandId = name, SessionId = "old" }, async (_, token) =>
+            Assert.That(work.Start(new() { CommandId = name, SessionId = "old" }, false, async (_, token) =>
             {
                 entered.Signal();
                 try { await Task.Delay(Timeout.Infinite, token); }
@@ -145,7 +231,7 @@ public sealed class PromptCommandWorkSetTests
         var work = new PromptCommandWorkSet(CancellationToken.None);
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         CancellationToken captured = default;
-        work.Start(new() { CommandId = "current", SessionId = "new" }, async (_, token) => { captured = token; await release.Task; });
+        work.Start(new() { CommandId = "current", SessionId = "new" }, false, async (_, token) => { captured = token; await release.Task; });
         await work.CancelAndWaitAsync(command => command.SessionId == "old");
         Assert.That(captured.IsCancellationRequested, Is.False);
         release.SetResult();
