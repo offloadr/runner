@@ -19,6 +19,15 @@ The Offloadr control plane implements the server side of these services, so a co
 2. Keep the seven shared protobuf definitions identical on both sides and regenerate every affected consumer. The platform is pre-deployment: change the current protocol directly, without legacy layouts or compatibility shims.
 3. Release the coordinated runner and control-plane changes together. Schema declarations alone do not mean the corresponding behavior is implemented.
 
+## Progress recovery projection
+
+`FindForgeEditorActionsRequest.progress_only` selects a bounded progress read.
+Its response uses `ForgeProgressRecovery`, with status facts, database read timing,
+the selected native progress evidence and its original expiry. This projection
+omits full invocation and SSE bodies. It does not grant execution, renew retention
+or turn HTTP acceptance into generation completion. The runner declares the shared
+schema; these editor-facing reads are served by the control plane.
+
 ## Current Stop identity
 
 Every Stop requires a nonempty UUID `command_id` (field 3). Its acknowledgement echoes the captured nonce and the registered runner process in string `instance_id` (field 4). Acknowledgement fields 5–7 echo lifecycle generation, runtime epoch and runtime instance when supplied. Invalid command or missing process identity never enters cleanup. Acknowledgements retry the captured result after cleanup; failed cleanup or host shutdown never acknowledges success.
