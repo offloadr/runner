@@ -705,4 +705,87 @@ public partial class ArtifactUploadServiceTests
             TryDelete(root);
         }
     }
+
+    [TestCase(false), NonParallelizable]
+    [TestCase(true)]
+    public async Task OversizedReplacementsReleaseObsoleteSnapshotBindings(bool hasUploadIdentity)
+    {
+        var root = CreateTempDirectory();
+        var previousLimit = ArtifactUploadService.MaxPendingUploads;
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
+        {
+            ArtifactUploadService.MaxPendingUploads = 1;
+            var paths = UploadIdentityPaths(root);
+            var clock = new ArtifactUploadBudgetTests.UploadClock();
+            var client = new FakeRunnerArtifactClient(new())
+            {
+                RejectAsRetiredUpload = hasUploadIdentity,
+                IssueIdentityGate = hasUploadIdentity ? null : release.Task,
+            };
+            var logger = new ListLogger<ArtifactUploadService>();
+            var policy = new ArtifactUploadPolicy
+            {
+                Clock = clock,
+                MaximumUnacknowledgedSnapshots = 1,
+                MetadataTimeout = TimeSpan.FromSeconds(2),
+                NoProgressTimeout = TimeSpan.FromSeconds(2),
+                ReceiptTimeout = TimeSpan.FromSeconds(2),
+            };
+            await using var service = new ArtifactUploadService("secret", client, logger, uploadPolicy: policy);
+            try
+            {
+                await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+                await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+                var retainedCount = hasUploadIdentity ? 1 : 2;
+                for (var index = 0; index < retainedCount; index++)
+                {
+                    var ready = Path.Combine(root, $"ready-{index}.bin");
+                    await File.WriteAllBytesAsync(ready, [1, 2, 3]);
+                    File.Move(ready, Path.Combine(paths.OutputDirectory, $"failed-{index}.bin"));
+                    if (hasUploadIdentity) await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+                    else
+                    {
+                        using var issued = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                        while (client.IssuedIdentityCount < index + 1) await Task.Delay(10, issued.Token);
+                        clock.Advance(TimeSpan.FromSeconds(6));
+                    }
+                    await WaitForIdentityUploadsToFinishAsync(service);
+                }
+
+                for (var index = 0; index < retainedCount; index++)
+                {
+                    var replacement = Path.Combine(root, $"oversized-{index}.bin");
+                    await using (var sparse = File.OpenWrite(replacement)) sparse.SetLength(ArtifactUploadService.MaxUploadBytes + 1);
+                    var path = Path.Combine(paths.OutputDirectory, $"failed-{index}.bin");
+                    File.Move(replacement, path, overwrite: true);
+                    await WaitForUploadLogAsync(logger, $"path={path} bytes={ArtifactUploadService.MaxUploadBytes + 1}");
+                }
+                client.RejectAsRetiredUpload = false;
+                release.TrySetResult();
+                var valid = Path.Combine(root, "ready-valid.bin");
+                await File.WriteAllBytesAsync(valid, [4, 5, 6]);
+                File.Move(valid, Path.Combine(paths.OutputDirectory, "valid.bin"));
+                CapturedUpload upload;
+                try { upload = await client.WaitForUploadAsync(TimeSpan.FromSeconds(5)); }
+                catch
+                {
+                    foreach (var entry in logger.Snapshot()) TestContext.Out.WriteLine(entry.Message);
+                    TestContext.Out.WriteLine($"Oversized replacements rejected; retained={retainedCount}; issued={client.IssuedIdentityCount}; uploads={client.UploadCount}");
+                    throw;
+                }
+                Assert.That(upload.Metadata!.Filename, Is.EqualTo("valid.bin"));
+                Assert.That(upload.Payload, Is.EqualTo(new byte[] { 4, 5, 6 }));
+                await WaitForIdentityUploadsToFinishAsync(service);
+                Assert.That(client.IssuedIdentityCount, Is.EqualTo(retainedCount + 1), "Oversized replacements must not receive another identity.");
+                Assert.That(client.UploadCount, Is.EqualTo(hasUploadIdentity ? 2 : 1));
+            }
+            finally { release.TrySetResult(); }
+        }
+        finally
+        {
+            ArtifactUploadService.MaxPendingUploads = previousLimit;
+            TryDelete(root);
+        }
+    }
 }
