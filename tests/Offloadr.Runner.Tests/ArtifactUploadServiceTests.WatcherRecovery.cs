@@ -28,7 +28,7 @@ public partial class ArtifactUploadServiceTests
             {
                 if (Volatile.Read(ref uploads) > 1) clock.Advance(TimeSpan.FromSeconds(2));
             };
-            await using var service = new ArtifactUploadService("secret", client,
+            await using var service = new ArtifactUploadService("secret", client, new ListLogger<ArtifactUploadService>(),
                 uploadPolicy: new ArtifactUploadPolicy
                 {
                     Clock = clock,
