@@ -598,6 +598,46 @@ public partial class ArtifactUploadServiceTests
     }
 
     [Test, NonParallelizable]
+    public async Task FilesGrowingBeyondTheUploadLimitReleaseTheirRetainedBudgetCapacity()
+    {
+        var root = CreateTempDirectory();
+        var previousLimit = ArtifactUploadService.MaxPendingUploads;
+        try
+        {
+            ArtifactUploadService.MaxPendingUploads = 1;
+            var paths = UploadIdentityPaths(root);
+            var client = new FakeRunnerArtifactClient(new());
+            var logger = new ListLogger<ArtifactUploadService>();
+            await using var service = new ArtifactUploadService("secret", client, logger,
+                uploadPolicy: new ArtifactUploadPolicy { MaximumUnacknowledgedSnapshots = 1 });
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            for (var index = 0; index < 2; index++)
+            {
+                var path = Path.Combine(paths.OutputDirectory, $"too-large-{index}.bin");
+                await File.WriteAllBytesAsync(path, []);
+                await WaitForUploadLogAsync(logger, $"path={path} bytes=0");
+                await using (var file = File.OpenWrite(path)) file.SetLength(ArtifactUploadService.MaxUploadBytes + 1);
+                await WaitForUploadLogAsync(logger, $"path={path} bytes={ArtifactUploadService.MaxUploadBytes + 1}");
+                await WaitForIdentityUploadsToFinishAsync(service);
+            }
+            var completed = Path.Combine(root, "completed-valid.bin");
+            await File.WriteAllBytesAsync(completed, [1, 2, 3]);
+            File.Move(completed, Path.Combine(paths.OutputDirectory, "valid.bin"));
+            var upload = await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            Assert.That(upload.Metadata!.Filename, Is.EqualTo("valid.bin"),
+                "Oversized snapshots must not consume the entire retained-budget set.");
+            await WaitForIdentityUploadsToFinishAsync(service);
+            Assert.That(client.IssuedIdentityCount, Is.EqualTo(1), "Oversized files receive no upload identity.");
+        }
+        finally
+        {
+            ArtifactUploadService.MaxPendingUploads = previousLimit;
+            TryDelete(root);
+        }
+    }
+
+    [Test, NonParallelizable]
     public async Task ExhaustionBeforeIdentityIssuanceRemainsBoundedAndMissingFilesReleaseItsCapacity()
     {
         var root = CreateTempDirectory();

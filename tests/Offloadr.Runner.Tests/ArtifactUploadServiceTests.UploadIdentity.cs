@@ -335,6 +335,63 @@ public partial class ArtifactUploadServiceTests
         finally { TryDelete(root); }
     }
 
+    [TestCase("object-key")]
+    [TestCase("digest")]
+    [TestCase("size")]
+    public async Task ChangedCatalogRescanCannotRestoreSavingAuthorityFromAHistoricalReceipt(string change)
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = CreateEvictionPaths(root, sealedSession: true);
+            var path = Path.Combine(paths.OutputDirectory, "changed-catalog.bin");
+            byte[] content = [1, 2, 3];
+            var catalog = new RunnerArtifactServiceListArtifactsResponse();
+            EditorArtifactMetadata? committed = null;
+            var client = new FakeRunnerArtifactClient(catalog)
+            {
+                RewriteUploadArtifact = artifact =>
+                {
+                    if (committed is null)
+                    {
+                        artifact.ObjectKey = "original-object";
+                        artifact.CreatedUtc = Timestamp.FromDateTime(DateTime.UtcNow.AddMinutes(-2));
+                        committed = artifact.Clone();
+                    }
+                    // Exact duplicate uploads return their original immutable receipt.
+                    return committed.Clone();
+                }
+            };
+            await using var service = new ArtifactUploadService("secret", client, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            await File.WriteAllBytesAsync(path, content);
+            await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            await WaitForIdentityUploadsToFinishAsync(service);
+            var replacement = committed!.Clone();
+            switch (change)
+            {
+                case "object-key": replacement.ObjectKey = "replacement-object"; break;
+                case "digest": replacement.Sha256 = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(new byte[] { 4, 5, 6 })); break;
+                case "size": replacement.SizeBytes++; break;
+            }
+            catalog.Artifacts.Add(replacement);
+            await service.RefreshSessionAsync("session-1");
+            await WaitForIdentityUploadsToFinishAsync(service);
+            var released = service.EvictUploadedArtifacts("session-1", long.MaxValue, TimeSpan.Zero);
+            TestContext.Out.WriteLine($"Uploads after changed catalog rescan: {client.UploadCount}; released bytes: {released}");
+            Assert.Multiple(() =>
+            {
+                Assert.That(released, Is.Zero, "The historical publication cannot authorize eviction against a replacement catalog item.");
+                Assert.That(new FileInfo(path).Length, Is.EqualTo(content.Length));
+                Assert.That(client.UploadCount, Is.EqualTo(1), "A rescan must not replay or reissue an unchanged saved snapshot.");
+                Assert.That(client.IssuedIdentityCount, Is.EqualTo(1));
+            });
+            Assert.That(await service.StopSessionAsync("session-1"), Is.EqualTo(1));
+        }
+        finally { TryDelete(root); }
+    }
+
     [Test]
     public async Task RetiredUploadRemainsUnsavedWithoutReissuingIdentityOnRescan()
     {
