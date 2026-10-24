@@ -112,7 +112,9 @@ snapshot through retries, queue removal and catalog refresh. The bounded uncerta
 snapshot set applies visible backpressure rather than forgetting an old ID. Remote
 deletion preserves the live file's last acknowledged binding while disabling its
 eviction/readback promise. Missing-path watcher events release retained capacity
-and wake owed scans. A separate bounded set keeps elapsed budgets across automatic
+and wake owed scans, including replacement of an entire output/temp root. Only
+bindings beneath the event path receive filesystem inspection. Catalog readbacks
+release their queued budgets. A separate bounded set keeps elapsed budgets across automatic
 rescans, including failures before ID issuance; only a changed version or explicit
 later refresh starts a new allowance. See [upload identity and retirement](artifact-upload-receipts.md).
 

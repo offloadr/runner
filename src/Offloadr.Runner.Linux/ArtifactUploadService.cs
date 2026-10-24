@@ -868,6 +868,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         {
                             UnregisterArtifactWatcher(deletedType, "root-deleted");
                         }
+                        if (PruneMissingUploadBindings(fullPath)) RescanIfOwed();
                     }
                     return;
                 }
@@ -876,8 +877,10 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 {
                     if (TryGetArtifactRootType(fullPath, out var createdType))
                     {
+                        PruneMissingUploadBindings(fullPath);
                         RegisterArtifactWatcher(GetArtifactRootPath(createdType), createdType);
                         EnqueueExistingFiles(GetArtifactRootPath(createdType), createdType);
+                        RescanIfOwed();
                     }
                     return;
                 }
@@ -890,12 +893,15 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         {
                             UnregisterArtifactWatcher(oldType, "root-moved-or-deleted");
                         }
+                        if (PruneMissingUploadBindings(oldFullPath)) RescanIfOwed();
                     }
 
                     if (TryGetArtifactRootType(fullPath, out var newType))
                     {
+                        PruneMissingUploadBindings(fullPath);
                         RegisterArtifactWatcher(GetArtifactRootPath(newType), newType);
                         EnqueueExistingFiles(GetArtifactRootPath(newType), newType);
+                        RescanIfOwed();
                     }
                 }
             }
@@ -981,10 +987,10 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
         private void OnArtifactWatcherEvent(string type, string root, WatcherChangeTypes changeType, string fullPath, string? oldFullPath = null)
         {
-            // A directory event can retire several exact old paths. Inspect the
-            // bounded sets securely; a failed inspection never proves removal.
+            // Inspect only bindings beneath this event's old path. Unrelated
+            // snapshots do not incur secure filesystem opens on each callback.
             if (changeType is WatcherChangeTypes.Deleted or WatcherChangeTypes.Renamed
-                && PruneMissingUploadBindings())
+                && PruneMissingUploadBindings(changeType == WatcherChangeTypes.Renamed ? oldFullPath ?? fullPath : fullPath))
                 RescanIfOwed();
 
             try
@@ -2223,7 +2229,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                                     {
                                         // A deletion may precede a late failed ID/RPC
                                         // observation; do not strand its capacity then.
-                                        if (!IsLiveRegularFile(item.Type, item.FullPath)) PruneMissingUploadBindings();
+                                        if (!IsLiveRegularFile(item.Type, item.FullPath)) PruneMissingUploadBindings(item.FullPath);
                                         else if (HasChangedUploadVersion(item, finished.SnapshotVersion))
                                             OnFileEvent(item.Type, item.FullPath, "changed-after-upload");
                                     }
@@ -2329,7 +2335,12 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     {
                         if (_catalog.TryGetValue(fullPath, out var known)
                             && (known.AccountsFor(snapshotVersion) || known.PlaceholderVersion == snapshotVersion))
+                        {
+                            // Catalog recognition is completed work, not a failed
+                            // file version whose budget must survive future scans.
+                            _pending[fullPath].Completed = true;
                             return null;
+                        }
                     }
                     if (sizeBytes > MaxUploadBytes)
                     {
@@ -2656,13 +2667,19 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
         private bool IsLiveRegularFile(string type, string path, SecureFileVersion? expectedVersion = null)
         {
-            if (!TryResolveSecureLocation(type, path, out var root, out var relative)) return false;
+            if (!TryResolveSecureLocation(type, path, out var root, out _)) return false;
             try
             {
-                using var directory = new LinuxSecureDirectoryRoot(root);
+                // Open the trusted parent so a missing output/temp root is an
+                // inspectable missing component, rather than an ambiguous open
+                // failure. All descendants remain descriptor-relative/no-follow.
+                var parent = Path.GetDirectoryName(root);
+                if (string.IsNullOrEmpty(parent)) return true;
+                using var directory = new LinuxSecureDirectoryRoot(parent);
+                var fromParent = Path.GetRelativePath(parent, path);
                 return expectedVersion is { } expected
-                    ? directory.GetVersion(relative) == expected
-                    : directory.GetStatus(relative).IsRegularFile;
+                    ? directory.GetVersion(fromParent) == expected
+                    : directory.GetStatus(fromParent).IsRegularFile;
             }
             catch (Exception error) when (error is IOException or UnauthorizedAccessException)
             {
@@ -2671,18 +2688,22 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             }
         }
 
-        private bool PruneMissingUploadBindings()
+        private bool PruneMissingUploadBindings(string? affectedPath = null)
         {
+            var normalized = affectedPath is null ? null : NormalizePath(affectedPath).TrimEnd(Path.DirectorySeparatorChar);
+            var prefix = normalized + Path.DirectorySeparatorChar;
+            bool Affected(string path) => normalized is null || path.Equals(normalized, StringComparison.Ordinal)
+                || path.StartsWith(prefix, StringComparison.Ordinal);
             var removed = false;
             foreach (var pair in _uncertainUploads)
             {
-                if (TryResolveArtifactPath(pair.Key, out var type, out _, out _)
+                if (Affected(pair.Key) && TryResolveArtifactPath(pair.Key, out var type, out _, out _)
                     && !IsLiveRegularFile(type, pair.Key))
                     removed |= ((ICollection<KeyValuePair<string, UploadSnapshotIdentity>>)_uncertainUploads).Remove(pair);
             }
             foreach (var pair in _uploadBudgets)
             {
-                if (TryResolveArtifactPath(pair.Key, out var type, out _, out _)
+                if (Affected(pair.Key) && TryResolveArtifactPath(pair.Key, out var type, out _, out _)
                     && !IsLiveRegularFile(type, pair.Key))
                     removed |= ((ICollection<KeyValuePair<string, PendingUpload>>)_uploadBudgets).Remove(pair);
             }

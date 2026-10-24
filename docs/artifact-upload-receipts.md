@@ -15,8 +15,10 @@ queue preserve the ID. A changed file version or target obtains a new ID.
 Unacknowledged snapshots retain their bindings in a bounded set, with a default
 limit of 4,096 and no eviction of live uncertainty to admit new files. At capacity,
 new snapshots wait for rescans. Deleted and renamed watcher events securely prune
-missing local bindings and wake an owed scan without requiring an external
-refresh. Inspection errors do not prove deletion. Acknowledged bindings use the existing
+missing local bindings beneath the affected old path and wake an owed scan without
+requiring an external refresh. Home-directory events cover removal or replacement
+of an entire output/temp root; unrelated bindings incur no filesystem inspection
+for each deletion. Inspection errors do not prove deletion. Acknowledged bindings use the existing
 one-entry-per-current-file catalog, rather than retaining version history. Remote
 catalog refresh/deletion cannot erase that local binding while the exact
 acknowledged local version survives. An evicted placeholder is not that version;
@@ -54,6 +56,8 @@ automatically renew its exhausted budget.
 An unchanged automatic rescan reuses its original elapsed budget, including
 failures before ID issuance. The bounded budget set has its own admission limit;
 an explicit later refresh can renew the allowance without changing a retained ID.
+A pending file recognized as a catalog readback or placeholder releases its budget;
+that recognition starts no upload and creates no new publication receipt.
 Committed receipt paths follow the server catalog's case-insensitive key identity;
 the catalog may retain an older spelling. Upload ID, editor and size remain exact.
 Saved accounting always uses the request's captured local path and secure version,
