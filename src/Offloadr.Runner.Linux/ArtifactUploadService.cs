@@ -1824,7 +1824,8 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     return;
                 }
 
-                if (TryGetCatalogEntry(fullPath, out var knownState) && ShouldSkipCatalogBackedUpload(status, version, knownState))
+                if (TryGetCatalogEntry(fullPath, out var knownState) && ShouldSkipCatalogBackedUpload(status, version, knownState)
+                    && !RetainCurrentUploadUncertainty(fullPath, version))
                 {
                     return;
                 }
@@ -2183,6 +2184,27 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             return version is { } current && knownState.MatchesLocalFile(current);
         }
 
+        private bool RetainCurrentUploadUncertainty(string path, SecureFileVersion? version)
+        {
+            if (_uncertainUploads.TryGetValue(path, out var uncertain))
+            {
+                // A catalog hash match is not the receipt for this operation.
+                // Keep the same ID eligible for recovery while its file survives.
+                if (version is null || version == uncertain.Version) return true;
+                if (!((ICollection<KeyValuePair<string, UploadSnapshotIdentity>>)_uncertainUploads).Remove(new(path, uncertain)))
+                    return true;
+            }
+
+            lock (_uploadBudgetGate)
+            {
+                // Recognition also releases an exhausted pre-ID budget. Never
+                // detach an active attempt: it may still acquire an uncertain ID.
+                if (!_pending.ContainsKey(path) && _uploadBudgets.TryGetValue(path, out var retained))
+                    ((ICollection<KeyValuePair<string, PendingUpload>>)_uploadBudgets).Remove(new(path, retained));
+            }
+            return false;
+        }
+
         private async Task ProcessQueueAsync()
         {
             try
@@ -2334,10 +2356,11 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     lock (_evictionGate)
                     {
                         if (_catalog.TryGetValue(fullPath, out var known)
-                            && (known.AccountsFor(snapshotVersion) || known.PlaceholderVersion == snapshotVersion))
+                            && (known.AccountsFor(snapshotVersion) || known.PlaceholderVersion == snapshotVersion)
+                            && !RetainCurrentUploadUncertainty(fullPath, snapshotVersion))
                         {
-                            // Catalog recognition is completed work, not a failed
-                            // file version whose budget must survive future scans.
+                            // No uncertain receipt remains for this version.
+                            // Release its queued budget without issuing another ID.
                             _pending[fullPath].Completed = true;
                             return null;
                         }

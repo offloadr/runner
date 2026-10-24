@@ -56,8 +56,11 @@ automatically renew its exhausted budget.
 An unchanged automatic rescan reuses its original elapsed budget, including
 failures before ID issuance. The bounded budget set has its own admission limit;
 an explicit later refresh can renew the allowance without changing a retained ID.
-A pending file recognized as a catalog readback or placeholder releases its budget;
-that recognition starts no upload and creates no new publication receipt.
+A catalog match does not replace an uncertain operation receipt. An unchanged
+snapshot with an uncertain ID stays eligible for same-ID receipt recovery, even
+when its bytes match the catalog. Catalog recognition releases inactive budgets
+that exhausted before ID issuance, and queued readbacks or placeholders with no
+uncertain binding; it starts no new upload and creates no publication receipt.
 Committed receipt paths follow the server catalog's case-insensitive key identity;
 the catalog may retain an older spelling. Upload ID, editor and size remain exact.
 Saved accounting always uses the request's captured local path and secure version,

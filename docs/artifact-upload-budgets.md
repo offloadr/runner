@@ -43,8 +43,10 @@ Retained budgets have a separate bounded set of one entry per current path,
 including a timeout before upload-ID issuance. Its limit is the pending allowance
 plus the unacknowledged-snapshot allowance: 8,192 by default. New paths wait when
 that set is full; live failed versions are not evicted to admit them. Committed
-unchanged files and queued files subsequently recognized as catalog readbacks or
-placeholders release their budget. Deletion or rename notifications securely
+unchanged files and catalog readbacks or placeholders without an uncertain
+binding release their budget, including inactive budgets exhausted before ID
+issuance. A catalog hash match preserves same-ID receipt recovery for an
+uncertain unchanged snapshot. Deletion or rename notifications securely
 inspect only bindings at or beneath the affected old path and wake an owed scan.
 Replacing an output or temp root also reclaims missing bindings, including when
 the root no longer opens. Inspection failures retain the binding. An explicit refresh may start a new elapsed allowance, while preserving
