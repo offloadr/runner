@@ -89,7 +89,10 @@ public partial class ArtifactUploadServiceTests
                         while (service.GetPendingUploadCount("session-1") != 2) await Task.Delay(10, queued.Token);
                     listing.Artifacts.Add(new EditorArtifactMetadata
                     {
-                        EditorSid = "editor-1", Type = "output", Filename = filename, SizeBytes = bytes.Length,
+                        EditorSid = "editor-1",
+                        Type = "output",
+                        Filename = filename,
+                        SizeBytes = bytes.Length,
                         Sha256 = Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(bytes))
                     });
                     await service.RefreshSessionAsync("session-1");
