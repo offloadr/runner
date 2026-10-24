@@ -78,7 +78,7 @@ public partial class ArtifactUploadServiceTests
                     await File.WriteAllBytesAsync(Path.Combine(paths.OutputDirectory, blocker), [1, 2, 3]);
                     var blocked = await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
                     Assert.That(blocked.Metadata!.Filename, Is.EqualTo(blocker));
-                    await client.LastPreparedUploadResponse!.WaitAsync(TimeSpan.FromSeconds(5));
+                    var committed = await client.LastPreparedUploadResponse!.WaitAsync(TimeSpan.FromSeconds(5));
 
                     // Catalog recognition lands after queue admission but before the
                     // single worker opens this file, as with a just-published readback.
@@ -98,6 +98,9 @@ public partial class ArtifactUploadServiceTests
                     await service.RefreshSessionAsync("session-1");
                     release.TrySetResult();
                     await WaitForIdentityUploadsToFinishAsync(service);
+                    // Subsequent catalog refreshes must keep these committed files;
+                    // omitting them would correctly report remote deletion at Stop.
+                    listing.Artifacts.Add(committed.Artifact.Clone());
                     Assert.That(client.IssuedIdentityCount, Is.EqualTo(i + 1), "A recognized catalog version needs no upload identity.");
                 }
 
