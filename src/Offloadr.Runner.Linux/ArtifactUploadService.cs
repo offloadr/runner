@@ -1847,7 +1847,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     // A formerly eligible snapshot may have changed beyond the
                     // limit after its last failed attempt. Reclaim only versions
                     // that no longer exist, without issuing an oversized upload.
-                    if (PruneMissingUploadBindings(fullPath)) RescanIfOwed();
+                    if (PruneMissingUploadBindings(fullPath, includeReplacedVersions: true)) RescanIfOwed();
                     _logger.LogWarning(
                         "Skipping artifact larger than the upload limit session={SessionId} type={Type} path={Path} bytes={Bytes} limit={Limit}",
                         _sessionId,
@@ -2392,7 +2392,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         // This snapshot cannot be uploaded. It must not occupy a
                         // retained elapsed-budget slot after its pending work ends.
                         pending.Completed = true;
-                        PruneMissingUploadBindings(fullPath);
+                        PruneMissingUploadBindings(fullPath, includeReplacedVersions: true);
                         _logger.LogWarning(
                             "Skipping artifact larger than the upload limit session={SessionId} type={Type} path={Relative} bytes={Bytes} limit={Limit}",
                             _sessionId,
@@ -2746,7 +2746,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             }
         }
 
-        private bool PruneMissingUploadBindings(string? affectedPath = null)
+        private bool PruneMissingUploadBindings(string? affectedPath = null, bool includeReplacedVersions = false)
         {
             var normalized = affectedPath is null ? null : NormalizePath(affectedPath).TrimEnd(Path.DirectorySeparatorChar);
             var prefix = normalized + Path.DirectorySeparatorChar;
@@ -2756,14 +2756,22 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             foreach (var pair in _uncertainUploads)
             {
                 if (Affected(pair.Key) && TryResolveArtifactPath(pair.Key, out var type, out _, out _)
-                    && !IsLiveRegularFile(type, pair.Key))
+                    && !IsLiveRegularFile(type, pair.Key, includeReplacedVersions ? pair.Value.Version : null))
                     removed |= ((ICollection<KeyValuePair<string, UploadSnapshotIdentity>>)_uncertainUploads).Remove(pair);
             }
             foreach (var pair in _uploadBudgets)
             {
                 if (Affected(pair.Key) && TryResolveArtifactPath(pair.Key, out var type, out _, out _)
-                    && !IsLiveRegularFile(type, pair.Key))
-                    removed |= ((ICollection<KeyValuePair<string, PendingUpload>>)_uploadBudgets).Remove(pair);
+                    && !IsLiveRegularFile(type, pair.Key, includeReplacedVersions ? pair.Value.SnapshotVersion : null))
+                {
+                    lock (_uploadBudgetGate)
+                    {
+                        // An active attempt owns its budget until queue completion.
+                        // Only an inactive replaced version may release it early.
+                        if (!includeReplacedVersions || !_pending.ContainsKey(pair.Key))
+                            removed |= ((ICollection<KeyValuePair<string, PendingUpload>>)_uploadBudgets).Remove(pair);
+                    }
+                }
             }
             return removed;
         }

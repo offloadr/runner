@@ -99,3 +99,8 @@ when the current catalog names a different receipt. The unchanged local file
 keeps its historical identity and remains unsaved and ineligible for eviction;
 it does not receive a fresh ID to overwrite the replacement remotely. A genuinely
 changed local snapshot can obtain its own ID through normal admission.
+
+An oversized replacement releases the obsolete local snapshot's uncertain ID
+binding after a secure version check, even while that path remains a regular
+file. This frees admission capacity without issuing an ID for the oversized file
+or claiming that either snapshot was saved.

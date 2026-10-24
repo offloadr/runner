@@ -81,3 +81,6 @@ A file that grows beyond the upload limit before its first secure open releases
 its pending elapsed budget when rejected. Oversized watcher observations also
 prune bindings whose recorded secure version no longer exists. Rejected files do
 not retain budget slots that prevent unrelated eligible outputs from uploading.
+The path may still contain a different oversized regular file: existence alone
+does not preserve the old binding. Active attempts keep their budget until their
+pending work finishes; inspection failures keep the retained binding.
