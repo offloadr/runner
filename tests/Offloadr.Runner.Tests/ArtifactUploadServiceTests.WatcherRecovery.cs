@@ -8,6 +8,101 @@ public partial class ArtifactUploadServiceTests
 {
     [TestCase(false)]
     [TestCase(true)]
+    public async Task AReplacementAfterAFailedAttemptReceivesItsOwnElapsedAllowance(bool ioFailure)
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = UploadIdentityPaths(root);
+            var path = Path.Combine(paths.OutputDirectory, "failed-replacement.bin");
+            var clock = new ArtifactUploadBudgetTests.UploadClock();
+            var client = new FakeRunnerArtifactClient(new());
+            byte[] final = new byte[512 * 1024];
+            var uploads = 0;
+            client.AfterUploadMetadata = () => Interlocked.Increment(ref uploads);
+            client.AfterUploadChunk = _ =>
+            {
+                if (Volatile.Read(ref uploads) > 1) clock.Advance(TimeSpan.FromSeconds(2));
+            };
+            var replies = 0;
+            client.UploadResponseFailure = _ =>
+            {
+                if (Interlocked.Increment(ref replies) != 1) return null;
+                var replacement = Path.Combine(root, "replacement.bin");
+                File.WriteAllBytes(replacement, final);
+                File.Move(replacement, path, overwrite: true);
+                return ioFailure ? new IOException("Read failed after replacement")
+                    : new RpcException(new Status(StatusCode.Internal, "Reply failed after replacement"));
+            };
+            await using var service = new ArtifactUploadService("secret", client, new ListLogger<ArtifactUploadService>(),
+                uploadPolicy: new ArtifactUploadPolicy
+                {
+                    Clock = clock,
+                    MetadataTimeout = TimeSpan.FromSeconds(3),
+                    NoProgressTimeout = TimeSpan.FromSeconds(3),
+                    ReceiptTimeout = TimeSpan.FromSeconds(3),
+                    MinimumBytesPerSecond = 64 * 1024
+                });
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            await File.WriteAllBytesAsync(path, new byte[3]);
+
+            var first = await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            var second = await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            await WaitForIdentityUploadsToFinishAsync(service);
+            Assert.That(first.Metadata!.SizeBytes, Is.EqualTo(3));
+            Assert.That(second.Metadata!.SizeBytes, Is.EqualTo(final.Length));
+            Assert.That(second.Metadata.UploadId, Is.Not.EqualTo(first.Metadata.UploadId));
+            Assert.That(second.Payload, Is.EqualTo(final));
+            Assert.That(client.IssuedIdentityCount, Is.EqualTo(2));
+            Assert.That(client.UploadCount, Is.EqualTo(2));
+            Assert.That(await service.StopSessionAsync("session-1"), Is.Zero);
+        }
+        finally { TryDelete(root); }
+    }
+
+    [Test]
+    public async Task AReplacementAfterTheOriginalLastRetryReceivesItsOwnRetryAllowance()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = UploadIdentityPaths(root);
+            var path = Path.Combine(paths.OutputDirectory, "last-retry-replacement.bin");
+            var client = new FakeRunnerArtifactClient(new());
+            var replies = 0;
+            client.UploadResponseFailure = _ =>
+            {
+                var attempt = Interlocked.Increment(ref replies);
+                if (attempt == 3)
+                {
+                    var replacement = Path.Combine(root, "replacement.bin");
+                    File.WriteAllBytes(replacement, [4, 5, 6, 7]);
+                    File.Move(replacement, path, overwrite: true);
+                }
+                return attempt <= 6 ? new RpcException(new Status(StatusCode.Internal, "Response lost")) : null;
+            };
+            await using var service = new ArtifactUploadService("secret", client, new ListLogger<ArtifactUploadService>());
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            await File.WriteAllBytesAsync(path, [1, 2, 3]);
+
+            var ids = new List<string>();
+            for (var i = 0; i < 7; i++)
+                ids.Add((await client.WaitForUploadAsync(TimeSpan.FromSeconds(5))).Metadata!.UploadId);
+            await WaitForIdentityUploadsToFinishAsync(service);
+            Assert.That(ids.Take(3).Distinct().Count(), Is.EqualTo(1));
+            Assert.That(ids.Skip(3).Distinct().Count(), Is.EqualTo(1));
+            Assert.That(ids[3], Is.Not.EqualTo(ids[0]));
+            Assert.That(client.IssuedIdentityCount, Is.EqualTo(2));
+            Assert.That(client.UploadCount, Is.EqualTo(7));
+            Assert.That(await service.StopSessionAsync("session-1"), Is.Zero);
+        }
+        finally { TryDelete(root); }
+    }
+
+    [TestCase(false)]
+    [TestCase(true)]
     public async Task AChangedLargerSnapshotReceivesItsOwnElapsedUploadAllowance(bool firstRetired)
     {
         var root = CreateTempDirectory();
