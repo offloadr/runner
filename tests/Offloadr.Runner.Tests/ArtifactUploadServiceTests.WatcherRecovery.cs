@@ -1,7 +1,120 @@
+using Offloadr.EditorRuntime.V1;
+using Offloadr.Runner.V1;
+
 namespace Offloadr.Runner.Tests;
 
 public partial class ArtifactUploadServiceTests
 {
+    [TestCase("output", false)]
+    [TestCase("output", true)]
+    [TestCase("temp", false)]
+    [TestCase("temp", true)]
+    public async Task ReplacingAnArtifactRootReclaimsItsUncertainBindings(string type, bool rename)
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = UploadIdentityPaths(root);
+            var directory = type == "output" ? paths.OutputDirectory : paths.TempDirectory;
+            var other = type == "output" ? paths.TempDirectory : paths.OutputDirectory;
+            var client = new FakeRunnerArtifactClient(new()) { RejectAsRetiredUpload = true };
+            var logger = new ListLogger<ArtifactUploadService>();
+            await using var service = new ArtifactUploadService("secret", client, logger,
+                uploadPolicy: new ArtifactUploadPolicy { MaximumUnacknowledgedSnapshots = 1 });
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            await File.WriteAllBytesAsync(Path.Combine(directory, "uncertain.bin"), [1, 2, 3]);
+            var original = await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            await WaitForIdentityUploadsToFinishAsync(service);
+            await File.WriteAllBytesAsync(Path.Combine(other, "waiting.bin"), [4, 5, 6]);
+            await WaitForUploadLogAsync(logger, "Artifact upload queue is full");
+            client.RejectAsRetiredUpload = false;
+
+            if (rename) Directory.Move(directory, Path.Combine(root, "retired-" + type));
+            else Directory.Delete(directory, recursive: true);
+            await WaitForUploadLogAsync(logger, "Artifact watcher removed");
+            Directory.CreateDirectory(directory);
+            await File.WriteAllBytesAsync(Path.Combine(directory, "fresh.bin"), [7, 8, 9]);
+
+            var names = new List<string>();
+            for (var i = 0; i < 2; i++)
+            {
+                var uploaded = await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+                names.Add(uploaded.Metadata!.Filename);
+                Assert.That(uploaded.Metadata.UploadId, Is.Not.EqualTo(original.Metadata!.UploadId));
+            }
+            Assert.That(names, Is.EquivalentTo(new[] { "waiting.bin", "fresh.bin" }));
+            await WaitForIdentityUploadsToFinishAsync(service);
+            Assert.That(client.IssuedIdentityCount, Is.EqualTo(3));
+            Assert.That(await service.StopSessionAsync("session-1"), Is.Zero);
+        }
+        finally { TryDelete(root); }
+    }
+
+    [Test, NonParallelizable]
+    public async Task RecognizedCatalogFilesReleaseTheirQueuedUploadBudgets()
+    {
+        var root = CreateTempDirectory();
+        var previousLimit = ArtifactUploadService.MaxPendingUploads;
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
+        {
+            ArtifactUploadService.MaxPendingUploads = 2;
+            var paths = UploadIdentityPaths(root);
+            var listing = new RunnerArtifactServiceListArtifactsResponse();
+            var client = new FakeRunnerArtifactClient(listing);
+            var logger = new ListLogger<ArtifactUploadService>();
+            await using var service = new ArtifactUploadService("secret", client, logger,
+                uploadPolicy: new ArtifactUploadPolicy { MaximumUnacknowledgedSnapshots = 2 });
+            try
+            {
+                await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+                await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+                for (var i = 0; i < 4; i++)
+                {
+                    release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                    client.UploadGate = release.Task;
+                    var blocker = $"blocker-{i}.bin";
+                    await File.WriteAllBytesAsync(Path.Combine(paths.OutputDirectory, blocker), [1, 2, 3]);
+                    var blocked = await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+                    Assert.That(blocked.Metadata!.Filename, Is.EqualTo(blocker));
+                    await client.LastPreparedUploadResponse!.WaitAsync(TimeSpan.FromSeconds(5));
+
+                    // Catalog recognition lands after queue admission but before the
+                    // single worker opens this file, as with a just-published readback.
+                    var filename = $"catalog-{i}.bin";
+                    byte[] bytes = [4, 5, 6];
+                    await File.WriteAllBytesAsync(Path.Combine(paths.OutputDirectory, filename), bytes);
+                    using (var queued = new CancellationTokenSource(TimeSpan.FromSeconds(5)))
+                        while (service.PendingUploadCount != 2) await Task.Delay(10, queued.Token);
+                    listing.Artifacts.Add(new EditorArtifactMetadata
+                    {
+                        EditorSid = "editor-1", Type = "output", Filename = filename, SizeBytes = bytes.Length,
+                        Sha256 = Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(bytes))
+                    });
+                    await service.RefreshSessionAsync("session-1");
+                    release.TrySetResult();
+                    await WaitForIdentityUploadsToFinishAsync(service);
+                    Assert.That(client.IssuedIdentityCount, Is.EqualTo(i + 1), "A recognized catalog version needs no upload identity.");
+                }
+
+                client.UploadGate = null;
+                await File.WriteAllBytesAsync(Path.Combine(paths.OutputDirectory, "new-output.bin"), [7, 8, 9]);
+                var next = await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+                Assert.That(next.Metadata!.Filename, Is.EqualTo("new-output.bin"));
+                await WaitForIdentityUploadsToFinishAsync(service);
+                Assert.That(client.IssuedIdentityCount, Is.EqualTo(5));
+                Assert.That(await service.StopSessionAsync("session-1"), Is.Zero);
+            }
+            finally { release.TrySetResult(); }
+        }
+        finally
+        {
+            ArtifactUploadService.MaxPendingUploads = previousLimit;
+            TryDelete(root);
+        }
+    }
+
     [TestCase(false)]
     [TestCase(true)]
     public async Task MissingUncertainSnapshotReleasesWatcherCapacityWithoutAnExplicitRefresh(bool rename)
