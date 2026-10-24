@@ -28,7 +28,10 @@ public partial class ArtifactUploadServiceTests
                 await File.WriteAllBytesAsync(growing, []);
                 await WaitForUploadLogAsync(logger, $"path={growing} bytes=0");
                 await File.WriteAllBytesAsync(growing, [2, 3, 4]);
-                await File.WriteAllBytesAsync(following, [5]);
+                // Only growing.bin should change after watcher admission.
+                var completedFollowing = Path.Combine(root, "completed-following.bin");
+                await File.WriteAllBytesAsync(completedFollowing, [5]);
+                File.Move(completedFollowing, following);
                 await WaitForUploadLogAsync(logger, $"path={following} bytes=1");
                 release.TrySetResult();
 
