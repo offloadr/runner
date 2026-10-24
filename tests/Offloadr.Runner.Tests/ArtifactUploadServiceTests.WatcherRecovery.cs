@@ -624,7 +624,14 @@ public partial class ArtifactUploadServiceTests
             var completed = Path.Combine(root, "completed-valid.bin");
             await File.WriteAllBytesAsync(completed, [1, 2, 3]);
             File.Move(completed, Path.Combine(paths.OutputDirectory, "valid.bin"));
-            var upload = await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            CapturedUpload upload;
+            try { upload = await client.WaitForUploadAsync(TimeSpan.FromSeconds(5)); }
+            catch
+            {
+                foreach (var entry in logger.Snapshot()) TestContext.Out.WriteLine(entry.Message);
+                TestContext.Out.WriteLine($"Oversized files rejected; issued={client.IssuedIdentityCount}; uploads={client.UploadCount}");
+                throw;
+            }
             Assert.That(upload.Metadata!.Filename, Is.EqualTo("valid.bin"),
                 "Oversized snapshots must not consume the entire retained-budget set.");
             await WaitForIdentityUploadsToFinishAsync(service);
