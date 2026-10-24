@@ -19,6 +19,14 @@ The Offloadr control plane implements the server side of these services, so a co
 2. Keep the seven shared protobuf definitions identical on both sides and regenerate every affected consumer. The platform is pre-deployment: change the current protocol directly, without legacy layouts or compatibility shims.
 3. Release the coordinated runner and control-plane changes together. Schema declarations alone do not mean the corresponding behavior is implemented.
 
+## Prompt content availability
+
+A prompt execution permission must state its recovery-content availability.
+`Available` permits only the matching committed execution or recovery path;
+`Expired` permits no native action or invented acknowledgement. `Unspecified`
+and unknown values fail with a protocol error. Server and runner implementations
+must be coordinated; no missing-field fallback grants execution.
+
 ## Progress recovery projection
 
 `FindForgeEditorActionsRequest.progress_only` selects a bounded progress read.

@@ -2530,9 +2530,9 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     {
                         // The watcher coalesces changes while this path is pending.
                         // Only a genuinely newer snapshot may acquire another ID.
-                        return changedDuringUpload && after.IsRegularFile
-                            ? request with { Attempt = 0 }
-                            : null;
+                        // The worker releases this pending snapshot before admitting
+                        // a changed secure version with its own elapsed allowance.
+                        return null;
                     }
 
                     // When it changed, record the snapshot's time so a later scan sees a newer file.
@@ -2561,9 +2561,9 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                             _sessionId,
                             type,
                             relPath);
-                        // A new snapshot has its own retry count; the pending path
-                        // keeps its original elapsed allowance across all versions.
-                        return request with { Attempt = 0 };
+                        // The worker rechecks the secure version after releasing
+                        // this entry. A changed snapshot gets a fresh finite budget;
+                        // retries of the unchanged version keep its original one.
                     }
 
                     return null;

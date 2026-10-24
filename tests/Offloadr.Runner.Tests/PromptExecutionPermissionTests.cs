@@ -71,11 +71,15 @@ public sealed class PromptExecutionPermissionTests
         var command = Command();
         var permission = Permission(command, mayExecute);
         permission.Submission.ContentAvailability = availability;
-        await Execute(command, (_, _) => Task.FromResult(permission),
+        Task Attempt() => Execute(command, (_, _) => Task.FromResult(permission),
             (_, _) => throw new AssertionException("Unavailable content invoked the runtime"),
             (_, _) => throw new AssertionException("Unavailable content probed the runtime"),
             (_, _) => throw new AssertionException("Unavailable content invented an acknowledgement"),
             captureRefresh: _ => throw new AssertionException("Unavailable content prepared artifacts"));
+        if (availability == PromptContentAvailability.Unspecified)
+            Assert.ThrowsAsync<InvalidOperationException>(Attempt);
+        else
+            await Attempt();
     }
 
     [TestCase("generation")]

@@ -22,8 +22,10 @@ Size is bound once to the first securely opened snapshot, before its RPC. A
 watcher's initial empty or growing file length cannot size that transfer. For
 ordinary uploads, wire bytes are the snapshot length; sealed uploads add their
 authentication-tag overhead. Binding keeps the original dequeue clock and cannot
-revive an expired attempt. The same pending entry never receives a larger
-allowance because a file changes during a retry. The ordinary 4 GiB file
+revive an expired attempt. A genuinely changed secure version leaves the old pending entry before
+admission, so its new snapshot receives its own size-based allowance and retry
+count. This applies after a committed or retired first response; it does not renew
+the allowance or issued ID for an unchanged failed snapshot. The ordinary 4 GiB file
 limit therefore has an elapsed ceiling of four hours, 37 minutes and four seconds.
 These are limits, not a throughput guarantee. The single reader cannot start a
 second file while the first transfer is progressing within its allowance.
@@ -34,8 +36,8 @@ phase expiry cancels the actual gRPC call and the associated file reads and
 sealing work. A local expired observation is distinguished from session shutdown.
 
 The existing queued retry cap also applies when editor identity is absent.
-Transient failures and changed-file retries retain their capped attempt count;
-all nested I/O attempts share the original elapsed ceiling. A later refresh can
+Transient failures of an unchanged snapshot retain their capped attempt count;
+all its nested I/O attempts share the original elapsed ceiling. A later refresh can
 queue an unsaved file again, but an unchanged secure file snapshot retains its
 original opaque upload ID.
 

@@ -6,7 +6,8 @@ Prompt execution permission includes explicit content availability. An expired
 or unspecified receipt cannot start generation, probe native recovery, prepare
 artifacts or create another acknowledgement, even if its permission flag is
 contradictory. Recorded permission and outcome facts remain distinct from access
-to the original content. Recovery-only command lifetimes, local memory and spool
+to the original content. Unspecified or unknown availability is an explicit
+protocol error, rather than a silent successful return. Recovery-only command lifetimes, local memory and spool
 cleanup still require their own finite retention enforcement; this check alone
 does not establish complete data deletion.
 
