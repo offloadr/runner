@@ -823,6 +823,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             RenamedEventHandler renameHandler = (sender, args) => OnArtifactWatcherEvent(type, root, WatcherChangeTypes.Renamed, args.FullPath, args.OldFullPath);
             watcher.Created += handler;
             watcher.Changed += handler;
+            watcher.Deleted += handler;
             watcher.Renamed += renameHandler;
             watcher.Error += (_, ex) => _logger.LogWarning(
                 ex.GetException() ?? new Exception("unknown"),
