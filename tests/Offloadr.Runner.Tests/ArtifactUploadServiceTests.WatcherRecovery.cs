@@ -1,3 +1,4 @@
+using Grpc.Core;
 using Offloadr.EditorRuntime.V1;
 using Offloadr.Runner.V1;
 
@@ -5,6 +6,59 @@ namespace Offloadr.Runner.Tests;
 
 public partial class ArtifactUploadServiceTests
 {
+    [Test]
+    public async Task CatalogRecognitionPreservesReceiptRecoveryForAnUncertainSnapshot()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = UploadIdentityPaths(root);
+            var listing = new RunnerArtifactServiceListArtifactsResponse();
+            var client = new FakeRunnerArtifactClient(listing)
+            {
+                UploadResponseFailure = _ => new RpcException(new Status(StatusCode.Internal, "Response lost"))
+            };
+            var logger = new ListLogger<ArtifactUploadService>();
+            await using var service = new ArtifactUploadService("secret", client, logger,
+                uploadPolicy: new ArtifactUploadPolicy { MaximumUnacknowledgedSnapshots = 1 });
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            byte[] bytes = [1, 2, 3];
+            await File.WriteAllBytesAsync(Path.Combine(paths.OutputDirectory, "uncertain.bin"), bytes);
+            var ids = new List<string>();
+            for (var i = 0; i < 4; i++)
+                ids.Add((await client.WaitForUploadAsync(TimeSpan.FromSeconds(5))).Metadata!.UploadId);
+            await WaitForIdentityUploadsToFinishAsync(service);
+            Assert.That(ids.Distinct().Count(), Is.EqualTo(1));
+            Assert.That(client.IssuedIdentityCount, Is.EqualTo(1));
+
+            // The catalog can recognize these bytes without proving which issued
+            // upload committed. Keep the original ID until its receipt is observed.
+            listing.Artifacts.Add(new EditorArtifactMetadata
+            {
+                EditorSid = "editor-1",
+                Type = "output",
+                Filename = "uncertain.bin",
+                SizeBytes = bytes.Length,
+                Sha256 = Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(bytes))
+            });
+            client.UploadResponseFailure = null;
+            await File.WriteAllBytesAsync(Path.Combine(paths.OutputDirectory, "waiting.bin"), [4, 5, 6]);
+            await WaitForUploadLogAsync(logger, "Artifact upload queue is full");
+            await service.RefreshSessionAsync("session-1");
+
+            var recovered = await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            Assert.That(recovered.Metadata!.Filename, Is.EqualTo("uncertain.bin"));
+            Assert.That(recovered.Metadata.UploadId, Is.EqualTo(ids[0]));
+            var waiting = await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            Assert.That(waiting.Metadata!.Filename, Is.EqualTo("waiting.bin"));
+            await WaitForIdentityUploadsToFinishAsync(service);
+            Assert.That(client.IssuedIdentityCount, Is.EqualTo(2));
+            Assert.That(await service.StopSessionAsync("session-1"), Is.Zero);
+        }
+        finally { TryDelete(root); }
+    }
+
     [TestCase("output", false)]
     [TestCase("output", true)]
     [TestCase("temp", false)]
