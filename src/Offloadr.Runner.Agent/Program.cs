@@ -4,7 +4,7 @@ using Grpc.Net.Client;
 using Microsoft.Extensions.Logging;
 using System.Globalization;
 using System.Reflection;
-using System.Runtime.InteropServices;
+using Offloadr.Runner.Agent;
 
 var options = RunnerAgentOptions.FromEnvironment();
 await using var runnerLogRelay = new RunnerLogRelay(options.RunnerId);
@@ -68,22 +68,9 @@ if (options.Session.Sealing.Mode == SealedStorageMode.Required)
     }
 }
 
-using var shutdown = new CancellationTokenSource();
+await using var shutdown = new RunnerAgentLifetime();
+using var shutdownSignals = new RunnerAgentShutdownSignals(shutdown);
 var runtimeIdentities = new RuntimeIdentityRegistry();
-Console.CancelKeyPress += (_, e) =>
-{
-    e.Cancel = true;
-    shutdown.Cancel();
-    RunnerLog.Info("Cancellation requested (Ctrl+C)");
-};
-// Container stops send SIGTERM to PID 1; treat it as a host shutdown so commands drain
-// and sessions are cleaned up before the process exits.
-using var sigtermRegistration = PosixSignalRegistration.Create(PosixSignal.SIGTERM, context =>
-{
-    context.Cancel = true;
-    shutdown.Cancel();
-    RunnerLog.Info("Termination requested (SIGTERM)");
-});
 
 await using var sessionProcessLogRelay = new SessionProcessLogRelay(options.RunnerId, runtimeIdentities);
 await using var sessionRuntimeTelemetryRelay = new SessionRuntimeTelemetryRelay(options.RunnerId, runtimeIdentities);
@@ -245,81 +232,79 @@ if (!string.IsNullOrWhiteSpace(options.LocalModelsDirectory))
         $"Local model scanning enabled dir='{options.LocalModelsDirectory}' interval={options.LocalModelsScanInterval.TotalSeconds:F0}s");
 }
 
-var commandTask = ServiceClientManager.CommandListenerLoopAsync(
-    options.OffloadrApiUrl,
-    options.TraceGrpcHttp,
-    options.RunnerSecret,
-    options.RunnerId,
-    instanceId,
-    options.RegistrationMinBackoff,
-    options.RegistrationMaxBackoff,
-    options.RegistrationRpcTimeout,
-    version,
-    sessionManager,
-    downloadService,
-    sessionEventRelay,
-    sessionProcessLogRelay,
-    runnerLogRelay,
-    sessionRuntimeTelemetryRelay,
-    gpuPowerLimitService,
-    artifactUploadService,
-    workspaceMirrorService,
-    logicalSessionState,
-    resources,
-    options.SupportedEditorTemplates,
-    scanner is null ? null : () => scanner.Scan(),
-    projector is null ? null : snapshot => projector.UpdateSnapshot(snapshot),
-    projector is null ? null : (downloads, replaceExisting) =>
-    {
-        if (replaceExisting)
-        {
-            projector.SetRequestedModels(downloads);
-        }
-        else
-        {
-            projector.AddRequestedModels(downloads);
-        }
-    },
-    options.LocalModelsScanInterval,
-    runtimeIdentities,
-    shutdown.Token);
-
-var runtimeTelemetryTask = runtimeTelemetryReporter.RunAsync(shutdown.Token);
-var sealedStorageEvictionTask = new SealedStorageEvictor(
-    options.Session.Sealing,
-    sealedStorageProbe,
-    logicalSessionState.GetActiveSessionId,
-    artifactUploadService.EvictUploadedArtifacts,
-    isSessionSealed: sessionManager.IsSessionSealed).RunAsync(shutdown.Token);
-
-var statusFilePath = RunnerStatusFileWriter.ResolvePath(Environment.GetEnvironmentVariable);
-var statusFileTask = statusFilePath is null
-    ? Task.CompletedTask
-    : new RunnerStatusFileWriter(
-        statusFilePath,
+await shutdown.RunAsync(
+    commandListener: cancellationToken => ServiceClientManager.CommandListenerLoopAsync(
+        options.OffloadrApiUrl,
+        options.TraceGrpcHttp,
+        options.RunnerSecret,
         options.RunnerId,
         instanceId,
+        options.RegistrationMinBackoff,
+        options.RegistrationMaxBackoff,
+        options.RegistrationRpcTimeout,
         version,
+        sessionManager,
+        downloadService,
+        sessionEventRelay,
+        sessionProcessLogRelay,
+        runnerLogRelay,
+        sessionRuntimeTelemetryRelay,
+        gpuPowerLimitService,
+        artifactUploadService,
+        workspaceMirrorService,
+        logicalSessionState,
+        resources,
         options.SupportedEditorTemplates,
-        logicalSessionState.GetActiveSessionId,
-        sealedStorage: () => sealedStorageProbe.Probe(options.Session.Sealing)).RunAsync(shutdown.Token);
+        scanner is null ? null : () => scanner.Scan(),
+        projector is null ? null : snapshot => projector.UpdateSnapshot(snapshot),
+        projector is null ? null : (downloads, replaceExisting) =>
+        {
+            if (replaceExisting)
+            {
+                projector.SetRequestedModels(downloads);
+            }
+            else
+            {
+                projector.AddRequestedModels(downloads);
+            }
+        },
+        options.LocalModelsScanInterval,
+        runtimeIdentities,
+        cancellationToken),
 
-try
-{
-    await Task.WhenAll(commandTask, runtimeTelemetryTask, statusFileTask, sealedStorageEvictionTask);
-}
-finally
-{
-    try
+    runtimeTelemetry: runtimeTelemetryReporter.RunAsync,
+    sealedStorageEviction: cancellationToken => new SealedStorageEvictor(
+        options.Session.Sealing,
+        sealedStorageProbe,
+        logicalSessionState.GetActiveSessionId,
+        artifactUploadService.EvictUploadedArtifacts,
+        isSessionSealed: sessionManager.IsSessionSealed).RunAsync(cancellationToken),
+
+    statusFile: cancellationToken =>
     {
-        await sessionManager.DisposeAsync();
-    }
-    catch (Exception ex)
+        var statusFilePath = RunnerStatusFileWriter.ResolvePath(Environment.GetEnvironmentVariable);
+        return statusFilePath is null ? Task.CompletedTask : new RunnerStatusFileWriter(
+            statusFilePath,
+            options.RunnerId,
+            instanceId,
+            version,
+            options.SupportedEditorTemplates,
+            logicalSessionState.GetActiveSessionId,
+            sealedStorage: () => sealedStorageProbe.Probe(options.Session.Sealing)).RunAsync(cancellationToken);
+    },
+
+    stopSessions: async () =>
     {
-        RunnerLog.Error($"Session shutdown failed; errorClass={ex.GetType().Name}.");
-        throw;
-    }
-}
+        try
+        {
+            await sessionManager.DisposeAsync();
+        }
+        catch (Exception ex)
+        {
+            RunnerLog.Error($"Session shutdown failed; errorClass={ex.GetType().Name}.");
+            throw;
+        }
+    });
 
 RunnerLog.Info("Runner agent exiting.");
 return 0;

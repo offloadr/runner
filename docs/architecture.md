@@ -1,5 +1,26 @@
 # Architecture
 
+## Agent producer shutdown
+
+The entry point starts command, runtime telemetry, sealed eviction and status-file
+producers inside one agent lifetime. Factories are invoked within its cleanup
+boundary, so partial setup still owns every task already started. A failed
+producer requests peer cancellation; the command listener also fails the agent
+if it ends before shutdown. Disabled optional producers may finish normally.
+
+Shutdown callers share the original cancellation-callback task. The lifetime
+joins all original producers and cancellation callbacks, then stops and joins
+the session manager before returning to the scope that disposes sidecars and
+channels. Cancellation does not count as a successful command acknowledgement.
+An uncooperative producer holds shutdown open rather than leaving its work
+running against disposed dependencies. Setup, producer, callback and session
+cleanup errors remain failures. Signal registrations are removed before the
+lifetime's cancellation source is disposed.
+
+Controlled factory and callback tests exercise this ownership order. They do not
+establish complete signal handling with real transports, native descendants,
+GPU workloads or provider shutdown deadlines.
+
 ## Runtime activity delivery preparation
 
 The required activity report carries only captured process/runtime identity and

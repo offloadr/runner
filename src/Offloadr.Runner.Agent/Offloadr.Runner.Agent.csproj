@@ -18,6 +18,7 @@
   <ItemGroup>
     <Using Include="Offloadr.Runner.Core" />
     <Using Include="Offloadr.Runner.Linux" />
+    <InternalsVisibleTo Include="Offloadr.Runner.Tests" />
   </ItemGroup>
 
   <ItemGroup>
