@@ -1400,14 +1400,24 @@ public partial class ServiceClientManagerTests
     public async Task HandleSubmitEditorActionAsync_RejectedPromptHoldsNoDemand()
     {
         Task? held = null;
+        Task? originalDemand = null;
+        CancellationToken demandToken = default;
         await HandlePromptWithDemandAsync(
-            token => Task.Delay(Timeout.InfiniteTimeSpan, token),
+            token =>
+            {
+                demandToken = token;
+                return originalDemand = Task.Delay(Timeout.InfiniteTimeSpan, token);
+            },
             nativeStatus: 400,
             _ => { },
             CancellationToken.None,
             holdPromptDemand: settling => held = settling).WaitAsync(TimeSpan.FromSeconds(5));
 
-        Assert.That(held, Is.Null);
+        // Rejection withdraws demand immediately. Any handed-off settling task
+        // owns original cancellation callbacks, which can finish asynchronously.
+        Assert.That(demandToken.IsCancellationRequested, Is.True);
+        if (held is not null) await held.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.That(originalDemand?.IsCanceled, Is.True);
     }
 
     [Test]

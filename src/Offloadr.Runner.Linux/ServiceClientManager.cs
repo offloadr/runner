@@ -3227,7 +3227,7 @@ internal static partial class ServiceClientManager
         // the cancellation callback, so a racing interrupt cannot drop the demand
         // of a prompt the runtime accepted.
         // Owned by the settling demand, which can outlive this command.
-        var promptDemandLifetime = CancellationTokenSource.CreateLinkedTokenSource(promptDemandCancellation);
+        var promptDemandLifetime = new OwnedCancellation(promptDemandCancellation);
         var demandGate = new object();
         var demandFollowsWork = true;
         using var withdrawDemandBeforeInvocation = cancellationToken.Register(() =>
@@ -3236,7 +3236,7 @@ internal static partial class ServiceClientManager
             {
                 if (demandFollowsWork)
                 {
-                    promptDemandLifetime.Cancel();
+                    _ = promptDemandLifetime.RequestAsync();
                 }
             }
         });
@@ -3404,7 +3404,7 @@ internal static partial class ServiceClientManager
         }
 
         withdrawDemandBeforeInvocation.Dispose();
-        var settling = SettleAndReleasePromptDemandAsync(
+        var settling = SettlePromptDemandAsync(
             promptDemand,
             keepPromptDemand,
             promptDemandLifetime,
@@ -3432,22 +3432,6 @@ internal static partial class ServiceClientManager
         Func<string, CancellationToken, Task<bool?>> probe, string promptId)
         => token => probe(promptId, token);
 
-    private static async Task SettleAndReleasePromptDemandAsync(
-        Task? demand,
-        bool keep,
-        CancellationTokenSource lifetime,
-        Func<CancellationToken, Task<bool?>>? isStillQueued)
-    {
-        try
-        {
-            await SettlePromptDemandAsync(demand, keep, lifetime, isStillQueued).ConfigureAwait(false);
-        }
-        finally
-        {
-            lifetime.Dispose();
-        }
-    }
-
     /// <summary>
     /// A queued prompt keeps its ordered model demand until hydration settles, after
     /// its acknowledgement was handed over, or until Stop or its terminal event
@@ -3458,38 +3442,41 @@ internal static partial class ServiceClientManager
     internal static async Task SettlePromptDemandAsync(
         Task? demand,
         bool keep,
-        CancellationTokenSource lifetime,
+        OwnedCancellation lifetime,
         Func<CancellationToken, Task<bool?>>? isStillQueued = null)
     {
-        if (demand is null)
-        {
-            // Preparation can fail after publishing managed demand without handing
-            // its completion over (a failed conventional download); withdraw it.
-            lifetime.Cancel();
-            return;
-        }
-
-        if (!keep)
-        {
-            lifetime.Cancel();
-        }
-        else if (isStillQueued is not null)
-        {
-            await WithdrawOnceDequeuedAsync(demand, lifetime, isStillQueued).ConfigureAwait(false);
-        }
-
         try
         {
-            await demand.ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) when (lifetime.IsCancellationRequested) { }
-        catch (Exception ex)
-        {
-            RunnerLog.Warning(nameof(ServiceClientManager), $"Prompt model hydration ended with {ex.GetType().Name}; managed reads remain gated.");
+            if (demand is null || !keep)
+            {
+                // Withdrawal requests cancellation without running user callbacks
+                // here. Their failure cannot bypass the original demand join.
+                _ = lifetime.RequestAsync();
+            }
+            else if (isStillQueued is not null)
+            {
+                await WithdrawOnceDequeuedAsync(demand, lifetime, isStillQueued).ConfigureAwait(false);
+            }
+
+            if (demand is not null)
+            {
+                try
+                {
+                    await demand.ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (lifetime.Token.IsCancellationRequested) { }
+                catch (Exception ex)
+                {
+                    RunnerLog.Warning(nameof(ServiceClientManager), $"Prompt model hydration ended with {ex.GetType().Name}; managed reads remain gated.");
+                }
+            }
         }
         finally
         {
-            lifetime.Cancel();
+            // Even preparation that returned no demand can have registered
+            // callbacks. This settling owner joins their first cancellation task.
+            _ = lifetime.RequestAsync();
+            await lifetime.CompleteAsync().ConfigureAwait(false);
         }
     }
 
@@ -3502,17 +3489,17 @@ internal static partial class ServiceClientManager
     /// </summary>
     private static async Task WithdrawOnceDequeuedAsync(
         Task demand,
-        CancellationTokenSource lifetime,
+        OwnedCancellation lifetime,
         Func<CancellationToken, Task<bool?>> isStillQueued)
     {
-        while (!demand.IsCompleted && !lifetime.IsCancellationRequested)
+        while (!demand.IsCompleted && !lifetime.Token.IsCancellationRequested)
         {
             bool? queued;
             try
             {
                 queued = await isStillQueued(lifetime.Token).ConfigureAwait(false);
             }
-            catch (OperationCanceledException) when (lifetime.IsCancellationRequested)
+            catch (OperationCanceledException) when (lifetime.Token.IsCancellationRequested)
             {
                 return;
             }
@@ -3523,7 +3510,7 @@ internal static partial class ServiceClientManager
 
             if (queued == false)
             {
-                lifetime.Cancel();
+                _ = lifetime.RequestAsync();
                 return;
             }
 

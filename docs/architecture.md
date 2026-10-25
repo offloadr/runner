@@ -189,7 +189,13 @@ handoff during Stop and a held demand replaced by recovery both remain owned.
 Execution drops its command and callback references before joining cleanup, so a
 held cancellation callback need not retain completed prompt content. Once settling
 ends, the registry drops that task reference as well, since a faulted task can
-retain arbitrary exception data. Host shutdown
+retain arbitrary exception data. The inner model-demand lifetime also owns its
+first cancellation-callback task. Native rejection, failed preparation and queue
+withdrawal request cancellation without running callbacks under the command's
+handoff lock. Settling joins every returned original demand task and its callbacks
+before releasing their lifetime, even if a callback fails. Preparation that returns
+no demand still joins its registered callbacks. An original queue probe must
+also finish; cancelling its token does not stand in for its completion. Host shutdown
 refuses new work; interrupt still preserves queued demand until terminal withdrawal
 or Stop. Controlled task/reference tests do not establish native queue cancellation,
 transport delivery, complete data deletion or physical memory erasure.
