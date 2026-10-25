@@ -178,7 +178,7 @@ public class SessionProcessManagerLinuxTests
             Directory.CreateDirectory(options.BundledCustomNodesSeedPath);
             Directory.CreateDirectory(options.BundledInputSeedPath);
 
-            using var manager = new SessionProcessManager(
+            await using var manager = new SessionProcessManager(TestRuntimeActivitySink.Accepted,
                 options,
                 new NoOpIsolationStrategy(),
                 new RunnerVfsEnvironmentBuilder(),
@@ -219,6 +219,9 @@ public class SessionProcessManagerLinuxTests
 
         public Task<PreparedSessionIdentity> PrepareAsync(string sessionId, string sessionRoot, CancellationToken cancellationToken)
             => throw new NotSupportedException();
+
+        public Task StopProcessesAsync(PreparedSessionIdentity identity, CancellationToken cancellationToken)
+            => Task.CompletedTask;
 
         public Task CleanupAsync(PreparedSessionIdentity identity, CancellationToken cancellationToken)
             => Task.CompletedTask;

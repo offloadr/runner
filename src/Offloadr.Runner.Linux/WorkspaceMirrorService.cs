@@ -1,3 +1,4 @@
+using Offloadr.Runner.Core;
 using System.Buffers;
 using System.Collections.Concurrent;
 using System.IO.Compression;
@@ -24,6 +25,16 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
     private readonly ConcurrentDictionary<string, SessionMirror> _sessions = new(StringComparer.Ordinal);
 
     private readonly RunnerReadRequesterIdentity _requester;
+    private readonly OwnedOperationScope _operations = new();
+    private readonly object _lifetimeGate = new();
+    private readonly Dictionary<string, StopInFlight> _stopping = new(StringComparer.Ordinal);
+    private sealed class StopInFlight(SessionMirror mirror, Task task)
+    {
+        public SessionMirror? Mirror { get; set; } = mirror;
+        public Task Task { get; } = task;
+    }
+    private Task? _disposal;
+    private bool _closing;
 
     public WorkspaceMirrorService(
         RunnerWorkspaceService.RunnerWorkspaceServiceClient workspaceClient,
@@ -43,65 +54,130 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
             : throw new ArgumentOutOfRangeException(nameof(maxDynamicInputEntries));
     }
 
-    public async Task PrepareSessionAsync(
+    public Task PrepareSessionAsync(
         string sessionId,
         SessionProcessManager.SessionPaths paths,
         string? editorSid,
         string? runtimeKind,
         IEnumerable<WorkspaceFileMetadata>? initialWorkspaceFiles,
         CancellationToken cancellationToken)
+        => _operations.Run(token => PrepareSessionCoreAsync(sessionId, paths, editorSid, runtimeKind, initialWorkspaceFiles, token), cancellationToken);
+
+    private async Task PrepareSessionCoreAsync(string sessionId, SessionProcessManager.SessionPaths paths,
+        string? editorSid, string? runtimeKind, IEnumerable<WorkspaceFileMetadata>? initialWorkspaceFiles,
+        CancellationToken cancellationToken)
     {
         await StopSessionAsync(sessionId).ConfigureAwait(false);
-
+        cancellationToken.ThrowIfCancellationRequested();
         ILogger logger = paths.IsSealed ? new SealedSessionLogger(_logger) : _logger;
         var mirror = new SessionMirror(_workspaceClient, _authHeaders, sessionId, paths, logger, _maxDynamicInputEntries, _requester);
-        if (!_sessions.TryAdd(sessionId, mirror))
+        bool added;
+        lock (_lifetimeGate) added = !_closing && !_stopping.ContainsKey(sessionId) && _sessions.TryAdd(sessionId, mirror);
+        if (!added)
         {
             await mirror.DisposeAsync().ConfigureAwait(false);
-            return;
+            throw new OperationCanceledException("Workspace preparation was superseded.", cancellationToken);
         }
-
         try
         {
             await mirror.InitializeAsync(editorSid, runtimeKind, initialWorkspaceFiles, cancellationToken).ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested();
+            lock (_lifetimeGate)
+                if (_closing || !_sessions.TryGetValue(sessionId, out var active) || !ReferenceEquals(active, mirror))
+                    throw new OperationCanceledException(cancellationToken);
         }
         catch
         {
-            _sessions.TryRemove(sessionId, out _);
-            await mirror.DisposeAsync().ConfigureAwait(false);
+            // Only retire this owner; a failed old prepare cannot remove a replacement.
+            try { await StopSessionAsync(sessionId, mirror).ConfigureAwait(false); }
+            catch (Exception error) { _logger.LogWarning("Workspace preparation cleanup ended with {ErrorClass}.", error.GetType().Name); }
             throw;
         }
     }
 
-    public async Task<bool> TryEnsureWorkspaceFileAvailableAsync(string path, bool highPriority, CancellationToken cancellationToken)
+    public Task<bool> TryEnsureWorkspaceFileAvailableAsync(string path, bool highPriority, CancellationToken cancellationToken)
+        => _operations.Run(token => TryEnsureWorkspaceFileCoreAsync(path, highPriority, token), cancellationToken);
+
+    private async Task<bool> TryEnsureWorkspaceFileCoreAsync(string path, bool highPriority, CancellationToken cancellationToken)
     {
         foreach (var mirror in _sessions.Values)
         {
-            if (await mirror.TryEnsureInputFileAsync(path, highPriority, cancellationToken).ConfigureAwait(false))
-            {
-                return true;
-            }
+            if (await mirror.TryEnsureInputFileAsync(path, highPriority, cancellationToken).ConfigureAwait(false)) return true;
         }
-
         return false;
     }
 
-    public async Task StopSessionAsync(string sessionId)
+    public Task StopSessionAsync(string sessionId) => StopSessionAsync(sessionId, expected: null);
+
+    private Task StopSessionAsync(string sessionId, SessionMirror? expected)
     {
-        if (_sessions.TryRemove(sessionId, out var mirror))
+        TaskCompletionSource start;
+        Task stop;
+        lock (_lifetimeGate)
         {
-            await mirror.DisposeAsync().ConfigureAwait(false);
+            if (!_sessions.TryGetValue(sessionId, out var mirror) || (expected is not null && !ReferenceEquals(expected, mirror)))
+                return _stopping.TryGetValue(sessionId, out var retiring) && (expected is null || ReferenceEquals(expected, retiring.Mirror)) ? retiring.Task : Task.CompletedTask;
+            _sessions.TryRemove(sessionId, out _);
+            start = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            stop = StopMirrorAsync(start.Task, mirror);
+            _stopping[sessionId] = new(mirror, stop);
+        }
+        _ = stop.ContinueWith(completed =>
+        {
+            // Never withdraw a task before the actual task is complete. A failed
+            // cleanup remains a failure for repeated Stop rather than replaying success.
+            lock (_lifetimeGate)
+            {
+                if (!_stopping.TryGetValue(sessionId, out var owner) || !ReferenceEquals(owner.Task, completed)) return;
+                owner.Mirror = null;
+                if (completed.IsCompletedSuccessfully) _stopping.Remove(sessionId);
+            }
+        }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        start.SetResult();
+        return stop;
+    }
+
+    private async Task StopMirrorAsync(Task start, SessionMirror mirror)
+    {
+        await start.ConfigureAwait(false);
+        try { await mirror.DisposeAsync().ConfigureAwait(false); }
+        catch (Exception error)
+        {
+            _logger.LogWarning("Workspace stop ended with {ErrorClass}.", error.GetType().Name);
+            throw new InvalidOperationException("Workspace stop failed.");
         }
     }
 
-    public async ValueTask DisposeAsync()
+    public ValueTask DisposeAsync()
     {
-        foreach (var mirror in _sessions.Values)
+        TaskCompletionSource start;
+        Task disposal;
+        lock (_lifetimeGate)
         {
-            await mirror.DisposeAsync().ConfigureAwait(false);
+            if (_disposal is not null) return new(_disposal);
+            _closing = true;
+            _operations.CloseAdmission();
+            start = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            disposal = _disposal = DisposeCoreAsync(start.Task);
         }
+        start.SetResult();
+        return new(disposal);
+    }
 
-        _sessions.Clear();
+    private async Task DisposeCoreAsync(Task start)
+    {
+        await start.ConfigureAwait(false);
+        var producers = _operations.CompleteAsync();
+        foreach (var sessionId in _sessions.Keys) _ = StopSessionAsync(sessionId);
+        Task[] stops;
+        lock (_lifetimeGate) stops = _stopping.Values.Select(owner => owner.Task).ToArray();
+        // WhenAll waits for every original even when a peer fails.
+        try { await Task.WhenAll(stops.Append(producers)).ConfigureAwait(false); }
+        catch (Exception error)
+        {
+            _logger.LogWarning("Workspace disposal ended with {ErrorClass}.", error.GetType().Name);
+            throw new InvalidOperationException("Workspace disposal failed.");
+        }
     }
 
     private static Metadata? BuildAuthHeaders(string? runnerSecret)
@@ -164,7 +240,9 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
         private readonly LinuxSecureDirectoryRoot _secureInputRoot;
         private readonly ConcurrentDictionary<string, WorkspaceFileState> _inputCatalog = new(StringComparer.Ordinal);
         private readonly ConcurrentDictionary<string, Task> _downloadTasks = new(StringComparer.Ordinal);
-        private readonly CancellationTokenSource _disposeCts = new();
+        private readonly OwnedOperationScope _operations = new();
+        private readonly object _stopGate = new();
+        private Task? _stop;
         private readonly object _dynamicInputGate = new();
         private readonly int _maxDynamicInputEntries;
 
@@ -192,7 +270,10 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
             _secureInputRoot = new LinuxSecureDirectoryRoot(paths.InputDirectory);
         }
 
-        public async Task InitializeAsync(string? editorSid, string? runtimeKind, IEnumerable<WorkspaceFileMetadata>? initialWorkspaceFiles, CancellationToken cancellationToken)
+        public Task InitializeAsync(string? editorSid, string? runtimeKind, IEnumerable<WorkspaceFileMetadata>? initialWorkspaceFiles, CancellationToken cancellationToken)
+            => _operations.Run(token => InitializeCoreAsync(editorSid, runtimeKind, initialWorkspaceFiles, token), cancellationToken);
+
+        private async Task InitializeCoreAsync(string? editorSid, string? runtimeKind, IEnumerable<WorkspaceFileMetadata>? initialWorkspaceFiles, CancellationToken cancellationToken)
         {
             _editorSid = string.IsNullOrWhiteSpace(editorSid) ? null : editorSid.Trim();
             if (string.IsNullOrWhiteSpace(_editorSid))
@@ -207,15 +288,24 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
             }
 
             var snapshot = initialWorkspaceFiles?.ToArray() ?? [];
+            cancellationToken.ThrowIfCancellationRequested();
             await HydrateArchiveAsync(WorkspaceRoot.User, _paths.UserDirectory, cancellationToken).ConfigureAwait(false);
             await HydrateArchiveAsync(WorkspaceRoot.CustomNodes, _paths.CustomNodesDirectory, cancellationToken).ConfigureAwait(false);
 
+            cancellationToken.ThrowIfCancellationRequested();
             SeedInputPlaceholders(snapshot.Where(static item => item.Root == WorkspaceRoot.Input));
         }
 
         public async Task<bool> TryEnsureInputFileAsync(string path, bool highPriority, CancellationToken cancellationToken)
         {
-            if (_disposeCts.IsCancellationRequested)
+            if (_operations.IsClosed) return false;
+            try { return await _operations.Run(token => TryEnsureInputFileCoreAsync(path, highPriority, token), cancellationToken).ConfigureAwait(false); }
+            catch (OperationCanceledException) when (_operations.IsClosed && !cancellationToken.IsCancellationRequested) { return false; }
+        }
+
+        private async Task<bool> TryEnsureInputFileCoreAsync(string path, bool highPriority, CancellationToken cancellationToken)
+        {
+            if (_operations.Token.IsCancellationRequested)
             {
                 return false;
             }
@@ -248,7 +338,7 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                 await downloadTask.WaitAsync(cancellationToken).ConfigureAwait(false);
                 return true;
             }
-            catch (OperationCanceledException) when (_disposeCts.IsCancellationRequested)
+            catch (OperationCanceledException) when (_operations.Token.IsCancellationRequested)
             {
                 return false;
             }
@@ -263,22 +353,20 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
                     return existing;
                 }
 
-                var download = Task.Run(() => DownloadInputFileAsync(state, highPriority, CancellationToken.None));
-                _downloadTasks[normalized] = download;
-                // Registered after the add, so an already finished download is still removed.
-                _ = download.ContinueWith(
-                    completed =>
+                var published = new TaskCompletionSource<Task>(TaskCreationOptions.RunContinuationsAsynchronously);
+                var download = _operations.Run(async token =>
+                {
+                    var original = await published.Task.ConfigureAwait(false);
+                    try { await DownloadInputFileAsync(state, highPriority, token).ConfigureAwait(false); }
+                    catch
                     {
-                        ((ICollection<KeyValuePair<string, Task>>)_downloadTasks).Remove(new(normalized, completed));
-                        if (!completed.IsCompletedSuccessfully && state.IsDynamic)
-                        {
-                            // Do not keep entries for paths the control plane could not serve.
-                            RemoveDynamicInputState(normalized, state);
-                        }
-                    },
-                    CancellationToken.None,
-                    TaskContinuationOptions.ExecuteSynchronously,
-                    TaskScheduler.Default);
+                        if (state.IsDynamic) RemoveDynamicInputState(normalized, state);
+                        throw;
+                    }
+                    finally { ((ICollection<KeyValuePair<string, Task>>)_downloadTasks).Remove(new(normalized, original)); }
+                });
+                _downloadTasks[normalized] = download;
+                published.SetResult(download);
                 return download;
             }
         }
@@ -380,7 +468,7 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
         private async Task DownloadInputFileAsync(WorkspaceFileState state, bool highPriority, CancellationToken cancellationToken)
         {
             _ = highPriority;
-            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeCts.Token);
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _operations.Token);
             var linkedCancellationToken = linkedCts.Token;
 
             using var call = _workspaceClient.ReadWorkspaceFile(
@@ -401,6 +489,7 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
 
         private async Task HydrateArchiveAsync(WorkspaceRoot root, string destinationRoot, CancellationToken cancellationToken)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             using var call = _workspaceClient.ReadWorkspaceSeedArchive(
                 new RunnerWorkspaceServiceReadWorkspaceSeedArchiveRequest
                 {
@@ -883,33 +972,32 @@ internal sealed class WorkspaceMirrorService : IAsyncDisposable
 
         public ValueTask DisposeAsync()
         {
-            _disposeCts.Cancel();
-            return DisposeAsyncCore();
+            TaskCompletionSource start;
+            Task stop;
+            lock (_stopGate)
+            {
+                if (_stop is not null) return new(_stop);
+                _operations.CloseAdmission();
+                start = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                stop = _stop = DisposeCoreAsync(start.Task);
+            }
+            start.SetResult();
+            return new(stop);
         }
 
-        private async ValueTask DisposeAsyncCore()
+        private async Task DisposeCoreAsync(Task start)
         {
-            try
+            await start.ConfigureAwait(false);
+            try { await _operations.CompleteAsync().ConfigureAwait(false); }
+            finally
             {
-                var tasks = _downloadTasks.Values.ToArray();
-                if (tasks.Length > 0)
-                {
-                    await Task.WhenAll(tasks).ConfigureAwait(false);
-                }
+                // Initialization, original shared downloads and their callbacks
+                // have all ended before directory handles and catalogs are released.
+                _inputCatalog.Clear();
+                _downloadTasks.Clear();
+                _editorSid = null;
+                _secureInputRoot.Dispose();
             }
-            catch (OperationCanceledException) when (_disposeCts.IsCancellationRequested)
-            {
-                // Expected during teardown.
-            }
-            catch (Exception ex)
-            {
-                _logger.LogDebug(ex, "Workspace mirror disposal observed a failed download for session {SessionId}.", _sessionId);
-            }
-
-            _inputCatalog.Clear();
-            _downloadTasks.Clear();
-            _secureInputRoot.Dispose();
-            _disposeCts.Dispose();
         }
 
         private sealed class WorkspaceFileState(

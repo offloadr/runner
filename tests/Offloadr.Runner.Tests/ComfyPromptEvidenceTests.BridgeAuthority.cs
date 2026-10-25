@@ -142,7 +142,7 @@ public sealed partial class ComfyPromptEvidenceTests
             if (Interlocked.Increment(ref activeResponses) == 1 && loseActive)
                 throw new RpcException(new(StatusCode.Unavailable, "Active response lost after commit."));
         };
-        await using var relay = new ComfySessionEventRelay(command.Target.RunnerId, "127.0.0.1", port,
+        await using var relay = new ComfySessionEventRelay(static (_, _) => { }, command.Target.RunnerId, "127.0.0.1", port,
             "test-process", _ => new SessionSealingStatus(), (_, _) => true);
         relay.AttachSink(sink);
         var nativeConnect = listener.GetContextAsync();
@@ -209,7 +209,7 @@ public sealed partial class ComfyPromptEvidenceTests
         };
         if (outcome == "reject")
             sink.Authority.TransformReportResult = result => { result.Outcome = EditorRuntimeBridgeOutcome.Preempted; return result; };
-        await using var relay = new ComfySessionEventRelay(command.Target.RunnerId, "127.0.0.1", port,
+        await using var relay = new ComfySessionEventRelay(static (_, _) => { }, command.Target.RunnerId, "127.0.0.1", port,
             "test-process", session => sealings.GetValueOrDefault(session),
             (session, runtime) => tracked.TryGetValue(session, out var current) && current.SameRuntime(runtime));
         relay.AttachSink(sink);
@@ -288,7 +288,7 @@ public sealed partial class ComfyPromptEvidenceTests
     public async Task ClientIdentifierContainingSeparatorDoesNotRetireAnotherClientsBridge()
     {
         var command = Command();
-        await using var relay = new ComfySessionEventRelay(command.Target.RunnerId, "127.0.0.1", 1,
+        await using var relay = new ComfySessionEventRelay(static (_, _) => { }, command.Target.RunnerId, "127.0.0.1", 1,
             "test-process", _ => new SessionSealingStatus(), (_, _) => true);
         foreach (var client in new[] { "client", "client|nested" })
             await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, client, command.Target.GpuGeneration,
@@ -316,7 +316,7 @@ public sealed partial class ComfyPromptEvidenceTests
             if (mismatch == "process") result.Lease.Target.InstanceId = "retired-process";
             return result;
         };
-        await using var relay = new ComfySessionEventRelay(command.Target.RunnerId, "127.0.0.1", port,
+        await using var relay = new ComfySessionEventRelay(static (_, _) => { }, command.Target.RunnerId, "127.0.0.1", port,
             "test-process", _ => new SessionSealingStatus(), (_, _) => true);
         relay.AttachSink(sink);
         await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", command.Target.GpuGeneration,
@@ -340,7 +340,7 @@ public sealed partial class ComfyPromptEvidenceTests
         var command = Command();
         var sink = new EvidenceSink((_, _) => Task.CompletedTask);
         sink.Authority.BeforeReservationResponse = async (_, token) => await Task.Delay(Timeout.InfiniteTimeSpan, token);
-        await using var relay = new ComfySessionEventRelay(command.Target.RunnerId, "127.0.0.1", 1,
+        await using var relay = new ComfySessionEventRelay(static (_, _) => { }, command.Target.RunnerId, "127.0.0.1", 1,
             "test-process", _ => new SessionSealingStatus(), (_, _) => true);
         relay.AttachSink(sink);
         var accepted = await Task.WhenAll(Enumerable.Range(0, 64).Select(async index =>

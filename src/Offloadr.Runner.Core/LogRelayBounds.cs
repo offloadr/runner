@@ -16,6 +16,9 @@ internal static class LogRelayBounds
     /// <summary>Largest serialized size of the entries in one report batch, far below the gRPC message limit.</summary>
     public const int MaxBatchBytes = 1024 * 1024;
 
+    public static readonly TimeSpan MaximumQueuedAge = TimeSpan.FromMinutes(5);
+    public static readonly TimeSpan AttemptTimeout = TimeSpan.FromSeconds(5);
+
     public static readonly TimeSpan DropWarningInterval = TimeSpan.FromMinutes(1);
 
     /// <summary>

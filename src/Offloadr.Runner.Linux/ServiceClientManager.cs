@@ -8,12 +8,10 @@ using Offloadr.EditorRuntime.V1;
 using Google.Protobuf;
 using Google.Protobuf.WellKnownTypes;
 using Grpc.Core;
-using Grpc.Core.Interceptors;
-using Grpc.Net.Client;
 
 namespace Offloadr.Runner.Linux;
 
-internal static class ServiceClientManager
+internal static partial class ServiceClientManager
 {
     internal const string HttpResponseChunkEventType = "http.response.chunk";
 
@@ -325,136 +323,6 @@ internal static class ServiceClientManager
         }
     }
 
-    /// <summary>
-    /// Cancellation for in-flight transient editor requests, per exact runtime.
-    /// A request leases its runtime's source for its lifetime; the source is
-    /// removed and disposed with the last lease, so entries never outlive their
-    /// requests and a cancelled source is never read after disposal.
-    /// </summary>
-    internal sealed class TransientCancellationRegistry(CancellationToken shutdown)
-    {
-        internal readonly record struct Key(string SessionId, RuntimeIdentity Runtime);
-
-        internal sealed class Entry(CancellationTokenSource source)
-        {
-            public CancellationTokenSource Source { get; } = source;
-            public int Leases { get; set; }
-        }
-
-        internal sealed class Lease : IDisposable
-        {
-            private readonly TransientCancellationRegistry _owner;
-            private readonly Key _key;
-            private readonly Entry _entry;
-            private int _disposed;
-
-            public Lease(TransientCancellationRegistry owner, Key key, Entry entry)
-            {
-                _owner = owner;
-                _key = key;
-                _entry = entry;
-                Token = entry.Source.Token;
-            }
-
-            public CancellationToken Token { get; }
-
-            public void Dispose()
-            {
-                if (Interlocked.Exchange(ref _disposed, 1) == 0)
-                {
-                    _owner.Release(_key, _entry);
-                }
-            }
-        }
-
-        private readonly object _gate = new();
-        private readonly Dictionary<Key, Entry> _entries = new();
-
-        public int Count
-        {
-            get { lock (_gate) return _entries.Count; }
-        }
-
-        public Lease Acquire(string? sessionId, ulong lifecycleGeneration, ulong runtimeEpoch, string? runtimeInstanceId)
-        {
-            var key = new Key(
-                sessionId?.Trim() ?? string.Empty,
-                new RuntimeIdentity(lifecycleGeneration, runtimeEpoch, runtimeInstanceId ?? string.Empty).Normalized());
-            lock (_gate)
-            {
-                if (!_entries.TryGetValue(key, out var entry))
-                {
-                    entry = new Entry(CancellationTokenSource.CreateLinkedTokenSource(shutdown));
-                    _entries.Add(key, entry);
-                }
-
-                entry.Leases++;
-                return new Lease(this, key, entry);
-            }
-        }
-
-        public void CancelSession(string? sessionId)
-        {
-            var normalizedSessionId = sessionId?.Trim() ?? string.Empty;
-            Cancel(key => string.Equals(key.SessionId, normalizedSessionId, StringComparison.Ordinal));
-        }
-
-        public void CancelRuntime(string? sessionId, RuntimeIdentity runtime)
-        {
-            var normalizedSessionId = sessionId?.Trim() ?? string.Empty;
-            var normalizedRuntime = runtime.Normalized();
-            Cancel(key => string.Equals(key.SessionId, normalizedSessionId, StringComparison.Ordinal) &&
-                          key.Runtime == normalizedRuntime);
-        }
-
-        public void CancelAll() => Cancel(_ => true);
-
-        private void Cancel(Func<Key, bool> matches)
-        {
-            List<Entry> cancelled;
-            lock (_gate)
-            {
-                cancelled = [];
-                foreach (var key in _entries.Keys.Where(matches).ToArray())
-                {
-                    cancelled.Add(_entries[key]);
-                    _entries.Remove(key);
-                }
-            }
-
-            // Later requests for the same runtime lease a fresh source.
-            foreach (var entry in cancelled)
-            {
-                try
-                {
-                    entry.Source.Cancel();
-                }
-                catch (ObjectDisposedException)
-                {
-                    // Its last request already completed and released it.
-                }
-            }
-        }
-
-        private void Release(Key key, Entry entry)
-        {
-            lock (_gate)
-            {
-                if (--entry.Leases > 0)
-                {
-                    return;
-                }
-
-                if (_entries.TryGetValue(key, out var current) && ReferenceEquals(current, entry))
-                {
-                    _entries.Remove(key);
-                }
-            }
-
-            entry.Source.Dispose();
-        }
-    }
-
     /// <summary>The shared result of one physical startup, acknowledged by every command that joined it.</summary>
     /// <summary>
     /// How a startup ended. <paramref name="Sealing"/> is captured inside the startup, which a Stop
@@ -462,30 +330,23 @@ internal static class ServiceClientManager
     /// </summary>
     internal readonly record struct StartupOutcome(bool Ready, string Message, SessionSealingStatus? Sealing = null);
 
-    internal sealed class TrackedCommandWork
+    internal sealed class TrackedCommandWork(CancellationToken shutdown)
     {
+        private readonly OwnedCancellation _cancellation = new(shutdown);
+
         public Task? Task { get; set; }
 
         /// <summary>The startup's result, set only for startup work so other commands can join it.</summary>
         public Task<StartupOutcome>? Outcome { get; set; }
-        public required CancellationTokenSource CancellationSource { get; init; }
+        public CancellationToken Token => _cancellation.Token;
         public required string SessionId { get; init; }
         public RuntimeIdentity RuntimeIdentity { get; init; }
 
         /// <summary>The sealing a startup runs with; only a command asking for the same joins it.</summary>
         public SessionSealing? Sealing { get; init; }
 
-        public void Cancel()
-        {
-            try
-            {
-                CancellationSource.Cancel();
-            }
-            catch (ObjectDisposedException)
-            {
-                // The work already finished and released its source.
-            }
-        }
+        public Task CancelAsync() => _cancellation.RequestAsync();
+        public Task CompleteAsync() => _cancellation.CompleteAsync();
     }
 
     /// <summary>
@@ -497,6 +358,7 @@ internal static class ServiceClientManager
         public required string RunnerId { get; init; }
         public required string InstanceId { get; init; }
         public required IRunnerSessionSink Sink { get; init; }
+        public required Func<Func<Task>, Task> StartAcknowledgement { get; init; }
         public required RunnerCommandWorkState WorkState { get; init; }
         public required LogicalSessionState LogicalSessionState { get; init; }
         public required RuntimeIdentityRegistry RuntimeIdentities { get; init; }
@@ -931,14 +793,12 @@ internal static class ServiceClientManager
     /// Long-lived Offloadr API supervisor that owns explicit status, commands, session-event, and ops lanes.
     /// </summary>
     public static async Task CommandListenerLoopAsync(
-        string offloadrApiUrl,
-        bool traceHttp,
-        string runnerSecret,
+        RunnerControlService.RunnerControlServiceClient commandClient,
+        IRunnerSessionSink sessionSink,
         string runnerId,
         string instanceId,
         TimeSpan minBackoff,
         TimeSpan maxBackoff,
-        TimeSpan rpcTimeout,
         string version,
         SessionProcessManager sessionManager,
         ModelDownloadService downloadService,
@@ -959,107 +819,99 @@ internal static class ServiceClientManager
         RuntimeIdentityRegistry runtimeIdentities,
         CancellationToken shutdown)
     {
-        using var statusChannel = GrpcChannelManager.CreateChannel(offloadrApiUrl, traceHttp);
-        using var commandChannel = GrpcChannelManager.CreateChannel(offloadrApiUrl, traceHttp);
-        using var sessionEventChannel = GrpcChannelManager.CreateChannel(offloadrApiUrl, traceHttp);
-        using var opsChannel = GrpcChannelManager.CreateChannel(offloadrApiUrl, traceHttp);
-
-        var statusClient = CreateAuthenticatedClient(statusChannel, runnerSecret);
-        var commandClient = CreateAuthenticatedClient(commandChannel, runnerSecret);
-        var sessionEventClient = CreateAuthenticatedClient(sessionEventChannel, runnerSecret);
-        var opsClient = CreateAuthenticatedClient(opsChannel, runnerSecret);
-
-        await using var sessionSink = new GrpcRunnerControlSink(
-            statusClient,
-            commandClient,
-            sessionEventClient,
-            opsClient,
-            rpcTimeout);
-
+        ArgumentNullException.ThrowIfNull(commandClient);
+        ArgumentNullException.ThrowIfNull(sessionSink);
+        await using var lifetime = new RunnerControlLifetime(shutdown);
+        shutdown = lifetime.Token;
         var initialStatusApplied = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var commandWorkState = new RunnerCommandWorkState(shutdown);
-        sessionEventRelay.AttachSink(sessionSink);
         // ComfyUI's terminal event (success, error or interrupted) ends an
         // accepted prompt's model demand; a global interrupt alone cannot tell
         // which accepted prompt it stopped.
         void WithdrawFinishedPromptDemand(ComfySessionEventRelay.PromptTerminalEvent finished)
             => commandWorkState.Prompts.WithdrawDemand(prompt => IsFinishedPrompt(prompt, finished));
-        sessionEventRelay.PromptFinished += WithdrawFinishedPromptDemand;
-        sessionProcessLogRelay.AttachSink(sessionSink);
-        runnerLogRelay.AttachSink(sessionSink);
-        sessionRuntimeTelemetryRelay.AttachSink(sessionSink);
-
-        var initialLocalModelSnapshot = PrepareInitialLocalModelSnapshot(localModelSnapshotProvider, localModelSnapshotObserver);
-
-        downloadService.RuntimeResolver = sessionId => runtimeIdentities.TryGet(sessionId, out var identity) ? identity : null;
-        downloadService.ProgressReporter = async progress =>
-        {
-            RuntimeIdentity? reportedRuntime = null;
-            try
+        LocalModelSnapshot? initialLocalModelSnapshot = null;
+        await lifetime.RunAsync(
+            attach: () =>
             {
-                var request = new ReportModelDownloadRequest
-                {
-                    RunnerId = runnerId,
-                    SessionId = progress.SessionId,
-                    ModelId = progress.ModelId,
-                    Filename = progress.Filename,
-                    DestinationPath = progress.DestinationPath,
-                    BytesDownloaded = progress.BytesDownloaded,
-                    TotalBytes = progress.TotalBytes,
-                    Percent = double.IsFinite(progress.Percent) ? Math.Clamp(progress.Percent, 0d, 100d) : 0d,
-                    BytesPerSecond = progress.BytesPerSecond,
-                    AverageBytesPerSecond = progress.AverageBytesPerSecond,
-                    State = progress.State,
-                    Message = progress.Message ?? string.Empty
-                };
-                // Report under the runtime the download was registered for. Only that identity
-                // may be treated as revoked: the session may since have a replacement runtime.
-                if (progress.Runtime is { IsValid: true } registeredRuntime)
-                {
-                    request.LifecycleGeneration = registeredRuntime.LifecycleGeneration;
-                    request.RuntimeEpoch = registeredRuntime.RuntimeEpoch;
-                    request.RuntimeInstanceId = registeredRuntime.RuntimeInstanceId;
-                    reportedRuntime = registeredRuntime;
-                }
-                else if (runtimeIdentities.TryGet(progress.SessionId, out var currentRuntime))
-                {
-                    // Registered before the session had a runtime: label it with the current
-                    // one so it is accepted, but never revoke a runtime on its rejection.
-                    request.LifecycleGeneration = currentRuntime.LifecycleGeneration;
-                    request.RuntimeEpoch = currentRuntime.RuntimeEpoch;
-                    request.RuntimeInstanceId = currentRuntime.RuntimeInstanceId;
-                }
-                await sessionSink.ReportModelDownloadAsync(request, CancellationToken.None).ConfigureAwait(false);
-            }
-            catch (RpcException ex) when (ex.StatusCode == StatusCode.PermissionDenied)
-            {
-                RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed to report model download progress: {ex.Message}");
-                await HandleRevokedRuntimeReportAsync(
-                    progress.SessionId,
-                    reportedRuntime,
-                    logicalSessionState,
-                    runtimeIdentities,
-                    sessionManager.GetActiveSessionId,
-                    sessionManager.StopSessionAsync,
-                    sessionManager.StopSessionIfRuntimeMatchesAsync,
-                    sessionEventRelay.StopSessionAsync,
-                    artifactUploadService.StopSessionAsync,
-                    workspaceMirrorService.StopSessionAsync,
-                    downloadService.CancelSession,
-                    downloadService.GetActiveSessionId,
-                    downloadService.SetActiveSession).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed to report model download progress: {ex.Message}");
-            }
-        };
+                sessionEventRelay.AttachSink(sessionSink);
+                sessionEventRelay.PromptFinished += WithdrawFinishedPromptDemand;
+                sessionProcessLogRelay.AttachSink(sessionSink);
+                runnerLogRelay.AttachSink(sessionSink);
+                sessionRuntimeTelemetryRelay.AttachSink(sessionSink);
 
-        try
-        {
-            var statusTask = RunRunnerStatusLoopAsync(
+                initialLocalModelSnapshot = PrepareInitialLocalModelSnapshot(localModelSnapshotProvider, localModelSnapshotObserver);
+
+                downloadService.RuntimeResolver = sessionId => runtimeIdentities.TryGet(sessionId, out var identity) ? identity : null;
+                downloadService.ProgressReporter = progress => lifetime.ReportProgressAsync(async progressCancellation =>
+                {
+                    RuntimeIdentity? reportedRuntime = null;
+                    try
+                    {
+                        var request = new ReportModelDownloadRequest
+                        {
+                            RunnerId = runnerId,
+                            SessionId = progress.SessionId,
+                            ModelId = progress.ModelId,
+                            Filename = progress.Filename,
+                            DestinationPath = progress.DestinationPath,
+                            BytesDownloaded = progress.BytesDownloaded,
+                            TotalBytes = progress.TotalBytes,
+                            Percent = double.IsFinite(progress.Percent) ? Math.Clamp(progress.Percent, 0d, 100d) : 0d,
+                            BytesPerSecond = progress.BytesPerSecond,
+                            AverageBytesPerSecond = progress.AverageBytesPerSecond,
+                            State = progress.State,
+                            Message = progress.Message ?? string.Empty
+                        };
+                        // Report under the runtime the download was registered for. Only that identity
+                        // may be treated as revoked: the session may since have a replacement runtime.
+                        if (progress.Runtime is { IsValid: true } registeredRuntime)
+                        {
+                            request.LifecycleGeneration = registeredRuntime.LifecycleGeneration;
+                            request.RuntimeEpoch = registeredRuntime.RuntimeEpoch;
+                            request.RuntimeInstanceId = registeredRuntime.RuntimeInstanceId;
+                            reportedRuntime = registeredRuntime;
+                        }
+                        else if (runtimeIdentities.TryGet(progress.SessionId, out var currentRuntime))
+                        {
+                            // Registered before the session had a runtime: label it with the current
+                            // one so it is accepted, but never revoke a runtime on its rejection.
+                            request.LifecycleGeneration = currentRuntime.LifecycleGeneration;
+                            request.RuntimeEpoch = currentRuntime.RuntimeEpoch;
+                            request.RuntimeInstanceId = currentRuntime.RuntimeInstanceId;
+                        }
+                        await sessionSink.ReportModelDownloadAsync(request, progressCancellation).ConfigureAwait(false);
+                    }
+                    catch (RpcException ex) when (ex.StatusCode == StatusCode.PermissionDenied)
+                    {
+                        RunnerLog.Error($"Model download progress failed; errorClass={ex.GetType().Name}.");
+                        await HandleRevokedRuntimeReportAsync(
+                            progress.SessionId,
+                            reportedRuntime,
+                            logicalSessionState,
+                            runtimeIdentities,
+                            sessionManager.GetActiveSessionId,
+                            sessionManager.StopSessionAsync,
+                            sessionManager.StopSessionIfRuntimeMatchesAsync,
+                            sessionEventRelay.StopSessionAsync,
+                            artifactUploadService.StopSessionAsync,
+                            workspaceMirrorService.StopSessionAsync,
+                            downloadService.CancelSession,
+                            downloadService.GetActiveSessionId,
+                            downloadService.SetActiveSession).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (progressCancellation.IsCancellationRequested)
+                    {
+                    }
+                    catch (Exception ex)
+                    {
+                        RunnerLog.Error($"Model download progress failed; errorClass={ex.GetType().Name}.");
+                    }
+                });
+            },
+            status: token => RunRunnerStatusLoopAsync(
                 sessionSink,
-                shutdown,
+                token,
                 runnerId,
                 instanceId,
                 version,
@@ -1069,12 +921,12 @@ internal static class ServiceClientManager
                 minBackoff,
                 maxBackoff,
                 initialStatusApplied,
-                sessionManager.DescribeSealedStorage);
-            var localModelTask = localModelSnapshotProvider is null
+                sessionManager.DescribeSealedStorage),
+            localModels: token => localModelSnapshotProvider is null
                 ? Task.CompletedTask
                 : RunLocalModelSyncLoopAsync(
                     sessionSink.SyncLocalModelsAsync,
-                    shutdown,
+                    token,
                     runnerId,
                     localModelsScanInterval,
                     minBackoff,
@@ -1082,11 +934,11 @@ internal static class ServiceClientManager
                     localModelSnapshotProvider,
                     localModelSnapshotObserver,
                     initialStatusApplied.Task,
-                    initialLocalModelSnapshot);
-            var commandTask = RunCommandStreamLoopAsync(
+                    initialLocalModelSnapshot),
+            commands: token => RunCommandStreamLoopAsync(
                 commandClient,
                 sessionSink,
-                shutdown,
+                token,
                 runnerId,
                 instanceId,
                 version,
@@ -1102,24 +954,22 @@ internal static class ServiceClientManager
                 localModelProjectionReconciler,
                 commandWorkState,
                 logicalSessionState,
-                runtimeIdentities);
-
-            await Task.WhenAll(statusTask, localModelTask, commandTask).ConfigureAwait(false);
-        }
-        finally
-        {
-            await gpuPowerLimitService.CancelAndDrainAsync().ConfigureAwait(false);
-            await commandWorkState.Prompts.CancelAndWaitAsync(_ => true).ConfigureAwait(false);
-            await CancelTrackedWorkAsync(commandWorkState.GetActiveStartup()).ConfigureAwait(false);
-
-            downloadService.ProgressReporter = null;
-            downloadService.SetActiveSession(null);
-            sessionEventRelay.PromptFinished -= WithdrawFinishedPromptDemand;
-            sessionEventRelay.DetachSink(sessionSink);
-            sessionProcessLogRelay.DetachSink(sessionSink);
-            runnerLogRelay.DetachSink(sessionSink);
-            sessionRuntimeTelemetryRelay.DetachSink(sessionSink);
-        }
+                runtimeIdentities,
+                lifetime.RequestShutdownAsync),
+            drainGpu: gpuPowerLimitService.CancelAndDrainAsync,
+            drainPrompts: () => commandWorkState.Prompts.CancelAndWaitAsync(_ => true),
+            drainStartup: () => CancelTrackedWorkAsync(commandWorkState.GetActiveStartup()),
+            detach:
+            [
+                () => downloadService.ProgressReporter = null,
+                () => downloadService.RuntimeResolver = null,
+                () => downloadService.SetActiveSession(null),
+                () => sessionEventRelay.PromptFinished -= WithdrawFinishedPromptDemand,
+                () => sessionEventRelay.DetachSink(sessionSink),
+                () => sessionProcessLogRelay.DetachSink(sessionSink),
+                () => runnerLogRelay.DetachSink(sessionSink),
+                () => sessionRuntimeTelemetryRelay.DetachSink(sessionSink)
+            ]).ConfigureAwait(false);
     }
 
     private static async Task RunRunnerStatusLoopAsync(
@@ -1378,7 +1228,8 @@ internal static class ServiceClientManager
         Action<IEnumerable<ModelDownloadRequest>, bool>? localModelProjectionReconciler,
         RunnerCommandWorkState commandWorkState,
         LogicalSessionState logicalSessionState,
-        RuntimeIdentityRegistry runtimeIdentities)
+        RuntimeIdentityRegistry runtimeIdentities,
+        Func<Task> requestParentShutdown)
     {
         ArgumentNullException.ThrowIfNull(commandClient);
         ArgumentNullException.ThrowIfNull(sessionSink);
@@ -1396,14 +1247,17 @@ internal static class ServiceClientManager
         var rng = new Random();
         var transientDeliveries = new TransientRequestDeliveries(new TransientAcknowledgementCache());
         var runtimeCommandDeduplication = new RuntimeCommandDeduplicationCache();
-        var transientCancellation = new TransientCancellationRegistry(shutdown);
         using var ordinaryControlGate = new SemaphoreSlim(1, 1);
         using var readGate = new SemaphoreSlim(4, 4);
+        await using var commandTasks = new RunnerCommandLifetime(shutdown, requestParentShutdown);
+        shutdown = commandTasks.Token;
+        await using var transientCancellation = new TransientCancellationRegistry(shutdown);
         var runtimeCommands = new RuntimeCommandDependencies
         {
             RunnerId = runnerId,
             InstanceId = instanceId,
             Sink = sessionSink,
+            StartAcknowledgement = commandTasks.Start,
             WorkState = commandWorkState,
             LogicalSessionState = logicalSessionState,
             RuntimeIdentities = runtimeIdentities,
@@ -1466,7 +1320,7 @@ internal static class ServiceClientManager
                         }
 
                         RunnerLog.Info(nameof(ServiceClientManager), $"StartSession event: session={evt.StartSession.SessionId} user={evt.StartSession.User}");
-                        _ = HandleStartSessionCommand(evt.StartSession, runtimeCommands);
+                        _ = commandTasks.Start(() => HandleStartSessionCommand(evt.StartSession, runtimeCommands));
                         continue;
                     }
 
@@ -1477,7 +1331,7 @@ internal static class ServiceClientManager
                             continue;
                         }
 
-                        _ = HandleQuiesceRuntimeCommandAsync(evt.QuiesceEditorRuntime, runtimeCommands);
+                        _ = commandTasks.Start(() => HandleQuiesceRuntimeCommandAsync(evt.QuiesceEditorRuntime, runtimeCommands));
                         continue;
                     }
 
@@ -1488,7 +1342,7 @@ internal static class ServiceClientManager
                             continue;
                         }
 
-                        _ = HandleLaunchRuntimeCommand(evt.LaunchEditorRuntime, runtimeCommands);
+                        _ = commandTasks.Start(() => HandleLaunchRuntimeCommand(evt.LaunchEditorRuntime, runtimeCommands));
                         continue;
                     }
 
@@ -1502,17 +1356,17 @@ internal static class ServiceClientManager
                     if (evt.SetGpuPowerLimit != null && !string.IsNullOrWhiteSpace(evt.SetGpuPowerLimit.CommandId))
                     {
                         // Physical work and acknowledgement retry must not block Stop delivery.
-                        _ = gpuPowerLimitService.HandleAsync(
+                        _ = commandTasks.Start(() => gpuPowerLimitService.HandleAsync(
                             evt.SetGpuPowerLimit, runnerId, logicalSessionState.GetActiveSessionId,
                             () => runtimeIdentities.TryGet(evt.SetGpuPowerLimit.SessionId, out var identity) ? identity.LifecycleGeneration : 0,
-                            sessionSink.GrantGpuPowerExecutionAsync, sessionSink.AckGpuPowerLimitAsync, shutdown);
+                            sessionSink.GrantGpuPowerExecutionAsync, sessionSink.AckGpuPowerLimitAsync, shutdown));
                         continue;
                     }
 
                     if (evt.RelayEditorRuntimeRequest != null && !string.IsNullOrWhiteSpace(evt.RelayEditorRuntimeRequest.RequestId))
                     {
                         var runtimeRequest = evt.RelayEditorRuntimeRequest;
-                        _ = DispatchTransientEditorRuntimeRequest(
+                        _ = commandTasks.Start(() => DispatchTransientEditorRuntimeRequest(
                             runtimeRequest,
                             runnerId,
                             transientDeliveries,
@@ -1541,7 +1395,7 @@ internal static class ServiceClientManager
                                     downloadService.InterruptSessionReads,
                                     sentToken)),
                             sessionSink.AckEditorRuntimeRequestAsync,
-                            shutdown);
+                            shutdown));
                         continue;
                     }
 
@@ -1551,14 +1405,7 @@ internal static class ServiceClientManager
                         commandWorkState.Prompts.Start(prompt, ShouldStreamHttpResponse(prompt), (captured, physicalCancellation, demandCancellation) =>
                         {
                             return HandleSubmitEditorActionAsync(
-                            (ack, acknowledgementCancellation) =>
-                            {
-                                // Delivery retries retain this exact result/identity and
-                                // run independently from the physical work joined by Stop.
-                                _ = AcknowledgeRuntimeCommandWithRetryAsync(
-                                    sessionSink.AckSubmitEditorActionAsync, ack, captured.CommandId, shutdown);
-                                return Task.CompletedTask;
-                            },
+                            (ack, _) => QueuePromptAcknowledgementAsync(commandTasks, sessionSink, ack, shutdown),
                             (events, token) => sessionSink.ReportSessionEventsAsync(events, token),
                             captured,
                             runnerId,
@@ -1642,7 +1489,20 @@ internal static class ServiceClientManager
             }
         }
 
-        transientCancellation.CancelAll();
+    }
+
+    internal static Task QueuePromptAcknowledgementAsync(
+        RunnerCommandLifetime commandTasks,
+        IRunnerSessionSink sessionSink,
+        AcknowledgePromptResultRequest acknowledgement,
+        CancellationToken shutdown)
+    {
+        // Construct the retry factory outside the physical prompt callback's
+        // closure, so it does not retain that callback's complete command body.
+        var captured = acknowledgement.Clone();
+        _ = commandTasks.Start(() => AcknowledgeRuntimeCommandWithRetryAsync(
+            sessionSink.AckSubmitEditorActionAsync, captured, captured.CommandId, shutdown));
+        return Task.CompletedTask;
     }
 
     internal static TimeSpan ComputeLocalModelLoopDelay(DateTime nowUtc, DateTime nextScanUtc, DateTime nextKeepAliveUtc)
@@ -1687,19 +1547,21 @@ internal static class ServiceClientManager
             setDownloadActiveSessionId(null);
         }
 
-        await stopSession(
-            activeSessionId,
-            (sessionId, token) => StopArtifactAndWorkspaceMirrorsAsync(sessionId, stopArtifactUploads, stopWorkspaceMirrors, token),
-            cancellationToken).ConfigureAwait(false);
-
-        try
+        Task? sidecars = null;
+        Task StopSidecarsAsync(string sid, CancellationToken token)
+            => sidecars ??= StopArtifactAndWorkspaceMirrorsAsync(sid, stopArtifactUploads, stopWorkspaceMirrors, token);
+        ExceptionDispatchInfo? failure = null;
+        try { await stopSession(activeSessionId, StopSidecarsAsync, cancellationToken).ConfigureAwait(false); }
+        catch (Exception error) { failure = ExceptionDispatchInfo.Capture(error); }
+        try { await StopSidecarsAsync(activeSessionId, CancellationToken.None).ConfigureAwait(false); }
+        catch (Exception error) { failure ??= ExceptionDispatchInfo.Capture(error); }
+        try { await stopSessionRelay(activeSessionId).ConfigureAwait(false); }
+        catch (Exception error)
         {
-            await stopSessionRelay(activeSessionId).ConfigureAwait(false);
+            RunnerLog.Warning(nameof(ServiceClientManager), $"Preempted relay cleanup ended with {error.GetType().Name}.");
+            failure ??= ExceptionDispatchInfo.Capture(new InvalidOperationException("Session relay cleanup failed."));
         }
-        catch (Exception ex)
-        {
-            RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed to stop websocket relay for preempted session {activeSessionId}");
-        }
+        failure?.Throw();
 
         return activeSessionId;
     }
@@ -1816,55 +1678,15 @@ internal static class ServiceClientManager
         var activeSessionId = getActiveSessionId()?.Trim() ?? string.Empty;
         if (!string.Equals(activeSessionId, normalizedSessionId, StringComparison.Ordinal))
         {
-            await StopArtifactAndWorkspaceMirrorsAsync(normalizedSessionId, stopArtifactUploads, stopWorkspaceMirrors, CancellationToken.None).ConfigureAwait(false);
-            try
-            {
-                await stopSessionRelay(normalizedSessionId).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed to stop websocket relay for revoked session {normalizedSessionId}");
-            }
+            await StopSidecarsAndRelayAsync(normalizedSessionId, stopArtifactUploads, stopWorkspaceMirrors,
+                stopSessionRelay, CancellationToken.None).ConfigureAwait(false);
 
             return false;
         }
 
-        var sidecarsStopped = false;
-        async Task StopSidecarsOnceAsync(string sid, CancellationToken token)
-        {
-            if (sidecarsStopped)
-            {
-                return;
-            }
-
-            await StopArtifactAndWorkspaceMirrorsAsync(sid, stopArtifactUploads, stopWorkspaceMirrors, token).ConfigureAwait(false);
-            sidecarsStopped = true;
-        }
-
-        try
-        {
-            await stopSession(
-                normalizedSessionId,
-                StopSidecarsOnceAsync,
-                CancellationToken.None).ConfigureAwait(false);
-        }
-        finally
-        {
-            await StopSidecarsOnceAsync(normalizedSessionId, CancellationToken.None).ConfigureAwait(false);
-            // A native open that was already in flight can publish its descriptor
-            // lease after the pre-stop cancellation. Once the child is gone, run
-            // the idempotent cleanup again so no leaked lease or sticky demand remains.
-            cancelSessionDownloads(normalizedSessionId);
-        }
-
-        try
-        {
-            await stopSessionRelay(normalizedSessionId).ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed to stop websocket relay for revoked session {normalizedSessionId}");
-        }
+        await StopSessionAndCleanupAsync(normalizedSessionId, stopSession, stopSessionRelay,
+            stopArtifactUploads, stopWorkspaceMirrors, cancelSessionDownloads,
+            getDownloadActiveSessionId, setDownloadActiveSessionId, CancellationToken.None).ConfigureAwait(false);
 
         return true;
     }
@@ -1893,47 +1715,33 @@ internal static class ServiceClientManager
             setDownloadActiveSessionId(null);
         }
 
-        var sidecarsStopped = false;
-        async Task StopSidecarsOnceAsync(string sid, CancellationToken token)
-        {
-            if (sidecarsStopped)
-            {
-                return;
-            }
-
-            await StopArtifactAndWorkspaceMirrorsAsync(sid, stopArtifactUploads, stopWorkspaceMirrors, token).ConfigureAwait(false);
-            sidecarsStopped = true;
-        }
+        Task? sidecarStop = null;
+        Task StopSidecarsOnceAsync(string sid, CancellationToken token)
+            => sidecarStop ??= StopArtifactAndWorkspaceMirrorsAsync(sid, stopArtifactUploads, stopWorkspaceMirrors, token);
 
         ExceptionDispatchInfo? stopFailure = null;
         try
         {
-            await stopSession(
-                normalizedSessionId,
-                StopSidecarsOnceAsync,
-                cancellationToken).ConfigureAwait(false);
+            await stopSession(normalizedSessionId, StopSidecarsOnceAsync, cancellationToken).ConfigureAwait(false);
         }
-        catch (Exception ex)
+        catch (Exception error)
         {
-            RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed to stop session {normalizedSessionId}: {ex.Message}");
-            stopFailure = ExceptionDispatchInfo.Capture(ex);
+            RunnerLog.Warning(nameof(ServiceClientManager), $"Session stop ended with {error.GetType().Name}.");
+            stopFailure = ExceptionDispatchInfo.Capture(error);
         }
-        finally
+        try { await StopSidecarsOnceAsync(normalizedSessionId, CancellationToken.None).ConfigureAwait(false); }
+        catch (Exception error)
         {
-            await StopSidecarsOnceAsync(normalizedSessionId, CancellationToken.None).ConfigureAwait(false);
-            // A native open that was already in flight can publish its descriptor
-            // lease after the pre-stop cancellation. Once the child is gone, run
-            // the idempotent cleanup again so no leaked lease or sticky demand remains.
-            cancelSessionDownloads(normalizedSessionId);
+            RunnerLog.Warning(nameof(ServiceClientManager), $"Sidecar cleanup ended with {error.GetType().Name}.");
+            stopFailure ??= ExceptionDispatchInfo.Capture(error);
         }
-
-        try
+        // A late native open may have published a descriptor lease during stop.
+        cancelSessionDownloads(normalizedSessionId);
+        try { await stopSessionRelay(normalizedSessionId).ConfigureAwait(false); }
+        catch (Exception error)
         {
-            await stopSessionRelay(normalizedSessionId).ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed to stop session websocket relay {normalizedSessionId}: {ex.Message}");
+            RunnerLog.Warning(nameof(ServiceClientManager), $"Relay cleanup ended with {error.GetType().Name}.");
+            stopFailure ??= ExceptionDispatchInfo.Capture(new InvalidOperationException("Session relay cleanup failed."));
         }
 
         // The child may still be alive: callers must not report it stopped or
@@ -2007,20 +1815,23 @@ internal static class ServiceClientManager
             setDownloadActiveSessionId(null);
         }
 
-        await StopArtifactAndWorkspaceMirrorsAsync(
-            normalizedSessionId,
-            stopArtifactUploads,
-            stopWorkspaceMirrors,
-            cancellationToken).ConfigureAwait(false);
+        await StopSidecarsAndRelayAsync(normalizedSessionId, stopArtifactUploads, stopWorkspaceMirrors,
+            stopSessionRelay, cancellationToken).ConfigureAwait(false);
+    }
 
-        try
+    private static async Task StopSidecarsAndRelayAsync(string sessionId, Func<string, Task> stopArtifactUploads,
+        Func<string, Task> stopWorkspaceMirrors, Func<string, Task> stopSessionRelay, CancellationToken cancellationToken)
+    {
+        ExceptionDispatchInfo? failure = null;
+        try { await StopArtifactAndWorkspaceMirrorsAsync(sessionId, stopArtifactUploads, stopWorkspaceMirrors, cancellationToken).ConfigureAwait(false); }
+        catch (Exception error) { failure = ExceptionDispatchInfo.Capture(error); }
+        try { await stopSessionRelay(sessionId).ConfigureAwait(false); }
+        catch (Exception error)
         {
-            await stopSessionRelay(normalizedSessionId).ConfigureAwait(false);
+            RunnerLog.Warning(nameof(ServiceClientManager), $"Relay cleanup ended with {error.GetType().Name}.");
+            failure ??= ExceptionDispatchInfo.Capture(new InvalidOperationException("Session relay cleanup failed."));
         }
-        catch (Exception ex)
-        {
-            RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed to stop websocket relay for exited session {normalizedSessionId}: {ex.Message}");
-        }
+        failure?.Throw();
     }
 
     internal static void ClearRuntimeSessionState(
@@ -2060,32 +1871,29 @@ internal static class ServiceClientManager
     {
         _ = cancellationToken;
 
-        // Stop must always complete: a mirror that does not stop in time is logged
-        // and left behind rather than blocking session cleanup.
-        try
-        {
-            await stopArtifactUploads(sessionId).WaitAsync(MirrorStopTimeout).ConfigureAwait(false);
-        }
-        catch (TimeoutException)
-        {
-            RunnerLog.Error(nameof(ServiceClientManager), $"Artifact uploader for session {sessionId} did not stop within {MirrorStopTimeout.TotalSeconds:F0}s; continuing");
-        }
-        catch (Exception ex)
-        {
-            RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed to stop artifact uploader for session {sessionId}");
-        }
+        // Invoke both owners even when the first factory fails. A slow-wait
+        // threshold is diagnostic; account/key cleanup still joins originals.
+        var artifacts = StopAsync(stopArtifactUploads, "Artifact uploader");
+        var workspace = StopAsync(stopWorkspaceMirrors, "Workspace mirror");
+        var results = await Task.WhenAll(artifacts, workspace).ConfigureAwait(false);
+        if (results.Any(succeeded => !succeeded)) throw new InvalidOperationException("Session sidecar cleanup failed.");
 
-        try
+        async Task<bool> StopAsync(Func<string, Task> factory, string kind)
         {
-            await stopWorkspaceMirrors(sessionId).WaitAsync(MirrorStopTimeout).ConfigureAwait(false);
-        }
-        catch (TimeoutException)
-        {
-            RunnerLog.Error(nameof(ServiceClientManager), $"Workspace mirror for session {sessionId} did not stop within {MirrorStopTimeout.TotalSeconds:F0}s; continuing");
-        }
-        catch (Exception ex)
-        {
-            RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed to stop workspace mirror for session {sessionId}");
+            try
+            {
+                var original = factory(sessionId);
+                if (await Task.WhenAny(original, Task.Delay(MirrorStopTimeout)).ConfigureAwait(false) != original)
+                    RunnerLog.Warning(nameof(ServiceClientManager), $"{kind} is still stopping; continuing to join original work.");
+                await original.ConfigureAwait(false);
+                return true;
+            }
+            catch (Exception error)
+            {
+                RunnerLog.Warning(nameof(ServiceClientManager), $"{kind} stop ended with {error.GetType().Name}.");
+                return false;
+            }
+            finally { factory = null!; }
         }
     }
 
@@ -2236,7 +2044,7 @@ internal static class ServiceClientManager
             {
                 // One retry loop per command; redelivery after a finished loop
                 // replays the same result without touching runtime state.
-                work.AcknowledgementTask = AcknowledgeStopAsync(work, acknowledgementKey, command, deps);
+                work.AcknowledgementTask = deps.StartAcknowledgement(() => AcknowledgeStopAsync(work, acknowledgementKey, command, deps));
             }
         }
         finally
@@ -2277,7 +2085,8 @@ internal static class ServiceClientManager
             await CancelTrackedWorkAsync(activeStartup).ConfigureAwait(false);
         }
 
-        deps.TransientCancellation.CancelSession(command.SessionId);
+        using var transientDrain = deps.TransientCancellation.BeginSessionDrain(command.SessionId);
+        await transientDrain.Completion.ConfigureAwait(false);
 
         try
         {
@@ -2527,7 +2336,8 @@ internal static class ServiceClientManager
 
                 await deps.WorkState.Prompts.CancelAndWaitAsync(
                     prompt => PromptTargetsRuntime(prompt, command.SessionId, target)).ConfigureAwait(false);
-                deps.TransientCancellation.CancelRuntime(command.SessionId, target);
+                using var transientDrain = deps.TransientCancellation.BeginRuntimeDrain(command.SessionId, target);
+                await transientDrain.Completion.ConfigureAwait(false);
 
                 if (!await StopRuntimeAndCleanupIfCurrentAsync(command.SessionId, target, deps, deps.Shutdown).ConfigureAwait(false))
                 {
@@ -2807,10 +2617,8 @@ internal static class ServiceClientManager
         }
 
         TrackedCommandWork? previous = null;
-        var cancellationSource = CancellationTokenSource.CreateLinkedTokenSource(deps.Shutdown);
-        var tracked = new TrackedCommandWork
+        var tracked = new TrackedCommandWork(deps.Shutdown)
         {
-            CancellationSource = cancellationSource,
             SessionId = sessionId,
             RuntimeIdentity = runtimeIdentity,
             Sealing = sealing?.Clone(),
@@ -2831,12 +2639,12 @@ internal static class ServiceClientManager
             try
             {
                 await CancelTrackedWorkAsync(previous).ConfigureAwait(false);
-                return await startup(cancellationSource.Token).ConfigureAwait(false);
+                return await startup(tracked.Token).ConfigureAwait(false);
             }
             finally
             {
-                deps.WorkState.ClearActiveStartup(tracked);
-                cancellationSource.Dispose();
+                try { await tracked.CompleteAsync().ConfigureAwait(false); }
+                finally { deps.WorkState.ClearActiveStartup(tracked); }
             }
         }
 
@@ -2919,20 +2727,21 @@ internal static class ServiceClientManager
             return;
         }
 
-        if (work.Task is null)
-        {
-            work.Cancel();
-            return;
-        }
-
-        work.Cancel();
+        var cancellation = work.CancelAsync();
         try
         {
-            await work.Task.ConfigureAwait(false);
+            if (work.Task is { } original) await original.ConfigureAwait(false);
         }
         catch
         {
-            // Prompt/start failures are logged and handled by their owning code path.
+            // Startup failures belong to the physical startup's outcome path.
+        }
+        try { await cancellation.ConfigureAwait(false); }
+        catch (Exception error)
+        {
+            // The original root and callbacks have ended. A callback failure
+            // must not skip runtime cleanup or copy its message into an ACK.
+            RunnerLog.Warning(nameof(ServiceClientManager), $"Startup cancellation ended with {error.GetType().Name}.");
         }
     }
 
@@ -2997,7 +2806,7 @@ internal static class ServiceClientManager
         AcknowledgeEditorRuntimeRequestRequest response;
         try
         {
-            using var lease = cancellation.Acquire(
+            await using var lease = cancellation.Acquire(
                 request.SessionId,
                 request.LifecycleGeneration,
                 request.RuntimeEpoch,
@@ -3418,7 +3227,7 @@ internal static class ServiceClientManager
         // the cancellation callback, so a racing interrupt cannot drop the demand
         // of a prompt the runtime accepted.
         // Owned by the settling demand, which can outlive this command.
-        var promptDemandLifetime = CancellationTokenSource.CreateLinkedTokenSource(promptDemandCancellation);
+        var promptDemandLifetime = new OwnedCancellation(promptDemandCancellation);
         var demandGate = new object();
         var demandFollowsWork = true;
         using var withdrawDemandBeforeInvocation = cancellationToken.Register(() =>
@@ -3427,7 +3236,7 @@ internal static class ServiceClientManager
             {
                 if (demandFollowsWork)
                 {
-                    promptDemandLifetime.Cancel();
+                    _ = promptDemandLifetime.RequestAsync();
                 }
             }
         });
@@ -3595,7 +3404,7 @@ internal static class ServiceClientManager
         }
 
         withdrawDemandBeforeInvocation.Dispose();
-        var settling = SettleAndReleasePromptDemandAsync(
+        var settling = SettlePromptDemandAsync(
             promptDemand,
             keepPromptDemand,
             promptDemandLifetime,
@@ -3623,22 +3432,6 @@ internal static class ServiceClientManager
         Func<string, CancellationToken, Task<bool?>> probe, string promptId)
         => token => probe(promptId, token);
 
-    private static async Task SettleAndReleasePromptDemandAsync(
-        Task? demand,
-        bool keep,
-        CancellationTokenSource lifetime,
-        Func<CancellationToken, Task<bool?>>? isStillQueued)
-    {
-        try
-        {
-            await SettlePromptDemandAsync(demand, keep, lifetime, isStillQueued).ConfigureAwait(false);
-        }
-        finally
-        {
-            lifetime.Dispose();
-        }
-    }
-
     /// <summary>
     /// A queued prompt keeps its ordered model demand until hydration settles, after
     /// its acknowledgement was handed over, or until Stop or its terminal event
@@ -3649,38 +3442,41 @@ internal static class ServiceClientManager
     internal static async Task SettlePromptDemandAsync(
         Task? demand,
         bool keep,
-        CancellationTokenSource lifetime,
+        OwnedCancellation lifetime,
         Func<CancellationToken, Task<bool?>>? isStillQueued = null)
     {
-        if (demand is null)
-        {
-            // Preparation can fail after publishing managed demand without handing
-            // its completion over (a failed conventional download); withdraw it.
-            lifetime.Cancel();
-            return;
-        }
-
-        if (!keep)
-        {
-            lifetime.Cancel();
-        }
-        else if (isStillQueued is not null)
-        {
-            await WithdrawOnceDequeuedAsync(demand, lifetime, isStillQueued).ConfigureAwait(false);
-        }
-
         try
         {
-            await demand.ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) when (lifetime.IsCancellationRequested) { }
-        catch (Exception ex)
-        {
-            RunnerLog.Warning(nameof(ServiceClientManager), $"Prompt model hydration ended with {ex.GetType().Name}; managed reads remain gated.");
+            if (demand is null || !keep)
+            {
+                // Withdrawal requests cancellation without running user callbacks
+                // here. Their failure cannot bypass the original demand join.
+                _ = lifetime.RequestAsync();
+            }
+            else if (isStillQueued is not null)
+            {
+                await WithdrawOnceDequeuedAsync(demand, lifetime, isStillQueued).ConfigureAwait(false);
+            }
+
+            if (demand is not null)
+            {
+                try
+                {
+                    await demand.ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (lifetime.Token.IsCancellationRequested) { }
+                catch (Exception ex)
+                {
+                    RunnerLog.Warning(nameof(ServiceClientManager), $"Prompt model hydration ended with {ex.GetType().Name}; managed reads remain gated.");
+                }
+            }
         }
         finally
         {
-            lifetime.Cancel();
+            // Even preparation that returned no demand can have registered
+            // callbacks. This settling owner joins their first cancellation task.
+            _ = lifetime.RequestAsync();
+            await lifetime.CompleteAsync().ConfigureAwait(false);
         }
     }
 
@@ -3693,17 +3489,17 @@ internal static class ServiceClientManager
     /// </summary>
     private static async Task WithdrawOnceDequeuedAsync(
         Task demand,
-        CancellationTokenSource lifetime,
+        OwnedCancellation lifetime,
         Func<CancellationToken, Task<bool?>> isStillQueued)
     {
-        while (!demand.IsCompleted && !lifetime.IsCancellationRequested)
+        while (!demand.IsCompleted && !lifetime.Token.IsCancellationRequested)
         {
             bool? queued;
             try
             {
                 queued = await isStillQueued(lifetime.Token).ConfigureAwait(false);
             }
-            catch (OperationCanceledException) when (lifetime.IsCancellationRequested)
+            catch (OperationCanceledException) when (lifetime.Token.IsCancellationRequested)
             {
                 return;
             }
@@ -3714,7 +3510,7 @@ internal static class ServiceClientManager
 
             if (queued == false)
             {
-                lifetime.Cancel();
+                _ = lifetime.RequestAsync();
                 return;
             }
 
@@ -4128,14 +3924,6 @@ internal static class ServiceClientManager
             request.SelectionHashes.AddRange(snapshot.SelectionHashes);
         }
         return request;
-    }
-
-    private static RunnerControlService.RunnerControlServiceClient CreateAuthenticatedClient(
-        GrpcChannel channel,
-        string runnerSecret)
-    {
-        var callInvoker = channel.Intercept(new RunnerSecretClientInterceptor(runnerSecret));
-        return new RunnerControlService.RunnerControlServiceClient(callInvoker);
     }
 
     private sealed class RunnerSessionRejectedException(string message)

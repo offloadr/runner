@@ -23,7 +23,7 @@ public sealed partial class ComfyPromptEvidenceTests
             if (request.State == EditorRuntimeBridgeState.Heartbeat) heartbeatRetried.TrySetResult();
             return Task.CompletedTask;
         };
-        await using var relay = new ComfySessionEventRelay(command.Target.RunnerId, "127.0.0.1", port,
+        await using var relay = new ComfySessionEventRelay(static (_, _) => { }, command.Target.RunnerId, "127.0.0.1", port,
             "test-process", _ => new SessionSealingStatus(), (_, _) => true);
         relay.AttachSink(sink);
         await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", command.Target.GpuGeneration,
@@ -96,7 +96,7 @@ public sealed partial class ComfyPromptEvidenceTests
             responseReady.TrySetResult();
             return result;
         };
-        await using var relay = new ComfySessionEventRelay(command.Target.RunnerId, "127.0.0.1", port,
+        await using var relay = new ComfySessionEventRelay(static (_, _) => { }, command.Target.RunnerId, "127.0.0.1", port,
             "test-process", _ => new SessionSealingStatus(), (_, _) => true);
         relay.AttachSink(sink);
         await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", command.Target.GpuGeneration,

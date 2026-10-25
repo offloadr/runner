@@ -7,6 +7,8 @@ public interface ISessionIsolationStrategy
 {
     void ValidatePrerequisites(ICollection<string> errors);
     Task<PreparedSessionIdentity> PrepareAsync(string sessionId, string sessionRoot, CancellationToken cancellationToken);
+    /// <summary>Reaps session processes while retaining the account, its home and other data.</summary>
+    Task StopProcessesAsync(PreparedSessionIdentity identity, CancellationToken cancellationToken);
     Task CleanupAsync(PreparedSessionIdentity identity, CancellationToken cancellationToken);
 
     /// <summary>
@@ -196,34 +198,52 @@ public sealed class LinuxUserIsolationStrategy : ISessionIsolationStrategy
         return userId;
     }
 
-    public async Task CleanupAsync(PreparedSessionIdentity identity, CancellationToken cancellationToken)
+    public async Task StopProcessesAsync(PreparedSessionIdentity identity, CancellationToken cancellationToken)
+    {
+        if (await ResolveCleanupUserIdAsync(identity, cancellationToken).ConfigureAwait(false) is { } userId)
+        {
+            await KillUserProcessesAsync(identity.UserName, userId, cancellationToken, requireNoSurvivors: true).ConfigureAwait(false);
+        }
+    }
+
+    private async Task<uint?> ResolveCleanupUserIdAsync(PreparedSessionIdentity identity, CancellationToken cancellationToken)
     {
         if (!identity.CleanupIdentity || string.IsNullOrWhiteSpace(identity.UserName))
+        {
+            return null;
+        }
+
+        // A saved uid is not proof of current ownership. After an earlier teardown it may
+        // belong to another account, and the same user name may have been recreated.
+        var lookup = await _commandRunner.RunAsync(LinuxCommandFactory.CheckUserExists(identity.UserName), cancellationToken).ConfigureAwait(false);
+        if (lookup.ExitCode == 1)
+        {
+            return null;
+        }
+
+        var currentUserId = ParseUserId(identity.UserName, lookup);
+        if (identity.UserId is { } expectedUserId && expectedUserId != currentUserId)
+        {
+            throw new InvalidOperationException("The session account's uid changed; refusing cleanup of its replacement.");
+        }
+
+        return currentUserId;
+    }
+
+    public async Task CleanupAsync(PreparedSessionIdentity identity, CancellationToken cancellationToken)
+    {
+        if (await ResolveCleanupUserIdAsync(identity, cancellationToken).ConfigureAwait(false) is not { } uid)
         {
             return;
         }
 
-        // Kill everything still running as the session uid, including processes that left the
-        // editor's tree, before the user is removed and its uid can be handed out again.
-        var userId = identity.UserId;
-        if (userId is null)
-        {
-            var lookup = await _commandRunner.RunAsync(LinuxCommandFactory.CheckUserExists(identity.UserName), cancellationToken).ConfigureAwait(false);
-            if (lookup.ExitCode == 0 &&
-                uint.TryParse(lookup.Stdout.Trim(), System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var resolved))
-            {
-                userId = resolved;
-            }
-        }
-
-        if (userId is { } uid and not 0)
-        {
-            // Survivors keep the account (and its uid) in place and fail the teardown, so the
-            // stop that asked for it is not reported as complete while they run.
-            await KillUserProcessesAsync(identity.UserName, uid, cancellationToken, requireNoSurvivors: true).ConfigureAwait(false);
-            RemoveSharedResidue(identity.UserName, uid);
-            await RemoveIpcResidueAsync(identity.UserName, uid, cancellationToken).ConfigureAwait(false);
-        }
+        // Revalidate and reap again immediately before final account/data retirement. The
+        // earlier process-only phase lets the owner join pipe readers without freeing the uid.
+        // Survivors keep the account (and its uid) in place and fail the teardown, so the
+        // stop that asked for it is not reported as complete while they run.
+        await KillUserProcessesAsync(identity.UserName, uid, cancellationToken, requireNoSurvivors: true).ConfigureAwait(false);
+        RemoveSharedResidue(identity.UserName, uid);
+        await RemoveIpcResidueAsync(identity.UserName, uid, cancellationToken).ConfigureAwait(false);
 
         // Any other failure fails the teardown, so the Stop that asked for it stays pending and a
         // later Stop retries. A retry after userdel removed the account but not its home finds
@@ -250,7 +270,7 @@ public sealed class LinuxUserIsolationStrategy : ISessionIsolationStrategy
             try
             {
                 await CleanupAsync(
-                        new PreparedSessionIdentity(userName, string.Empty, CleanupIdentity: true, userId),
+                        new PreparedSessionIdentity(userName, homeDirectory, CleanupIdentity: true, userId),
                         cancellationToken)
                     .ConfigureAwait(false);
             }

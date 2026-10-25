@@ -9,17 +9,30 @@ public sealed class RunnerStartupValidator
     private readonly string _passwdPath;
     private readonly SealedStorageProbe _sealedStorageProbe;
     private readonly RunnerVfsEnvironmentBuilder _vfsEnvironmentBuilder;
+    private readonly Func<string?> _processSignalUnsupportedReason;
 
     public RunnerStartupValidator(
         ISessionIsolationStrategy sessionIsolationStrategy,
         string passwdPath = "/etc/passwd",
         SealedStorageProbe? sealedStorageProbe = null,
         RunnerVfsEnvironmentBuilder? vfsEnvironmentBuilder = null)
+        : this(sessionIsolationStrategy, passwdPath, sealedStorageProbe, vfsEnvironmentBuilder,
+            SessionProcessSignal.GetUnsupportedReason)
+    {
+    }
+
+    internal RunnerStartupValidator(
+        ISessionIsolationStrategy sessionIsolationStrategy,
+        string passwdPath,
+        SealedStorageProbe? sealedStorageProbe,
+        RunnerVfsEnvironmentBuilder? vfsEnvironmentBuilder,
+        Func<string?> processSignalUnsupportedReason)
     {
         _sessionIsolationStrategy = sessionIsolationStrategy ?? throw new ArgumentNullException(nameof(sessionIsolationStrategy));
         _passwdPath = passwdPath;
         _sealedStorageProbe = sealedStorageProbe ?? new SealedStorageProbe();
         _vfsEnvironmentBuilder = vfsEnvironmentBuilder ?? new RunnerVfsEnvironmentBuilder();
+        _processSignalUnsupportedReason = processSignalUnsupportedReason ?? throw new ArgumentNullException(nameof(processSignalUnsupportedReason));
     }
 
     public void ValidateOrThrow(RunnerAgentOptions options)
@@ -31,6 +44,10 @@ public sealed class RunnerStartupValidator
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
         {
             errors.Add("RunnerAgent currently supports Linux only.");
+        }
+        else if (_processSignalUnsupportedReason() is { } processSignalsError)
+        {
+            errors.Add(processSignalsError);
         }
 
         if (string.IsNullOrWhiteSpace(options.RunnerSecret))

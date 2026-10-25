@@ -655,12 +655,12 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
-    public async Task PreemptActiveSessionIfNeededAsync_Continues_WhenResourceCleanupFails()
+    public void PreemptActiveSessionIfNeededAsync_RejectsAfterBothSidecarCleanupFailures()
     {
         var stopCalls = 0;
         string? cancelledDownloadSession = null;
 
-        var preempted = await ServiceClientManager.PreemptActiveSessionIfNeededAsync(
+        var failure = Assert.ThrowsAsync<InvalidOperationException>(() => ServiceClientManager.PreemptActiveSessionIfNeededAsync(
             "session-new",
             getActiveSessionId: () => "session-old",
             stopSession: (_, callback, _) =>
@@ -678,9 +678,9 @@ public partial class ServiceClientManagerTests
             cancelSessionDownloads: sessionId => cancelledDownloadSession = sessionId,
             getDownloadActiveSessionId: () => "session-old",
             setDownloadActiveSessionId: _ => { },
-            cancellationToken: CancellationToken.None);
+            cancellationToken: CancellationToken.None));
 
-        Assert.That(preempted, Is.EqualTo("session-old"));
+        Assert.That(failure!.Message, Is.EqualTo("Session sidecar cleanup failed."));
         Assert.That(stopCalls, Is.EqualTo(1));
         Assert.That(cancelledDownloadSession, Is.EqualTo("session-old"));
     }
@@ -1400,14 +1400,24 @@ public partial class ServiceClientManagerTests
     public async Task HandleSubmitEditorActionAsync_RejectedPromptHoldsNoDemand()
     {
         Task? held = null;
+        Task? originalDemand = null;
+        CancellationToken demandToken = default;
         await HandlePromptWithDemandAsync(
-            token => Task.Delay(Timeout.InfiniteTimeSpan, token),
+            token =>
+            {
+                demandToken = token;
+                return originalDemand = Task.Delay(Timeout.InfiniteTimeSpan, token);
+            },
             nativeStatus: 400,
             _ => { },
             CancellationToken.None,
             holdPromptDemand: settling => held = settling).WaitAsync(TimeSpan.FromSeconds(5));
 
-        Assert.That(held, Is.Null);
+        // Rejection withdraws demand immediately. Any handed-off settling task
+        // owns original cancellation callbacks, which can finish asynchronously.
+        Assert.That(demandToken.IsCancellationRequested, Is.True);
+        if (held is not null) await held.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.That(originalDemand?.IsCanceled, Is.True);
     }
 
     [Test]

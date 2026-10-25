@@ -11,6 +11,34 @@ namespace Offloadr.Runner.Tests;
 public class RunnerLogRelayTests
 {
     [Test]
+    public async Task RelayIdentitySurvivesReconnectButChangesOnRestart()
+    {
+        await using var first = new RunnerLogRelay("runner-1");
+        var initial = new RecordingSink();
+        first.AttachSink(initial);
+        first.Enqueue("RunnerAgent", "initial");
+        var one = (await WaitForAsync(initial.FirstRequest.Task, TimeSpan.FromSeconds(3))).Entries.Single();
+        first.DetachSink(initial);
+        var reconnected = new RecordingSink();
+        first.AttachSink(reconnected);
+        first.Enqueue("RunnerAgent", "reconnected");
+        var two = (await WaitForAsync(reconnected.FirstRequest.Task, TimeSpan.FromSeconds(3))).Entries.Single();
+        await using var restarted = new RunnerLogRelay("runner-1");
+        var next = new RecordingSink();
+        restarted.AttachSink(next);
+        restarted.Enqueue("RunnerAgent", "restarted");
+        var three = (await WaitForAsync(next.FirstRequest.Task, TimeSpan.FromSeconds(3))).Entries.Single();
+        Assert.Multiple(() =>
+        {
+            Assert.That(Guid.TryParse(one.RelayInstanceId, out var identity) && identity != Guid.Empty, Is.True);
+            Assert.That(two.RelayInstanceId, Is.EqualTo(one.RelayInstanceId));
+            Assert.That(two.Sequence, Is.GreaterThan(one.Sequence));
+            Assert.That(three.RelayInstanceId, Is.Not.EqualTo(one.RelayInstanceId));
+            Assert.That(three.Sequence, Is.EqualTo(1));
+        });
+    }
+
+    [Test]
     public async Task EnqueuedLogs_AreDroppedUntilSinkAttaches()
     {
         await using var relay = new RunnerLogRelay("runner-1");

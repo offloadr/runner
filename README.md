@@ -8,6 +8,10 @@ The runner images Offloadr uses on its own hosted GPUs are built from this repos
 
 You need an NVIDIA GPU, Docker with GPU support, and a personal runner key from Settings in the Offloadr web app.
 
+The Linux kernel and container policy must permit `pidfd_open` and `pidfd_send_signal`.
+The agent checks both during startup and exits before registering or accepting work
+if they are unavailable or denied.
+
 ### Desktop app (Windows)
 
 Download `OffloadrRunner-<version>-windows-x64.zip` from the [releases](https://github.com/offloadr/runner/releases), extract it and run `OffloadrRunner.exe`. It needs Docker Desktop with the WSL 2 backend and the [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/), which Windows 11 includes; on Windows 10, install it if the app's window stays blank. Paste your runner key under Settings and press Start runner. The app picks the runner image for your editor, downloads it and keeps it running. Closing the window leaves it in the notification area, where a coloured dot on the icon shows the runner's state; quit from the tray icon to stop the runner. Settings can make the app start in the notification area when you sign in to Windows, and the app tells you when a newer release is out.

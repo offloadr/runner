@@ -27,13 +27,11 @@ public partial class App : MauiWinUIApplication
     {
         try
         {
-            var logs = MauiProgram.Paths().Logs;
-            Directory.CreateDirectory(logs);
-            File.AppendAllText(Path.Combine(logs, "desktop-startup.log"), $"{DateTimeOffset.UtcNow:O} {error}\n");
+            Offloadr.Runner.Supervisor.Logging.DesktopStartupDiagnostics.WriteError(MauiProgram.Paths().Logs, error);
         }
-        catch (IOException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException or ArgumentException)
         {
-            // Nothing else can report this.
+            // There is no content-bearing fallback if the configured folder is unavailable.
         }
     }
 }

@@ -39,7 +39,7 @@ public partial class SessionProcessManagerOwnershipTests
 
         try
         {
-            using var manager = new SessionProcessManager(options, isolation, new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
+            await using var manager = new SessionProcessManager(TestRuntimeActivitySink.Accepted, options, isolation, new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
 
             Exception? launchError = null;
             try
@@ -107,7 +107,7 @@ public partial class SessionProcessManagerOwnershipTests
 
         try
         {
-            using var manager = new SessionProcessManager(options, isolation, new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
+            await using var manager = new SessionProcessManager(TestRuntimeActivitySink.Accepted, options, isolation, new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
 
             Exception? launchError = null;
             try
@@ -172,7 +172,7 @@ public partial class SessionProcessManagerOwnershipTests
 
         try
         {
-            using var manager = new SessionProcessManager(options, isolation, new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
+            await using var manager = new SessionProcessManager(TestRuntimeActivitySink.Accepted, options, isolation, new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
 
             Exception? launchError = null;
             try
@@ -245,7 +245,7 @@ public partial class SessionProcessManagerOwnershipTests
 
         try
         {
-            using var manager = new SessionProcessManager(options, isolation, new RunnerVfsEnvironmentBuilder(), commandRunner);
+            await using var manager = new SessionProcessManager(TestRuntimeActivitySink.Accepted, options, isolation, new RunnerVfsEnvironmentBuilder(), commandRunner);
 
             Exception? launchError = null;
             try
@@ -314,7 +314,7 @@ public partial class SessionProcessManagerOwnershipTests
 
         try
         {
-            using var manager = new SessionProcessManager(options, isolation, new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
+            await using var manager = new SessionProcessManager(TestRuntimeActivitySink.Accepted, options, isolation, new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
 
             Exception? launchError = null;
             try
@@ -373,7 +373,7 @@ public partial class SessionProcessManagerOwnershipTests
 
         try
         {
-            using var manager = new SessionProcessManager(options, isolation, new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
+            await using var manager = new SessionProcessManager(TestRuntimeActivitySink.Accepted, options, isolation, new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
 
             Exception? launchError = null;
             try
@@ -439,7 +439,7 @@ public partial class SessionProcessManagerOwnershipTests
 
         try
         {
-            using var manager = new SessionProcessManager(options, isolation, new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
+            await using var manager = new SessionProcessManager(TestRuntimeActivitySink.Accepted, options, isolation, new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
 
             Exception? launchError = null;
             try
@@ -543,7 +543,7 @@ public partial class SessionProcessManagerOwnershipTests
 
         try
         {
-            using var manager = new SessionProcessManager(options, isolation, new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
+            await using var manager = new SessionProcessManager(TestRuntimeActivitySink.Accepted, options, isolation, new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
 
             Exception? launchError = null;
             try
@@ -643,7 +643,7 @@ public partial class SessionProcessManagerOwnershipTests
 
         try
         {
-            using var manager = new SessionProcessManager(options, isolation, new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
+            await using var manager = new SessionProcessManager(TestRuntimeActivitySink.Accepted, options, isolation, new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
 
             Exception? launchError = null;
             try
@@ -1038,7 +1038,7 @@ public partial class SessionProcessManagerOwnershipTests
                 """);
             MakeExecutable(pythonPath);
 
-            using var manager = new SessionProcessManager(options, new RecordingIsolationStrategy(identity.UserName, identity.HomeDirectory), new RunnerVfsEnvironmentBuilder(), commandRunner);
+            await using var manager = new SessionProcessManager(TestRuntimeActivitySink.Accepted, options, new RecordingIsolationStrategy(identity.UserName, identity.HomeDirectory), new RunnerVfsEnvironmentBuilder(), commandRunner);
 
             var synced = await manager.TryRunManagerUvSyncAsync("session-sync-rollback", identity, paths, CancellationToken.None);
 
@@ -1091,7 +1091,7 @@ public partial class SessionProcessManagerOwnershipTests
     }
 
     [Test]
-    public void BuildManagerUvSyncStartInfo_TargetsSessionComfyPath()
+    public async Task BuildManagerUvSyncStartInfo_TargetsSessionComfyPath()
     {
         var tempRoot = Path.Combine(Path.GetTempPath(), $"runner-manager-sync-{Guid.NewGuid():N}");
         Directory.CreateDirectory(tempRoot);
@@ -1131,7 +1131,7 @@ public partial class SessionProcessManagerOwnershipTests
 
         try
         {
-            using var manager = new SessionProcessManager(options, new RecordingIsolationStrategy(identity.UserName, identity.HomeDirectory), new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
+            await using var manager = new SessionProcessManager(TestRuntimeActivitySink.Accepted, options, new RecordingIsolationStrategy(identity.UserName, identity.HomeDirectory), new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
 
             var psi = manager.BuildManagerUvSyncStartInfo("session-sync", identity, paths);
 
@@ -1163,7 +1163,7 @@ public partial class SessionProcessManagerOwnershipTests
     }
 
     [Test]
-    public void SessionStartInfos_DoNotInheritAgentSecretsOrHostVariables()
+    public async Task SessionStartInfos_DoNotInheritAgentSecretsOrHostVariables()
     {
         var tempRoot = Path.Combine(Path.GetTempPath(), $"runner-session-env-{Guid.NewGuid():N}");
         Directory.CreateDirectory(tempRoot);
@@ -1210,7 +1210,7 @@ public partial class SessionProcessManagerOwnershipTests
                 Environment.SetEnvironmentVariable(name, $"value-of-{name}");
             }
 
-            using var manager = new SessionProcessManager(options, new RecordingIsolationStrategy(identity.UserName, identity.HomeDirectory), new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
+            await using var manager = new SessionProcessManager(TestRuntimeActivitySink.Accepted, options, new RecordingIsolationStrategy(identity.UserName, identity.HomeDirectory), new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
 
             foreach (var psi in new[]
             {
@@ -1302,7 +1302,7 @@ public partial class SessionProcessManagerOwnershipTests
                 """);
             MakeExecutable(pythonPath);
 
-            using var manager = new SessionProcessManager(options, new RecordingIsolationStrategy(identity.UserName, identity.HomeDirectory), new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
+            await using var manager = new SessionProcessManager(TestRuntimeActivitySink.Accepted, options, new RecordingIsolationStrategy(identity.UserName, identity.HomeDirectory), new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
 
             var result = await manager.RunManagerUvSyncOnceAsync("session-sync", identity, paths, CancellationToken.None);
 
@@ -1367,7 +1367,7 @@ public partial class SessionProcessManagerOwnershipTests
                 """);
             MakeExecutable(pythonPath);
 
-            using var manager = new SessionProcessManager(options, new RecordingIsolationStrategy(identity.UserName, identity.HomeDirectory), new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
+            await using var manager = new SessionProcessManager(TestRuntimeActivitySink.Accepted, options, new RecordingIsolationStrategy(identity.UserName, identity.HomeDirectory), new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
 
             var result = await manager.RunManagerUvSyncOnceAsync("session-sync", identity, paths, CancellationToken.None);
             var lines = result.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries).Select(line => line.TrimEnd('\r')).ToArray();
@@ -1418,7 +1418,7 @@ public partial class SessionProcessManagerOwnershipTests
 
         try
         {
-            using var manager = new SessionProcessManager(options, isolation, new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
+            await using var manager = new SessionProcessManager(TestRuntimeActivitySink.Accepted, options, isolation, new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
 
             Exception? launchError = null;
             try
@@ -1483,7 +1483,7 @@ public partial class SessionProcessManagerOwnershipTests
 
         try
         {
-            using var manager = new SessionProcessManager(options, isolation, new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
+            await using var manager = new SessionProcessManager(TestRuntimeActivitySink.Accepted, options, isolation, new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
             using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
 
             var startTask = manager.StartSessionAsync(
@@ -1579,7 +1579,7 @@ public partial class SessionProcessManagerOwnershipTests
 
         try
         {
-            using var manager = new SessionProcessManager(options, isolation, new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
+            await using var manager = new SessionProcessManager(TestRuntimeActivitySink.Accepted, options, isolation, new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
 
             Exception? launchError = null;
             try
@@ -1685,6 +1685,8 @@ public partial class SessionProcessManagerOwnershipTests
     {
         public int CleanupCallCount { get; private set; }
         public Func<Task>? Cleanup { get; init; }
+        public int QuiescenceCallCount { get; private set; }
+        public Func<Task>? Quiesce { get; init; }
 
         public void ValidatePrerequisites(ICollection<string> errors)
         {
@@ -1693,6 +1695,12 @@ public partial class SessionProcessManagerOwnershipTests
         public Task<PreparedSessionIdentity> PrepareAsync(string sessionId, string sessionRoot, CancellationToken cancellationToken)
         {
             return Task.FromResult(new PreparedSessionIdentity(userName, homeDirectory, CleanupIdentity: true));
+        }
+
+        public Task StopProcessesAsync(PreparedSessionIdentity identity, CancellationToken cancellationToken)
+        {
+            QuiescenceCallCount++;
+            return Quiesce?.Invoke() ?? Task.CompletedTask;
         }
 
         public Task CleanupAsync(PreparedSessionIdentity identity, CancellationToken cancellationToken)

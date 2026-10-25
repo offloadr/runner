@@ -500,6 +500,34 @@ message SessionStreamEvent {
     string runtime_instance_id = 13;
 }
 
+// A required fact that a managed runtime produced native activity. It carries no
+// log, prompt, result, exception text or producer timestamp. Physical readiness
+// and optional diagnostic delivery remain independent.
+message ReportRuntimeActivityRequest {
+    string runner_id = 1;
+    string session_id = 2;
+    string instance_id = 3;
+    uint64 lifecycle_generation = 4;
+    uint64 runtime_epoch = 5;
+    string runtime_instance_id = 6;
+    SessionSealingStatus sealing = 7;
+}
+
+enum RuntimeActivityOutcome {
+    RUNTIME_ACTIVITY_OUTCOME_UNSPECIFIED = 0;
+    RUNTIME_ACTIVITY_OUTCOME_APPLIED = 1;
+    RUNTIME_ACTIVITY_OUTCOME_ALREADY_APPLIED_EXACTLY = 2;
+    RUNTIME_ACTIVITY_OUTCOME_OBSOLETE_OR_PREEMPTED = 3;
+    RUNTIME_ACTIVITY_OUTCOME_INVALID_IDENTITY = 4;
+    RUNTIME_ACTIVITY_OUTCOME_CONFLICTING_STATE = 5;
+    RUNTIME_ACTIVITY_OUTCOME_NOT_READY = 6;
+}
+
+message ReportRuntimeActivityResponse {
+    RuntimeActivityOutcome outcome = 1;
+    google.protobuf.Timestamp runtime_started_utc = 2;
+}
+
 message ReportSessionEventsRequest {
     repeated SessionStreamEvent events = 1;
 }
@@ -536,6 +564,8 @@ message RunnerLogEntry {
     string message = 3;
     google.protobuf.Timestamp created_utc = 4;
     uint64 sequence = 5;
+    // Stable for one relay lifetime, including reconnects/retries; new on restart.
+    string relay_instance_id = 6;
 }
 
 message ReportRunnerLogsRequest {
@@ -801,6 +831,7 @@ service RunnerControlService {
     rpc AcknowledgeEditorRuntimeLaunch(AcknowledgeEditorRuntimeLaunchRequest) returns (AcknowledgeEditorRuntimeLaunchResponse);
     rpc ReportModelDownload(ReportModelDownloadRequest) returns (ReportModelDownloadResponse);
     rpc SyncLocalModels(SyncLocalModelsRequest) returns (SyncLocalModelsResponse);
+    rpc ReportRuntimeActivity(ReportRuntimeActivityRequest) returns (ReportRuntimeActivityResponse);
     rpc ReportSessionEvents(ReportSessionEventsRequest) returns (ReportSessionEventsResponse);
     rpc ReportSessionLogs(ReportSessionLogsRequest) returns (ReportSessionLogsResponse);
     rpc ReportRunnerLogs(ReportRunnerLogsRequest) returns (ReportRunnerLogsResponse);

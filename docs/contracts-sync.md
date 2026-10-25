@@ -40,6 +40,16 @@ schema; these editor-facing reads are served by the control plane.
 
 Every Stop requires a nonempty UUID `command_id` (field 3). Its acknowledgement echoes the captured nonce and the registered runner process in string `instance_id` (field 4). Acknowledgement fields 5–7 echo lifecycle generation, runtime epoch and runtime instance when supplied. Invalid command or missing process identity never enters cleanup. Acknowledgements retry the captured result after cleanup; failed cleanup or host shutdown never acknowledges success.
 
+## Runner log relay identity
+
+Each `RunnerLogEntry` carries a nonempty UUID `relay_instance_id`, created once
+for the relay lifetime and preserved through reconnection and retries. A restarted
+relay gets a new UUID and may restart its sequence at one. Duplicate suppression
+keeps the old relay's watermark; sequence one alone never proves a restart.
+Missing or invalid relay identities are dropped. Coordinate the current producer
+and server together; there is no missing-field compatibility fallback. This
+identity neither authenticates a runner nor grants runtime activity authority.
+
 ## Pending on the control plane
 
 These declarations are shared, but the server behavior below remains pending. The sealed-transfer rows follow `docs/sealed-envelope.md`, which defines the envelope format. Runtime fences apply only when the control plane supplies them; the command nonce and runner process identity above are always required.

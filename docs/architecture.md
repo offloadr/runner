@@ -1,5 +1,172 @@
 # Architecture
 
+## Agent producer shutdown
+
+The entry point starts command, runtime telemetry, sealed eviction and status-file
+producers inside one agent lifetime. Factories are invoked within its cleanup
+boundary, so partial setup still owns every task already started. A failed
+producer requests peer cancellation; the command listener also fails the agent
+if it ends before shutdown. Disabled optional producers may finish normally.
+
+Shutdown callers share the original cancellation-callback task. The lifetime
+joins all original producers and cancellation callbacks, then stops and joins
+the session manager before returning to the scope that disposes sidecars and
+channels. Cancellation does not count as a successful command acknowledgement.
+An uncooperative producer holds shutdown open rather than leaving its work
+running against disposed dependencies. Setup, producer, callback and session
+cleanup errors remain failures. Signal registrations are removed before the
+lifetime's cancellation source is disposed.
+
+The command listener separately owns its original status, local-model and
+command-stream tasks. A failed or prematurely ended required lane cancels its
+peers. Partial attachment and producer setup still drain GPU work, prompts and
+startup work; a failed drain cannot skip the others or later detachments. Download
+progress callbacks share that lifetime's cancellation and admission gate. An old
+captured reporter cannot admit work after shutdown, while admitted original
+callbacks and cancellation callbacks must finish before detachment completes.
+
+Startup publishes its original physical task before execution and keeps the
+active slot until both execution and its original cancellation callbacks end.
+Host shutdown, Stop, Quiesce and replacement share that callback ownership.
+Joining never uses a cancelled waiting wrapper. A callback failure is reported
+by class after the join and cannot skip runtime cleanup or enter an acknowledgement
+message. Startup acknowledgement retries remain independent of that physical join.
+
+Each command stream also owns its admitted start, launch, quiesce, GPU and
+transient-request tasks, and the detached Stop and prompt acknowledgement tasks.
+Stop's physical handler remains awaited in stream order. Stream reconnects keep
+these owners; shutdown closes admission and joins original descendants before
+disposing the request gates. A command failure cancels control peers immediately,
+even when another original command is still being joined. Failure facts and idle
+completed task records do not retain arbitrary exception details. Prompt ACK
+retry factories are built outside the physical command callback's closure.
+Controlled stream tests use the production sink with held fake RPC responses;
+they do not establish real transport cancellation or physical deadline budgets.
+
+All four control channels and their sink belong to the outer entry-point scope,
+before any relay is created. They therefore remain alive through producer,
+session, sidecar and relay cleanup. The final entry-point exception handler exits
+nonzero and prints only the exception class. Other diagnostic paths still require
+their own content, encryption and retention review.
+
+Controlled factory and callback tests exercise this ownership order. They do not
+establish complete signal handling with real transports, native descendants,
+GPU workloads or provider shutdown deadlines.
+
+The GPU executor publishes both activation and power-delivery roots before they
+can execute, closes both admission paths under one gate, and shares one original
+drain task between shutdown callers. Each operation owns its original cancellation
+callbacks through completion. Drain joins those original operation and callback
+roots before closing its cancellation source. Completed observation records keep
+failure facts without retaining arbitrary action exceptions; shutdown reports a
+content-free failure. Controlled tests cover held activation and grant callbacks,
+peer cancellation, caller shutdown and managed reference release. They do not
+establish real GPU effects, SDK deadlines, native cleanup or complete memory erasure.
+
+## Sidecar operation ownership
+
+Artifact and workspace services own public preparation and read operations before
+publishing a session resource. Closing global admission prevents a late resource
+from becoming active; already admitted preparation must finish its own cleanup.
+Removing a resource from the active map retains its original stop task. Repeated
+Stop and global disposal join that same owner, including a stop already in flight.
+An old failed preparation cannot remove a replacement resource.
+
+Each session resource closes admission before taking its operation snapshot.
+Original initialization, catalog refresh, shared downloads, upload workers,
+synchronous filesystem borrowers and admitted watcher callbacks remain owned
+through completion and cancellation callbacks. A caller may stop waiting for a
+shared read without transferring ownership away from the session. Partial setup
+and repeated disposal use the same join. Watchers are removed again after all
+borrowers finish so an earlier admitted callback cannot resurrect one after Stop.
+
+The uploader may drain its queue briefly before cancellation. Slow-wait warnings
+and bounded conservative loss accounting never complete the original stop.
+An upload owns its response task from call construction, including when a request
+write or stream completion fails. Cancellation requests are followed by joins;
+cleanup errors do not replace the body's original failure. Failure of one sidecar
+cannot skip the other's original join, and cleanup failure remains a content-free
+failure rather than a successful Stop.
+
+These ownership rules and controlled tests do not establish real SDK/HTTP2
+deadline budgets, native account/key cleanup, GPU behavior, all-copy privacy,
+backup/restore or release qualification.
+
+## Runtime activity delivery preparation
+
+The required activity report carries only captured process/runtime identity and
+three sealing flags. Its transport constructs a fresh request for each attempt
+and requires an accepted server timestamp for success. No output line, prompt,
+result, exception detail or client timestamp belongs to this fact.
+
+The process-scoped delivery primitive latches the first observation before
+optional work. Concurrent signals share one fact. Transient transport failures
+and NotReady retry the original values with capped backoff; exact success ends
+delivery, while retired, invalid, conflicting or unknown outcomes fail closed.
+Each attempt has a finite deadline. A separate finite admission budget starts at
+the first observation using a monotonic clock and is never renewed by retries.
+Disposal cancels and joins the original delivery task, including an uncooperative
+attempt that has not yet returned. The process lifetime must consume rejection
+or expiry and stop only its captured child.
+
+The session manager captures this scope and the original transfer-sealing flags
+before starting readers. The first nonempty read signals it before line buffering;
+a bridge data frame signals only its matching current runtime before size limits,
+parsing, suppression or optional enqueueing. Program owns a separate physical
+channel, using the same runner-secret interceptor factory as the other control
+lanes, and joins the asynchronous session manager before disposing the channel.
+The existing ready timeout bounds activity admission from its first observation;
+it remains separate from the physical readiness clock, heartbeat and prompt authority.
+
+Admission has a separate decision and original-transport completion. Expiry can
+stop the captured child while an uncooperative call remains pending, but cleanup
+still cancels and joins that call. An accepted decision remains immutable during
+later Stop. The candidate still requires native account/descendant, actual wire,
+GPU and release qualification, plus coordinated retirement of diagnostic activity
+authority. Source wiring alone proves none of those acceptance gates.
+
+## Process retirement preparation
+
+The isolation strategy exposes a process-only quiescence phase. It reaps the
+session's processes while retaining its account, home, shared residue and IPC.
+For a tracked runtime, both Stop and unexpected exit join one context-owned
+quiescence operation before invoking the final sidecar snapshot hook. The account
+and data remain available to that hook. A failed quiescence skips the hook and
+retirement, retains the context, and allows a later retry; successful quiescence
+is reused by final cleanup rather than starting a concurrent reaper.
+Final cleanup repeats the ownership check and reaping before removing data and
+the account. Both phases resolve the current account uid, reject a changed,
+root or invalid uid, and avoid acting on a remembered uid when the account is
+already gone. This does not protect against arbitrary concurrent host-root
+account changes.
+
+The bounded output reader passes cancellation to its original read and discards
+late output after cancellation. Its returned task still owns that read until
+it ends; callers must join it rather than cancel only a waiting wrapper. These
+operations prepare the required order: stop writers, join readers and activity,
+then retire the account, data and keys. The manager retains pending starts and
+exit monitors, rejects starts during Stop/shutdown, and coalesces cleanup so a
+concurrent caller waits for its owner. Stop joins the captured monitor; that
+monitor never joins itself. Shutdown cancels and joins original starts, stops
+and monitors before releasing dependencies. Once the account is retired, a
+failed sealed-data deletion retains its key and pending context; retries remove
+the remaining data without reaping or retiring that uid again. A pinned Linux
+pidfd targets the
+original child for TERM/KILL, with no numeric-pid fallback. Kernels and container
+policies must allow pidfd_open and pidfd_send_signal. Startup validation pins the
+agent itself, probes signal zero without delivering a signal, and closes the probe
+descriptor before registration or work admission. Unsupported or denied operations
+produce a fixed diagnostic and fail startup. Real account/descendant
+teardown, publication failures, all sidecar owners and deployed kernels still
+require qualification; controlled process tests alone cannot establish them.
+
+The prelaunch dependency-sync helper uses the process-only phase before waiting
+for output EOF. Its success, failure and cancellation paths join the original
+process exit, quiescence task and both readers. Cancellation cannot replace that
+join with a cancelled waiting wrapper, and a reaper failure fails startup. This
+helper retains the account and data for its startup owner; it does not retire
+the session or establish the lifetime of the editor child or bridge.
+
 ## Expired prompt receipts
 
 Prompt execution permission includes explicit content availability. An expired
@@ -20,6 +187,26 @@ execution hands off its acknowledgement, held demand retains that identity and
 its cancellation/settling tasks. It does not retain the command or prompt body.
 Queue probes capture only the queue reader, session/runtime and accepted prompt
 ID, independently from the command callback's closure.
+
+Prompt work retains the original execution and held-demand release tasks. Task
+publication only wakes joiners, which then await those originals. Stop closes
+matching admission until its join ends, requests each physical/demand cancellation
+outside the admission lock, and joins the original cancellation callbacks even
+when one fails. Concurrent Stops share those original callback tasks. A demand
+handoff during Stop and a held demand replaced by recovery both remain owned.
+Execution drops its command and callback references before joining cleanup, so a
+held cancellation callback need not retain completed prompt content. Once settling
+ends, the registry drops that task reference as well, since a faulted task can
+retain arbitrary exception data. The inner model-demand lifetime also owns its
+first cancellation-callback task. Native rejection, failed preparation and queue
+withdrawal request cancellation without running callbacks under the command's
+handoff lock. Settling joins every returned original demand task and its callbacks
+before releasing their lifetime, even if a callback fails. Preparation that returns
+no demand still joins its registered callbacks. An original queue probe must
+also finish; cancelling its token does not stand in for its completion. Host shutdown
+refuses new work; interrupt still preserves queued demand until terminal withdrawal
+or Stop. Controlled task/reference tests do not establish native queue cancellation,
+transport delivery, complete data deletion or physical memory erasure.
 
 An accepted prompt keeps model demand while queued or while its queue cannot be
 read. Terminal withdrawal, Stop, replacement and shutdown keep their existing
@@ -72,6 +259,24 @@ markers last until the original deadline. This is process-local protection, not
 persistent deduplication across a runner process replacement, nor proof that an
 uncertain native mutation did not execute. In-flight delivery lists, transport
 buffers and total process memory are separate resource boundaries.
+
+Each admitted transient request owns its cancellation source and the original
+callback task until its physical execution and asynchronous lease completion
+finish. Cancellation retires matching active entries without dropping these
+owners. A failed or held callback cannot skip cancellation of other requests;
+the affected request retains callback failure after completion, so its capturing
+drain makes Stop fail and quiesce report failure. A completed failed request stays
+owned until a matching drain observes it. That drain joins and consumes only its
+captured roots; unrelated sessions and later teardown attempts remain usable.
+Callback failures are observed with class-only diagnostics. Registry shutdown
+closes admission and joins current and retired original completion roots.
+
+Stop and Quiesce keep matching admission closed while joining requests and
+performing physical runtime cleanup. Their fence remains in place after the
+request drain finishes, until cleanup ends; unrelated sessions remain independent.
+These rules cover runner-local ownership. Controlled dispatch and handler tests
+do not establish actual HTTP cancellation, account/key cleanup, transport deadlines,
+or complete content retention and deletion.
 
 ## Artifact upload progress
 
@@ -145,3 +350,48 @@ later refresh starts a new allowance. See [upload identity and retirement](artif
 ## Origin
 
 The agent was developed alongside the Offloadr control plane and moved here without its earlier history. Its behavior is unchanged apart from three additions: it reports its own version instead of the .NET runtime's, logs where its source is at startup, and writes the status file.
+
+## Optional diagnostic delivery bounds
+
+The runner and session log relays capture each line's original UTC and monotonic
+clock before queueing it. A line may be delivered for at most five minutes;
+retries and reconnection preserve its timestamp, sequence and producer identity.
+Either clock expiry or an observed rollback permanently retires its delivery
+window. Expired backlog is discarded before batching or another upload. The
+existing 4,096-entry, 64-entry/1 MiB batch and 16 KiB message limits remain.
+
+Each report attempt is cancelled after at most five seconds, or the remaining
+original age when shorter. The sender awaits that original sink task before
+retrying or moving to another batch. Cancellation alone does not establish that
+an uncooperative task has ended: it remains joined. Queue and batch references
+are released at sender completion; this does not claim CLR-wide physical erasure
+or termination of an arbitrary transport that ignores cancellation. Captured
+connection generation prevents a line still being prepared during replacement
+from adopting the next runner connection. Session lines keep their original
+writing-runtime identity.
+
+Retry diagnostics retain only fixed counts and error classes, not exception
+objects or arbitrary detail. Optional log expiry does not admit runtime activity
+or complete a physical acknowledgement; those existing owners are independent.
+The log path remains a best-effort presentation lane. The agent console and
+Windows desktop diagnostic files emit only a UTC timestamp, severity, a fixed
+component label and a fixed failure class. These sinks never invoke the arbitrary
+message formatter or inspect state, scopes, event names, exception messages or
+stacks. Category strings are mapped to fixed component labels and are not retained.
+The separate account-protected runner and session forwarding lanes keep their
+existing content delivery, limits and original capture deadlines.
+
+Desktop metadata uses invariant UTC hourly filenames, capped at 64 KiB each.
+Files expire 24 hours after the filename's hour; an active app sweeps each minute,
+and startup and writes also sweep. A stopped app cannot run the sweep; the next
+startup removes expired files. Startup failures use the same metadata sink.
+The app removes its retired `runner-yyyy-MM-dd.log` and `desktop-startup.log`
+files without reading their content, preserving unrelated files. Unwritable
+folders cannot create a raw-content fallback. These are app-owned cleanup attempts,
+not proof that old files on a real host, external collectors, backups or native
+histories have been erased. Those copies need their own protection and disposition.
+
+Thirty-four focused cases pass: the four original regression cases, eleven
+clock/join/retry/connection-race controls and nineteen prior relay cases. These
+are controlled sink/clock tests, not real gRPC, full Linux, Windows/GPU or
+published-release qualification.

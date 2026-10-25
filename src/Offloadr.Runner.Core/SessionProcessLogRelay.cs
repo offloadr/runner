@@ -15,13 +15,15 @@ internal sealed class SessionProcessLogRelay : IAsyncDisposable
     private static readonly TimeSpan FlushInterval = TimeSpan.FromMilliseconds(150);
 
     private readonly string _runnerId;
+    private readonly TimeProvider _clock;
     private readonly RuntimeIdentityRegistry? _runtimeIdentities;
-    private readonly Channel<SessionProcessLogEntry> _queue;
+    private readonly Channel<QueuedSessionLogEntry> _queue;
     private readonly CancellationTokenSource _shutdown = new();
     private readonly Task _senderTask;
     private readonly object _sinkLock = new();
     private readonly LogRelayDropWarning _dropWarning = new(LogRelayBounds.DropWarningInterval);
     private long _nextSequence;
+    private volatile bool _completing;
 
     private IRunnerSessionSink? _sink;
 
@@ -30,16 +32,17 @@ internal sealed class SessionProcessLogRelay : IAsyncDisposable
     {
     }
 
-    internal SessionProcessLogRelay(string runnerId, int queueCapacity, RuntimeIdentityRegistry? runtimeIdentities = null)
+    internal SessionProcessLogRelay(string runnerId, int queueCapacity, RuntimeIdentityRegistry? runtimeIdentities = null, TimeProvider? clock = null)
     {
         _runnerId = runnerId ?? throw new ArgumentNullException(nameof(runnerId));
+        _clock = clock ?? TimeProvider.System;
         _runtimeIdentities = runtimeIdentities;
         if (queueCapacity <= 0)
         {
             throw new ArgumentOutOfRangeException(nameof(queueCapacity), "Queue capacity must be positive.");
         }
 
-        _queue = Channel.CreateBounded<SessionProcessLogEntry>(new BoundedChannelOptions(queueCapacity)
+        _queue = Channel.CreateBounded<QueuedSessionLogEntry>(new BoundedChannelOptions(queueCapacity)
         {
             SingleReader = true,
             SingleWriter = false,
@@ -76,18 +79,19 @@ internal sealed class SessionProcessLogRelay : IAsyncDisposable
     /// </summary>
     public void Enqueue(string sessionId, SessionProcessLogStream stream, string message, RuntimeIdentity? runtimeIdentity = null)
     {
-        if (string.IsNullOrWhiteSpace(sessionId) || string.IsNullOrWhiteSpace(message))
+        if (_completing || string.IsNullOrWhiteSpace(sessionId) || string.IsNullOrWhiteSpace(message))
         {
             return;
         }
 
+        var deadline = new LogRelayDeadline(_clock);
         var entry = new SessionProcessLogEntry
         {
             RunnerId = _runnerId,
             SessionId = sessionId.Trim(),
             Stream = stream,
             Message = LogRelayBounds.TruncateMessage(message),
-            CreatedUtc = Timestamp.FromDateTime(DateTime.UtcNow),
+            CreatedUtc = Timestamp.FromDateTimeOffset(deadline.CapturedUtc),
             Sequence = (ulong)Interlocked.Increment(ref _nextSequence)
         };
         if (runtimeIdentity is { IsValid: true } writer)
@@ -103,103 +107,86 @@ internal sealed class SessionProcessLogRelay : IAsyncDisposable
             entry.RuntimeInstanceId = identity.RuntimeInstanceId;
         }
 
-        _queue.Writer.TryWrite(entry);
+        _queue.Writer.TryWrite(new(entry, deadline));
     }
 
     private async Task SenderLoopAsync()
     {
-        var buffer = new List<SessionProcessLogEntry>(MaxBatchSize);
-        SessionProcessLogEntry? carry = null;
-
-        while (!_shutdown.IsCancellationRequested)
+        var buffer = new List<QueuedSessionLogEntry>(MaxBatchSize);
+        QueuedSessionLogEntry? carry = null;
+        try
         {
-            SessionProcessLogEntry entry;
-            if (carry is not null)
+            while (!_shutdown.IsCancellationRequested)
             {
-                entry = carry;
-                carry = null;
-            }
-            else
-            {
-                try
+                FillBuffer(buffer, ref carry);
+                if (buffer.Count == 0)
                 {
-                    entry = await _queue.Reader.ReadAsync(_shutdown.Token).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException)
-                {
-                    break;
-                }
-            }
-
-            buffer.Add(entry);
-            var batchBytes = LogRelayBounds.EntryBytes(entry);
-            var flushDelay = Task.Delay(FlushInterval, _shutdown.Token);
-
-            while (buffer.Count < MaxBatchSize)
-            {
-                if (_queue.Reader.TryRead(out var next))
-                {
-                    var nextBytes = LogRelayBounds.EntryBytes(next);
-                    if (batchBytes + nextBytes > LogRelayBounds.MaxBatchBytes)
+                    try
                     {
-                        carry = next;
-                        break;
+                        buffer.Add(await _queue.Reader.ReadAsync(_shutdown.Token).ConfigureAwait(false));
                     }
-
-                    buffer.Add(next);
-                    batchBytes += nextBytes;
-                    continue;
+                    catch (ChannelClosedException) { break; }
+                    catch (OperationCanceledException) { break; }
+                    buffer.RemoveAll(entry => entry.Deadline.Remaining <= TimeSpan.Zero);
+                    if (buffer.Count == 0) continue;
+                    FillBuffer(buffer, ref carry);
                 }
 
-                try
+                if (buffer.Count < MaxBatchSize && carry is null)
                 {
-                    await Task.WhenAny(flushDelay).ConfigureAwait(false);
+                    try { await Task.Delay(FlushInterval, _shutdown.Token).ConfigureAwait(false); }
+                    catch (OperationCanceledException) { break; }
                 }
-                catch (OperationCanceledException)
-                {
-                    break;
-                }
-
-                if (!flushDelay.IsCompleted)
-                {
-                    continue;
-                }
-
-                break;
+                await FlushBufferWithRetryAsync(buffer).ConfigureAwait(false);
+                buffer.Clear();
             }
 
-            await FlushBufferWithRetryAsync(buffer).ConfigureAwait(false);
-            buffer.Clear();
-        }
-
-        var drainBytes = 0;
-        if (carry is not null)
-        {
-            buffer.Add(carry);
-            drainBytes = LogRelayBounds.EntryBytes(carry);
-        }
-
-        while (_queue.Reader.TryRead(out var remaining))
-        {
-            var remainingBytes = LogRelayBounds.EntryBytes(remaining);
-            if (buffer.Count >= MaxBatchSize || (buffer.Count > 0 && drainBytes + remainingBytes > LogRelayBounds.MaxBatchBytes))
+            // Graceful runner shutdown still gets one bounded attempt per surviving batch.
+            // Session shutdown has already cancelled admission, so its batches are just retired.
+            while (true)
             {
+                FillBuffer(buffer, ref carry);
+                if (buffer.Count == 0) break;
                 await TryFlushBufferAsync(buffer).ConfigureAwait(false);
                 buffer.Clear();
-                drainBytes = 0;
             }
-
-            buffer.Add(remaining);
-            drainBytes += remainingBytes;
         }
-
-        if (buffer.Count > 0)
+        finally
         {
-            await TryFlushBufferAsync(buffer).ConfigureAwait(false);
+            buffer.Clear();
+            carry = null;
+            while (_queue.Reader.TryRead(out _)) { }
         }
     }
 
-    private async Task FlushBufferWithRetryAsync(List<SessionProcessLogEntry> entries)
+    // Keep payload temporaries on this synchronous stack, outside the idle sender await.
+    private void FillBuffer(List<QueuedSessionLogEntry> buffer, ref QueuedSessionLogEntry? carry)
+    {
+        var bytes = buffer.Sum(entry => LogRelayBounds.EntryBytes(entry.Entry));
+        if (carry is { } pending)
+        {
+            carry = null;
+            if (pending.Deadline.Remaining > TimeSpan.Zero)
+            {
+                buffer.Add(pending);
+                bytes += LogRelayBounds.EntryBytes(pending.Entry);
+            }
+        }
+        while (buffer.Count < MaxBatchSize && _queue.Reader.TryRead(out var next))
+        {
+            if (next.Deadline.Remaining <= TimeSpan.Zero) continue;
+            var nextBytes = LogRelayBounds.EntryBytes(next.Entry);
+            if (buffer.Count > 0 && bytes + nextBytes > LogRelayBounds.MaxBatchBytes)
+            {
+                carry = next;
+                break;
+            }
+            buffer.Add(next);
+            bytes += nextBytes;
+        }
+    }
+
+    private async Task FlushBufferWithRetryAsync(List<QueuedSessionLogEntry> entries)
     {
         var attempt = 0;
         while (!_shutdown.IsCancellationRequested)
@@ -224,8 +211,9 @@ internal sealed class SessionProcessLogRelay : IAsyncDisposable
     /// Returns true when the batch is finished with (delivered, or dropped because the control plane
     /// will never accept it) and false when the same batch should be retried.
     /// </summary>
-    private async Task<bool> TryFlushBufferAsync(List<SessionProcessLogEntry> entries, bool logFailure = true)
+    private async Task<bool> TryFlushBufferAsync(List<QueuedSessionLogEntry> entries, bool logFailure = true)
     {
+        entries.RemoveAll(entry => entry.Deadline.Remaining <= TimeSpan.Zero);
         if (entries.Count == 0)
         {
             return true;
@@ -247,12 +235,17 @@ internal sealed class SessionProcessLogRelay : IAsyncDisposable
             return false;
         }
 
+        var remaining = entries.Min(entry => entry.Deadline.Remaining);
+        if (remaining <= TimeSpan.Zero) return false;
         var request = new ReportSessionLogsRequest();
-        request.Entries.AddRange(entries);
+        request.Entries.AddRange(entries.Select(queued => queued.Entry));
 
         try
         {
-            await sink.ReportSessionLogsAsync(request, _shutdown.Token).ConfigureAwait(false);
+            using var budget = new CancellationTokenSource(remaining < LogRelayBounds.AttemptTimeout ? remaining : LogRelayBounds.AttemptTimeout, _clock);
+            using var attempt = CancellationTokenSource.CreateLinkedTokenSource(_shutdown.Token, budget.Token);
+            // Cancellation retires this attempt, not its original task. Join before any retry.
+            await sink.ReportSessionLogsAsync(request, attempt.Token).ConfigureAwait(false);
             return true;
         }
         catch (OperationCanceledException) when (_shutdown.IsCancellationRequested)
@@ -275,15 +268,18 @@ internal sealed class SessionProcessLogRelay : IAsyncDisposable
         {
             if (logFailure)
             {
-                RunnerLog.Error<SessionProcessLogRelay>(ex, $"Failed to report session process logs batch ({entries.Count}); retrying: {ex.Message}");
+                RunnerLog.Warning<SessionProcessLogRelay>($"Session log report failed; entries={entries.Count}; errorClass={ex.GetType().Name}; retrying within original age.");
             }
 
             return false;
         }
     }
 
+    private readonly record struct QueuedSessionLogEntry(SessionProcessLogEntry Entry, LogRelayDeadline Deadline);
+
     public async ValueTask DisposeAsync()
     {
+        _completing = true;
         if (!_shutdown.IsCancellationRequested)
         {
             _shutdown.Cancel();

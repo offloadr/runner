@@ -38,7 +38,7 @@ public sealed partial class ComfyPromptEvidenceTests
             responseReady.TrySetResult();
             return result;
         };
-        await using var relay = new ComfySessionEventRelay(command.Target.RunnerId, "127.0.0.1", port,
+        await using var relay = new ComfySessionEventRelay(static (_, _) => { }, command.Target.RunnerId, "127.0.0.1", port,
             "test-process", _ => new SessionSealingStatus(), (_, _) => true);
         relay.AttachSink(sink);
         await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", command.Target.GpuGeneration,
@@ -98,7 +98,7 @@ public sealed partial class ComfyPromptEvidenceTests
             retryEntered.TrySetResult();
             await allowRetry.Task.WaitAsync(ct);
         };
-        await using var relay = new ComfySessionEventRelay(command.Target.RunnerId, "127.0.0.1", port,
+        await using var relay = new ComfySessionEventRelay(static (_, _) => { }, command.Target.RunnerId, "127.0.0.1", port,
             "test-process", _ => new SessionSealingStatus(), (_, _) => true);
         relay.AttachSink(sink);
         await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", command.Target.GpuGeneration,
@@ -154,7 +154,7 @@ public sealed partial class ComfyPromptEvidenceTests
             retryEntered.TrySetResult();
             await allowRetry.Task.WaitAsync(ct);
         };
-        await using var relay = new ComfySessionEventRelay(command.Target.RunnerId, "127.0.0.1", port,
+        await using var relay = new ComfySessionEventRelay(static (_, _) => { }, command.Target.RunnerId, "127.0.0.1", port,
             "test-process", _ => new SessionSealingStatus(), (_, _) => true);
         relay.AttachSink(sink);
         var accept = listener.GetContextAsync();
@@ -200,7 +200,7 @@ public sealed partial class ComfyPromptEvidenceTests
         var command = Command();
         var sink = new EvidenceSink((_, _) => Task.CompletedTask);
         sink.Authority.TransformReservationResult = result => { result.Outcome = outcome; return result; };
-        await using var relay = new ComfySessionEventRelay(command.Target.RunnerId, "127.0.0.1", 1,
+        await using var relay = new ComfySessionEventRelay(static (_, _) => { }, command.Target.RunnerId, "127.0.0.1", 1,
             "test-process", _ => new SessionSealingStatus(), (_, _) => true);
         relay.AttachSink(sink);
         try
@@ -234,7 +234,7 @@ public sealed partial class ComfyPromptEvidenceTests
             if (Interlocked.Increment(ref responses) == 1) result.Outcome = EditorRuntimeBridgeOutcome.Stale;
             return result;
         };
-        await using var relay = new ComfySessionEventRelay(command.Target.RunnerId, "127.0.0.1", port,
+        await using var relay = new ComfySessionEventRelay(static (_, _) => { }, command.Target.RunnerId, "127.0.0.1", port,
             "test-process", _ => new SessionSealingStatus(), (_, _) => true);
         relay.AttachSink(sink);
         await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", command.Target.GpuGeneration,
@@ -261,7 +261,7 @@ public sealed partial class ComfyPromptEvidenceTests
         var tracked = new RuntimeIdentity(command.Target.GpuGeneration, command.Target.RuntimeEpoch, command.Target.RuntimeInstanceId);
         var sink = new EvidenceSink((_, _) => Task.CompletedTask);
         sink.Authority.BeforeReservationResponse = async (_, ct) => await Task.Delay(Timeout.InfiniteTimeSpan, ct);
-        await using var relay = new ComfySessionEventRelay(command.Target.RunnerId, "127.0.0.1", 1,
+        await using var relay = new ComfySessionEventRelay(static (_, _) => { }, command.Target.RunnerId, "127.0.0.1", 1,
             "test-process", _ => new SessionSealingStatus(), (_, runtime) => runtime.SameRuntime(tracked));
         relay.AttachSink(sink);
         try

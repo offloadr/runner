@@ -1,7 +1,7 @@
 
 namespace Offloadr.Runner.Tests;
 
-public class RunnerStartupValidatorTests
+public partial class RunnerStartupValidatorTests
 {
     [Test]
     public void ValidateOrThrow_ThrowsWhenAriaBinaryMissing()
@@ -634,6 +634,9 @@ public class RunnerStartupValidatorTests
         {
             return Task.FromResult(new PreparedSessionIdentity("sess_test", Path.Combine(sessionRoot, sessionId), CleanupIdentity: false));
         }
+
+        public Task StopProcessesAsync(PreparedSessionIdentity identity, CancellationToken cancellationToken)
+            => Task.CompletedTask;
 
         public Task CleanupAsync(PreparedSessionIdentity identity, CancellationToken cancellationToken)
         {
