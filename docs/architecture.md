@@ -338,3 +338,34 @@ later refresh starts a new allowance. See [upload identity and retirement](artif
 ## Origin
 
 The agent was developed alongside the Offloadr control plane and moved here without its earlier history. Its behavior is unchanged apart from three additions: it reports its own version instead of the .NET runtime's, logs where its source is at startup, and writes the status file.
+
+## Optional diagnostic delivery bounds
+
+The runner and session log relays capture each line's original UTC and monotonic
+clock before queueing it. A line may be delivered for at most five minutes;
+retries and reconnection preserve its timestamp, sequence and producer identity.
+Either clock expiry or an observed rollback permanently retires its delivery
+window. Expired backlog is discarded before batching or another upload. The
+existing 4,096-entry, 64-entry/1 MiB batch and 16 KiB message limits remain.
+
+Each report attempt is cancelled after at most five seconds, or the remaining
+original age when shorter. The sender awaits that original sink task before
+retrying or moving to another batch. Cancellation alone does not establish that
+an uncooperative task has ended: it remains joined. Queue and batch references
+are released at sender completion; this does not claim CLR-wide physical erasure
+or termination of an arbitrary transport that ignores cancellation. Captured
+connection generation prevents a line still being prepared during replacement
+from adopting the next runner connection. Session lines keep their original
+writing-runtime identity.
+
+Retry diagnostics retain only fixed counts and error classes, not exception
+objects or arbitrary detail. Optional log expiry does not admit runtime activity
+or complete a physical acknowledgement; those existing owners are independent.
+The log path remains a best-effort presentation lane. Container console mirrors,
+desktop files, collectors and native histories need their own content and lifetime
+protection; these queue bounds do not cover those copies.
+
+Thirty-four focused cases pass: the four original regression cases, eleven
+clock/join/retry/connection-race controls and nineteen prior relay cases. These
+are controlled sink/clock tests, not real gRPC, full Linux, Windows/GPU or
+published-release qualification.

@@ -15,6 +15,7 @@ internal sealed class RunnerLogRelay : IAsyncDisposable
     private static readonly TimeSpan ShutdownDrainTimeout = TimeSpan.FromSeconds(2);
 
     private readonly string _runnerId;
+    private readonly TimeProvider _clock;
     private readonly string _relayInstanceId = Guid.NewGuid().ToString("n");
     private readonly Channel<QueuedRunnerLogEntry> _queue;
     private readonly CancellationTokenSource _shutdown = new();
@@ -33,9 +34,10 @@ internal sealed class RunnerLogRelay : IAsyncDisposable
     {
     }
 
-    internal RunnerLogRelay(string runnerId, int queueCapacity)
+    internal RunnerLogRelay(string runnerId, int queueCapacity, TimeProvider? clock = null)
     {
         _runnerId = runnerId ?? throw new ArgumentNullException(nameof(runnerId));
+        _clock = clock ?? TimeProvider.System;
         if (queueCapacity <= 0)
         {
             throw new ArgumentOutOfRangeException(nameof(queueCapacity), "Queue capacity must be positive.");
@@ -81,126 +83,108 @@ internal sealed class RunnerLogRelay : IAsyncDisposable
 
     public void Enqueue(string category, string message)
     {
-        if (string.IsNullOrWhiteSpace(message))
+        if (_completing || string.IsNullOrWhiteSpace(message))
         {
             return;
         }
 
+        long capturedGeneration;
         lock (_sinkLock)
         {
             if (_sink is null)
             {
                 return;
             }
+            capturedGeneration = _sinkGeneration;
         }
 
+        var deadline = new LogRelayDeadline(_clock);
         var entry = new RunnerLogEntry
         {
             RunnerId = _runnerId,
             RelayInstanceId = _relayInstanceId,
             Category = string.IsNullOrWhiteSpace(category) ? "RunnerAgent" : category.Trim(),
             Message = LogRelayBounds.TruncateMessage(message.Trim()),
-            CreatedUtc = Timestamp.FromDateTime(DateTime.UtcNow),
+            CreatedUtc = Timestamp.FromDateTimeOffset(deadline.CapturedUtc),
             Sequence = (ulong)Interlocked.Increment(ref _nextSequence),
         };
 
-        _queue.Writer.TryWrite(new QueuedRunnerLogEntry(entry, Volatile.Read(ref _sinkGeneration)));
+        _queue.Writer.TryWrite(new QueuedRunnerLogEntry(entry, capturedGeneration, deadline));
     }
 
     private async Task SenderLoopAsync()
     {
         var buffer = new List<QueuedRunnerLogEntry>(MaxBatchSize);
         QueuedRunnerLogEntry? carry = null;
-
-        while (!_shutdown.IsCancellationRequested)
+        try
         {
-            QueuedRunnerLogEntry entry;
-            if (carry is { } carried)
+            while (!_shutdown.IsCancellationRequested)
             {
-                entry = carried;
-                carry = null;
-            }
-            else
-            {
-                try
+                FillBuffer(buffer, ref carry);
+                if (buffer.Count == 0)
                 {
-                    entry = await _queue.Reader.ReadAsync(_shutdown.Token).ConfigureAwait(false);
-                }
-                catch (ChannelClosedException)
-                {
-                    break;
-                }
-                catch (OperationCanceledException)
-                {
-                    break;
-                }
-            }
-
-            buffer.Add(entry);
-            var batchBytes = LogRelayBounds.EntryBytes(entry.Entry);
-            var flushDelay = Task.Delay(FlushInterval, _shutdown.Token);
-
-            while (buffer.Count < MaxBatchSize)
-            {
-                if (_queue.Reader.TryRead(out var next))
-                {
-                    var nextBytes = LogRelayBounds.EntryBytes(next.Entry);
-                    if (batchBytes + nextBytes > LogRelayBounds.MaxBatchBytes)
+                    try
                     {
-                        carry = next;
-                        break;
+                        buffer.Add(await _queue.Reader.ReadAsync(_shutdown.Token).ConfigureAwait(false));
                     }
-
-                    buffer.Add(next);
-                    batchBytes += nextBytes;
-                    continue;
+                    catch (ChannelClosedException) { break; }
+                    catch (OperationCanceledException) { break; }
+                    buffer.RemoveAll(entry => entry.Deadline.Remaining <= TimeSpan.Zero);
+                    if (buffer.Count == 0) continue;
+                    FillBuffer(buffer, ref carry);
                 }
 
-                try
+                if (buffer.Count < MaxBatchSize && carry is null)
                 {
-                    await Task.WhenAny(flushDelay).ConfigureAwait(false);
+                    try { await Task.Delay(FlushInterval, _shutdown.Token).ConfigureAwait(false); }
+                    catch (OperationCanceledException) { break; }
                 }
-                catch (OperationCanceledException)
-                {
-                    break;
-                }
-
-                if (!flushDelay.IsCompleted)
-                {
-                    continue;
-                }
-
-                break;
+                await FlushBufferWithRetryAsync(buffer).ConfigureAwait(false);
+                buffer.Clear();
             }
 
-            await FlushBufferWithRetryAsync(buffer).ConfigureAwait(false);
-            buffer.Clear();
-        }
-
-        var drainBytes = 0;
-        if (carry is { } leftover)
-        {
-            buffer.Add(leftover);
-            drainBytes = LogRelayBounds.EntryBytes(leftover.Entry);
-        }
-
-        while (_queue.Reader.TryRead(out var remaining))
-        {
-            var remainingBytes = LogRelayBounds.EntryBytes(remaining.Entry);
-            if (buffer.Count >= MaxBatchSize || (buffer.Count > 0 && drainBytes + remainingBytes > LogRelayBounds.MaxBatchBytes))
+            // Graceful runner shutdown still gets one bounded attempt per surviving batch.
+            // Session shutdown has already cancelled admission, so its batches are just retired.
+            while (true)
             {
+                FillBuffer(buffer, ref carry);
+                if (buffer.Count == 0) break;
                 await TryFlushBufferAsync(buffer).ConfigureAwait(false);
                 buffer.Clear();
-                drainBytes = 0;
             }
-
-            buffer.Add(remaining);
-            drainBytes += remainingBytes;
         }
-
-        if (buffer.Count > 0)
+        finally
         {
-            await TryFlushBufferAsync(buffer).ConfigureAwait(false);
+            buffer.Clear();
+            carry = null;
+            while (_queue.Reader.TryRead(out _)) { }
+        }
+    }
+
+    // Keep payload temporaries on this synchronous stack, outside the idle sender await.
+    private void FillBuffer(List<QueuedRunnerLogEntry> buffer, ref QueuedRunnerLogEntry? carry)
+    {
+        var bytes = buffer.Sum(entry => LogRelayBounds.EntryBytes(entry.Entry));
+        if (carry is { } pending)
+        {
+            carry = null;
+            if (pending.Deadline.Remaining > TimeSpan.Zero)
+            {
+                buffer.Add(pending);
+                bytes += LogRelayBounds.EntryBytes(pending.Entry);
+            }
+        }
+        while (buffer.Count < MaxBatchSize && _queue.Reader.TryRead(out var next))
+        {
+            if (next.Deadline.Remaining <= TimeSpan.Zero) continue;
+            var nextBytes = LogRelayBounds.EntryBytes(next.Entry);
+            if (buffer.Count > 0 && bytes + nextBytes > LogRelayBounds.MaxBatchBytes)
+            {
+                carry = next;
+                break;
+            }
+            buffer.Add(next);
+            bytes += nextBytes;
         }
     }
 
@@ -243,24 +227,29 @@ internal sealed class RunnerLogRelay : IAsyncDisposable
         }
 
         IRunnerSessionSink? sink;
-        CancellationTokenSource? sinkLifetime;
+        CancellationToken sinkToken;
         lock (_sinkLock)
         {
             sink = _sink;
-            sinkLifetime = _sinkLifetime;
+            // Capture the token while its source is still owned by this connection.
+            sinkToken = _sinkLifetime?.Token ?? default;
         }
 
-        if (sink is null || sinkLifetime is null)
+        if (sink is null || !sinkToken.CanBeCanceled)
         {
             return false;
         }
 
+        var remaining = entries.Min(entry => entry.Deadline.Remaining);
+        if (remaining <= TimeSpan.Zero) return false;
         var request = new ReportRunnerLogsRequest();
         request.Entries.AddRange(entries.Select(queued => queued.Entry));
 
         try
         {
-            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(_shutdown.Token, sinkLifetime.Token);
+            using var budget = new CancellationTokenSource(remaining < LogRelayBounds.AttemptTimeout ? remaining : LogRelayBounds.AttemptTimeout, _clock);
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(_shutdown.Token, sinkToken, budget.Token);
+            // Await the original call even when it ignores cancellation. Never overlap a replacement.
             await sink.ReportRunnerLogsAsync(request, linkedCts.Token).ConfigureAwait(false);
             return true;
         }
@@ -268,7 +257,7 @@ internal sealed class RunnerLogRelay : IAsyncDisposable
         {
             return false;
         }
-        catch (OperationCanceledException) when (sinkLifetime.IsCancellationRequested)
+        catch (OperationCanceledException) when (sinkToken.IsCancellationRequested)
         {
             return true;
         }
@@ -294,10 +283,10 @@ internal sealed class RunnerLogRelay : IAsyncDisposable
     private void DiscardStaleEntries(List<QueuedRunnerLogEntry> entries)
     {
         var activeGeneration = Volatile.Read(ref _sinkGeneration);
-        entries.RemoveAll(entry => entry.Generation != activeGeneration);
+        entries.RemoveAll(entry => entry.Generation != activeGeneration || entry.Deadline.Remaining <= TimeSpan.Zero);
     }
 
-    private readonly record struct QueuedRunnerLogEntry(RunnerLogEntry Entry, long Generation);
+    private readonly record struct QueuedRunnerLogEntry(RunnerLogEntry Entry, long Generation, LogRelayDeadline Deadline);
     public async ValueTask DisposeAsync()
     {
         _completing = true;
