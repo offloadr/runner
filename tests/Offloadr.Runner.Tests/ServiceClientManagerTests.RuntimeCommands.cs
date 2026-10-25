@@ -931,9 +931,13 @@ public partial class ServiceClientManagerTests
         {
             for (var iteration = 0; iteration < iterations && !stopRacing.IsCancellationRequested; iteration++)
             {
-                using var lease = registry.Acquire(CommandSessionId, 7, 3, InstanceA);
-                _ = lease.Token.IsCancellationRequested;
-                lease.Token.Register(static () => { }).Dispose();
+                var lease = registry.Acquire(CommandSessionId, 7, 3, InstanceA);
+                try
+                {
+                    _ = lease.Token.IsCancellationRequested;
+                    lease.Token.Register(static () => { }).Dispose();
+                }
+                finally { lease.DisposeAsync().AsTask().GetAwaiter().GetResult(); }
             }
         })).ToArray();
         var stops = RunWorker(() =>
@@ -962,13 +966,13 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
-    public void TransientCancellation_IsScopedToTheRuntimeAndRenewedAfterCancel()
+    public async Task TransientCancellation_IsScopedToTheRuntimeAndRenewedAfterCancel()
     {
         using var shutdown = new CancellationTokenSource();
         var registry = new ServiceClientManager.TransientCancellationRegistry(shutdown.Token);
-        using var oldRuntime = registry.Acquire(CommandSessionId, 7, 3, InstanceA);
-        using var sameRuntimeOtherSpelling = registry.Acquire(CommandSessionId, 7, 3, Guid.Parse(InstanceA).ToString("D"));
-        using var newRuntime = registry.Acquire(CommandSessionId, 7, 4, InstanceB);
+        await using var oldRuntime = registry.Acquire(CommandSessionId, 7, 3, InstanceA);
+        await using var sameRuntimeOtherSpelling = registry.Acquire(CommandSessionId, 7, 3, Guid.Parse(InstanceA).ToString("D"));
+        await using var newRuntime = registry.Acquire(CommandSessionId, 7, 4, InstanceB);
         Assert.That(registry.Count, Is.EqualTo(2));
 
         registry.CancelRuntime(CommandSessionId, new RuntimeIdentity(7, 3, InstanceA));
@@ -979,7 +983,7 @@ public partial class ServiceClientManagerTests
             Assert.That(newRuntime.Token.IsCancellationRequested, Is.False);
         });
 
-        using var later = registry.Acquire(CommandSessionId, 7, 3, InstanceA);
+        await using var later = registry.Acquire(CommandSessionId, 7, 3, InstanceA);
         Assert.That(later.Token.IsCancellationRequested, Is.False);
 
         registry.CancelSession(CommandSessionId);
@@ -995,13 +999,15 @@ public partial class ServiceClientManagerTests
     public async Task Quiesce_CancelsOnlyTheQuiescedRuntimesTransientRequests()
     {
         var harness = RunningHarness(7, 3, InstanceA);
-        using var quiesced = harness.TransientCancellation.Acquire(CommandSessionId, 7, 3, InstanceA);
-        using var other = harness.TransientCancellation.Acquire(CommandSessionId, 7, 4, InstanceB);
+        await using var quiesced = harness.TransientCancellation.Acquire(CommandSessionId, 7, 3, InstanceA);
+        await using var other = harness.TransientCancellation.Acquire(CommandSessionId, 7, 4, InstanceB);
 
-        await ServiceClientManager.HandleQuiesceRuntimeCommandAsync(Quiesce(7, 3, InstanceA, revision: 1), harness.Deps);
-
+        var quiesce = ServiceClientManager.HandleQuiesceRuntimeCommandAsync(Quiesce(7, 3, InstanceA, revision: 1), harness.Deps);
         Assert.That(quiesced.Token.IsCancellationRequested, Is.True);
         Assert.That(other.Token.IsCancellationRequested, Is.False);
+        Assert.That(quiesce.IsCompleted, Is.False);
+        await quiesced.DisposeAsync();
+        await quiesce.WaitAsync(TimeSpan.FromSeconds(5));
     }
 
     [Test]

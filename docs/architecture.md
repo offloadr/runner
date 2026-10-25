@@ -207,6 +207,20 @@ persistent deduplication across a runner process replacement, nor proof that an
 uncertain native mutation did not execute. In-flight delivery lists, transport
 buffers and total process memory are separate resource boundaries.
 
+Each admitted transient request owns its cancellation source and the original
+callback task until its physical execution and asynchronous lease completion
+finish. Cancellation retires matching active entries without dropping these
+owners. A failed or held callback cannot skip cancellation of other requests;
+callback failures are observed with class-only diagnostics. Registry shutdown
+closes admission and joins current and retired original completion roots.
+
+Stop and Quiesce keep matching admission closed while joining requests and
+performing physical runtime cleanup. Their fence remains in place after the
+request drain finishes, until cleanup ends; unrelated sessions remain independent.
+These rules cover runner-local ownership. Controlled dispatch and handler tests
+do not establish actual HTTP cancellation, account/key cleanup, transport deadlines,
+or complete content retention and deletion.
+
 ## Artifact upload progress
 
 Artifact uploads use a size-aware elapsed allowance across retries, with separate

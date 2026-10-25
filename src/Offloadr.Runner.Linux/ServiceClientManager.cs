@@ -11,7 +11,7 @@ using Grpc.Core;
 
 namespace Offloadr.Runner.Linux;
 
-internal static class ServiceClientManager
+internal static partial class ServiceClientManager
 {
     internal const string HttpResponseChunkEventType = "http.response.chunk";
 
@@ -320,136 +320,6 @@ internal static class ServiceClientManager
 
                 return true;
             }
-        }
-    }
-
-    /// <summary>
-    /// Cancellation for in-flight transient editor requests, per exact runtime.
-    /// A request leases its runtime's source for its lifetime; the source is
-    /// removed and disposed with the last lease, so entries never outlive their
-    /// requests and a cancelled source is never read after disposal.
-    /// </summary>
-    internal sealed class TransientCancellationRegistry(CancellationToken shutdown)
-    {
-        internal readonly record struct Key(string SessionId, RuntimeIdentity Runtime);
-
-        internal sealed class Entry(CancellationTokenSource source)
-        {
-            public CancellationTokenSource Source { get; } = source;
-            public int Leases { get; set; }
-        }
-
-        internal sealed class Lease : IDisposable
-        {
-            private readonly TransientCancellationRegistry _owner;
-            private readonly Key _key;
-            private readonly Entry _entry;
-            private int _disposed;
-
-            public Lease(TransientCancellationRegistry owner, Key key, Entry entry)
-            {
-                _owner = owner;
-                _key = key;
-                _entry = entry;
-                Token = entry.Source.Token;
-            }
-
-            public CancellationToken Token { get; }
-
-            public void Dispose()
-            {
-                if (Interlocked.Exchange(ref _disposed, 1) == 0)
-                {
-                    _owner.Release(_key, _entry);
-                }
-            }
-        }
-
-        private readonly object _gate = new();
-        private readonly Dictionary<Key, Entry> _entries = new();
-
-        public int Count
-        {
-            get { lock (_gate) return _entries.Count; }
-        }
-
-        public Lease Acquire(string? sessionId, ulong lifecycleGeneration, ulong runtimeEpoch, string? runtimeInstanceId)
-        {
-            var key = new Key(
-                sessionId?.Trim() ?? string.Empty,
-                new RuntimeIdentity(lifecycleGeneration, runtimeEpoch, runtimeInstanceId ?? string.Empty).Normalized());
-            lock (_gate)
-            {
-                if (!_entries.TryGetValue(key, out var entry))
-                {
-                    entry = new Entry(CancellationTokenSource.CreateLinkedTokenSource(shutdown));
-                    _entries.Add(key, entry);
-                }
-
-                entry.Leases++;
-                return new Lease(this, key, entry);
-            }
-        }
-
-        public void CancelSession(string? sessionId)
-        {
-            var normalizedSessionId = sessionId?.Trim() ?? string.Empty;
-            Cancel(key => string.Equals(key.SessionId, normalizedSessionId, StringComparison.Ordinal));
-        }
-
-        public void CancelRuntime(string? sessionId, RuntimeIdentity runtime)
-        {
-            var normalizedSessionId = sessionId?.Trim() ?? string.Empty;
-            var normalizedRuntime = runtime.Normalized();
-            Cancel(key => string.Equals(key.SessionId, normalizedSessionId, StringComparison.Ordinal) &&
-                          key.Runtime == normalizedRuntime);
-        }
-
-        public void CancelAll() => Cancel(_ => true);
-
-        private void Cancel(Func<Key, bool> matches)
-        {
-            List<Entry> cancelled;
-            lock (_gate)
-            {
-                cancelled = [];
-                foreach (var key in _entries.Keys.Where(matches).ToArray())
-                {
-                    cancelled.Add(_entries[key]);
-                    _entries.Remove(key);
-                }
-            }
-
-            // Later requests for the same runtime lease a fresh source.
-            foreach (var entry in cancelled)
-            {
-                try
-                {
-                    entry.Source.Cancel();
-                }
-                catch (ObjectDisposedException)
-                {
-                    // Its last request already completed and released it.
-                }
-            }
-        }
-
-        private void Release(Key key, Entry entry)
-        {
-            lock (_gate)
-            {
-                if (--entry.Leases > 0)
-                {
-                    return;
-                }
-
-                if (_entries.TryGetValue(key, out var current) && ReferenceEquals(current, entry))
-                {
-                    _entries.Remove(key);
-                }
-            }
-
-            entry.Source.Dispose();
         }
     }
 
@@ -1381,7 +1251,7 @@ internal static class ServiceClientManager
         using var readGate = new SemaphoreSlim(4, 4);
         await using var commandTasks = new RunnerCommandLifetime(shutdown, requestParentShutdown);
         shutdown = commandTasks.Token;
-        var transientCancellation = new TransientCancellationRegistry(shutdown);
+        await using var transientCancellation = new TransientCancellationRegistry(shutdown);
         var runtimeCommands = new RuntimeCommandDependencies
         {
             RunnerId = runnerId,
@@ -1619,7 +1489,6 @@ internal static class ServiceClientManager
             }
         }
 
-        transientCancellation.CancelAll();
     }
 
     internal static Task QueuePromptAcknowledgementAsync(
@@ -2268,7 +2137,8 @@ internal static class ServiceClientManager
             await CancelTrackedWorkAsync(activeStartup).ConfigureAwait(false);
         }
 
-        deps.TransientCancellation.CancelSession(command.SessionId);
+        using var transientDrain = deps.TransientCancellation.BeginSessionDrain(command.SessionId);
+        await transientDrain.Completion.ConfigureAwait(false);
 
         try
         {
@@ -2518,7 +2388,8 @@ internal static class ServiceClientManager
 
                 await deps.WorkState.Prompts.CancelAndWaitAsync(
                     prompt => PromptTargetsRuntime(prompt, command.SessionId, target)).ConfigureAwait(false);
-                deps.TransientCancellation.CancelRuntime(command.SessionId, target);
+                using var transientDrain = deps.TransientCancellation.BeginRuntimeDrain(command.SessionId, target);
+                await transientDrain.Completion.ConfigureAwait(false);
 
                 if (!await StopRuntimeAndCleanupIfCurrentAsync(command.SessionId, target, deps, deps.Shutdown).ConfigureAwait(false))
                 {
@@ -2987,7 +2858,7 @@ internal static class ServiceClientManager
         AcknowledgeEditorRuntimeRequestRequest response;
         try
         {
-            using var lease = cancellation.Acquire(
+            await using var lease = cancellation.Acquire(
                 request.SessionId,
                 request.LifecycleGeneration,
                 request.RuntimeEpoch,
