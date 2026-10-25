@@ -21,15 +21,14 @@ public partial class SessionProcessManagerOwnershipTests
             Quiesce = async () =>
             {
                 if (child is null) return;
-                if (!child.HasExited) child.Kill();
-                await child.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(5));
+                await QuiesceSnapshotDescendantAsync(child);
             }
         };
         await using var manager = new SessionProcessManager(TestRuntimeActivitySink.Accepted, options, isolation,
             new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
         Task SnapshotAsync(string _, CancellationToken __)
         {
-            snapshots.Add(!child!.HasExited);
+            snapshots.Add(SnapshotDescendantCanWrite(child!));
             TestContext.Out.WriteLine($"descendantAliveAtSnapshot={snapshots[^1]}; accountRetired={isolation.CleanupCallCount > 0}; dataPresent={Directory.Exists(identity.HomeDirectory)}");
             Assert.That(isolation.CleanupCallCount, Is.Zero);
             Assert.That(Directory.Exists(identity.HomeDirectory), Is.True);
@@ -42,7 +41,7 @@ public partial class SessionProcessManagerOwnershipTests
             var childFile = Path.Combine(identity.HomeDirectory, "survivor.pid");
             await WaitForFileAsync(childFile);
             child = Process.GetProcessById(int.Parse(File.ReadAllText(childFile)));
-            Assert.That(child.HasExited, Is.False, "The real child must be alive before the parent exits.");
+            Assert.That(SnapshotDescendantCanWrite(child), Is.True, "The real child must be alive before the parent exits.");
             if (unexpectedExit)
             {
                 manager.UnexpectedSessionExitCleanup = (session, _, _, token) => SnapshotAsync(session, token);
@@ -56,7 +55,7 @@ public partial class SessionProcessManagerOwnershipTests
             Assert.Multiple(() =>
             {
                 Assert.That(snapshots, Is.EqualTo(new[] { false }), "No descendant may keep writing during the final sidecar snapshot.");
-                Assert.That(child.HasExited, Is.True);
+                Assert.That(SnapshotDescendantCanWrite(child), Is.False);
                 Assert.That(isolation.CleanupCallCount, Is.EqualTo(1));
             });
         }
@@ -64,8 +63,7 @@ public partial class SessionProcessManagerOwnershipTests
         {
             if (child is not null)
             {
-                if (!child.HasExited) child.Kill();
-                await child.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(5));
+                await QuiesceSnapshotDescendantAsync(child);
             }
             await manager.DisposeAsync();
             child?.Dispose();
@@ -90,8 +88,7 @@ public partial class SessionProcessManagerOwnershipTests
             {
                 if (child is null) return;
                 if (fail) throw new InvalidOperationException("controlled surviving descendant");
-                if (!child.HasExited) child.Kill();
-                await child.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(5));
+                await QuiesceSnapshotDescendantAsync(child);
             }
         };
         await using var manager = new SessionProcessManager(TestRuntimeActivitySink.Accepted, options, isolation,
@@ -104,31 +101,56 @@ public partial class SessionProcessManagerOwnershipTests
             await WaitForFileAsync(childFile);
             child = Process.GetProcessById(int.Parse(File.ReadAllText(childFile)));
             Assert.ThrowsAsync<InvalidOperationException>(() => manager.StopSessionAsync(ActivitySessionId, SnapshotAsync, CancellationToken.None));
-            TestContext.Out.WriteLine($"failedQuiescenceSnapshotCount={snapshots}; descendantAlive={!child.HasExited}");
+            TestContext.Out.WriteLine($"failedQuiescenceSnapshotCount={snapshots}; descendantAlive={SnapshotDescendantCanWrite(child)}");
             Assert.Multiple(() =>
             {
                 Assert.That(snapshots, Is.Zero);
-                Assert.That(child.HasExited, Is.False);
+                Assert.That(SnapshotDescendantCanWrite(child), Is.True);
                 Assert.That(isolation.CleanupCallCount, Is.Zero);
                 Assert.That(Directory.Exists(identity.HomeDirectory), Is.True);
             });
             fail = false;
             await manager.StopSessionAsync(ActivitySessionId, SnapshotAsync, CancellationToken.None);
             Assert.That(snapshots, Is.EqualTo(1));
-            Assert.That(child.HasExited, Is.True);
+            Assert.That(SnapshotDescendantCanWrite(child), Is.False);
         }
         finally
         {
             fail = false;
             if (child is not null)
             {
-                if (!child.HasExited) child.Kill();
-                await child.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(5));
+                await QuiesceSnapshotDescendantAsync(child);
             }
             await manager.DisposeAsync();
             child?.Dispose();
             TryDelete(root);
         }
+    }
+
+    private static async Task QuiesceSnapshotDescendantAsync(Process child)
+    {
+        if (SnapshotDescendantCanWrite(child)) child.Kill();
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        while (SnapshotDescendantCanWrite(child)) await Task.Delay(10, timeout.Token);
+        TestContext.Out.WriteLine($"descendantQuiescedPid={child.Id}; kernelState={SnapshotDescendantState(child)}");
+    }
+
+    private static bool SnapshotDescendantCanWrite(Process child)
+        => SnapshotDescendantState(child) is not ("gone" or "Z" or "X");
+
+    private static string SnapshotDescendantState(Process child)
+    {
+        if (child.HasExited) return "gone";
+        try
+        {
+            // Container PID 1 may leave an orphan as a zombie after SIGKILL.
+            // Match the production reaper: a zombie cannot write the session files.
+            var state = File.ReadLines($"/proc/{child.Id}/status")
+                .Single(line => line.StartsWith("State:", StringComparison.Ordinal));
+            return state["State:".Length..].TrimStart()[..1];
+        }
+        catch (FileNotFoundException) { return "gone"; }
+        catch (DirectoryNotFoundException) { return "gone"; }
     }
 
     private const string SurvivorEntryPoint = "#!/bin/sh\n/bin/sh -c 'trap \"\" TERM; exec /bin/sleep 300' >/dev/null 2>&1 &\nprintf '%s\\n' \"$!\" > \"$HOME/survivor.pid\"\nprintf x\nexec /bin/sleep 300\n";
