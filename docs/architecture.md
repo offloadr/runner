@@ -41,6 +41,13 @@ then retire the account, data and keys. The session manager has not yet been
 converted to that complete lifetime, including inherited pipe writers and root
 shutdown. The prepared operations alone do not prove that order at runtime.
 
+The prelaunch dependency-sync helper uses the process-only phase before waiting
+for output EOF. Its success, failure and cancellation paths join the original
+process exit, quiescence task and both readers. Cancellation cannot replace that
+join with a cancelled waiting wrapper, and a reaper failure fails startup. This
+helper retains the account and data for its startup owner; it does not retire
+the session or establish the lifetime of the editor child or bridge.
+
 ## Expired prompt receipts
 
 Prompt execution permission includes explicit content availability. An expired

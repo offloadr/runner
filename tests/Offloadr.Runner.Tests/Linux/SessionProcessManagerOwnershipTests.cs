@@ -1685,6 +1685,8 @@ public partial class SessionProcessManagerOwnershipTests
     {
         public int CleanupCallCount { get; private set; }
         public Func<Task>? Cleanup { get; init; }
+        public int QuiescenceCallCount { get; private set; }
+        public Func<Task>? Quiesce { get; init; }
 
         public void ValidatePrerequisites(ICollection<string> errors)
         {
@@ -1696,7 +1698,10 @@ public partial class SessionProcessManagerOwnershipTests
         }
 
         public Task StopProcessesAsync(PreparedSessionIdentity identity, CancellationToken cancellationToken)
-            => Task.CompletedTask;
+        {
+            QuiescenceCallCount++;
+            return Quiesce?.Invoke() ?? Task.CompletedTask;
+        }
 
         public Task CleanupAsync(PreparedSessionIdentity identity, CancellationToken cancellationToken)
         {

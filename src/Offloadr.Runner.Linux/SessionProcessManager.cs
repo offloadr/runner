@@ -2256,8 +2256,13 @@ internal sealed partial class SessionProcessManager : IDisposable
         }
 
         // The sync runs session-controlled package builds; bound each line it prints.
-        var stdoutPump = BoundedLineReader.PumpAsync(process.StandardOutput, OnOutputLine);
-        var stderrPump = BoundedLineReader.PumpAsync(process.StandardError, OnOutputLine);
+        using var outputStopping = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var stdoutPump = BoundedLineReader.PumpAsync(process.StandardOutput, OnOutputLine, cancellationToken: outputStopping.Token);
+        var stderrPump = BoundedLineReader.PumpAsync(process.StandardError, OnOutputLine, cancellationToken: outputStopping.Token);
+        Task? processQuiescence = null;
+        Task QuiesceProcessesAsync() => processQuiescence ??= ReapProcessesAsync();
+        async Task ReapProcessesAsync()
+            => await _sessionIsolationStrategy.StopProcessesAsync(identity, CancellationToken.None).ConfigureAwait(false);
 
         using var registration = cancellationToken.Register(() =>
         {
@@ -2274,13 +2279,44 @@ internal sealed partial class SessionProcessManager : IDisposable
             }
         });
 
-        var exitCode = await exitTcs.Task.ConfigureAwait(false);
-        cancellationToken.ThrowIfCancellationRequested();
-        await Task.WhenAll(stdoutPump, stderrPump).WaitAsync(cancellationToken).ConfigureAwait(false);
-        cancellationToken.ThrowIfCancellationRequested();
-        lock (outputLock)
+        try
         {
-            return new ProcessRunResult(exitCode, output.ToString());
+            var exitCode = await exitTcs.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+            // A package helper can leave descendants holding its inherited output handles.
+            // Reap those writers without deleting the account or data before requiring EOF.
+            await QuiesceProcessesAsync().ConfigureAwait(false);
+            await Task.WhenAll(stdoutPump, stderrPump).ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested();
+            lock (outputLock)
+            {
+                return new ProcessRunResult(exitCode, output.ToString());
+            }
+        }
+        finally
+        {
+            try { await outputStopping.CancelAsync().ConfigureAwait(false); }
+            finally
+            {
+                try
+                {
+                    try
+                    {
+                        if (!process.HasExited) process.Kill(entireProcessTree: true);
+                    }
+                    catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception)
+                    {
+                        LogSessionWarning(sessionId, $"Dependency sync termination failed; errorClass={ex.GetType().Name}.");
+                    }
+
+                    try { await QuiesceProcessesAsync().ConfigureAwait(false); }
+                    finally { await exitTcs.Task.ConfigureAwait(false); }
+                }
+                finally
+                {
+                    // Cancellation above ends the wait in the try, never these original owners.
+                    await Task.WhenAll(stdoutPump, stderrPump).ConfigureAwait(false);
+                }
+            }
         }
     }
 
