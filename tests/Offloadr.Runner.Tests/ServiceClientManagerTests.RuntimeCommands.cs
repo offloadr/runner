@@ -1480,7 +1480,7 @@ public partial class ServiceClientManagerTests
                     RunnerSessionId = CommandSessionId,
                 },
             };
-            WorkState.Prompts.Start(prompt, async (_, token) =>
+            WorkState.Prompts.Start(prompt, false, async (_, token) =>
             {
                 try
                 {

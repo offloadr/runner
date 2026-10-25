@@ -204,10 +204,10 @@ public sealed class PromptExecutionPermissionTests
             RuntimeEpoch = command.Target.RuntimeEpoch,
             RuntimeInstanceId = command.Target.RuntimeInstanceId,
         };
-        Assert.That(ServiceClientManager.TargetsPromptRuntime(interrupt, command), Is.True);
+        Assert.That(ServiceClientManager.TargetsPromptRuntime(interrupt, PromptWorkIdentity.Capture(command, false)), Is.True);
         command.Target.RuntimeEpoch++;
         command.Target.RuntimeInstanceId = Guid.NewGuid().ToString("n");
-        Assert.That(ServiceClientManager.TargetsPromptRuntime(interrupt, command), Is.False);
+        Assert.That(ServiceClientManager.TargetsPromptRuntime(interrupt, PromptWorkIdentity.Capture(command, false)), Is.False);
     }
 
     private static SubmitPromptCommand Command() => new()

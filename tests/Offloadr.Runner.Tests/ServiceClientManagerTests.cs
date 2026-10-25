@@ -1654,14 +1654,14 @@ public partial class ServiceClientManagerTests
         Assert.Multiple(() =>
         {
             // An evicted evidence identity leaves no submission id; the native prompt id still matches.
-            Assert.That(ServiceClientManager.IsFinishedPrompt(prompt, Finished(nativePromptId)), Is.True);
-            Assert.That(ServiceClientManager.IsFinishedPrompt(prompt, Finished("other-prompt", PromptSubmissionId)), Is.True);
-            Assert.That(ServiceClientManager.IsFinishedPrompt(prompt, Finished("other-prompt")), Is.False);
+            Assert.That(ServiceClientManager.IsFinishedPrompt(PromptWorkIdentity.Capture(prompt, false), Finished(nativePromptId)), Is.True);
+            Assert.That(ServiceClientManager.IsFinishedPrompt(PromptWorkIdentity.Capture(prompt, false), Finished("other-prompt", PromptSubmissionId)), Is.True);
+            Assert.That(ServiceClientManager.IsFinishedPrompt(PromptWorkIdentity.Capture(prompt, false), Finished("other-prompt")), Is.False);
             Assert.That(ServiceClientManager.IsFinishedPrompt(
-                WithPromptIdentity(new() { SessionId = PromptSessionId, SubmissionId = PromptSubmissionId }),
+                PromptWorkIdentity.Capture(WithPromptIdentity(new() { SessionId = PromptSessionId, SubmissionId = PromptSubmissionId }), false),
                 Finished(string.Empty)), Is.False, "A prompt without a native id never matches an empty one.");
             Assert.That(ServiceClientManager.IsFinishedPrompt(
-                prompt,
+                PromptWorkIdentity.Capture(prompt, false),
                 Finished(nativePromptId, on: runtime with { RuntimeEpoch = runtime.RuntimeEpoch + 1 })), Is.False);
         });
     }
