@@ -25,6 +25,13 @@ progress callbacks share that lifetime's cancellation and admission gate. An old
 captured reporter cannot admit work after shutdown, while admitted original
 callbacks and cancellation callbacks must finish before detachment completes.
 
+Startup publishes its original physical task before execution and keeps the
+active slot until both execution and its original cancellation callbacks end.
+Host shutdown, Stop, Quiesce and replacement share that callback ownership.
+Joining never uses a cancelled waiting wrapper. A callback failure is reported
+by class after the join and cannot skip runtime cleanup or enter an acknowledgement
+message. Startup acknowledgement retries remain independent of that physical join.
+
 All four control channels and their sink belong to the outer entry-point scope,
 before any relay is created. They therefore remain alive through producer,
 session, sidecar and relay cleanup. The final entry-point exception handler exits

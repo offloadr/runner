@@ -460,30 +460,23 @@ internal static class ServiceClientManager
     /// </summary>
     internal readonly record struct StartupOutcome(bool Ready, string Message, SessionSealingStatus? Sealing = null);
 
-    internal sealed class TrackedCommandWork
+    internal sealed class TrackedCommandWork(CancellationToken shutdown)
     {
+        private readonly OwnedCancellation _cancellation = new(shutdown);
+
         public Task? Task { get; set; }
 
         /// <summary>The startup's result, set only for startup work so other commands can join it.</summary>
         public Task<StartupOutcome>? Outcome { get; set; }
-        public required CancellationTokenSource CancellationSource { get; init; }
+        public CancellationToken Token => _cancellation.Token;
         public required string SessionId { get; init; }
         public RuntimeIdentity RuntimeIdentity { get; init; }
 
         /// <summary>The sealing a startup runs with; only a command asking for the same joins it.</summary>
         public SessionSealing? Sealing { get; init; }
 
-        public void Cancel()
-        {
-            try
-            {
-                CancellationSource.Cancel();
-            }
-            catch (ObjectDisposedException)
-            {
-                // The work already finished and released its source.
-            }
-        }
+        public Task CancelAsync() => _cancellation.RequestAsync();
+        public Task CompleteAsync() => _cancellation.CompleteAsync();
     }
 
     /// <summary>
@@ -2792,10 +2785,8 @@ internal static class ServiceClientManager
         }
 
         TrackedCommandWork? previous = null;
-        var cancellationSource = CancellationTokenSource.CreateLinkedTokenSource(deps.Shutdown);
-        var tracked = new TrackedCommandWork
+        var tracked = new TrackedCommandWork(deps.Shutdown)
         {
-            CancellationSource = cancellationSource,
             SessionId = sessionId,
             RuntimeIdentity = runtimeIdentity,
             Sealing = sealing?.Clone(),
@@ -2816,12 +2807,12 @@ internal static class ServiceClientManager
             try
             {
                 await CancelTrackedWorkAsync(previous).ConfigureAwait(false);
-                return await startup(cancellationSource.Token).ConfigureAwait(false);
+                return await startup(tracked.Token).ConfigureAwait(false);
             }
             finally
             {
-                deps.WorkState.ClearActiveStartup(tracked);
-                cancellationSource.Dispose();
+                try { await tracked.CompleteAsync().ConfigureAwait(false); }
+                finally { deps.WorkState.ClearActiveStartup(tracked); }
             }
         }
 
@@ -2904,20 +2895,21 @@ internal static class ServiceClientManager
             return;
         }
 
-        if (work.Task is null)
-        {
-            work.Cancel();
-            return;
-        }
-
-        work.Cancel();
+        var cancellation = work.CancelAsync();
         try
         {
-            await work.Task.ConfigureAwait(false);
+            if (work.Task is { } original) await original.ConfigureAwait(false);
         }
         catch
         {
-            // Prompt/start failures are logged and handled by their owning code path.
+            // Startup failures belong to the physical startup's outcome path.
+        }
+        try { await cancellation.ConfigureAwait(false); }
+        catch (Exception error)
+        {
+            // The original root and callbacks have ended. A callback failure
+            // must not skip runtime cleanup or copy its message into an ACK.
+            RunnerLog.Warning(nameof(ServiceClientManager), $"Startup cancellation ended with {error.GetType().Name}.");
         }
     }
 
