@@ -564,6 +564,8 @@ message RunnerLogEntry {
     string message = 3;
     google.protobuf.Timestamp created_utc = 4;
     uint64 sequence = 5;
+    // Stable for one relay lifetime, including reconnects/retries; new on restart.
+    string relay_instance_id = 6;
 }
 
 message ReportRunnerLogsRequest {

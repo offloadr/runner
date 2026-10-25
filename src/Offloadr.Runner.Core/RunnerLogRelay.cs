@@ -15,6 +15,7 @@ internal sealed class RunnerLogRelay : IAsyncDisposable
     private static readonly TimeSpan ShutdownDrainTimeout = TimeSpan.FromSeconds(2);
 
     private readonly string _runnerId;
+    private readonly string _relayInstanceId = Guid.NewGuid().ToString("n");
     private readonly Channel<QueuedRunnerLogEntry> _queue;
     private readonly CancellationTokenSource _shutdown = new();
     private readonly Task _senderTask;
@@ -96,6 +97,7 @@ internal sealed class RunnerLogRelay : IAsyncDisposable
         var entry = new RunnerLogEntry
         {
             RunnerId = _runnerId,
+            RelayInstanceId = _relayInstanceId,
             Category = string.IsNullOrWhiteSpace(category) ? "RunnerAgent" : category.Trim(),
             Message = LogRelayBounds.TruncateMessage(message.Trim()),
             CreatedUtc = Timestamp.FromDateTime(DateTime.UtcNow),
