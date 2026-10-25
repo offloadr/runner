@@ -41,7 +41,8 @@ public static class MauiProgram
         builder.Services.AddRunnerSupervisor(paths).AddRunnerUI();
         builder.Services.AddRunnerUpdateChecks(Offloadr.Runner.Supervisor.Hosting.UpdateChecker.VersionOf(typeof(MauiProgram).Assembly));
 
-        builder.Logging.AddProvider(new FileLoggerProvider(paths.Logs));
+        builder.Logging.ClearProviders();
+        builder.Logging.AddProvider(new Offloadr.Runner.Supervisor.Logging.DesktopDiagnosticLogProvider(paths.Logs));
         builder.Services.AddSingleton<DesktopRuntime>();
         builder.Services.AddSingleton<MainPage>();
 #if DEBUG

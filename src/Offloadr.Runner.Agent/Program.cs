@@ -34,17 +34,7 @@ static async Task<int> RunAgentAsync()
         options.RegistrationRpcTimeout);
     await using var runnerLogRelay = new RunnerLogRelay(options.RunnerId);
 
-    using var loggerFactory = LoggerFactory.Create(builder =>
-    {
-        builder.ClearProviders();
-        builder.AddSimpleConsole(console =>
-        {
-            console.SingleLine = true;
-            console.TimestampFormat = "HH:mm:ss ";
-        });
-        builder.AddProvider(new RunnerLogForwardingProvider(runnerLogRelay));
-        builder.SetMinimumLevel(LogLevel.Information);
-    });
+    using var loggerFactory = AgentLogging.CreateFactory(runnerLogRelay);
 
     RunnerLog.Configure(loggerFactory);
     var sessionIsolationStrategy = new LinuxUserIsolationStrategy(new LinuxCommandRunner());

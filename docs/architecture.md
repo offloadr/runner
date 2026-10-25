@@ -361,9 +361,23 @@ writing-runtime identity.
 Retry diagnostics retain only fixed counts and error classes, not exception
 objects or arbitrary detail. Optional log expiry does not admit runtime activity
 or complete a physical acknowledgement; those existing owners are independent.
-The log path remains a best-effort presentation lane. Container console mirrors,
-desktop files, collectors and native histories need their own content and lifetime
-protection; these queue bounds do not cover those copies.
+The log path remains a best-effort presentation lane. The agent console and
+Windows desktop diagnostic files emit only a UTC timestamp, severity, a fixed
+component label and a fixed failure class. These sinks never invoke the arbitrary
+message formatter or inspect state, scopes, event names, exception messages or
+stacks. Category strings are mapped to fixed component labels and are not retained.
+The separate account-protected runner and session forwarding lanes keep their
+existing content delivery, limits and original capture deadlines.
+
+Desktop metadata uses invariant UTC hourly filenames, capped at 64 KiB each.
+Files expire 24 hours after the filename's hour; an active app sweeps each minute,
+and startup and writes also sweep. A stopped app cannot run the sweep; the next
+startup removes expired files. Startup failures use the same metadata sink.
+The app removes its retired `runner-yyyy-MM-dd.log` and `desktop-startup.log`
+files without reading their content, preserving unrelated files. Unwritable
+folders cannot create a raw-content fallback. These are app-owned cleanup attempts,
+not proof that old files on a real host, external collectors, backups or native
+histories have been erased. Those copies need their own protection and disposition.
 
 Thirty-four focused cases pass: the four original regression cases, eleven
 clock/join/retry/connection-race controls and nineteen prior relay cases. These
