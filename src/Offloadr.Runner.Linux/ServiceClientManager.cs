@@ -8,7 +8,6 @@ using Offloadr.EditorRuntime.V1;
 using Google.Protobuf;
 using Google.Protobuf.WellKnownTypes;
 using Grpc.Core;
-using Grpc.Net.Client;
 
 namespace Offloadr.Runner.Linux;
 
@@ -930,14 +929,12 @@ internal static class ServiceClientManager
     /// Long-lived Offloadr API supervisor that owns explicit status, commands, session-event, and ops lanes.
     /// </summary>
     public static async Task CommandListenerLoopAsync(
-        string offloadrApiUrl,
-        bool traceHttp,
-        string runnerSecret,
+        RunnerControlService.RunnerControlServiceClient commandClient,
+        IRunnerSessionSink sessionSink,
         string runnerId,
         string instanceId,
         TimeSpan minBackoff,
         TimeSpan maxBackoff,
-        TimeSpan rpcTimeout,
         string version,
         SessionProcessManager sessionManager,
         ModelDownloadService downloadService,
@@ -958,107 +955,99 @@ internal static class ServiceClientManager
         RuntimeIdentityRegistry runtimeIdentities,
         CancellationToken shutdown)
     {
-        using var statusChannel = GrpcChannelManager.CreateChannel(offloadrApiUrl, traceHttp);
-        using var commandChannel = GrpcChannelManager.CreateChannel(offloadrApiUrl, traceHttp);
-        using var sessionEventChannel = GrpcChannelManager.CreateChannel(offloadrApiUrl, traceHttp);
-        using var opsChannel = GrpcChannelManager.CreateChannel(offloadrApiUrl, traceHttp);
-
-        var statusClient = GrpcChannelManager.CreateAuthenticatedControlClient(statusChannel, runnerSecret);
-        var commandClient = GrpcChannelManager.CreateAuthenticatedControlClient(commandChannel, runnerSecret);
-        var sessionEventClient = GrpcChannelManager.CreateAuthenticatedControlClient(sessionEventChannel, runnerSecret);
-        var opsClient = GrpcChannelManager.CreateAuthenticatedControlClient(opsChannel, runnerSecret);
-
-        await using var sessionSink = new GrpcRunnerControlSink(
-            statusClient,
-            commandClient,
-            sessionEventClient,
-            opsClient,
-            rpcTimeout);
-
+        ArgumentNullException.ThrowIfNull(commandClient);
+        ArgumentNullException.ThrowIfNull(sessionSink);
+        await using var lifetime = new RunnerControlLifetime(shutdown);
+        shutdown = lifetime.Token;
         var initialStatusApplied = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var commandWorkState = new RunnerCommandWorkState(shutdown);
-        sessionEventRelay.AttachSink(sessionSink);
         // ComfyUI's terminal event (success, error or interrupted) ends an
         // accepted prompt's model demand; a global interrupt alone cannot tell
         // which accepted prompt it stopped.
         void WithdrawFinishedPromptDemand(ComfySessionEventRelay.PromptTerminalEvent finished)
             => commandWorkState.Prompts.WithdrawDemand(prompt => IsFinishedPrompt(prompt, finished));
-        sessionEventRelay.PromptFinished += WithdrawFinishedPromptDemand;
-        sessionProcessLogRelay.AttachSink(sessionSink);
-        runnerLogRelay.AttachSink(sessionSink);
-        sessionRuntimeTelemetryRelay.AttachSink(sessionSink);
-
-        var initialLocalModelSnapshot = PrepareInitialLocalModelSnapshot(localModelSnapshotProvider, localModelSnapshotObserver);
-
-        downloadService.RuntimeResolver = sessionId => runtimeIdentities.TryGet(sessionId, out var identity) ? identity : null;
-        downloadService.ProgressReporter = async progress =>
-        {
-            RuntimeIdentity? reportedRuntime = null;
-            try
+        LocalModelSnapshot? initialLocalModelSnapshot = null;
+        await lifetime.RunAsync(
+            attach: () =>
             {
-                var request = new ReportModelDownloadRequest
-                {
-                    RunnerId = runnerId,
-                    SessionId = progress.SessionId,
-                    ModelId = progress.ModelId,
-                    Filename = progress.Filename,
-                    DestinationPath = progress.DestinationPath,
-                    BytesDownloaded = progress.BytesDownloaded,
-                    TotalBytes = progress.TotalBytes,
-                    Percent = double.IsFinite(progress.Percent) ? Math.Clamp(progress.Percent, 0d, 100d) : 0d,
-                    BytesPerSecond = progress.BytesPerSecond,
-                    AverageBytesPerSecond = progress.AverageBytesPerSecond,
-                    State = progress.State,
-                    Message = progress.Message ?? string.Empty
-                };
-                // Report under the runtime the download was registered for. Only that identity
-                // may be treated as revoked: the session may since have a replacement runtime.
-                if (progress.Runtime is { IsValid: true } registeredRuntime)
-                {
-                    request.LifecycleGeneration = registeredRuntime.LifecycleGeneration;
-                    request.RuntimeEpoch = registeredRuntime.RuntimeEpoch;
-                    request.RuntimeInstanceId = registeredRuntime.RuntimeInstanceId;
-                    reportedRuntime = registeredRuntime;
-                }
-                else if (runtimeIdentities.TryGet(progress.SessionId, out var currentRuntime))
-                {
-                    // Registered before the session had a runtime: label it with the current
-                    // one so it is accepted, but never revoke a runtime on its rejection.
-                    request.LifecycleGeneration = currentRuntime.LifecycleGeneration;
-                    request.RuntimeEpoch = currentRuntime.RuntimeEpoch;
-                    request.RuntimeInstanceId = currentRuntime.RuntimeInstanceId;
-                }
-                await sessionSink.ReportModelDownloadAsync(request, CancellationToken.None).ConfigureAwait(false);
-            }
-            catch (RpcException ex) when (ex.StatusCode == StatusCode.PermissionDenied)
-            {
-                RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed to report model download progress: {ex.Message}");
-                await HandleRevokedRuntimeReportAsync(
-                    progress.SessionId,
-                    reportedRuntime,
-                    logicalSessionState,
-                    runtimeIdentities,
-                    sessionManager.GetActiveSessionId,
-                    sessionManager.StopSessionAsync,
-                    sessionManager.StopSessionIfRuntimeMatchesAsync,
-                    sessionEventRelay.StopSessionAsync,
-                    artifactUploadService.StopSessionAsync,
-                    workspaceMirrorService.StopSessionAsync,
-                    downloadService.CancelSession,
-                    downloadService.GetActiveSessionId,
-                    downloadService.SetActiveSession).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed to report model download progress: {ex.Message}");
-            }
-        };
+                sessionEventRelay.AttachSink(sessionSink);
+                sessionEventRelay.PromptFinished += WithdrawFinishedPromptDemand;
+                sessionProcessLogRelay.AttachSink(sessionSink);
+                runnerLogRelay.AttachSink(sessionSink);
+                sessionRuntimeTelemetryRelay.AttachSink(sessionSink);
 
-        try
-        {
-            var statusTask = RunRunnerStatusLoopAsync(
+                initialLocalModelSnapshot = PrepareInitialLocalModelSnapshot(localModelSnapshotProvider, localModelSnapshotObserver);
+
+                downloadService.RuntimeResolver = sessionId => runtimeIdentities.TryGet(sessionId, out var identity) ? identity : null;
+                downloadService.ProgressReporter = progress => lifetime.ReportProgressAsync(async progressCancellation =>
+                {
+                    RuntimeIdentity? reportedRuntime = null;
+                    try
+                    {
+                        var request = new ReportModelDownloadRequest
+                        {
+                            RunnerId = runnerId,
+                            SessionId = progress.SessionId,
+                            ModelId = progress.ModelId,
+                            Filename = progress.Filename,
+                            DestinationPath = progress.DestinationPath,
+                            BytesDownloaded = progress.BytesDownloaded,
+                            TotalBytes = progress.TotalBytes,
+                            Percent = double.IsFinite(progress.Percent) ? Math.Clamp(progress.Percent, 0d, 100d) : 0d,
+                            BytesPerSecond = progress.BytesPerSecond,
+                            AverageBytesPerSecond = progress.AverageBytesPerSecond,
+                            State = progress.State,
+                            Message = progress.Message ?? string.Empty
+                        };
+                        // Report under the runtime the download was registered for. Only that identity
+                        // may be treated as revoked: the session may since have a replacement runtime.
+                        if (progress.Runtime is { IsValid: true } registeredRuntime)
+                        {
+                            request.LifecycleGeneration = registeredRuntime.LifecycleGeneration;
+                            request.RuntimeEpoch = registeredRuntime.RuntimeEpoch;
+                            request.RuntimeInstanceId = registeredRuntime.RuntimeInstanceId;
+                            reportedRuntime = registeredRuntime;
+                        }
+                        else if (runtimeIdentities.TryGet(progress.SessionId, out var currentRuntime))
+                        {
+                            // Registered before the session had a runtime: label it with the current
+                            // one so it is accepted, but never revoke a runtime on its rejection.
+                            request.LifecycleGeneration = currentRuntime.LifecycleGeneration;
+                            request.RuntimeEpoch = currentRuntime.RuntimeEpoch;
+                            request.RuntimeInstanceId = currentRuntime.RuntimeInstanceId;
+                        }
+                        await sessionSink.ReportModelDownloadAsync(request, progressCancellation).ConfigureAwait(false);
+                    }
+                    catch (RpcException ex) when (ex.StatusCode == StatusCode.PermissionDenied)
+                    {
+                        RunnerLog.Error($"Model download progress failed; errorClass={ex.GetType().Name}.");
+                        await HandleRevokedRuntimeReportAsync(
+                            progress.SessionId,
+                            reportedRuntime,
+                            logicalSessionState,
+                            runtimeIdentities,
+                            sessionManager.GetActiveSessionId,
+                            sessionManager.StopSessionAsync,
+                            sessionManager.StopSessionIfRuntimeMatchesAsync,
+                            sessionEventRelay.StopSessionAsync,
+                            artifactUploadService.StopSessionAsync,
+                            workspaceMirrorService.StopSessionAsync,
+                            downloadService.CancelSession,
+                            downloadService.GetActiveSessionId,
+                            downloadService.SetActiveSession).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (progressCancellation.IsCancellationRequested)
+                    {
+                    }
+                    catch (Exception ex)
+                    {
+                        RunnerLog.Error($"Model download progress failed; errorClass={ex.GetType().Name}.");
+                    }
+                });
+            },
+            status: token => RunRunnerStatusLoopAsync(
                 sessionSink,
-                shutdown,
+                token,
                 runnerId,
                 instanceId,
                 version,
@@ -1068,12 +1057,12 @@ internal static class ServiceClientManager
                 minBackoff,
                 maxBackoff,
                 initialStatusApplied,
-                sessionManager.DescribeSealedStorage);
-            var localModelTask = localModelSnapshotProvider is null
+                sessionManager.DescribeSealedStorage),
+            localModels: token => localModelSnapshotProvider is null
                 ? Task.CompletedTask
                 : RunLocalModelSyncLoopAsync(
                     sessionSink.SyncLocalModelsAsync,
-                    shutdown,
+                    token,
                     runnerId,
                     localModelsScanInterval,
                     minBackoff,
@@ -1081,11 +1070,11 @@ internal static class ServiceClientManager
                     localModelSnapshotProvider,
                     localModelSnapshotObserver,
                     initialStatusApplied.Task,
-                    initialLocalModelSnapshot);
-            var commandTask = RunCommandStreamLoopAsync(
+                    initialLocalModelSnapshot),
+            commands: token => RunCommandStreamLoopAsync(
                 commandClient,
                 sessionSink,
-                shutdown,
+                token,
                 runnerId,
                 instanceId,
                 version,
@@ -1101,24 +1090,21 @@ internal static class ServiceClientManager
                 localModelProjectionReconciler,
                 commandWorkState,
                 logicalSessionState,
-                runtimeIdentities);
-
-            await Task.WhenAll(statusTask, localModelTask, commandTask).ConfigureAwait(false);
-        }
-        finally
-        {
-            await gpuPowerLimitService.CancelAndDrainAsync().ConfigureAwait(false);
-            await commandWorkState.Prompts.CancelAndWaitAsync(_ => true).ConfigureAwait(false);
-            await CancelTrackedWorkAsync(commandWorkState.GetActiveStartup()).ConfigureAwait(false);
-
-            downloadService.ProgressReporter = null;
-            downloadService.SetActiveSession(null);
-            sessionEventRelay.PromptFinished -= WithdrawFinishedPromptDemand;
-            sessionEventRelay.DetachSink(sessionSink);
-            sessionProcessLogRelay.DetachSink(sessionSink);
-            runnerLogRelay.DetachSink(sessionSink);
-            sessionRuntimeTelemetryRelay.DetachSink(sessionSink);
-        }
+                runtimeIdentities),
+            drainGpu: gpuPowerLimitService.CancelAndDrainAsync,
+            drainPrompts: () => commandWorkState.Prompts.CancelAndWaitAsync(_ => true),
+            drainStartup: () => CancelTrackedWorkAsync(commandWorkState.GetActiveStartup()),
+            detach:
+            [
+                () => downloadService.ProgressReporter = null,
+                () => downloadService.RuntimeResolver = null,
+                () => downloadService.SetActiveSession(null),
+                () => sessionEventRelay.PromptFinished -= WithdrawFinishedPromptDemand,
+                () => sessionEventRelay.DetachSink(sessionSink),
+                () => sessionProcessLogRelay.DetachSink(sessionSink),
+                () => runnerLogRelay.DetachSink(sessionSink),
+                () => sessionRuntimeTelemetryRelay.DetachSink(sessionSink)
+            ]).ConfigureAwait(false);
     }
 
     private static async Task RunRunnerStatusLoopAsync(

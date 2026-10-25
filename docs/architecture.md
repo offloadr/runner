@@ -17,6 +17,20 @@ running against disposed dependencies. Setup, producer, callback and session
 cleanup errors remain failures. Signal registrations are removed before the
 lifetime's cancellation source is disposed.
 
+The command listener separately owns its original status, local-model and
+command-stream tasks. A failed or prematurely ended required lane cancels its
+peers. Partial attachment and producer setup still drain GPU work, prompts and
+startup work; a failed drain cannot skip the others or later detachments. Download
+progress callbacks share that lifetime's cancellation and admission gate. An old
+captured reporter cannot admit work after shutdown, while admitted original
+callbacks and cancellation callbacks must finish before detachment completes.
+
+All four control channels and their sink belong to the outer entry-point scope,
+before any relay is created. They therefore remain alive through producer,
+session, sidecar and relay cleanup. The final entry-point exception handler exits
+nonzero and prints only the exception class. Other diagnostic paths still require
+their own content, encryption and retention review.
+
 Controlled factory and callback tests exercise this ownership order. They do not
 establish complete signal handling with real transports, native descendants,
 GPU workloads or provider shutdown deadlines.
