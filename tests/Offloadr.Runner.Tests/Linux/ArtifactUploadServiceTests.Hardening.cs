@@ -171,34 +171,130 @@ public partial class ArtifactUploadServiceTests
         }
     }
 
-    [Test]
-    public async Task StopSessionAsync_CompletesWhenUploadWorkerIgnoresCancellation()
+    [TestCase(false)]
+    [TestCase(true)]
+    public async Task StopSessionAsync_JoinsUncooperativeWriteAndResponseAfterBodyFailure(bool failCompletion)
     {
         var originalTimeout = ArtifactUploadService.StopWaitTimeout;
-        ArtifactUploadService.StopWaitTimeout = TimeSpan.FromMilliseconds(200);
+        ArtifactUploadService.StopWaitTimeout = TimeSpan.FromMilliseconds(20);
+        var root = CreateTempDirectory();
+        var artifactClient = new HangingUploadArtifactClient(failCompletion);
+        await using var service = new ArtifactUploadService("runner-secret-value", artifactClient, NullLogger<ArtifactUploadService>.Instance);
+        Task? stop = null;
+        Task? disposal = null;
+        try
+        {
+            var paths = CreateSessionPaths(root);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            await File.WriteAllBytesAsync(Path.Combine(paths.OutputDirectory, "stuck.png"), [1, 2, 3]);
+            await artifactClient.Writer.Started.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            if (failCompletion)
+            {
+                artifactClient.Writer.WriteRelease.SetResult();
+                await artifactClient.Writer.CompleteStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            }
+            stop = service.StopSessionAsync("session-1");
+            disposal = service.DisposeAsync().AsTask();
+            await Task.Delay(100);
+            Assert.Multiple(() =>
+            {
+                Assert.That(stop.IsCompleted, Is.False, "The original write ignores cancellation.");
+                Assert.That(disposal.IsCompleted, Is.False);
+            });
+            if (failCompletion) artifactClient.Writer.CompleteRelease.SetResult();
+            else artifactClient.Writer.WriteRelease.SetResult();
+            await artifactClient.Disposed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await Task.Delay(50);
+            Assert.Multiple(() =>
+            {
+                Assert.That(artifactClient.Response.Task.IsCompleted, Is.False);
+                Assert.That(stop.IsCompleted, Is.False, "The call response remains owned after Write/Complete failed.");
+                Assert.That(disposal.IsCompleted, Is.False);
+            });
+            artifactClient.Response.SetCanceled();
+            await Task.WhenAll(stop, disposal).WaitAsync(TimeSpan.FromSeconds(5));
+        }
+        finally
+        {
+            artifactClient.Writer.WriteRelease.TrySetResult();
+            artifactClient.Writer.CompleteRelease.TrySetResult();
+            artifactClient.Response.TrySetCanceled();
+            try { await Task.WhenAll(stop ?? Task.CompletedTask, disposal ?? service.DisposeAsync().AsTask()).WaitAsync(TimeSpan.FromSeconds(10)); }
+            finally { ArtifactUploadService.StopWaitTimeout = originalTimeout; TryDelete(root); }
+        }
+    }
+
+    [Test]
+    public async Task UploadBodyFailure_CancelsAndJoinsItsResponseBeforeTheNextAttempt()
+    {
         var root = CreateTempDirectory();
         try
         {
             var paths = CreateSessionPaths(root);
-            var artifactClient = new HangingUploadArtifactClient();
-            await using var service = new ArtifactUploadService(
-                runnerSecret: "runner-secret-value",
-                artifactClient,
-                NullLogger<ArtifactUploadService>.Instance);
+            var client = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse());
+            var metadataCalls = 0;
+            client.AfterUploadMetadata = () =>
+            {
+                if (Interlocked.Increment(ref metadataCalls) == 1) throw new IOException("synthetic write failure");
+            };
+            await using var service = new ArtifactUploadService("runner-secret-value", client, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, default);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", default);
+            await File.WriteAllBytesAsync(Path.Combine(paths.OutputDirectory, "retry.png"), [1, 2, 3]);
+            var saved = await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            Assert.That(saved.Metadata!.Filename, Is.EqualTo("retry.png"));
+            Assert.That(client.FirstUploadCallCompleted.Task.IsCompleted, Is.False);
+            Assert.That(client.FirstUploadCallDisposed.Task.IsCompleted, Is.True);
+            Assert.That(client.UploadCallsCancelled, Is.EqualTo(1), "Only the failed partial call is cancelled.");
+        }
+        finally { TryDelete(root); }
+    }
 
-            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
-            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
-            await File.WriteAllBytesAsync(Path.Combine(paths.OutputDirectory, "stuck.png"), [1, 2, 3]);
-            await artifactClient.UploadStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
-
-            var stopwatch = Stopwatch.StartNew();
-            await service.StopSessionAsync("session-1").WaitAsync(TimeSpan.FromSeconds(20));
-
-            Assert.That(stopwatch.Elapsed, Is.LessThan(TimeSpan.FromSeconds(15)));
+    [TestCase(false)]
+    [TestCase(true)]
+    public async Task StopUpload_JoinsOriginalCallCancellationCallbacks(bool callbackFails)
+    {
+        var root = CreateTempDirectory();
+        var client = new HangingUploadArtifactClient(true, true, callbackFails);
+        var service = new ArtifactUploadService("runner-secret-value", client, NullLogger<ArtifactUploadService>.Instance);
+        Task? stop = null;
+        Task? disposal = null;
+        try
+        {
+            var paths = CreateSessionPaths(root);
+            await service.StartSessionAsync("session-1", paths, default);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", default);
+            await File.WriteAllBytesAsync(Path.Combine(paths.OutputDirectory, "callback.png"), [1, 2, 3]);
+            await client.Writer.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            client.Writer.WriteRelease.SetResult();
+            await client.Writer.CompleteStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            stop = service.StopSessionAsync("session-1");
+            disposal = service.DisposeAsync().AsTask();
+            await client.CallbackEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            client.Writer.CompleteRelease.SetResult();
+            client.Response.SetCanceled();
+            await client.Disposed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await Task.Delay(50);
+            Assert.That(stop.IsCompleted, Is.False, "The original call callback is still held after body/response completion.");
+            Assert.That(disposal.IsCompleted, Is.False);
+            client.CallbackRelease.SetResult();
+            if (callbackFails)
+            {
+                var failure = Assert.ThrowsAsync<InvalidOperationException>(() => stop.WaitAsync(TimeSpan.FromSeconds(5)))!;
+                Assert.That(failure.InnerException, Is.Null);
+                Assert.That(failure.Message, Does.Not.Contain("synthetic callback detail"));
+                Assert.ThrowsAsync<InvalidOperationException>(() => disposal.WaitAsync(TimeSpan.FromSeconds(5)));
+            }
+            else await Task.WhenAll(stop, disposal).WaitAsync(TimeSpan.FromSeconds(5));
         }
         finally
         {
-            ArtifactUploadService.StopWaitTimeout = originalTimeout;
+            client.Writer.WriteRelease.TrySetResult(); client.Writer.CompleteRelease.TrySetResult();
+            client.Response.TrySetCanceled(); client.CallbackRelease.TrySetResult();
+            try { await Task.WhenAll(stop ?? Task.CompletedTask, disposal ?? service.DisposeAsync().AsTask()).WaitAsync(TimeSpan.FromSeconds(10)); }
+            catch (InvalidOperationException) when (callbackFails) { }
+            client.CallbackRegistration.Dispose();
             TryDelete(root);
         }
     }
@@ -481,9 +577,14 @@ public partial class ArtifactUploadServiceTests
     [DllImport("libc", SetLastError = true)]
     private static extern int link(string existingPath, string newPath);
 
-    private sealed class HangingUploadArtifactClient : RunnerArtifactService.RunnerArtifactServiceClient
+    private sealed class HangingUploadArtifactClient(bool failCompletion, bool holdCancellation = false, bool callbackFails = false) : RunnerArtifactService.RunnerArtifactServiceClient
     {
-        public TaskCompletionSource UploadStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public HangingStreamWriter Writer { get; } = new(failCompletion);
+        public TaskCompletionSource<RunnerArtifactServiceUploadArtifactResponse> Response { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource Disposed { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource CallbackEntered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource CallbackRelease { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public CancellationTokenRegistration CallbackRegistration { get; private set; }
 
         public override AsyncUnaryCall<RunnerArtifactServiceIssueUploadIdentityResponse> IssueUploadIdentityAsync(
             RunnerArtifactServiceIssueUploadIdentityRequest request, CallOptions options)
@@ -503,27 +604,45 @@ public partial class ArtifactUploadServiceTests
         public override AsyncClientStreamingCall<RunnerArtifactServiceUploadArtifactRequest, RunnerArtifactServiceUploadArtifactResponse> UploadArtifact(
             CallOptions options)
         {
-            UploadStarted.TrySetResult();
+            if (holdCancellation)
+                CallbackRegistration = options.CancellationToken.Register(() =>
+                {
+                    CallbackEntered.TrySetResult();
+                    CallbackRelease.Task.GetAwaiter().GetResult();
+                    if (callbackFails) throw new InvalidOperationException("synthetic callback detail");
+                });
             return new AsyncClientStreamingCall<RunnerArtifactServiceUploadArtifactRequest, RunnerArtifactServiceUploadArtifactResponse>(
-                new HangingStreamWriter(),
-                new TaskCompletionSource<RunnerArtifactServiceUploadArtifactResponse>().Task,
+                Writer,
+                Response.Task,
                 Task.FromResult(new Metadata()),
                 () => Status.DefaultSuccess,
                 () => new Metadata(),
-                () => { });
+                () => Disposed.TrySetResult());
         }
     }
 
     // Simulates a transport write that never observes cancellation.
-    private sealed class HangingStreamWriter : IClientStreamWriter<RunnerArtifactServiceUploadArtifactRequest>
+    private sealed class HangingStreamWriter(bool failCompletion) : IClientStreamWriter<RunnerArtifactServiceUploadArtifactRequest>
     {
         public WriteOptions? WriteOptions { get; set; }
+        public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource WriteRelease { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource CompleteStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource CompleteRelease { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        public Task WriteAsync(RunnerArtifactServiceUploadArtifactRequest message)
-            => new TaskCompletionSource().Task;
+        public async Task WriteAsync(RunnerArtifactServiceUploadArtifactRequest message)
+        {
+            Started.TrySetResult();
+            await WriteRelease.Task.ConfigureAwait(false);
+            if (!failCompletion) throw new IOException("synthetic write failure");
+        }
 
-        public Task CompleteAsync()
-            => new TaskCompletionSource().Task;
+        public async Task CompleteAsync()
+        {
+            CompleteStarted.TrySetResult();
+            await CompleteRelease.Task.ConfigureAwait(false);
+            throw new IOException("synthetic completion failure");
+        }
     }
 
     /// <summary>Returns the metadata frame, then holds the content until released.</summary>

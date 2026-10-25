@@ -423,18 +423,17 @@ public partial class ArtifactUploadServiceTests
             await File.WriteAllBytesAsync(Path.Combine(paths.OutputDirectory, "late.png"), [1, 2, 3]);
             await artifactClient.WaitForUploadAsync(TimeSpan.FromSeconds(5));
 
-            // The uploader is still draining when the stop's time is up.
+            // Loss accounting may settle conservatively while the original drain
+            // is still held. It does not authorize releasing paths or keys.
             var stopped = service.StopSessionAsync("session-1");
-            var finished = await Task.WhenAny(stopped, Task.Delay(TimeSpan.FromSeconds(3)));
-
-            Assert.That(finished, Is.SameAs(stopped), "the stop does not wait for the drain");
-            Assert.That(await stopped, Is.GreaterThanOrEqualTo(1));
-            Assert.That(service.TakeUnsavedUploads("session-1"), Is.EqualTo(new UnsavedUploads(await stopped, Incomplete: true)));
-
-            // The uploader finishes later (after its 5 s drain and the wait for its worker); what it
-            // counts then is not added again.
-            await Task.Delay(TimeSpan.FromSeconds(6.5));
-            Assert.That(service.TakeUnsavedUploadCount("session-1"), Is.Zero);
+            await Task.Delay(300);
+            Assert.That(stopped.IsCompleted, Is.False);
+            var recorded = service.TakeUnsavedUploads("session-1");
+            Assert.That(recorded.Count, Is.GreaterThanOrEqualTo(1));
+            Assert.That(recorded.Incomplete, Is.True);
+            await service.DisposeAsync();
+            Assert.That(await stopped, Is.EqualTo(recorded.Count));
+            Assert.That(service.TakeUnsavedUploadCount("session-1"), Is.Zero, "Finishing the original stop cannot count a second loss.");
         }
         finally
         {

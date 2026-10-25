@@ -16,6 +16,7 @@ internal sealed class OwnedCancellation
     }
 
     public CancellationToken Token { get; }
+    public bool CallbackFailed { get; private set; }
 
     public Task RequestAsync()
     {
@@ -47,6 +48,7 @@ internal sealed class OwnedCancellation
         }
         catch (Exception error)
         {
+            CallbackFailed = true;
             // A concurrent Stop owns the same original faulted task. A
             // fire-and-forget interrupt still observes it without content.
             RunnerLog.Warning(nameof(OwnedCancellation), $"Cancellation callbacks ended with {error.GetType().Name}.");

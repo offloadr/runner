@@ -655,12 +655,12 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
-    public async Task PreemptActiveSessionIfNeededAsync_Continues_WhenResourceCleanupFails()
+    public void PreemptActiveSessionIfNeededAsync_RejectsAfterBothSidecarCleanupFailures()
     {
         var stopCalls = 0;
         string? cancelledDownloadSession = null;
 
-        var preempted = await ServiceClientManager.PreemptActiveSessionIfNeededAsync(
+        var failure = Assert.ThrowsAsync<InvalidOperationException>(() => ServiceClientManager.PreemptActiveSessionIfNeededAsync(
             "session-new",
             getActiveSessionId: () => "session-old",
             stopSession: (_, callback, _) =>
@@ -678,9 +678,9 @@ public partial class ServiceClientManagerTests
             cancelSessionDownloads: sessionId => cancelledDownloadSession = sessionId,
             getDownloadActiveSessionId: () => "session-old",
             setDownloadActiveSessionId: _ => { },
-            cancellationToken: CancellationToken.None);
+            cancellationToken: CancellationToken.None));
 
-        Assert.That(preempted, Is.EqualTo("session-old"));
+        Assert.That(failure!.Message, Is.EqualTo("Session sidecar cleanup failed."));
         Assert.That(stopCalls, Is.EqualTo(1));
         Assert.That(cancelledDownloadSession, Is.EqualTo("session-old"));
     }

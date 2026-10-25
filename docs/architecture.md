@@ -63,6 +63,35 @@ content-free failure. Controlled tests cover held activation and grant callbacks
 peer cancellation, caller shutdown and managed reference release. They do not
 establish real GPU effects, SDK deadlines, native cleanup or complete memory erasure.
 
+## Sidecar operation ownership
+
+Artifact and workspace services own public preparation and read operations before
+publishing a session resource. Closing global admission prevents a late resource
+from becoming active; already admitted preparation must finish its own cleanup.
+Removing a resource from the active map retains its original stop task. Repeated
+Stop and global disposal join that same owner, including a stop already in flight.
+An old failed preparation cannot remove a replacement resource.
+
+Each session resource closes admission before taking its operation snapshot.
+Original initialization, catalog refresh, shared downloads, upload workers,
+synchronous filesystem borrowers and admitted watcher callbacks remain owned
+through completion and cancellation callbacks. A caller may stop waiting for a
+shared read without transferring ownership away from the session. Partial setup
+and repeated disposal use the same join. Watchers are removed again after all
+borrowers finish so an earlier admitted callback cannot resurrect one after Stop.
+
+The uploader may drain its queue briefly before cancellation. Slow-wait warnings
+and bounded conservative loss accounting never complete the original stop.
+An upload owns its response task from call construction, including when a request
+write or stream completion fails. Cancellation requests are followed by joins;
+cleanup errors do not replace the body's original failure. Failure of one sidecar
+cannot skip the other's original join, and cleanup failure remains a content-free
+failure rather than a successful Stop.
+
+These ownership rules and controlled tests do not establish real SDK/HTTP2
+deadline budgets, native account/key cleanup, GPU behavior, all-copy privacy,
+backup/restore or release qualification.
+
 ## Runtime activity delivery preparation
 
 The required activity report carries only captured process/runtime identity and

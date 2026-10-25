@@ -1547,19 +1547,21 @@ internal static partial class ServiceClientManager
             setDownloadActiveSessionId(null);
         }
 
-        await stopSession(
-            activeSessionId,
-            (sessionId, token) => StopArtifactAndWorkspaceMirrorsAsync(sessionId, stopArtifactUploads, stopWorkspaceMirrors, token),
-            cancellationToken).ConfigureAwait(false);
-
-        try
+        Task? sidecars = null;
+        Task StopSidecarsAsync(string sid, CancellationToken token)
+            => sidecars ??= StopArtifactAndWorkspaceMirrorsAsync(sid, stopArtifactUploads, stopWorkspaceMirrors, token);
+        ExceptionDispatchInfo? failure = null;
+        try { await stopSession(activeSessionId, StopSidecarsAsync, cancellationToken).ConfigureAwait(false); }
+        catch (Exception error) { failure = ExceptionDispatchInfo.Capture(error); }
+        try { await StopSidecarsAsync(activeSessionId, CancellationToken.None).ConfigureAwait(false); }
+        catch (Exception error) { failure ??= ExceptionDispatchInfo.Capture(error); }
+        try { await stopSessionRelay(activeSessionId).ConfigureAwait(false); }
+        catch (Exception error)
         {
-            await stopSessionRelay(activeSessionId).ConfigureAwait(false);
+            RunnerLog.Warning(nameof(ServiceClientManager), $"Preempted relay cleanup ended with {error.GetType().Name}.");
+            failure ??= ExceptionDispatchInfo.Capture(new InvalidOperationException("Session relay cleanup failed."));
         }
-        catch (Exception ex)
-        {
-            RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed to stop websocket relay for preempted session {activeSessionId}");
-        }
+        failure?.Throw();
 
         return activeSessionId;
     }
@@ -1676,55 +1678,15 @@ internal static partial class ServiceClientManager
         var activeSessionId = getActiveSessionId()?.Trim() ?? string.Empty;
         if (!string.Equals(activeSessionId, normalizedSessionId, StringComparison.Ordinal))
         {
-            await StopArtifactAndWorkspaceMirrorsAsync(normalizedSessionId, stopArtifactUploads, stopWorkspaceMirrors, CancellationToken.None).ConfigureAwait(false);
-            try
-            {
-                await stopSessionRelay(normalizedSessionId).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed to stop websocket relay for revoked session {normalizedSessionId}");
-            }
+            await StopSidecarsAndRelayAsync(normalizedSessionId, stopArtifactUploads, stopWorkspaceMirrors,
+                stopSessionRelay, CancellationToken.None).ConfigureAwait(false);
 
             return false;
         }
 
-        var sidecarsStopped = false;
-        async Task StopSidecarsOnceAsync(string sid, CancellationToken token)
-        {
-            if (sidecarsStopped)
-            {
-                return;
-            }
-
-            await StopArtifactAndWorkspaceMirrorsAsync(sid, stopArtifactUploads, stopWorkspaceMirrors, token).ConfigureAwait(false);
-            sidecarsStopped = true;
-        }
-
-        try
-        {
-            await stopSession(
-                normalizedSessionId,
-                StopSidecarsOnceAsync,
-                CancellationToken.None).ConfigureAwait(false);
-        }
-        finally
-        {
-            await StopSidecarsOnceAsync(normalizedSessionId, CancellationToken.None).ConfigureAwait(false);
-            // A native open that was already in flight can publish its descriptor
-            // lease after the pre-stop cancellation. Once the child is gone, run
-            // the idempotent cleanup again so no leaked lease or sticky demand remains.
-            cancelSessionDownloads(normalizedSessionId);
-        }
-
-        try
-        {
-            await stopSessionRelay(normalizedSessionId).ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed to stop websocket relay for revoked session {normalizedSessionId}");
-        }
+        await StopSessionAndCleanupAsync(normalizedSessionId, stopSession, stopSessionRelay,
+            stopArtifactUploads, stopWorkspaceMirrors, cancelSessionDownloads,
+            getDownloadActiveSessionId, setDownloadActiveSessionId, CancellationToken.None).ConfigureAwait(false);
 
         return true;
     }
@@ -1753,47 +1715,33 @@ internal static partial class ServiceClientManager
             setDownloadActiveSessionId(null);
         }
 
-        var sidecarsStopped = false;
-        async Task StopSidecarsOnceAsync(string sid, CancellationToken token)
-        {
-            if (sidecarsStopped)
-            {
-                return;
-            }
-
-            await StopArtifactAndWorkspaceMirrorsAsync(sid, stopArtifactUploads, stopWorkspaceMirrors, token).ConfigureAwait(false);
-            sidecarsStopped = true;
-        }
+        Task? sidecarStop = null;
+        Task StopSidecarsOnceAsync(string sid, CancellationToken token)
+            => sidecarStop ??= StopArtifactAndWorkspaceMirrorsAsync(sid, stopArtifactUploads, stopWorkspaceMirrors, token);
 
         ExceptionDispatchInfo? stopFailure = null;
         try
         {
-            await stopSession(
-                normalizedSessionId,
-                StopSidecarsOnceAsync,
-                cancellationToken).ConfigureAwait(false);
+            await stopSession(normalizedSessionId, StopSidecarsOnceAsync, cancellationToken).ConfigureAwait(false);
         }
-        catch (Exception ex)
+        catch (Exception error)
         {
-            RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed to stop session {normalizedSessionId}: {ex.Message}");
-            stopFailure = ExceptionDispatchInfo.Capture(ex);
+            RunnerLog.Warning(nameof(ServiceClientManager), $"Session stop ended with {error.GetType().Name}.");
+            stopFailure = ExceptionDispatchInfo.Capture(error);
         }
-        finally
+        try { await StopSidecarsOnceAsync(normalizedSessionId, CancellationToken.None).ConfigureAwait(false); }
+        catch (Exception error)
         {
-            await StopSidecarsOnceAsync(normalizedSessionId, CancellationToken.None).ConfigureAwait(false);
-            // A native open that was already in flight can publish its descriptor
-            // lease after the pre-stop cancellation. Once the child is gone, run
-            // the idempotent cleanup again so no leaked lease or sticky demand remains.
-            cancelSessionDownloads(normalizedSessionId);
+            RunnerLog.Warning(nameof(ServiceClientManager), $"Sidecar cleanup ended with {error.GetType().Name}.");
+            stopFailure ??= ExceptionDispatchInfo.Capture(error);
         }
-
-        try
+        // A late native open may have published a descriptor lease during stop.
+        cancelSessionDownloads(normalizedSessionId);
+        try { await stopSessionRelay(normalizedSessionId).ConfigureAwait(false); }
+        catch (Exception error)
         {
-            await stopSessionRelay(normalizedSessionId).ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed to stop session websocket relay {normalizedSessionId}: {ex.Message}");
+            RunnerLog.Warning(nameof(ServiceClientManager), $"Relay cleanup ended with {error.GetType().Name}.");
+            stopFailure ??= ExceptionDispatchInfo.Capture(new InvalidOperationException("Session relay cleanup failed."));
         }
 
         // The child may still be alive: callers must not report it stopped or
@@ -1867,20 +1815,23 @@ internal static partial class ServiceClientManager
             setDownloadActiveSessionId(null);
         }
 
-        await StopArtifactAndWorkspaceMirrorsAsync(
-            normalizedSessionId,
-            stopArtifactUploads,
-            stopWorkspaceMirrors,
-            cancellationToken).ConfigureAwait(false);
+        await StopSidecarsAndRelayAsync(normalizedSessionId, stopArtifactUploads, stopWorkspaceMirrors,
+            stopSessionRelay, cancellationToken).ConfigureAwait(false);
+    }
 
-        try
+    private static async Task StopSidecarsAndRelayAsync(string sessionId, Func<string, Task> stopArtifactUploads,
+        Func<string, Task> stopWorkspaceMirrors, Func<string, Task> stopSessionRelay, CancellationToken cancellationToken)
+    {
+        ExceptionDispatchInfo? failure = null;
+        try { await StopArtifactAndWorkspaceMirrorsAsync(sessionId, stopArtifactUploads, stopWorkspaceMirrors, cancellationToken).ConfigureAwait(false); }
+        catch (Exception error) { failure = ExceptionDispatchInfo.Capture(error); }
+        try { await stopSessionRelay(sessionId).ConfigureAwait(false); }
+        catch (Exception error)
         {
-            await stopSessionRelay(normalizedSessionId).ConfigureAwait(false);
+            RunnerLog.Warning(nameof(ServiceClientManager), $"Relay cleanup ended with {error.GetType().Name}.");
+            failure ??= ExceptionDispatchInfo.Capture(new InvalidOperationException("Session relay cleanup failed."));
         }
-        catch (Exception ex)
-        {
-            RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed to stop websocket relay for exited session {normalizedSessionId}: {ex.Message}");
-        }
+        failure?.Throw();
     }
 
     internal static void ClearRuntimeSessionState(
@@ -1920,32 +1871,29 @@ internal static partial class ServiceClientManager
     {
         _ = cancellationToken;
 
-        // Stop must always complete: a mirror that does not stop in time is logged
-        // and left behind rather than blocking session cleanup.
-        try
-        {
-            await stopArtifactUploads(sessionId).WaitAsync(MirrorStopTimeout).ConfigureAwait(false);
-        }
-        catch (TimeoutException)
-        {
-            RunnerLog.Error(nameof(ServiceClientManager), $"Artifact uploader for session {sessionId} did not stop within {MirrorStopTimeout.TotalSeconds:F0}s; continuing");
-        }
-        catch (Exception ex)
-        {
-            RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed to stop artifact uploader for session {sessionId}");
-        }
+        // Invoke both owners even when the first factory fails. A slow-wait
+        // threshold is diagnostic; account/key cleanup still joins originals.
+        var artifacts = StopAsync(stopArtifactUploads, "Artifact uploader");
+        var workspace = StopAsync(stopWorkspaceMirrors, "Workspace mirror");
+        var results = await Task.WhenAll(artifacts, workspace).ConfigureAwait(false);
+        if (results.Any(succeeded => !succeeded)) throw new InvalidOperationException("Session sidecar cleanup failed.");
 
-        try
+        async Task<bool> StopAsync(Func<string, Task> factory, string kind)
         {
-            await stopWorkspaceMirrors(sessionId).WaitAsync(MirrorStopTimeout).ConfigureAwait(false);
-        }
-        catch (TimeoutException)
-        {
-            RunnerLog.Error(nameof(ServiceClientManager), $"Workspace mirror for session {sessionId} did not stop within {MirrorStopTimeout.TotalSeconds:F0}s; continuing");
-        }
-        catch (Exception ex)
-        {
-            RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed to stop workspace mirror for session {sessionId}");
+            try
+            {
+                var original = factory(sessionId);
+                if (await Task.WhenAny(original, Task.Delay(MirrorStopTimeout)).ConfigureAwait(false) != original)
+                    RunnerLog.Warning(nameof(ServiceClientManager), $"{kind} is still stopping; continuing to join original work.");
+                await original.ConfigureAwait(false);
+                return true;
+            }
+            catch (Exception error)
+            {
+                RunnerLog.Warning(nameof(ServiceClientManager), $"{kind} stop ended with {error.GetType().Name}.");
+                return false;
+            }
+            finally { factory = null!; }
         }
     }
 

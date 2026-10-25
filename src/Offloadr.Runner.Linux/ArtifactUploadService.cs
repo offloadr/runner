@@ -1,3 +1,4 @@
+using Offloadr.Runner.Core;
 using Offloadr.Runner.V1;
 using Offloadr.EditorRuntime.V1;
 using Offloadr.Runner.Core.Sealing;
@@ -45,14 +46,10 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             AttributesToSkip = FileAttributes.ReparsePoint,
         });
 
-    /// <summary>How long Stop waits for cancelled upload and download work before moving on.</summary>
+    /// <summary>How long cancelled work may take before Stop warns and keeps joining it.</summary>
     internal static TimeSpan StopWaitTimeout { get; set; } = TimeSpan.FromSeconds(10);
 
-    /// <summary>
-    /// How long a session's stop may take before its lost artifacts are recorded without waiting
-    /// further. Under the caller's own bound, so the count is fixed before the session's data is
-    /// removed: a stop that finishes after that would count none.
-    /// </summary>
+    /// <summary>Delay before recording a conservative loss count while the original stop remains owned.</summary>
     internal static TimeSpan StopRecordTimeout { get; set; } = TimeSpan.FromSeconds(25);
 
     private readonly string? _runnerSecret;
@@ -68,13 +65,17 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
     // Keyed by lifecycle generation too: a session id is reused by a newer lifecycle, whose Stop
     // must not report an older one's losses.
     private readonly ConcurrentDictionary<(string SessionId, ulong Generation), UnsavedUploads> _unsavedBySession = new();
+    private readonly OwnedOperationScope _operations = new();
     private readonly object _stopGate = new();
+    private Task? _disposal;
+    private bool _closing;
     private readonly Dictionary<string, StopInFlight> _stopping = new(StringComparer.Ordinal);
 
     /// <summary>A session's stop that has not finished; its count is recorded once, by whichever comes first.</summary>
     private sealed class StopInFlight(SessionUploader uploader)
     {
-        public SessionUploader Uploader { get; } = uploader;
+        public SessionUploader? Uploader { get; set; } = uploader;
+        public ulong LifecycleGeneration { get; } = uploader.LifecycleGeneration;
         public Task<int> Task { get; set; } = System.Threading.Tasks.Task.FromResult(0);
         public int? RecordedCount { get; set; }
     }
@@ -109,36 +110,68 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         return headers;
     }
 
-    public async Task StartSessionAsync(string sessionId, SessionProcessManager.SessionPaths paths, CancellationToken cancellationToken)
+    public Task StartSessionAsync(string sessionId, SessionProcessManager.SessionPaths paths, CancellationToken cancellationToken)
+        => _operations.Run(token => StartSessionCoreAsync(sessionId, paths, token), cancellationToken);
+
+    private async Task StartSessionCoreAsync(string sessionId, SessionProcessManager.SessionPaths paths, CancellationToken cancellationToken)
     {
-        if (_sessions.TryGetValue(sessionId, out var existing))
+        while (true)
         {
-            // A repeated start of the same runtime keeps its uploader. One left by an earlier
-            // runtime (it exited while a relaunch was already admitted, so nothing stopped it) is
-            // stopped, which records what it lost, and replaced: its reads name that runtime.
-            var current = CurrentRuntime(sessionId);
-            if (existing.CreatedFor is { } createdFor ? current is { } now && createdFor.SameRuntime(now) : current is null)
+            cancellationToken.ThrowIfCancellationRequested();
+            SessionUploader? existing;
+            Task<int>? retiring;
+            lock (_stopGate)
             {
+                if (_closing) throw new OperationCanceledException(cancellationToken);
+                _stopping.TryGetValue(sessionId, out var stopping);
+                retiring = stopping?.Task;
+                _sessions.TryGetValue(sessionId, out existing);
+            }
+            // A removed runtime still owns its reads, callbacks and paths.
+            if (retiring is not null) { await retiring.ConfigureAwait(false); continue; }
+            if (existing is not null)
+            {
+                var current = CurrentRuntime(sessionId);
+                if (existing.CreatedFor is { } createdFor ? current is { } now && createdFor.SameRuntime(now) : current is null)
+                {
+                    await existing.InitializeAsync(cancellationToken).ConfigureAwait(false);
+                    cancellationToken.ThrowIfCancellationRequested();
+                    lock (_stopGate)
+                        if (_closing || !_sessions.TryGetValue(sessionId, out var active) || !ReferenceEquals(active, existing))
+                            throw new OperationCanceledException(cancellationToken);
+                    return;
+                }
+                await StopSessionAsync(sessionId, existing).ConfigureAwait(false);
+                continue;
+            }
+            ILogger logger = paths.IsSealed ? new SealedSessionLogger(_logger) : _logger;
+            var uploader = new SessionUploader(_runnerSecret, _artifactClient, _authHeaders, sessionId, paths, logger, _runtimeIdentities, _runnerId, _requester, _uploadPolicy);
+            bool added;
+            lock (_stopGate) added = !_closing && !_stopping.ContainsKey(sessionId) && _sessions.TryAdd(sessionId, uploader);
+            if (!added) { await uploader.DisposeAsync().ConfigureAwait(false); continue; }
+            try
+            {
+                await uploader.InitializeAsync(cancellationToken).ConfigureAwait(false);
+                cancellationToken.ThrowIfCancellationRequested();
+                lock (_stopGate)
+                    if (_closing || !_sessions.TryGetValue(sessionId, out var active) || !ReferenceEquals(active, uploader))
+                        throw new OperationCanceledException(cancellationToken);
                 return;
             }
-
-            await StopSessionAsync(sessionId).ConfigureAwait(false);
-        }
-
-        // A sealed session's artifact names stay out of the console, which reaches the host's disk.
-        ILogger logger = paths.IsSealed ? new SealedSessionLogger(_logger) : _logger;
-        var uploader = new SessionUploader(_runnerSecret, _artifactClient, _authHeaders, sessionId, paths, logger, _runtimeIdentities, _runnerId, _requester, _uploadPolicy);
-        if (!_sessions.TryAdd(sessionId, uploader))
-        {
-            await uploader.DisposeAsync().ConfigureAwait(false);
-        }
-        else
-        {
-            await uploader.InitializeAsync(cancellationToken).ConfigureAwait(false);
+            catch
+            {
+                try { await StopSessionAsync(sessionId, uploader).ConfigureAwait(false); }
+                catch (Exception error) { _logger.LogWarning("Artifact preparation cleanup ended with {ErrorClass}.", error.GetType().Name); }
+                throw;
+            }
         }
     }
 
-    public async Task SeedSessionAsync(
+    public Task SeedSessionAsync(string sessionId, string editorSid, string? owner,
+        IEnumerable<EditorArtifactMetadata>? initialArtifacts, CancellationToken cancellationToken)
+        => _operations.Run(token => SeedSessionCoreAsync(sessionId, editorSid, owner, initialArtifacts, token), cancellationToken);
+
+    private async Task SeedSessionCoreAsync(
         string sessionId,
         string editorSid,
         string? owner,
@@ -226,7 +259,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
             // A stop still running has not counted yet: what it would find is not known.
             if (_stopping.TryGetValue(sessionId, out var inFlight) && !inFlight.Task.IsCompleted &&
-                (unfenced || inFlight.Uploader.LifecycleGeneration == lifecycleGeneration))
+                (unfenced || inFlight.LifecycleGeneration == lifecycleGeneration))
             {
                 RecordWithoutWaiting(sessionId, inFlight);
             }
@@ -288,7 +321,10 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         }
     }
 
-    public async Task ActivateSessionAsync(string sessionId, string editorSid, string? owner, CancellationToken cancellationToken)
+    public Task ActivateSessionAsync(string sessionId, string editorSid, string? owner, CancellationToken cancellationToken)
+        => _operations.Run(token => ActivateSessionCoreAsync(sessionId, editorSid, owner, token), cancellationToken);
+
+    private async Task ActivateSessionCoreAsync(string sessionId, string editorSid, string? owner, CancellationToken cancellationToken)
     {
         if (_sessions.TryGetValue(sessionId, out var uploader))
         {
@@ -296,7 +332,10 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         }
     }
 
-    public async Task<bool> TryEnsureArtifactAvailableAsync(string path, bool highPriority, CancellationToken cancellationToken)
+    public Task<bool> TryEnsureArtifactAvailableAsync(string path, bool highPriority, CancellationToken cancellationToken)
+        => _operations.Run(token => TryEnsureArtifactAvailableCoreAsync(path, highPriority, token), cancellationToken);
+
+    private async Task<bool> TryEnsureArtifactAvailableCoreAsync(string path, bool highPriority, CancellationToken cancellationToken)
     {
         foreach (var uploader in _sessions.Values)
         {
@@ -338,7 +377,10 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             ? captured.RefreshAsync() : Task.CompletedTask;
     }
 
-    public async Task RefreshSessionAsync(string sessionId)
+    public Task RefreshSessionAsync(string sessionId)
+        => _operations.Run(_ => RefreshSessionCoreAsync(sessionId));
+
+    private async Task RefreshSessionCoreAsync(string sessionId)
     {
         if (_sessions.TryGetValue(sessionId, out var uploader))
         {
@@ -350,49 +392,59 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
     /// Stops the session's uploads after a short drain. Returns how many artifacts were not
     /// uploaded: they failed or were still pending, and are lost once the session's data is removed.
     /// </summary>
-    public Task<int> StopSessionAsync(string sessionId)
+    public Task<int> StopSessionAsync(string sessionId) => StopSessionAsync(sessionId, expected: null);
+
+    private Task<int> StopSessionAsync(string sessionId, SessionUploader? expected)
     {
-        // A stop that overlaps another one for the session (an exit cleanup still draining when
-        // the Stop arrives) waits for it, so the lost artifacts are recorded before anyone takes them.
+        TaskCompletionSource start;
+        StopInFlight stopping;
         lock (_stopGate)
         {
-            if (!_sessions.TryRemove(sessionId, out var uploader))
-            {
-                return _stopping.TryGetValue(sessionId, out var inFlight) ? inFlight.Task : Task.FromResult(0);
-            }
-
-            var stopping = new StopInFlight(uploader);
-            stopping.Task = StopAndRecordAsync(sessionId, stopping);
+            if (!_sessions.TryGetValue(sessionId, out var uploader) || (expected is not null && !ReferenceEquals(expected, uploader)))
+                return _stopping.TryGetValue(sessionId, out var inFlight) && (expected is null || ReferenceEquals(expected, inFlight.Uploader)) ? inFlight.Task : Task.FromResult(0);
+            _sessions.TryRemove(sessionId, out _);
+            start = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            stopping = new StopInFlight(uploader);
+            stopping.Task = StopAndRecordPublishedAsync(start.Task, sessionId, stopping);
             _stopping[sessionId] = stopping;
-            _ = stopping.Task.ContinueWith(
-                _ =>
-                {
-                    lock (_stopGate)
-                    {
-                        ((ICollection<KeyValuePair<string, StopInFlight>>)_stopping).Remove(new(sessionId, stopping));
-                    }
-                },
-                CancellationToken.None,
-                TaskContinuationOptions.ExecuteSynchronously,
-                TaskScheduler.Default);
-            return stopping.Task;
+        }
+        _ = stopping.Task.ContinueWith(completed =>
+        {
+            lock (_stopGate)
+            {
+                stopping.Uploader = null;
+                if (completed.IsCompletedSuccessfully)
+                    ((ICollection<KeyValuePair<string, StopInFlight>>)_stopping).Remove(new(sessionId, stopping));
+            }
+        }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        start.SetResult();
+        return stopping.Task;
+    }
+
+    private async Task<int> StopAndRecordPublishedAsync(Task start, string sessionId, StopInFlight stopping)
+    {
+        await start.ConfigureAwait(false);
+        try { return await StopAndRecordAsync(sessionId, stopping).ConfigureAwait(false); }
+        catch (Exception error)
+        {
+            _logger.LogWarning("Artifact stop ended with {ErrorClass}.", error.GetType().Name);
+            throw new InvalidOperationException("Artifact stop failed.");
         }
     }
 
     private async Task<int> StopAndRecordAsync(string sessionId, StopInFlight stopping)
     {
-        var stop = stopping.Uploader.StopAsync();
+        var uploader = stopping.Uploader ?? throw new InvalidOperationException("Artifact stop owner is unavailable.");
+        var stop = uploader.StopAsync();
         if (await Task.WhenAny(stop, Task.Delay(StopRecordTimeout)).ConfigureAwait(false) != stop)
         {
-            _ = stop.ContinueWith(static failed => _ = failed.Exception, CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
-            lock (_stopGate)
-            {
-                return RecordWithoutWaiting(sessionId, stopping);
-            }
+            lock (_stopGate) RecordWithoutWaiting(sessionId, stopping);
+            // Accounting is bounded; resource ownership is not a timed wait.
+            // The original stop must end before paths or sealing keys are released.
         }
 
         await stop.ConfigureAwait(false);
-        var unsaved = stopping.Uploader.UnsavedUploadCount;
+        var unsaved = uploader.UnsavedUploadCount;
         lock (_stopGate)
         {
             if (stopping.RecordedCount is { } recorded)
@@ -402,9 +454,9 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             }
 
             stopping.RecordedCount = unsaved;
-            if (unsaved > 0 || stopping.Uploader.UnsavedCountIncomplete)
+            if (unsaved > 0 || uploader.UnsavedCountIncomplete)
             {
-                Record(sessionId, stopping.Uploader.LifecycleGeneration, new UnsavedUploads(unsaved, stopping.Uploader.UnsavedCountIncomplete));
+                Record(sessionId, stopping.LifecycleGeneration, new UnsavedUploads(unsaved, uploader.UnsavedCountIncomplete));
             }
         }
 
@@ -431,9 +483,9 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             return recorded;
         }
 
-        var unsaved = Math.Max(1, stopping.Uploader.PendingUploadCount);
+        var unsaved = Math.Max(1, stopping.Uploader?.PendingUploadCount ?? 0);
         stopping.RecordedCount = unsaved;
-        Record(sessionId, stopping.Uploader.LifecycleGeneration, new UnsavedUploads(unsaved, Incomplete: true));
+        Record(sessionId, stopping.LifecycleGeneration, new UnsavedUploads(unsaved, Incomplete: true));
         _logger.LogWarning(
             "Artifact uploads of session={SessionId} did not stop in time; counting {Count} as not uploaded",
             sessionId,
@@ -441,20 +493,37 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         return unsaved;
     }
 
-    public async ValueTask DisposeAsync()
+    public ValueTask DisposeAsync()
     {
-        foreach (var kvp in _sessions)
+        TaskCompletionSource start;
+        Task disposal;
+        lock (_stopGate)
         {
-            try
-            {
-                await kvp.Value.DisposeAsync().ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Failed to dispose artifact uploader for session {SessionId}", kvp.Key);
-            }
+            if (_disposal is not null) return new(_disposal);
+            _closing = true;
+            _operations.CloseAdmission();
+            start = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            disposal = _disposal = DisposeCoreAsync(start.Task);
         }
-        _sessions.Clear();
+        start.SetResult();
+        return new(disposal);
+    }
+
+    private async Task DisposeCoreAsync(Task start)
+    {
+        await start.ConfigureAwait(false);
+        var producers = _operations.CompleteAsync();
+        foreach (var sessionId in _sessions.Keys) _ = StopSessionAsync(sessionId);
+        StopInFlight[] stops;
+        lock (_stopGate) stops = _stopping.Values.ToArray();
+        // Escalate a graceful stop without creating another physical stop owner.
+        var joins = stops.Select(stop => stop.Uploader?.DisposeAsync().AsTask() ?? Task.CompletedTask).Concat(stops.Select(stop => (Task)stop.Task)).Append(producers).ToArray();
+        try { await Task.WhenAll(joins).ConfigureAwait(false); }
+        catch (Exception error)
+        {
+            _logger.LogWarning("Artifact disposal ended with {ErrorClass}.", error.GetType().Name);
+            throw new InvalidOperationException("Artifact disposal failed.");
+        }
     }
 
     private sealed class SessionUploader : IAsyncDisposable
@@ -492,7 +561,11 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         private readonly string _runnerId;
         private readonly Channel<UploadRequest> _queue;
         private readonly ArtifactUploadOperationIdentity _uploadOperationIdentity = new();
-        private readonly CancellationTokenSource _cts = new();
+        private readonly OwnedOperationScope _operations = new();
+        private readonly object _lifetimeGate = new();
+        private Task? _initialization;
+        private Task? _stop;
+        private bool _transferCancellationFailed;
         private readonly ConcurrentDictionary<string, PendingUpload> _pending = new(StringComparer.Ordinal);
         // Queue removal does not renew a failed file version's elapsed allowance.
         // Keep one bounded budget per current path, including failures before ID issuance.
@@ -553,10 +626,18 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
         public Task InitializeAsync(CancellationToken cancellationToken)
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            CaptureInputSeeds();
-            _worker = Task.Run(ProcessQueueAsync, _cts.Token);
-            return Task.CompletedTask;
+            lock (_lifetimeGate)
+            {
+                if (_operations.IsClosed) return Task.FromCanceled(new CancellationToken(true));
+                return _initialization ??= _operations.Run(token =>
+                {
+                    token.ThrowIfCancellationRequested();
+                    CaptureInputSeeds();
+                    _worker = _operations.Run(_ => ProcessQueueAsync());
+                    if (_operations.IsClosed) throw new OperationCanceledException(token);
+                    return Task.CompletedTask;
+                }, cancellationToken);
+            }
         }
 
         public async Task ActivateAsync(string editorSid, string? owner, CancellationToken cancellationToken)
@@ -564,7 +645,10 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             await SeedSnapshotAsync(editorSid, owner, initialArtifacts: null, cancellationToken).ConfigureAwait(false);
         }
 
-        public async Task RefreshAsync()
+        public Task RefreshAsync()
+            => _operations.IsClosed ? Task.CompletedTask : _operations.Run(RefreshCoreAsync);
+
+        private async Task RefreshCoreAsync(CancellationToken cancellationToken)
         {
             if (!_activated)
             {
@@ -572,12 +656,15 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             }
 
             PruneMissingUploadBindings();
-            await EnsureCatalogAsync(CancellationToken.None, forceReload: true).ConfigureAwait(false);
+            await EnsureCatalogAsync(cancellationToken, forceReload: true).ConfigureAwait(false);
             EnqueueExistingFiles(_paths.OutputDirectory, "output", restartElapsedBudget: true);
             EnqueueExistingFiles(_paths.TempDirectory, "temp", restartElapsedBudget: true);
         }
 
-        public async Task SeedSnapshotAsync(
+        public Task SeedSnapshotAsync(string editorSid, string? owner, IEnumerable<EditorArtifactMetadata>? initialArtifacts, CancellationToken cancellationToken)
+            => _operations.Run(token => SeedSnapshotCoreAsync(editorSid, owner, initialArtifacts, token), cancellationToken);
+
+        private async Task SeedSnapshotCoreAsync(
             string editorSid,
             string? owner,
             IEnumerable<EditorArtifactMetadata>? initialArtifacts,
@@ -604,6 +691,8 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             }
 
             await EnsureCatalogAsync(cancellationToken, pruneMissing: !seededCatalog).ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (_operations.IsClosed) throw new OperationCanceledException(cancellationToken);
             _activated = true;
             RegisterArtifactWatcher(_paths.OutputDirectory, "output");
             RegisterArtifactWatcher(_paths.TempDirectory, "temp");
@@ -625,6 +714,13 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         }
 
         public async Task<bool> TryEnsureArtifactAsync(string path, bool highPriority, CancellationToken cancellationToken)
+        {
+            if (_operations.IsClosed) return false;
+            try { return await _operations.Run(token => TryEnsureArtifactCoreAsync(path, highPriority, token), cancellationToken).ConfigureAwait(false); }
+            catch (OperationCanceledException) when (_operations.IsClosed && !cancellationToken.IsCancellationRequested) { return false; }
+        }
+
+        private async Task<bool> TryEnsureArtifactCoreAsync(string path, bool highPriority, CancellationToken cancellationToken)
         {
             if (string.IsNullOrWhiteSpace(path))
             {
@@ -710,7 +806,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 await downloadTask.WaitAsync(cancellationToken).ConfigureAwait(false);
                 return true;
             }
-            catch (OperationCanceledException) when (_cts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+            catch (OperationCanceledException) when (_operations.Token.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
             {
                 return false;
             }
@@ -734,14 +830,15 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     return existing;
                 }
 
-                var download = Task.Run(() => DownloadArtifactAsync(state, highPriority, CancellationToken.None));
+                var published = new TaskCompletionSource<Task>(TaskCreationOptions.RunContinuationsAsynchronously);
+                var download = _operations.Run(async token =>
+                {
+                    var original = await published.Task.ConfigureAwait(false);
+                    try { await DownloadArtifactAsync(state, highPriority, token).ConfigureAwait(false); }
+                    finally { ((ICollection<KeyValuePair<string, Task>>)_downloadTasks).Remove(new(state.LocalPath, original)); }
+                });
                 _downloadTasks[state.LocalPath] = download;
-                // Registered after the add, so an already finished download is still removed.
-                _ = download.ContinueWith(
-                    completed => ((ICollection<KeyValuePair<string, Task>>)_downloadTasks).Remove(new(state.LocalPath, completed)),
-                    CancellationToken.None,
-                    TaskContinuationOptions.ExecuteSynchronously,
-                    TaskScheduler.Default);
+                published.SetResult(download);
                 return download;
             }
         }
@@ -780,11 +877,11 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             watcher.Created += createdHandler;
             watcher.Deleted += deletedHandler;
             watcher.Renamed += renameHandler;
-            watcher.Error += (_, ex) => _logger.LogWarning(
-                ex.GetException() ?? new Exception("unknown"),
-                "Artifact home watcher error session={SessionId} root={Root}",
-                _sessionId,
-                root);
+            watcher.Error += (_, _) =>
+            {
+                using var admission = _operations.TryEnter();
+                if (admission is not null) _logger.LogWarning("Artifact home watcher failed.");
+            };
 
             lock (_watcherGate)
             {
@@ -825,12 +922,11 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             watcher.Changed += handler;
             watcher.Deleted += handler;
             watcher.Renamed += renameHandler;
-            watcher.Error += (_, ex) => _logger.LogWarning(
-                ex.GetException() ?? new Exception("unknown"),
-                "Artifact watcher error session={SessionId} type={Type} root={Root}",
-                _sessionId,
-                type,
-                root);
+            watcher.Error += (_, _) =>
+            {
+                using var admission = _operations.TryEnter();
+                if (admission is not null) _logger.LogWarning("Artifact watcher failed.");
+            };
 
             lock (_watcherGate)
             {
@@ -858,6 +954,8 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
         private void OnHomeWatcherEvent(string root, WatcherChangeTypes changeType, string fullPath, string? oldFullPath = null)
         {
+            using var admission = _operations.TryEnter();
+            if (admission is null) return;
             try
             {
                 if (changeType == WatcherChangeTypes.Deleted)
@@ -987,6 +1085,8 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
         private void OnArtifactWatcherEvent(string type, string root, WatcherChangeTypes changeType, string fullPath, string? oldFullPath = null)
         {
+            using var admission = _operations.TryEnter();
+            if (admission is null) return;
             // Inspect only bindings beneath this event's old path. Unrelated
             // snapshots do not incur secure filesystem opens on each callback.
             if (changeType is WatcherChangeTypes.Deleted or WatcherChangeTypes.Renamed
@@ -1129,7 +1229,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 return false;
             }
 
-            using var linked = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, cancellationToken);
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(_operations.Token, cancellationToken);
             var token = linked.Token;
 
             try
@@ -1392,6 +1492,8 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
         public void CaptureInputSeeds()
         {
+            using var admission = _operations.TryEnter();
+            if (admission is null) return;
             var root = _paths.InputDirectory;
             if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root))
             {
@@ -1621,7 +1723,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
         private async Task DownloadArtifactAsync(RemoteArtifactState state, bool highPriority, CancellationToken cancellationToken)
         {
-            using var linked = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, cancellationToken);
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(_operations.Token, cancellationToken);
             var token = linked.Token;
             _ = highPriority;
 
@@ -1993,6 +2095,8 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
         internal void RefreshRecordedVersions()
         {
+            using var admission = _operations.TryEnter();
+            if (admission is null) return;
             lock (_evictionGate)
             {
                 foreach (var state in _catalog.Values)
@@ -2049,6 +2153,8 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
         internal long EvictUploadedArtifacts(long bytesToFree, TimeSpan minimumIdle, DateTimeOffset now)
         {
+            using var admission = _operations.TryEnter();
+            if (admission is null) return 0;
             long released = 0;
             // The pass stops on the space that actually came back, not on the lengths it replaced.
             var freeBefore = ReadSealedFreeBytes();
@@ -2060,7 +2166,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 .ToArray();
             foreach (var state in candidates)
             {
-                if (_cts.IsCancellationRequested)
+                if (_operations.Token.IsCancellationRequested)
                 {
                     break;
                 }
@@ -2218,7 +2324,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         {
             try
             {
-                while (await _queue.Reader.WaitToReadAsync(_cts.Token).ConfigureAwait(false))
+                while (await _queue.Reader.WaitToReadAsync(_operations.Token).ConfigureAwait(false))
                 {
                     while (_queue.Reader.TryRead(out var item))
                     {
@@ -2229,7 +2335,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         {
                             retry = await UploadAsync(item).ConfigureAwait(false);
                         }
-                        catch (OperationCanceledException) when (_cts.IsCancellationRequested)
+                        catch (OperationCanceledException) when (_operations.Token.IsCancellationRequested)
                         {
                             return;
                         }
@@ -2239,7 +2345,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                             {
                                 retry = item with { Attempt = item.Attempt + 1 };
                                 _logger.LogDebug(ex, "Retrying artifact upload {Path} attempt {Attempt}", item.FullPath, item.Attempt + 1);
-                                await Task.Delay(TimeSpan.FromMilliseconds(200 * (item.Attempt + 1)), _cts.Token).ConfigureAwait(false);
+                                await Task.Delay(TimeSpan.FromMilliseconds(200 * (item.Attempt + 1)), _operations.Token).ConfigureAwait(false);
                             }
                             else
                             {
@@ -2261,7 +2367,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                                 {
                                     if (finished.Completed)
                                         ((ICollection<KeyValuePair<string, PendingUpload>>)_uploadBudgets).Remove(new(item.FullPath, finished));
-                                    if (!_cts.IsCancellationRequested)
+                                    if (!_operations.Token.IsCancellationRequested)
                                     {
                                         // A deletion may precede a late failed ID/RPC
                                         // observation; do not strand its capacity then.
@@ -2300,12 +2406,12 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
         private async Task<UploadRequest?> UploadAsync(UploadRequest request)
         {
-            using var budget = _pending[request.FullPath].Budget.BeginAttempt(_cts.Token);
+            using var budget = _pending[request.FullPath].Budget.BeginAttempt(_operations.Token);
             try
             {
                 return await UploadWithinBudgetAsync(request, budget).ConfigureAwait(false);
             }
-            catch (Exception error) when (!_cts.IsCancellationRequested && budget.IsTimedOut)
+            catch (Exception error) when (!_operations.Token.IsCancellationRequested && budget.IsTimedOut)
             {
                 // An expired observation cannot tell whether the server committed. A later
                 // retry/rescan keeps the unchanged snapshot ID and Stop still counts it.
@@ -2461,135 +2567,160 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         relPath,
                         sizeBytes);
 
-                    // Disposed on every path, so an upload that fails midway (a sealed file that shrank) cancels its RPC.
-                    using var call = _artifactClient.UploadArtifact(headers: _authHeaders, cancellationToken: budget.Token);
-                    await call.RequestStream.WriteAsync(new RunnerArtifactServiceUploadArtifactRequest { Metadata = metadata }).ConfigureAwait(false);
-                    budget.BeginBody();
-
-                    if (writer is not null)
-                    {
-                        // Seal exactly the size declared in the header, even if the file grows.
-                        await using var limited = new LengthLimitedReadStream(stream, sizeBytes);
-                        await foreach (var sealedChunk in writer.EncryptChunksAsync(limited, budget.Token).ConfigureAwait(false))
-                        {
-                            await call.RequestStream.WriteAsync(new RunnerArtifactServiceUploadArtifactRequest
-                            {
-                                Chunk = Google.Protobuf.ByteString.CopyFrom(sealedChunk.Span)
-                            }).ConfigureAwait(false);
-                            budget.BodyWritten(sealedChunk.Length);
-                        }
-                    }
-
-                    var buffer = ArrayPool<byte>.Shared.Rent(128 * 1024);
+                    var callCancellation = new OwnedCancellation(budget.Token);
+                    AsyncClientStreamingCall<RunnerArtifactServiceUploadArtifactRequest, RunnerArtifactServiceUploadArtifactResponse>? call = null;
+                    Task<RunnerArtifactServiceUploadArtifactResponse>? responseTask = null;
+                    var requestStreamCompleted = false;
                     try
                     {
-                        // Send at most the size declared in the metadata, even if the file grows.
-                        var remaining = writer is null ? sizeBytes : 0;
-                        int read;
-                        while (remaining > 0 &&
-                               (read = await stream.ReadAsync(buffer.AsMemory(0, (int)Math.Min(buffer.Length, remaining)), budget.Token).ConfigureAwait(false)) > 0)
+                        callCancellation.Token.ThrowIfCancellationRequested();
+                        call = _artifactClient.UploadArtifact(headers: _authHeaders, cancellationToken: callCancellation.Token);
+                        responseTask = call.ResponseAsync;
+                        await call.RequestStream.WriteAsync(new RunnerArtifactServiceUploadArtifactRequest { Metadata = metadata }).ConfigureAwait(false);
+                        budget.BeginBody();
+
+                        if (writer is not null)
                         {
-                            remaining -= read;
-                            await call.RequestStream.WriteAsync(new RunnerArtifactServiceUploadArtifactRequest
+                            // Seal exactly the size declared in the header, even if the file grows.
+                            await using var limited = new LengthLimitedReadStream(stream, sizeBytes);
+                            await foreach (var sealedChunk in writer.EncryptChunksAsync(limited, budget.Token).ConfigureAwait(false))
                             {
-                                Chunk = Google.Protobuf.ByteString.CopyFrom(buffer, 0, read)
-                            }).ConfigureAwait(false);
-                            budget.BodyWritten(read);
+                                await call.RequestStream.WriteAsync(new RunnerArtifactServiceUploadArtifactRequest
+                                {
+                                    Chunk = Google.Protobuf.ByteString.CopyFrom(sealedChunk.Span)
+                                }).ConfigureAwait(false);
+                                budget.BodyWritten(sealedChunk.Length);
+                            }
                         }
+
+                        var buffer = ArrayPool<byte>.Shared.Rent(128 * 1024);
+                        try
+                        {
+                            // Send at most the size declared in the metadata, even if the file grows.
+                            var remaining = writer is null ? sizeBytes : 0;
+                            int read;
+                            while (remaining > 0 &&
+                                   (read = await stream.ReadAsync(buffer.AsMemory(0, (int)Math.Min(buffer.Length, remaining)), budget.Token).ConfigureAwait(false)) > 0)
+                            {
+                                remaining -= read;
+                                await call.RequestStream.WriteAsync(new RunnerArtifactServiceUploadArtifactRequest
+                                {
+                                    Chunk = Google.Protobuf.ByteString.CopyFrom(buffer, 0, read)
+                                }).ConfigureAwait(false);
+                                budget.BodyWritten(read);
+                            }
+                        }
+                        finally
+                        {
+                            ArrayPool<byte>.Shared.Return(buffer);
+                        }
+
+                        budget.BeginReceipt();
+                        await call.RequestStream.CompleteAsync().ConfigureAwait(false);
+                        requestStreamCompleted = true;
+                        var response = await responseTask.ConfigureAwait(false);
+                        budget.Token.ThrowIfCancellationRequested();
+
+                        var retired = response.Outcome == RunnerArtifactUploadOutcome.RejectedRetiredUpload;
+                        if (retired)
+                        {
+                            // Retirement proves no saving outcome. Keep this exact binding
+                            // for rescans; never acquire fresh authority for the old file.
+                            snapshot.Retired = true;
+                        }
+                        if (response.Outcome == RunnerArtifactUploadOutcome.RejectedStaleRuntime)
+                        {
+                            // Rejection never proves that these bytes reached durable storage.
+                            return null;
+                        }
+                        // These are case-insensitive catalog keys, not local paths.
+                        // Local saving below always uses the captured request path and
+                        // secure version, never a path selected by the response.
+                        if (!retired && (response.Outcome != RunnerArtifactUploadOutcome.Committed || response.UploadId != metadata.UploadId
+                            || response.Artifact is null
+                            || response.Artifact.EditorSid != _editorSid
+                            || !string.Equals(response.Artifact.Type, type, StringComparison.OrdinalIgnoreCase)
+                            || !string.Equals(response.Artifact.Subfolder, subfolder, StringComparison.OrdinalIgnoreCase)
+                            || !string.Equals(response.Artifact.Filename, fileName, StringComparison.OrdinalIgnoreCase)
+                            || response.Artifact.SizeBytes != sizeBytes))
+                        {
+                            throw new InvalidOperationException(string.IsNullOrWhiteSpace(response.Message) ? "upload failed" : response.Message);
+                        }
+
+                        // A rewrite during the upload is dropped by the pending set, so compare the
+                        // file with the snapshot that was sent before recording it as uploaded.
+                        SecureFileStatus after;
+                        SecureFileVersion? afterVersion;
+                        using (var secureRoot = new LinuxSecureDirectoryRoot(root))
+                        {
+                            after = secureRoot.GetStatus(relPath);
+                            afterVersion = secureRoot.GetVersion(relPath);
+                        }
+
+                        var changedDuringUpload = !after.IsRegularFile ||
+                                                  after.Length != sizeBytes ||
+                                                  after.LastWriteTimeUtc != snapshotWriteUtc ||
+                                                  afterVersion is null ||
+                                                  afterVersion != snapshotVersion;
+
+                        if (retired)
+                        {
+                            // The watcher coalesces changes while this path is pending.
+                            // Only a genuinely newer snapshot may acquire another ID.
+                            // The worker releases this pending snapshot before admitting
+                            // a changed secure version with its own elapsed allowance.
+                            return null;
+                        }
+
+                        // When it changed, record the snapshot's time so a later scan sees a newer file.
+                        var createdUtc = changedDuringUpload
+                            ? new DateTimeOffset(snapshotWriteUtc, TimeSpan.Zero)
+                            : DateTimeOffset.UtcNow;
+                        var localPath = NormalizePath(fullPath);
+                        var remote = new RemoteArtifactState(_editorSid, type, subfolder, fileName, localPath, sizeBytes, null, createdUtc);
+                        lock (_evictionGate)
+                        {
+                            remote.UploadSnapshot = snapshot;
+                            remote.CommittedArtifact = response.Artifact.Clone();
+                            remote.CatalogArtifact = remote.CommittedArtifact;
+                            _catalog[remote.LocalPath] = remote;
+                            _uncertainUploads.TryRemove(fullPath, out _);
+                            _pending[fullPath].Completed = !changedDuringUpload;
+                            // A file that changed while it was sent matches no uploaded version yet.
+                            remote.MarkDownloaded(changedDuringUpload ? null : afterVersion);
+                        }
+
+                        _logger.LogInformation("Uploaded artifact session={SessionId} type={Type} path={Relative}", _sessionId, type, relPath);
+                        if (changedDuringUpload && after.IsRegularFile)
+                        {
+                            _logger.LogInformation(
+                                "Artifact changed during upload; uploading it again session={SessionId} type={Type} path={Relative}",
+                                _sessionId,
+                                type,
+                                relPath);
+                            // The worker rechecks the secure version after releasing
+                            // this entry. A changed snapshot gets a fresh finite budget;
+                            // retries of the unchanged version keep its original one.
+                        }
+
+                        return null;
                     }
                     finally
                     {
-                        ArrayPool<byte>.Shared.Return(buffer);
+                        // ResponseAsync exists as soon as the call does. A failed
+                        // write or Complete must still cancel and join that original.
+                        // Cleanup errors cannot mask the original body failure.
+                        var callbacks = responseTask is not null && requestStreamCompleted && responseTask.IsCompleted
+                            ? Task.CompletedTask : callCancellation.RequestAsync();
+                        try { call?.Dispose(); }
+                        catch (Exception error) { _logger.LogWarning("Upload call disposal ended with {ErrorClass}.", error.GetType().Name); }
+                        try { if (responseTask is not null) await responseTask.ConfigureAwait(false); }
+                        catch (Exception error) { _logger.LogDebug("Upload response ended with {ErrorClass}.", error.GetType().Name); }
+                        try { await callbacks.ConfigureAwait(false); }
+                        catch (Exception error) { _logger.LogDebug("Upload cancellation ended with {ErrorClass}.", error.GetType().Name); }
+                        await callCancellation.CompleteAsync().ConfigureAwait(false);
+                        if (callCancellation.CallbackFailed) _transferCancellationFailed = true;
                     }
-
-                    budget.BeginReceipt();
-                    await call.RequestStream.CompleteAsync().ConfigureAwait(false);
-                    var response = await call.ResponseAsync.ConfigureAwait(false);
-                    budget.Token.ThrowIfCancellationRequested();
-
-                    var retired = response.Outcome == RunnerArtifactUploadOutcome.RejectedRetiredUpload;
-                    if (retired)
-                    {
-                        // Retirement proves no saving outcome. Keep this exact binding
-                        // for rescans; never acquire fresh authority for the old file.
-                        snapshot.Retired = true;
-                    }
-                    if (response.Outcome == RunnerArtifactUploadOutcome.RejectedStaleRuntime)
-                    {
-                        // Rejection never proves that these bytes reached durable storage.
-                        return null;
-                    }
-                    // These are case-insensitive catalog keys, not local paths.
-                    // Local saving below always uses the captured request path and
-                    // secure version, never a path selected by the response.
-                    if (!retired && (response.Outcome != RunnerArtifactUploadOutcome.Committed || response.UploadId != metadata.UploadId
-                        || response.Artifact is null
-                        || response.Artifact.EditorSid != _editorSid
-                        || !string.Equals(response.Artifact.Type, type, StringComparison.OrdinalIgnoreCase)
-                        || !string.Equals(response.Artifact.Subfolder, subfolder, StringComparison.OrdinalIgnoreCase)
-                        || !string.Equals(response.Artifact.Filename, fileName, StringComparison.OrdinalIgnoreCase)
-                        || response.Artifact.SizeBytes != sizeBytes))
-                    {
-                        throw new InvalidOperationException(string.IsNullOrWhiteSpace(response.Message) ? "upload failed" : response.Message);
-                    }
-
-                    // A rewrite during the upload is dropped by the pending set, so compare the
-                    // file with the snapshot that was sent before recording it as uploaded.
-                    SecureFileStatus after;
-                    SecureFileVersion? afterVersion;
-                    using (var secureRoot = new LinuxSecureDirectoryRoot(root))
-                    {
-                        after = secureRoot.GetStatus(relPath);
-                        afterVersion = secureRoot.GetVersion(relPath);
-                    }
-
-                    var changedDuringUpload = !after.IsRegularFile ||
-                                              after.Length != sizeBytes ||
-                                              after.LastWriteTimeUtc != snapshotWriteUtc ||
-                                              afterVersion is null ||
-                                              afterVersion != snapshotVersion;
-
-                    if (retired)
-                    {
-                        // The watcher coalesces changes while this path is pending.
-                        // Only a genuinely newer snapshot may acquire another ID.
-                        // The worker releases this pending snapshot before admitting
-                        // a changed secure version with its own elapsed allowance.
-                        return null;
-                    }
-
-                    // When it changed, record the snapshot's time so a later scan sees a newer file.
-                    var createdUtc = changedDuringUpload
-                        ? new DateTimeOffset(snapshotWriteUtc, TimeSpan.Zero)
-                        : DateTimeOffset.UtcNow;
-                    var localPath = NormalizePath(fullPath);
-                    var remote = new RemoteArtifactState(_editorSid, type, subfolder, fileName, localPath, sizeBytes, null, createdUtc);
-                    lock (_evictionGate)
-                    {
-                        remote.UploadSnapshot = snapshot;
-                        remote.CommittedArtifact = response.Artifact.Clone();
-                        remote.CatalogArtifact = remote.CommittedArtifact;
-                        _catalog[remote.LocalPath] = remote;
-                        _uncertainUploads.TryRemove(fullPath, out _);
-                        _pending[fullPath].Completed = !changedDuringUpload;
-                        // A file that changed while it was sent matches no uploaded version yet.
-                        remote.MarkDownloaded(changedDuringUpload ? null : afterVersion);
-                    }
-
-                    _logger.LogInformation("Uploaded artifact session={SessionId} type={Type} path={Relative}", _sessionId, type, relPath);
-                    if (changedDuringUpload && after.IsRegularFile)
-                    {
-                        _logger.LogInformation(
-                            "Artifact changed during upload; uploading it again session={SessionId} type={Type} path={Relative}",
-                            _sessionId,
-                            type,
-                            relPath);
-                        // The worker rechecks the secure version after releasing
-                        // this entry. A changed snapshot gets a fresh finite budget;
-                        // retries of the unchanged version keep its original one.
-                    }
-
-                    return null;
                 }
                 catch (UnauthorizedAccessException ex)
                 {
@@ -2879,95 +3010,58 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                    && CreatedUtc == other.CreatedUtc;
         }
 
-        public async ValueTask DisposeAsync()
+        public ValueTask DisposeAsync()
         {
-            await StopAsyncCore(cancelOutstandingWork: true).ConfigureAwait(false);
+            var stop = StopAsync();
+            _ = _operations.RequestCancellation();
+            return new(stop);
         }
 
-        public async Task StopAsync()
+        public Task StopAsync()
         {
-            await StopAsyncCore(cancelOutstandingWork: false).ConfigureAwait(false);
+            TaskCompletionSource start;
+            Task stop;
+            lock (_lifetimeGate)
+            {
+                if (_stop is not null) return _stop;
+                _operations.CloseAdmission();
+                start = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                stop = _stop = StopCoreAsync(start.Task);
+            }
+            start.SetResult();
+            return stop;
         }
 
-        private async Task StopAsyncCore(bool cancelOutstandingWork)
+        private async Task StopCoreAsync(Task start)
         {
+            await start.ConfigureAwait(false);
             StopWatchers();
             _queue.Writer.TryComplete();
-
-            if (cancelOutstandingWork)
-            {
-                CancelOutstandingTransfers();
-            }
-            else
-            {
-                await WaitForWorkerDrainAsync().ConfigureAwait(false);
-                CancelOutstandingTransfers();
-            }
-
-            // Outstanding work has been cancelled; bound the wait so a worker stuck in a
-            // non-cancellable operation cannot keep Stop from completing.
-            if (_worker is not null)
-            {
-                await WaitAfterCancellationAsync(_worker, "upload worker").ConfigureAwait(false);
-            }
-
-            var downloadTasks = _downloadTasks.Values.ToArray();
-            if (downloadTasks.Length > 0)
-            {
-                await WaitAfterCancellationAsync(Task.WhenAll(downloadTasks), "artifact downloads").ConfigureAwait(false);
-            }
-
-            // Uploads have stopped: whatever is not on the control plane now is lost with the session's data.
-            UnsavedUploadCount = CountUnsavedArtifacts();
-        }
-
-        private async Task WaitAfterCancellationAsync(Task task, string description)
-        {
-            var timeout = StopWaitTimeout;
-            try
-            {
-                await task.WaitAsync(timeout).ConfigureAwait(false);
-            }
-            catch (TimeoutException) when (!task.IsCompleted)
-            {
-                _logger.LogWarning(
-                    "Artifact {Description} did not stop within {TimeoutSeconds}s session={SessionId}; continuing",
-                    description,
-                    timeout.TotalSeconds,
-                    _sessionId);
-            }
-            catch
-            {
-                // Failures of cancelled work are observed by their callers.
-            }
-        }
-
-        private async Task WaitForWorkerDrainAsync()
-        {
-            if (_worker is null)
-            {
-                return;
-            }
-
-            try
-            {
+            if (_worker is not null && !_operations.Token.IsCancellationRequested)
                 await Task.WhenAny(_worker, Task.Delay(StopDrainGracePeriod)).ConfigureAwait(false);
-            }
-            catch
+            var joined = _operations.CompleteAsync();
+            if (await Task.WhenAny(joined, Task.Delay(StopWaitTimeout)).ConfigureAwait(false) != joined)
+                _logger.LogWarning("Artifact work is still stopping; continuing to join original operations.");
+            try { await joined.ConfigureAwait(false); }
+            finally
             {
-                // Best effort before forced cancellation.
+                // A seed or watcher callback admitted before closing may have
+                // published a watcher after the first pass. All borrowers ended.
+                StopWatchers();
+                UnsavedUploadCount = CountUnsavedArtifacts();
+                _catalog.Clear();
+                _downloadTasks.Clear();
+                _pending.Clear();
+                _uploadBudgets.Clear();
+                _uncertainUploads.Clear();
+                _inputSeeds.Clear();
+                _editorSid = null;
+                _owner = null;
+                _initialization = null;
+                _worker = null;
+                BeforeEvictionCandidate = null;
             }
-        }
-
-        private void CancelOutstandingTransfers()
-        {
-            try
-            {
-                _cts.Cancel();
-            }
-            catch
-            {
-            }
+            if (_transferCancellationFailed) throw new InvalidOperationException("Artifact transfer cancellation failed.");
         }
 
         private void StopWatchers()
