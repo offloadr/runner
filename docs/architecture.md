@@ -153,7 +153,10 @@ failed sealed-data deletion retains its key and pending context; retries remove
 the remaining data without reaping or retiring that uid again. A pinned Linux
 pidfd targets the
 original child for TERM/KILL, with no numeric-pid fallback. Kernels and container
-policies must allow pidfd_open and pidfd_send_signal. Real account/descendant
+policies must allow pidfd_open and pidfd_send_signal. Startup validation pins the
+agent itself, probes signal zero without delivering a signal, and closes the probe
+descriptor before registration or work admission. Unsupported or denied operations
+produce a fixed diagnostic and fail startup. Real account/descendant
 teardown, publication failures, all sidecar owners and deployed kernels still
 require qualification; controlled process tests alone cannot establish them.
 
@@ -261,7 +264,9 @@ Each admitted transient request owns its cancellation source and the original
 callback task until its physical execution and asynchronous lease completion
 finish. Cancellation retires matching active entries without dropping these
 owners. A failed or held callback cannot skip cancellation of other requests;
-callback failures are observed with class-only diagnostics. Registry shutdown
+the registry retains callback failure after completion, so Stop cannot acknowledge
+cleanup success and quiesce reports failure when a request callback fails.
+Callback failures are observed with class-only diagnostics. Registry shutdown
 closes admission and joins current and retired original completion roots.
 
 Stop and Quiesce keep matching admission closed while joining requests and

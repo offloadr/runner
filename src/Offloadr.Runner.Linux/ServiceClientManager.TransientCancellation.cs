@@ -61,7 +61,12 @@ internal static partial class ServiceClientManager
             private async Task CompleteAsync(Task start)
             {
                 await start.ConfigureAwait(false);
-                try { await _cancellation.CompleteAsync().ConfigureAwait(false); }
+                try
+                {
+                    await _cancellation.CompleteAsync().ConfigureAwait(false);
+                    if (_cancellation.CallbackFailed)
+                        _owner.NoteFailure(new InvalidOperationException("Transient cancellation callback failed."));
+                }
                 catch (Exception error) { _owner.NoteFailure(error); }
                 finally { _owner.Release(this); }
             }

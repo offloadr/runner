@@ -1,7 +1,7 @@
 
 namespace Offloadr.Runner.Tests;
 
-public class RunnerStartupValidatorTests
+public partial class RunnerStartupValidatorTests
 {
     [Test]
     public void ValidateOrThrow_ThrowsWhenAriaBinaryMissing()

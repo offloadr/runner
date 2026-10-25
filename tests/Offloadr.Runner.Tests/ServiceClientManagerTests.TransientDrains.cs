@@ -6,17 +6,28 @@ public partial class ServiceClientManagerTests
     [TestCase(true)]
     public async Task TransientLifetime_CallbackFailureCannotSkipPeerCancellation(bool sameRuntime)
     {
-        await using var registry = new ServiceClientManager.TransientCancellationRegistry(CancellationToken.None);
-        await using var failed = registry.Acquire(CommandSessionId, 7, 3, InstanceA);
-        await using var peer = registry.Acquire(CommandSessionId, 7, sameRuntime ? 3UL : 4UL, sameRuntime ? InstanceA : InstanceB);
-        var peerCancelled = TransientLifetimeGate();
-        using var failedRegistration = failed.Token.Register(() => throw new InvalidOperationException("synthetic callback failure"));
-        using var peerRegistration = peer.Token.Register(() => peerCancelled.TrySetResult());
-        registry.CancelAll();
-        await peerCancelled.Task.WaitAsync(TimeSpan.FromSeconds(5));
-        registry.CancelAll();
-        await Task.WhenAll(failed.DisposeAsync().AsTask(), peer.DisposeAsync().AsTask()).WaitAsync(TimeSpan.FromSeconds(5));
-        Assert.That(registry.Count, Is.Zero);
+        var registry = new ServiceClientManager.TransientCancellationRegistry(CancellationToken.None);
+        try
+        {
+            await using var failed = registry.Acquire(CommandSessionId, 7, 3, InstanceA);
+            await using var peer = registry.Acquire(CommandSessionId, 7, sameRuntime ? 3UL : 4UL, sameRuntime ? InstanceA : InstanceB);
+            var peerCancelled = TransientLifetimeGate();
+            using var failedRegistration = failed.Token.Register(() => throw new InvalidOperationException("synthetic callback failure"));
+            using var peerRegistration = peer.Token.Register(() => peerCancelled.TrySetResult());
+            registry.CancelAll();
+            await peerCancelled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            registry.CancelAll();
+            await Task.WhenAll(failed.DisposeAsync().AsTask(), peer.DisposeAsync().AsTask()).WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.That(registry.Count, Is.Zero);
+            var failure = Assert.ThrowsAsync<InvalidOperationException>(
+                () => registry.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5)));
+            Assert.That(failure!.Message, Is.EqualTo("Transient request cleanup failed."));
+        }
+        finally
+        {
+            try { await registry.DisposeAsync(); }
+            catch (InvalidOperationException error) when (error.Message == "Transient request cleanup failed.") { }
+        }
     }
 
     [Test]

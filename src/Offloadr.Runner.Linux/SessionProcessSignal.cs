@@ -11,6 +11,31 @@ internal sealed class SessionProcessSignal : IDisposable
     private readonly object _gate = new();
     private int _descriptor;
 
+    internal static string? GetUnsupportedReason()
+        => GetUnsupportedReason(
+            () => (int)Open(434, Environment.ProcessId, 0),
+            descriptor => (int)SendSignal(424, descriptor, 0, IntPtr.Zero, 0),
+            descriptor => Close(descriptor),
+            Marshal.GetLastPInvokeError);
+
+    internal static string? GetUnsupportedReason(
+        Func<int> openSelf,
+        Func<int, int> checkSignal,
+        Action<int> close,
+        Func<int> lastError)
+    {
+        var descriptor = openSelf();
+        if (descriptor < 0)
+            return $"Session process ownership requires pidfd_open; kernel or container policy rejected it with errno={lastError()}.";
+        try
+        {
+            // Signal zero checks permission without delivering a signal to the agent.
+            return checkSignal(descriptor) == 0 ? null
+                : $"Session process ownership requires pidfd_send_signal; kernel or container policy rejected it with errno={lastError()}.";
+        }
+        finally { close(descriptor); }
+    }
+
     public SessionProcessSignal(Process process)
     {
         _descriptor = (int)Open(434, process.Id, 0);
