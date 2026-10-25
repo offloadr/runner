@@ -488,6 +488,7 @@ internal static class ServiceClientManager
         public required string RunnerId { get; init; }
         public required string InstanceId { get; init; }
         public required IRunnerSessionSink Sink { get; init; }
+        public required Func<Func<Task>, Task> StartAcknowledgement { get; init; }
         public required RunnerCommandWorkState WorkState { get; init; }
         public required LogicalSessionState LogicalSessionState { get; init; }
         public required RuntimeIdentityRegistry RuntimeIdentities { get; init; }
@@ -1083,7 +1084,8 @@ internal static class ServiceClientManager
                 localModelProjectionReconciler,
                 commandWorkState,
                 logicalSessionState,
-                runtimeIdentities),
+                runtimeIdentities,
+                lifetime.RequestShutdownAsync),
             drainGpu: gpuPowerLimitService.CancelAndDrainAsync,
             drainPrompts: () => commandWorkState.Prompts.CancelAndWaitAsync(_ => true),
             drainStartup: () => CancelTrackedWorkAsync(commandWorkState.GetActiveStartup()),
@@ -1356,7 +1358,8 @@ internal static class ServiceClientManager
         Action<IEnumerable<ModelDownloadRequest>, bool>? localModelProjectionReconciler,
         RunnerCommandWorkState commandWorkState,
         LogicalSessionState logicalSessionState,
-        RuntimeIdentityRegistry runtimeIdentities)
+        RuntimeIdentityRegistry runtimeIdentities,
+        Func<Task> requestParentShutdown)
     {
         ArgumentNullException.ThrowIfNull(commandClient);
         ArgumentNullException.ThrowIfNull(sessionSink);
@@ -1374,14 +1377,17 @@ internal static class ServiceClientManager
         var rng = new Random();
         var transientDeliveries = new TransientRequestDeliveries(new TransientAcknowledgementCache());
         var runtimeCommandDeduplication = new RuntimeCommandDeduplicationCache();
-        var transientCancellation = new TransientCancellationRegistry(shutdown);
         using var ordinaryControlGate = new SemaphoreSlim(1, 1);
         using var readGate = new SemaphoreSlim(4, 4);
+        await using var commandTasks = new RunnerCommandLifetime(shutdown, requestParentShutdown);
+        shutdown = commandTasks.Token;
+        var transientCancellation = new TransientCancellationRegistry(shutdown);
         var runtimeCommands = new RuntimeCommandDependencies
         {
             RunnerId = runnerId,
             InstanceId = instanceId,
             Sink = sessionSink,
+            StartAcknowledgement = commandTasks.Start,
             WorkState = commandWorkState,
             LogicalSessionState = logicalSessionState,
             RuntimeIdentities = runtimeIdentities,
@@ -1444,7 +1450,7 @@ internal static class ServiceClientManager
                         }
 
                         RunnerLog.Info(nameof(ServiceClientManager), $"StartSession event: session={evt.StartSession.SessionId} user={evt.StartSession.User}");
-                        _ = HandleStartSessionCommand(evt.StartSession, runtimeCommands);
+                        _ = commandTasks.Start(() => HandleStartSessionCommand(evt.StartSession, runtimeCommands));
                         continue;
                     }
 
@@ -1455,7 +1461,7 @@ internal static class ServiceClientManager
                             continue;
                         }
 
-                        _ = HandleQuiesceRuntimeCommandAsync(evt.QuiesceEditorRuntime, runtimeCommands);
+                        _ = commandTasks.Start(() => HandleQuiesceRuntimeCommandAsync(evt.QuiesceEditorRuntime, runtimeCommands));
                         continue;
                     }
 
@@ -1466,7 +1472,7 @@ internal static class ServiceClientManager
                             continue;
                         }
 
-                        _ = HandleLaunchRuntimeCommand(evt.LaunchEditorRuntime, runtimeCommands);
+                        _ = commandTasks.Start(() => HandleLaunchRuntimeCommand(evt.LaunchEditorRuntime, runtimeCommands));
                         continue;
                     }
 
@@ -1480,17 +1486,17 @@ internal static class ServiceClientManager
                     if (evt.SetGpuPowerLimit != null && !string.IsNullOrWhiteSpace(evt.SetGpuPowerLimit.CommandId))
                     {
                         // Physical work and acknowledgement retry must not block Stop delivery.
-                        _ = gpuPowerLimitService.HandleAsync(
+                        _ = commandTasks.Start(() => gpuPowerLimitService.HandleAsync(
                             evt.SetGpuPowerLimit, runnerId, logicalSessionState.GetActiveSessionId,
                             () => runtimeIdentities.TryGet(evt.SetGpuPowerLimit.SessionId, out var identity) ? identity.LifecycleGeneration : 0,
-                            sessionSink.GrantGpuPowerExecutionAsync, sessionSink.AckGpuPowerLimitAsync, shutdown);
+                            sessionSink.GrantGpuPowerExecutionAsync, sessionSink.AckGpuPowerLimitAsync, shutdown));
                         continue;
                     }
 
                     if (evt.RelayEditorRuntimeRequest != null && !string.IsNullOrWhiteSpace(evt.RelayEditorRuntimeRequest.RequestId))
                     {
                         var runtimeRequest = evt.RelayEditorRuntimeRequest;
-                        _ = DispatchTransientEditorRuntimeRequest(
+                        _ = commandTasks.Start(() => DispatchTransientEditorRuntimeRequest(
                             runtimeRequest,
                             runnerId,
                             transientDeliveries,
@@ -1519,7 +1525,7 @@ internal static class ServiceClientManager
                                     downloadService.InterruptSessionReads,
                                     sentToken)),
                             sessionSink.AckEditorRuntimeRequestAsync,
-                            shutdown);
+                            shutdown));
                         continue;
                     }
 
@@ -1529,14 +1535,7 @@ internal static class ServiceClientManager
                         commandWorkState.Prompts.Start(prompt, ShouldStreamHttpResponse(prompt), (captured, physicalCancellation, demandCancellation) =>
                         {
                             return HandleSubmitEditorActionAsync(
-                            (ack, acknowledgementCancellation) =>
-                            {
-                                // Delivery retries retain this exact result/identity and
-                                // run independently from the physical work joined by Stop.
-                                _ = AcknowledgeRuntimeCommandWithRetryAsync(
-                                    sessionSink.AckSubmitEditorActionAsync, ack, captured.CommandId, shutdown);
-                                return Task.CompletedTask;
-                            },
+                            (ack, _) => QueuePromptAcknowledgementAsync(commandTasks, sessionSink, ack, shutdown),
                             (events, token) => sessionSink.ReportSessionEventsAsync(events, token),
                             captured,
                             runnerId,
@@ -1621,6 +1620,20 @@ internal static class ServiceClientManager
         }
 
         transientCancellation.CancelAll();
+    }
+
+    internal static Task QueuePromptAcknowledgementAsync(
+        RunnerCommandLifetime commandTasks,
+        IRunnerSessionSink sessionSink,
+        AcknowledgePromptResultRequest acknowledgement,
+        CancellationToken shutdown)
+    {
+        // Construct the retry factory outside the physical prompt callback's
+        // closure, so it does not retain that callback's complete command body.
+        var captured = acknowledgement.Clone();
+        _ = commandTasks.Start(() => AcknowledgeRuntimeCommandWithRetryAsync(
+            sessionSink.AckSubmitEditorActionAsync, captured, captured.CommandId, shutdown));
+        return Task.CompletedTask;
     }
 
     internal static TimeSpan ComputeLocalModelLoopDelay(DateTime nowUtc, DateTime nextScanUtc, DateTime nextKeepAliveUtc)
@@ -2214,7 +2227,7 @@ internal static class ServiceClientManager
             {
                 // One retry loop per command; redelivery after a finished loop
                 // replays the same result without touching runtime state.
-                work.AcknowledgementTask = AcknowledgeStopAsync(work, acknowledgementKey, command, deps);
+                work.AcknowledgementTask = deps.StartAcknowledgement(() => AcknowledgeStopAsync(work, acknowledgementKey, command, deps));
             }
         }
         finally

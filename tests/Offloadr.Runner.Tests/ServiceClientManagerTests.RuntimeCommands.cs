@@ -1499,6 +1499,7 @@ public partial class ServiceClientManagerTests
             RunnerId = CommandRunnerId,
             InstanceId = InstanceId,
             Sink = Sink,
+            StartAcknowledgement = factory => factory(),
             WorkState = WorkState,
             LogicalSessionState = Logical,
             RuntimeIdentities = Identities,

@@ -32,6 +32,17 @@ Joining never uses a cancelled waiting wrapper. A callback failure is reported
 by class after the join and cannot skip runtime cleanup or enter an acknowledgement
 message. Startup acknowledgement retries remain independent of that physical join.
 
+Each command stream also owns its admitted start, launch, quiesce, GPU and
+transient-request tasks, and the detached Stop and prompt acknowledgement tasks.
+Stop's physical handler remains awaited in stream order. Stream reconnects keep
+these owners; shutdown closes admission and joins original descendants before
+disposing the request gates. A command failure cancels control peers immediately,
+even when another original command is still being joined. Failure facts and idle
+completed task records do not retain arbitrary exception details. Prompt ACK
+retry factories are built outside the physical command callback's closure.
+Controlled stream tests use the production sink with held fake RPC responses;
+they do not establish real transport cancellation or physical deadline budgets.
+
 All four control channels and their sink belong to the outer entry-point scope,
 before any relay is created. They therefore remain alive through producer,
 session, sidecar and relay cleanup. The final entry-point exception handler exits
