@@ -1,6 +1,6 @@
-using System.Collections.Concurrent;
 using Grpc.Core;
 using Offloadr.Common.V1;
+using Offloadr.Runner.Core;
 using Offloadr.Runner.V1;
 
 namespace Offloadr.Runner.Linux;
@@ -15,21 +15,51 @@ public sealed class GpuPowerCommandExecutor(GpuPowerLimitService service)
     /// </summary>
     internal const int MaxRetainedCompletedDeliveries = 256;
 
-    private sealed record Delivery(SetGpuPowerLimitCommand Command, Lazy<Task> Work);
-    private readonly ConcurrentDictionary<string, Delivery> _deliveries = new(StringComparer.Ordinal);
+    private sealed record Delivery(SetGpuPowerLimitCommand Command, Task Work);
+    private readonly Dictionary<string, Delivery> _deliveries = new(StringComparer.Ordinal);
     private readonly Queue<string> _completedDeliveries = new();
     private readonly SemaphoreSlim _physicalExecution = new(1, 1);
     private readonly object _admission = new();
-    private readonly CancellationTokenSource _stopping = new();
+    private readonly OwnedCancellation _stopping = new(CancellationToken.None);
+    private readonly HashSet<Task> _operations = [];
+    private Task? _drain;
     private bool _closed;
+    private bool _operationFailed;
 
-    public async Task ActivateSessionAsync(Action activate, CancellationToken shutdown)
+    public Task ActivateSessionAsync(Action activate, CancellationToken shutdown)
     {
-        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(shutdown, _stopping.Token);
+        TaskCompletionSource start;
+        Task original;
+        lock (_admission)
+        {
+            if (_closed) return Task.FromCanceled(new CancellationToken(canceled: true));
+            if (shutdown.IsCancellationRequested) return Task.FromCanceled(shutdown);
+            start = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            original = ActivateCoreAsync(activate, shutdown, start.Task);
+            TrackOriginal(original, shutdown, start.Task);
+        }
+        start.SetResult();
+        return original;
+    }
+
+    private async Task ActivateCoreAsync(Action activate, CancellationToken shutdown, Task start)
+    {
+        await start.ConfigureAwait(false);
+        var cancellation = new OwnedCancellation(shutdown);
+        var stopping = _stopping.Token.Register(() => _ = cancellation.RequestAsync());
         shutdown = cancellation.Token;
-        await _physicalExecution.WaitAsync(shutdown).ConfigureAwait(false);
-        try { shutdown.ThrowIfCancellationRequested(); activate(); }
-        finally { _physicalExecution.Release(); }
+        try
+        {
+            await _physicalExecution.WaitAsync(shutdown).ConfigureAwait(false);
+            try { shutdown.ThrowIfCancellationRequested(); activate(); }
+            finally { _physicalExecution.Release(); }
+        }
+        finally
+        {
+            activate = null!;
+            stopping.Dispose();
+            await cancellation.CompleteAsync().ConfigureAwait(false);
+        }
     }
 
     public Task HandleAsync(SetGpuPowerLimitCommand command, string runnerId,
@@ -38,26 +68,49 @@ public sealed class GpuPowerCommandExecutor(GpuPowerLimitService service)
         Func<AcknowledgeGpuPowerLimitRequest, CancellationToken, Task> acknowledge,
         CancellationToken shutdown)
     {
+        TaskCompletionSource start;
+        Task original;
         lock (_admission)
         {
-            if (_closed) return Task.CompletedTask;
+            if (_closed || shutdown.IsCancellationRequested) return Task.CompletedTask;
             var captured = command.Clone();
-            var delivery = _deliveries.GetOrAdd(captured.CommandId, _ => new(captured,
-                new Lazy<Task>(() => Task.Run(async () =>
-                {
-                    try { await ExecuteAsync(captured, runnerId, activeSession, activeGeneration, grant, acknowledge, shutdown).ConfigureAwait(false); }
-                    finally { RetireDelivery(captured.CommandId); }
-                }))));
-            if (!delivery.Command.Equals(captured))
+            if (_deliveries.TryGetValue(captured.CommandId, out var delivery))
             {
+                if (delivery.Command.Equals(captured)) return delivery.Work;
                 RunnerLog.Error(nameof(GpuPowerCommandExecutor), $"Conflicting delivery for power command {captured.CommandId}");
                 return Task.CompletedTask;
             }
-            return delivery.Work.Value;
+            start = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            original = ExecuteAsync(captured, runnerId, activeSession, activeGeneration, grant, acknowledge, shutdown, start.Task);
+            _deliveries.Add(captured.CommandId, new(captured, original));
+            TrackOriginal(original, shutdown, start.Task);
         }
+        start.SetResult();
+        return original;
     }
 
-    internal int RetainedDeliveryCount => _deliveries.Count;
+    internal int RetainedDeliveryCount { get { lock (_admission) return _deliveries.Count; } }
+
+    // Caller holds admission; neither original work nor its observer can run
+    // until publication finishes and the caller opens their shared start gate.
+    private void TrackOriginal(Task original, CancellationToken shutdown, Task start)
+    {
+        _operations.RemoveWhere(task => task.IsCompleted);
+        _operations.Add(ObserveOriginalAsync(original, shutdown, start));
+    }
+
+    private async Task ObserveOriginalAsync(Task original, CancellationToken shutdown, Task start)
+    {
+        await start.ConfigureAwait(false);
+        try { await original.ConfigureAwait(false); }
+        catch (OperationCanceledException) when (shutdown.IsCancellationRequested || _stopping.Token.IsCancellationRequested) { }
+        catch (Exception error)
+        {
+            lock (_admission) _operationFailed = true;
+            RunnerLog.Warning(nameof(GpuPowerCommandExecutor), $"GPU work failed; errorClass={error.GetType().Name}.");
+        }
+        finally { original = null!; }
+    }
 
     private void RetireDelivery(string commandId)
     {
@@ -66,35 +119,56 @@ public sealed class GpuPowerCommandExecutor(GpuPowerLimitService service)
             _completedDeliveries.Enqueue(commandId);
             while (_completedDeliveries.Count > MaxRetainedCompletedDeliveries)
             {
-                _deliveries.TryRemove(_completedDeliveries.Dequeue(), out _);
+                _deliveries.Remove(_completedDeliveries.Dequeue());
             }
         }
     }
 
-    public async Task CancelAndDrainAsync()
+    public Task CancelAndDrainAsync()
     {
-        Task[] work;
+        TaskCompletionSource start;
+        Task drain;
         lock (_admission)
         {
+            if (_drain is not null) return _drain;
             _closed = true;
-            work = _deliveries.Values.Select(delivery => delivery.Work.Value).ToArray();
+            start = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            drain = _drain = DrainCoreAsync(start.Task, _operations.ToArray());
         }
-        try { _stopping.Cancel(); }
-        finally
+        start.SetResult();
+        return drain;
+    }
+
+    private async Task DrainCoreAsync(Task start, Task[] work)
+    {
+        await start.ConfigureAwait(false);
+        var cancellation = _stopping.RequestAsync();
+        var failed = false;
+        // These successful observation roots join the actual activation and
+        // delivery tasks, including each operation's original callback task.
+        try { await Task.WhenAll(work).ConfigureAwait(false); }
+        catch { failed = true; }
+        try { await cancellation.ConfigureAwait(false); }
+        catch { failed = true; }
+        try { await _stopping.CompleteAsync().ConfigureAwait(false); }
+        catch { failed = true; }
+        lock (_admission)
         {
-            // Shutdown cancellation initiates native termination; it must not
-            // cancel the join before child-process cleanup actually completes.
-            await Task.WhenAll(work).ConfigureAwait(false);
+            _operations.Clear();
+            failed |= _operationFailed;
         }
+        if (failed) throw new InvalidOperationException("GPU work failed during shutdown.");
     }
 
     private async Task ExecuteAsync(SetGpuPowerLimitCommand command, string runnerId,
         Func<string> activeSession, Func<ulong> activeGeneration,
         Func<GrantGpuPowerExecutionRequest, CancellationToken, Task<GrantGpuPowerExecutionResponse>> grant,
         Func<AcknowledgeGpuPowerLimitRequest, CancellationToken, Task> acknowledge,
-        CancellationToken shutdown)
+        CancellationToken shutdown, Task start)
     {
-        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(shutdown, _stopping.Token);
+        await start.ConfigureAwait(false);
+        var cancellation = new OwnedCancellation(shutdown);
+        var stopping = _stopping.Token.Register(() => _ = cancellation.RequestAsync());
         shutdown = cancellation.Token;
         try
         {
@@ -159,6 +233,12 @@ public sealed class GpuPowerCommandExecutor(GpuPowerLimitService service)
         catch (Exception ex)
         {
             RunnerLog.Error(nameof(GpuPowerCommandExecutor), ex, $"Power execution permission unconfirmed for {command.CommandId}");
+        }
+        finally
+        {
+            stopping.Dispose();
+            try { await cancellation.CompleteAsync().ConfigureAwait(false); }
+            finally { RetireDelivery(command.CommandId); }
         }
     }
 

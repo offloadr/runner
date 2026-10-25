@@ -53,6 +53,16 @@ Controlled factory and callback tests exercise this ownership order. They do not
 establish complete signal handling with real transports, native descendants,
 GPU workloads or provider shutdown deadlines.
 
+The GPU executor publishes both activation and power-delivery roots before they
+can execute, closes both admission paths under one gate, and shares one original
+drain task between shutdown callers. Each operation owns its original cancellation
+callbacks through completion. Drain joins those original operation and callback
+roots before closing its cancellation source. Completed observation records keep
+failure facts without retaining arbitrary action exceptions; shutdown reports a
+content-free failure. Controlled tests cover held activation and grant callbacks,
+peer cancellation, caller shutdown and managed reference release. They do not
+establish real GPU effects, SDK deadlines, native cleanup or complete memory erasure.
+
 ## Runtime activity delivery preparation
 
 The required activity report carries only captured process/runtime identity and
