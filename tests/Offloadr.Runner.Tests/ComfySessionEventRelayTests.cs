@@ -9,7 +9,7 @@ public class ComfySessionEventRelayTests
     [Test]
     public async Task Enqueue_DropsOldestBufferedEvents_WhenQueueOverflows()
     {
-        await using var relay = new ComfySessionEventRelay("runner-1", "127.0.0.1", 8188, "test-process", _ => new SessionSealingStatus(), isTrackedRuntime: (_, _) => true, queueCapacity: 2);
+        await using var relay = new ComfySessionEventRelay(static (_, _) => { }, "runner-1", "127.0.0.1", 8188, "test-process", _ => new SessionSealingStatus(), isTrackedRuntime: (_, _) => true, queueCapacity: 2);
         var sink = new BlockingThenRecordingSink();
         relay.AttachSink(sink);
 
@@ -59,7 +59,7 @@ public class ComfySessionEventRelayTests
     [Test]
     public async Task Enqueue_KeepsQueuedPayloadsWithinBudget_AndReportsWithinTheBatchLimit()
     {
-        await using var relay = new ComfySessionEventRelay("runner-1", "127.0.0.1", 8188, "test-process", _ => new SessionSealingStatus(), isTrackedRuntime: (_, _) => true);
+        await using var relay = new ComfySessionEventRelay(static (_, _) => { }, "runner-1", "127.0.0.1", 8188, "test-process", _ => new SessionSealingStatus(), isTrackedRuntime: (_, _) => true);
         var sink = new BlockingThenRecordingSink();
         relay.AttachSink(sink);
         relay.Enqueue(new SessionStreamEvent { RunnerId = "runner-1", SessionId = "session-0", ClientId = "client-1" });
@@ -99,7 +99,7 @@ public class ComfySessionEventRelayTests
     [Test]
     public async Task PermanentlyRejectedEvent_DoesNotBlockLaterValidEvents()
     {
-        await using var relay = new ComfySessionEventRelay("runner-1", "127.0.0.1", 8188, "test-process", _ => new SessionSealingStatus(), isTrackedRuntime: (_, _) => true, queueCapacity: 8);
+        await using var relay = new ComfySessionEventRelay(static (_, _) => { }, "runner-1", "127.0.0.1", 8188, "test-process", _ => new SessionSealingStatus(), isTrackedRuntime: (_, _) => true, queueCapacity: 8);
         var sink = new RejectStaleSessionSink();
         relay.AttachSink(sink);
 

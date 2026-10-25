@@ -1,4 +1,6 @@
 using Grpc.Net.Client;
+using Grpc.Core.Interceptors;
+using Offloadr.Runner.V1;
 using System.Net;
 
 namespace Offloadr.Runner.Core;
@@ -30,6 +32,9 @@ public static class GrpcChannelManager
         => Uri.TryCreate(url?.Trim(), UriKind.Absolute, out var uri)
             ? $"{uri.Scheme}://{uri.Authority}"
             : "(unparsable url)";
+
+    public static RunnerControlService.RunnerControlServiceClient CreateAuthenticatedControlClient(GrpcChannel channel, string runnerSecret)
+        => new(channel.Intercept(new RunnerSecretClientInterceptor(runnerSecret)));
 
     public static GrpcChannel CreateChannel(
         string offloadrApiUrl,

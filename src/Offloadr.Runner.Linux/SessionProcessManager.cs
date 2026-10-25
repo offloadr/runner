@@ -21,7 +21,7 @@ namespace Offloadr.Runner.Linux;
 /// <summary>
 /// Manages lifecycle of editor worker processes, keeping each session isolated under its own ephemeral user.
 /// </summary>
-internal sealed partial class SessionProcessManager : IDisposable
+internal sealed partial class SessionProcessManager : IAsyncDisposable
 {
     private static readonly TimeSpan ExitWaitAfterKill = TimeSpan.FromSeconds(5);
     // Match Forge's browser progress cadence closely enough to keep snapshots fresh without over-polling.
@@ -60,6 +60,7 @@ internal sealed partial class SessionProcessManager : IDisposable
     private readonly RunnerVfsEnvironmentBuilder _vfsEnvironmentBuilder;
     private readonly ILinuxCommandRunner _signalCommandRunner;
     private readonly SessionProcessLogRelay? _processLogRelay;
+    private readonly IRuntimeActivitySink _activitySink;
     private readonly SealedStorageOptions _sealing;
     private readonly SealedStorageProbe _sealedStorageProbe;
     // The transfer sealing of each session's current runtime; its reader key is released only
@@ -86,13 +87,14 @@ internal sealed partial class SessionProcessManager : IDisposable
     private volatile string? _sealedHostFailure;
 
     internal int? TryGetTrackedProcessId(string sessionId)
-        => _sessions.TryGetValue(sessionId, out var context) ? context.Process.Id : null;
+        => _sessions.TryGetValue(sessionId, out var context) ? context.ProcessId : null;
 
     /// <summary>How long a start waits for a retired runtime of its session to finish cleanup.</summary>
     internal static TimeSpan RetiredRuntimeCleanupWait { get; set; } = TimeSpan.FromSeconds(60);
 
-    public SessionProcessManager()
+    public SessionProcessManager(IRuntimeActivitySink activitySink)
         : this(
+            activitySink,
             SessionProcessOptions.FromEnvironment(),
             new LinuxUserIsolationStrategy(new LinuxCommandRunner()),
             new RunnerVfsEnvironmentBuilder(),
@@ -101,6 +103,7 @@ internal sealed partial class SessionProcessManager : IDisposable
     }
 
     internal SessionProcessManager(
+        IRuntimeActivitySink activitySink,
         SessionProcessOptions options,
         ISessionIsolationStrategy sessionIsolationStrategy,
         RunnerVfsEnvironmentBuilder vfsEnvironmentBuilder,
@@ -114,6 +117,7 @@ internal sealed partial class SessionProcessManager : IDisposable
         _vfsEnvironmentBuilder = vfsEnvironmentBuilder ?? throw new ArgumentNullException(nameof(vfsEnvironmentBuilder));
         _signalCommandRunner = signalCommandRunner ?? throw new ArgumentNullException(nameof(signalCommandRunner));
         _processLogRelay = processLogRelay;
+        _activitySink = activitySink ?? throw new ArgumentNullException(nameof(activitySink));
         _sessionRoot = options.SessionRoot;
         _entryPointPath = options.EntryPointPath;
         _workingDirectory = options.WorkingDirectory;
@@ -167,7 +171,7 @@ internal sealed partial class SessionProcessManager : IDisposable
         CancellationToken cancellationToken)
         => StartSessionAsync(command, initializer, afterWorkspaceRootsPrepared: null, cancellationToken);
 
-    public async Task StartSessionAsync(
+    private async Task StartSessionCoreAsync(
         StartSessionCommand command,
         Func<SessionPaths, CancellationToken, Task>? initializer,
         Func<SessionPaths, CancellationToken, Task>? afterWorkspaceRootsPrepared,
@@ -189,7 +193,7 @@ internal sealed partial class SessionProcessManager : IDisposable
                 $"This runner runs editor runtime '{_runtimeKind}', not '{requestedRuntimeKind}'.", nameof(command));
         if (_sessions.TryGetValue(sessionId, out var existing))
         {
-            if (existing.Process.HasExited && !existing.StopInProgress && !existing.RuntimeIdentity.SameRuntime(runtimeIdentity))
+            if (existing.ExitTask.IsCompleted && !existing.StopInProgress && !existing.RuntimeIdentity.SameRuntime(runtimeIdentity))
             {
                 // A runtime of this session exited on its own and its exit cleanup is still
                 // running. Wait until it leaves tracking: failing here would run failed-start
@@ -208,7 +212,7 @@ internal sealed partial class SessionProcessManager : IDisposable
                 if (_sessions.ContainsKey(sessionId))
                     throw new InvalidOperationException("The tracked session is a different or retired runtime.");
             }
-            else if (existing.StopInProgress || existing.Process.HasExited || existing.RuntimeIdentity != runtimeIdentity)
+            else if (existing.StopInProgress || existing.ExitTask.IsCompleted || existing.RuntimeIdentity != runtimeIdentity)
             {
                 throw new InvalidOperationException("The tracked session is a different or retired runtime.");
             }
@@ -303,21 +307,43 @@ internal sealed partial class SessionProcessManager : IDisposable
                 await TryRunManagerUvSyncAsync(sessionId, identity, paths, cancellationToken).ConfigureAwait(false);
             }
 
+            cancellationToken.ThrowIfCancellationRequested();
             launchedContext = await LaunchSessionProcessAsync(sessionId, runtimeIdentity, identity, paths).ConfigureAwait(false);
             launchedContext.Sealing = command.Sealing?.Clone();
+            launchedContext.MonitorTask = MonitorExitAsync(launchedContext);
+            lock (_lifetimeGate) _runtimeRoots.Add(launchedContext);
+            cancellationToken.ThrowIfCancellationRequested();
             if (!_sessions.TryAdd(sessionId, launchedContext))
             {
                 throw new InvalidOperationException($"Failed to track session '{sessionId}'.");
             }
 
-            _ = MonitorExitAsync(launchedContext);
-            LogSessionInfo(sessionId, $"Started pid={launchedContext.Process.Id} user={identity.UserName} port={_comfyPort}.");
+            LogSessionInfo(sessionId, $"Started pid={launchedContext.ProcessId} user={identity.UserName} port={_comfyPort}.");
+            launchedContext.Publication.TrySetResult(true);
         }
         catch
         {
             if (launchedContext is not null)
             {
-                await CleanupUntrackedLaunchAsync(launchedContext).ConfigureAwait(false);
+                launchedContext.Publication.TrySetResult(false);
+                if (_sessions.TryGetValue(sessionId, out var tracked) && ReferenceEquals(tracked, launchedContext))
+                {
+                    launchedContext.TryBeginStop(out var failedStartStop, out _);
+                    try
+                    {
+                        await TerminateProcessAsync(launchedContext, CancellationToken.None).ConfigureAwait(false);
+                        await CleanupTrackedContextAsync(launchedContext, CancellationToken.None).ConfigureAwait(false);
+                        await launchedContext.MonitorTask.ConfigureAwait(false);
+                        failedStartStop.TrySetResult();
+                    }
+                    catch (Exception ex)
+                    {
+                        failedStartStop.TrySetException(ex);
+                        _ = failedStartStop.Task.Exception;
+                        throw;
+                    }
+                }
+                else await CleanupUntrackedLaunchAsync(launchedContext).ConfigureAwait(false);
             }
             else if (prepared)
             {
@@ -390,7 +416,7 @@ internal sealed partial class SessionProcessManager : IDisposable
         }
     }
 
-    private async Task<bool> StopSessionCoreAsync(
+    private async Task<bool> StopSessionRuntimeCoreAsync(
         string sessionId,
         RuntimeIdentity? expectedRuntime,
         Func<string, CancellationToken, Task>? beforeCleanup,
@@ -408,6 +434,12 @@ internal sealed partial class SessionProcessManager : IDisposable
 
             // A retried Stop for a session whose processes survived its first teardown.
             await EnsureTeardownCompleteAsync(sessionId).ConfigureAwait(false);
+            Task[] retiring;
+            lock (_lifetimeGate)
+                retiring = _runtimeRoots.Where(root => root.SessionId == sessionId &&
+                    (expectedRuntime is null || root.RuntimeIdentity.SameRuntime(expectedRuntime.Value)))
+                    .Select(JoinRuntimeMonitorAsync).ToArray();
+            await Task.WhenAll(retiring).ConfigureAwait(false);
             LogSessionInfo(sessionId, "Stop requested for unknown session.");
             return true;
         }
@@ -427,12 +459,12 @@ internal sealed partial class SessionProcessManager : IDisposable
             return true;
         }
 
-        context.Cancellation.Cancel();
+        _ = context.CancelAsync();
         var beforeCleanupCompleted = false;
         var cleanedUp = false;
         try
         {
-            await TerminateProcessAsync(context, cancellationToken).ConfigureAwait(false);
+            await TerminateProcessAsync(context, CancellationToken.None).ConfigureAwait(false);
             if (beforeCleanup is not null)
             {
                 await beforeCleanup(sessionId, cancellationToken).ConfigureAwait(false);
@@ -442,6 +474,8 @@ internal sealed partial class SessionProcessManager : IDisposable
             await CleanupTrackedContextAsync(context, cancellationToken).ConfigureAwait(false);
             cleanedUp = true;
             ThrowIfTeardownPending(sessionId);
+            await JoinRuntimeMonitorAsync(context).ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested();
             stopCompletion.TrySetResult();
             return true;
         }
@@ -453,7 +487,7 @@ internal sealed partial class SessionProcessManager : IDisposable
             {
                 // After its cleanup the process handle is disposed; what is left is retried as a
                 // pending teardown by the next Stop.
-                if (!cleanedUp && context.Process.HasExited)
+                if (!cleanedUp && context.ExitTask.IsCompleted)
                 {
                     if (!beforeCleanupCompleted)
                     {
@@ -475,29 +509,21 @@ internal sealed partial class SessionProcessManager : IDisposable
 
     public async Task StopAllAsync(CancellationToken cancellationToken)
     {
-        var sessionIds = _sessions.Keys.ToArray();
+        string[] sessionIds;
+        lock (_lifetimeGate)
+            sessionIds = _sessions.Keys.Concat(_pendingTeardowns.Keys).Concat(_pendingSealedDeletes.Keys)
+                .Concat(_starts.Select(start => start.SessionId)).Distinct(StringComparer.Ordinal).ToArray();
+        List<Exception> failures = [];
         foreach (var sessionId in sessionIds)
         {
-            try
-            {
-                await StopSessionAsync(sessionId, cancellationToken).ConfigureAwait(false);
-            }
+            try { await StopSessionAsync(sessionId, cancellationToken).ConfigureAwait(false); }
             catch (Exception ex)
             {
-                RunnerLog.Error<SessionProcessManager>(ex, $"Failed to stop session '{sessionId}': {ex.Message}");
+                failures.Add(ex);
+                LogSessionWarning(sessionId, $"Stop failed; errorClass={ex.GetType().Name}.");
             }
         }
-    }
-
-    public void Dispose()
-    {
-        foreach (var entry in _sessions.Values)
-        {
-            entry.Cancellation.Cancel();
-            try { entry.Process.Dispose(); } catch { }
-        }
-        _sessions.Clear();
-        try { _httpClient.Dispose(); } catch { }
+        if (failures.Count != 0) throw new AggregateException("Session shutdown is incomplete.", failures);
     }
 
     public bool TryGetSessionPaths(string sessionId, out SessionPaths paths)
@@ -1686,65 +1712,49 @@ internal sealed partial class SessionProcessManager : IDisposable
         return paths;
     }
 
-    private Task<SessionContext> LaunchSessionProcessAsync(
+    private async Task<SessionContext> LaunchSessionProcessAsync(
         string sessionId,
         RuntimeIdentity runtimeIdentity,
         PreparedSessionIdentity identity,
         SessionPaths paths)
     {
-        Process? process = null;
-
+        var profile = paths.TransferSealing?.ToStatus() ?? throw new InvalidOperationException("The original process sealing profile is required.");
+        var startInfo = BuildEditorStartInfo(sessionId, identity, paths);
+        var activity = new RuntimeActivityScope(RuntimeActivityObservation.Capture(sessionId, runtimeIdentity, profile), _activitySink, _readyTimeout);
+        var process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
+        var exit = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var context = new SessionContext(sessionId, runtimeIdentity, identity, paths, process, exit.Task, activity);
+        process.Exited += (_, _) => exit.TrySetResult(process.ExitCode);
+        var started = false;
         try
         {
-            var sessionCategory = SessionLogCategory(sessionId);
-            // Editor output carries prompts, filenames and node values. A sealed session keeps it
-            // off the console (which the container engine writes to the host's disk) and only
-            // relays it to the control plane.
+            if (!process.Start()) throw new InvalidOperationException("The editor process could not be started.");
+            started = true;
+            context.ProcessId = process.Id;
+            context.Signals = new SessionProcessSignal(process);
+            context.ActivitySupervisor = SuperviseActivityAsync(context);
+            var category = SessionLogCategory(sessionId);
             var logToConsole = !paths.IsSealed;
-            var psi = BuildEditorStartInfo(sessionId, identity, paths);
-
-            process = new Process { StartInfo = psi, EnableRaisingEvents = true };
-            var exitTcs = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
-
-            process.Exited += (_, __) => exitTcs.TrySetResult(process.ExitCode);
-
-            if (!process.Start())
+            void OnLine(string line, SessionProcessLogStream stream)
             {
-                throw new InvalidOperationException($"Failed to start editor runtime '{_runtimeKind}' for session '{sessionId}'.");
+                // The fact captures only the original scope, before optional content handling.
+                if (string.IsNullOrWhiteSpace(line)) return;
+                if (logToConsole) RunnerLog.Info(category, line);
+                _processLogRelay?.Enqueue(sessionId, stream, line, runtimeIdentity);
             }
-
-            // Session output is untrusted: read it with a bounded line reader rather than
-            // BeginOutputReadLine, which buffers a line of any length.
-            _ = BoundedLineReader.PumpAsync(process.StandardOutput, line =>
-            {
-                if (!string.IsNullOrWhiteSpace(line))
-                {
-                    if (logToConsole)
-                    {
-                        RunnerLog.Info(sessionCategory, line);
-                    }
-
-                    _processLogRelay?.Enqueue(sessionId, SessionProcessLogStream.Stdout, line, runtimeIdentity);
-                }
-            });
-            _ = BoundedLineReader.PumpAsync(process.StandardError, line =>
-            {
-                if (!string.IsNullOrWhiteSpace(line))
-                {
-                    if (logToConsole)
-                    {
-                        RunnerLog.Info(sessionCategory, line);
-                    }
-
-                    _processLogRelay?.Enqueue(sessionId, SessionProcessLogStream.Stderr, line, runtimeIdentity);
-                }
-            });
-
-            return Task.FromResult(new SessionContext(sessionId, runtimeIdentity, identity, paths, process, exitTcs.Task));
+            context.Stdout = BoundedLineReader.PumpAsync(process.StandardOutput, line => OnLine(line, SessionProcessLogStream.Stdout), cancellationToken: context.Cancellation.Token, onData: activity.Signal);
+            context.Stderr = BoundedLineReader.PumpAsync(process.StandardError, line => OnLine(line, SessionProcessLogStream.Stderr), cancellationToken: context.Cancellation.Token, onData: activity.Signal);
+            return context;
         }
         catch
         {
-            CleanupFailedLaunch(process);
+            if (started) await CleanupUntrackedLaunchAsync(context).ConfigureAwait(false);
+            else
+            {
+                await activity.DisposeAsync().ConfigureAwait(false);
+                context.Cancellation.Dispose();
+                process.Dispose();
+            }
             throw;
         }
     }
@@ -1798,25 +1808,27 @@ internal sealed partial class SessionProcessManager : IDisposable
         return args;
     }
 
-    private Task MonitorExitAsync(SessionContext context)
+    private async Task MonitorExitAsync(SessionContext context)
     {
-        return Task.Run(async () =>
+        if (!await context.Publication.Task.ConfigureAwait(false)) return;
+        int? exitCode = null;
+        try
         {
-            int? exitCode = null;
-            try
-            {
-                exitCode = await context.ExitTask.ConfigureAwait(false);
-                LogSessionExit(context, exitCode.Value);
-            }
-            catch (Exception ex)
-            {
-                RunnerLog.Error<SessionProcessManager>(ex, $"Session '{context.SessionId}' exit watcher failed: {ex.Message}");
-            }
-            finally
-            {
-                await CleanupAfterExitAsync(context, exitCode, CancellationToken.None).ConfigureAwait(false);
-            }
-        });
+            exitCode = await context.ExitTask.ConfigureAwait(false);
+            LogSessionExit(context, exitCode.Value);
+        }
+        finally { await CleanupAfterExitAsync(context, exitCode, CancellationToken.None).ConfigureAwait(false); }
+    }
+
+    private static async Task JoinRuntimeMonitorAsync(SessionContext context)
+    {
+        try { await context.MonitorTask.ConfigureAwait(false); }
+        catch (Exception ex) when (context.Untracked.IsCompleted)
+        {
+            // A later cleanup owner completed every barrier. Retain the original join,
+            // while its earlier failed cleanup cannot make a completed Stop fail forever.
+            LogSessionDebug(context.SessionId, $"Earlier exit cleanup ended; errorClass={ex.GetType().Name}.");
+        }
     }
 
     private static void LogSessionExit(SessionContext context, int exitCode)
@@ -1832,37 +1844,28 @@ internal sealed partial class SessionProcessManager : IDisposable
 
     private async Task TerminateProcessAsync(SessionContext context, CancellationToken cancellationToken)
     {
-        var proc = context.Process;
-        if (proc.HasExited)
+        if (context.ExitTask.IsCompleted)
         {
             await context.ExitTask.ConfigureAwait(false);
             return;
         }
 
-        LogSessionInfo(context.SessionId, $"Stopping pid={proc.Id}...");
+        LogSessionInfo(context.SessionId, $"Stopping pid={context.ProcessId}...");
 
-        await SendSignalAsync(proc.Id, "TERM", cancellationToken).ConfigureAwait(false);
+        context.Signals?.Send(15);
         var completed = await WaitForExitAsync(context.ExitTask, _shutdownGracePeriod, cancellationToken).ConfigureAwait(false);
-        if (!completed && !proc.HasExited)
+        if (!completed && !context.ExitTask.IsCompleted)
         {
             LogSessionWarning(context.SessionId, $"Did not exit after {_shutdownGracePeriod.TotalSeconds:F0}s; killing.");
-            try
-            {
-                proc.Kill(entireProcessTree: true);
-            }
-            catch (Exception ex)
-            {
-                RunnerLog.Error<SessionProcessManager>(ex, $"Failed to kill session '{context.SessionId}' process: {ex.Message}");
-            }
-
-            // Give a short window for the process tree to exit
-            await WaitForExitAsync(context.ExitTask, ExitWaitAfterKill, cancellationToken).ConfigureAwait(false);
+            context.Signals?.Send(9);
+            if (!await WaitForExitAsync(context.ExitTask, ExitWaitAfterKill, cancellationToken).ConfigureAwait(false))
+                throw new InvalidOperationException("The captured session process is still alive after termination.");
         }
     }
 
     private async Task CleanupAfterExitAsync(SessionContext context, int? exitCode, CancellationToken cancellationToken)
     {
-        context.Cancellation.Cancel();
+        _ = context.CancelAsync();
         if (context.StopInProgress)
         {
             return;
@@ -1898,22 +1901,24 @@ internal sealed partial class SessionProcessManager : IDisposable
 
     private async Task CleanupTrackedContextAsync(SessionContext context, CancellationToken cancellationToken)
     {
-        if (!_sessions.TryGetValue(context.SessionId, out var tracked) || !ReferenceEquals(tracked, context))
+        if (!context.TryBeginCleanup(out var completion))
         {
+            await completion.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
             return;
         }
-
-        if (context.TryBeginCleanup())
+        try
         {
-            // Keep the retired context visible until its filesystem cleanup is
-            // finished. Otherwise a same-ID replacement can create a home which
-            // the old cleanup then removes. Removal also compares the exact value.
-            try { await CleanupContextAsync(context, cancellationToken).ConfigureAwait(false); }
-            finally
-            {
-                ((ICollection<KeyValuePair<string, SessionContext>>)_sessions).Remove(new(context.SessionId, context));
-                context.MarkUntracked();
-            }
+            await CleanupContextAsync(context, cancellationToken).ConfigureAwait(false);
+            ((ICollection<KeyValuePair<string, SessionContext>>)_sessions).Remove(new(context.SessionId, context));
+            context.MarkUntracked();
+            completion.TrySetResult();
+        }
+        catch (Exception ex)
+        {
+            context.ResetCleanup(completion);
+            completion.TrySetException(ex);
+            _ = completion.Task.Exception;
+            throw;
         }
     }
 
@@ -1938,13 +1943,36 @@ internal sealed partial class SessionProcessManager : IDisposable
 
     private async Task CleanupContextAsync(SessionContext context, CancellationToken cancellationToken)
     {
-        context.Cancellation.Cancel();
-        try { context.Process.Dispose(); } catch { }
-
-        await CleanupPreparedStartupAsync(context.Identity, context.SessionId).ConfigureAwait(false);
+        if (!context.IdentityRetired)
+        {
+            foreach (var prepared in _preparedIdentities.Where(pair => pair.Value == context.Identity).ToArray())
+                ((ICollection<KeyValuePair<string, PreparedSessionIdentity>>)_preparedIdentities).Remove(prepared);
+            var cancellation = context.CancelAsync();
+            var activityJoin = context.Activity.DisposeAsync().AsTask();
+            try
+            {
+                // Inherited pipe writers must be stopped while the account and its uid are retained.
+                await _sessionIsolationStrategy.StopProcessesAsync(context.Identity, CancellationToken.None).ConfigureAwait(false);
+            }
+            finally
+            {
+                await Task.WhenAll(cancellation, activityJoin, context.Stdout, context.Stderr, context.ActivitySupervisor).ConfigureAwait(false);
+            }
+            context.IdentityRetired = await CleanupPreparedStartupAsync(context.Identity, context.SessionId).ConfigureAwait(false);
+        }
+        else
+        {
+            // Its uid may already belong to another account. Retry only the remaining data.
+            await EnsureTeardownCompleteAsync(context.SessionId).ConfigureAwait(false);
+        }
+        ThrowIfTeardownPending(context.SessionId);
+        context.Signals?.Dispose();
+        context.Process.Dispose();
+        context.Cancellation.Dispose();
     }
 
-    private async Task CleanupPreparedStartupAsync(PreparedSessionIdentity identity, string sessionId)
+    // Reports account retirement separately from pending sealed-data deletion.
+    private async Task<bool> CleanupPreparedStartupAsync(PreparedSessionIdentity identity, string sessionId)
     {
         // Stop authorizing the uid before its processes are killed and the user is removed.
         foreach (var prepared in _preparedIdentities.Where(pair => pair.Value == identity).ToArray())
@@ -1962,7 +1990,7 @@ internal sealed partial class SessionProcessManager : IDisposable
             // so its uid is not handed out again, and Stop stays pending until a retry reaps them.
             RunnerLog.Error<SessionProcessManager>(ex, $"Failed to cleanup isolation for user '{identity.UserName}': {ex.Message}");
             _pendingTeardowns[sessionId] = identity;
-            return;
+            return false;
         }
 
         // The account is gone, and its uid may be handed out again: a retry must never act on
@@ -1974,10 +2002,12 @@ internal sealed partial class SessionProcessManager : IDisposable
             // Plaintext session data is still there: Stop stays pending until a retry removes it,
             // and the reader key is kept until then.
             _pendingSealedDeletes[sessionId] = 0;
-            return;
+            return true;
         }
 
+        _pendingSealedDeletes.TryRemove(sessionId, out _);
         ReleaseTransferSealing(sessionId);
+        return true;
     }
 
     /// <summary>
@@ -2423,39 +2453,16 @@ internal sealed partial class SessionProcessManager : IDisposable
 
     private async Task CleanupUntrackedLaunchAsync(SessionContext context)
     {
-        try
+        context.Publication.TrySetResult(false);
+        if (context.Signals is not null) await TerminateProcessAsync(context, CancellationToken.None).ConfigureAwait(false);
+        else
         {
-            if (!context.Process.HasExited)
-            {
-                context.Process.Kill(entireProcessTree: true);
-                await WaitForExitAsync(context.ExitTask, ExitWaitAfterKill, CancellationToken.None).ConfigureAwait(false);
-            }
+            await _sessionIsolationStrategy.StopProcessesAsync(context.Identity, CancellationToken.None).ConfigureAwait(false);
+            await context.ExitTask.ConfigureAwait(false);
         }
-        catch
-        {
-            // Best effort for failed launch cleanup.
-        }
-        finally
-        {
-            CleanupFailedLaunch(context.Process);
-        }
-
-        try
-        {
-            await CleanupPreparedStartupAsync(context.Identity, context.SessionId).ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            RunnerLog.Error<SessionProcessManager>(ex, $"Failed to cleanup untracked launch for session '{context.SessionId}': {ex.Message}");
-        }
-    }
-
-    private void CleanupFailedLaunch(Process? process)
-    {
-        if (process is not null)
-        {
-            try { process.Dispose(); } catch { }
-        }
+        await CleanupContextAsync(context, CancellationToken.None).ConfigureAwait(false);
+        context.MarkUntracked();
+        await context.MonitorTask.ConfigureAwait(false);
     }
 
     private async Task PrepareSessionVirtualEnvAsync(
@@ -3715,9 +3722,12 @@ internal sealed partial class SessionProcessManager : IDisposable
         private readonly object _stopGate = new();
         private TaskCompletionSource? _stopCompletion;
         private int _stopState;
-        private int _cleanupState;
+        private readonly object _cleanupGate = new();
+        private TaskCompletionSource? _cleanupCompletion;
+        private readonly object _cancelGate = new();
+        private Task? _cancellationTask;
 
-        public SessionContext(string sessionId, RuntimeIdentity runtimeIdentity, PreparedSessionIdentity identity, SessionPaths paths, Process process, Task<int> exitTask)
+        public SessionContext(string sessionId, RuntimeIdentity runtimeIdentity, PreparedSessionIdentity identity, SessionPaths paths, Process process, Task<int> exitTask, RuntimeActivityScope activity)
         {
             SessionId = sessionId;
             RuntimeIdentity = runtimeIdentity;
@@ -3725,6 +3735,7 @@ internal sealed partial class SessionProcessManager : IDisposable
             Paths = paths;
             Process = process;
             ExitTask = exitTask;
+            Activity = activity;
         }
 
         public string SessionId { get; }
@@ -3738,7 +3749,21 @@ internal sealed partial class SessionProcessManager : IDisposable
         public SessionPaths Paths { get; }
         public string HomeDirectory => Paths.HomeDirectory;
         public Process Process { get; }
+        public int ProcessId { get; set; }
         public Task<int> ExitTask { get; }
+        public RuntimeActivityScope Activity { get; }
+        public SessionProcessSignal? Signals { get; set; }
+        public Task Stdout { get; set; } = Task.CompletedTask;
+        public Task Stderr { get; set; } = Task.CompletedTask;
+        public Task ActivitySupervisor { get; set; } = Task.CompletedTask;
+        public Task MonitorTask { get; set; } = Task.CompletedTask;
+        // The cleanup owner sets this only after account retirement succeeds.
+        public bool IdentityRetired { get; set; }
+        public TaskCompletionSource<bool> Publication { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public Task CancelAsync()
+        {
+            lock (_cancelGate) return _cancellationTask ??= Cancellation.CancelAsync();
+        }
         public bool StopInProgress => Volatile.Read(ref _stopState) != 0;
 
         /// <summary>Completes once this context has been removed from tracking.</summary>
@@ -3748,7 +3773,20 @@ internal sealed partial class SessionProcessManager : IDisposable
 
         public void MarkUntracked() => _untracked.TrySetResult();
 
-        public bool TryBeginCleanup() => Interlocked.CompareExchange(ref _cleanupState, 1, 0) == 0;
+        public bool TryBeginCleanup(out TaskCompletionSource completion)
+        {
+            lock (_cleanupGate)
+            {
+                if (_cleanupCompletion is not null) { completion = _cleanupCompletion; return false; }
+                completion = _cleanupCompletion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                return true;
+            }
+        }
+        public void ResetCleanup(TaskCompletionSource completion)
+        {
+            lock (_cleanupGate)
+                if (ReferenceEquals(_cleanupCompletion, completion)) _cleanupCompletion = null;
+        }
 
         /// <summary>
         /// Claims termination for one caller. Later callers receive the in-flight

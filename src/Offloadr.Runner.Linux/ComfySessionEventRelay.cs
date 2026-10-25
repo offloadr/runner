@@ -102,7 +102,10 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
     /// </summary>
     internal event Action<PromptTerminalEvent>? PromptFinished;
 
+    private readonly Action<string, RuntimeIdentity> _observeRuntimeActivity;
+
     public ComfySessionEventRelay(
+        Action<string, RuntimeIdentity> observeRuntimeActivity,
         string runnerId,
         string comfyHost,
         int comfyPort,
@@ -112,6 +115,7 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
         Func<string, Func<Task>>? captureSessionArtifactRefresh = null,
         int queueCapacity = DefaultQueueCapacity)
     {
+        _observeRuntimeActivity = observeRuntimeActivity ?? throw new ArgumentNullException(nameof(observeRuntimeActivity));
         _runnerId = runnerId ?? throw new ArgumentNullException(nameof(runnerId));
         _comfyHost = string.IsNullOrWhiteSpace(comfyHost) ? "127.0.0.1" : comfyHost.Trim();
         _comfyPort = comfyPort;
@@ -843,6 +847,9 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
                             await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "closing", token).ConfigureAwait(false);
                             return;
                         }
+
+                        if (result.Count > 0)
+                            _owner._observeRuntimeActivity(_sessionId, new RuntimeIdentity(_lifecycleGeneration, _runtimeEpoch, _runtimeInstanceId));
 
                         // Session code controls message size: past the cap the rest of the
                         // message is read and discarded instead of buffered.

@@ -26,7 +26,8 @@ internal static class BoundedLineReader
         TextReader reader,
         Action<string> onLine,
         int maxLineChars = DefaultMaxLineChars,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        Action? onData = null)
     {
         ArgumentNullException.ThrowIfNull(reader);
         ArgumentNullException.ThrowIfNull(onLine);
@@ -53,6 +54,9 @@ internal static class BoundedLineReader
             {
                 break;
             }
+
+            if (cancellationToken.IsCancellationRequested) return;
+            onData?.Invoke();
 
             for (var i = 0; i < read; i++)
             {

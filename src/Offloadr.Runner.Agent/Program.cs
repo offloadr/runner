@@ -87,7 +87,10 @@ using var sigtermRegistration = PosixSignalRegistration.Create(PosixSignal.SIGTE
 
 await using var sessionProcessLogRelay = new SessionProcessLogRelay(options.RunnerId, runtimeIdentities);
 await using var sessionRuntimeTelemetryRelay = new SessionRuntimeTelemetryRelay(options.RunnerId, runtimeIdentities);
-using var sessionManager = new SessionProcessManager(options.Session, sessionIsolationStrategy, new RunnerVfsEnvironmentBuilder(), new LinuxCommandRunner(), sessionProcessLogRelay);
+using var activityChannel = GrpcChannelManager.CreateChannel(options.OffloadrApiUrl, options.TraceGrpcHttp);
+var activitySink = new GrpcRuntimeActivitySink(
+    GrpcChannelManager.CreateAuthenticatedControlClient(activityChannel, options.RunnerSecret), options.RunnerId, instanceId);
+await using var sessionManager = new SessionProcessManager(activitySink, options.Session, sessionIsolationStrategy, new RunnerVfsEnvironmentBuilder(), new LinuxCommandRunner(), sessionProcessLogRelay);
 // Before any session starts: users, processes and homes left by a crashed earlier run.
 try
 {
@@ -164,6 +167,7 @@ await using var downloadService = new ModelDownloadService(
     new ModelDestinationPolicy(modelRoots),
     new SessionModelDownloadStaging(options.Session.SessionRoot, options.Aria2.StagingDirectory));
 await using var sessionEventRelay = new ComfySessionEventRelay(
+    sessionManager.SignalRuntimeActivity,
     options.RunnerId,
     sessionManager.ComfyHost,
     sessionManager.ComfyPort,
@@ -308,11 +312,12 @@ finally
 {
     try
     {
-        await sessionManager.StopAllAsync(CancellationToken.None);
+        await sessionManager.DisposeAsync();
     }
     catch (Exception ex)
     {
-        RunnerLog.Error(ex, $"Failed to stop active sessions during shutdown: {ex.Message}");
+        RunnerLog.Error($"Session shutdown failed; errorClass={ex.GetType().Name}.");
+        throw;
     }
 }
 

@@ -169,6 +169,58 @@ public class RuntimeActivityScopeTests
         Assert.That(calls, Is.GreaterThan(0));
     }
 
+    [Test]
+    public async Task ExpiryDecisionDoesNotWaitForAnUncooperativeTransportButDisposalStillJoinsIt()
+    {
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cancelled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource<RuntimeActivityOutcome>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var sink = new RecordingSink(async (_, token) =>
+        {
+            using var registration = token.Register(() => cancelled.TrySetResult());
+            entered.TrySetResult();
+            return await release.Task;
+        });
+        var scope = new RuntimeActivityScope(Observation(), sink, TimeSpan.FromMilliseconds(250));
+        scope.Signal();
+        Task? first = null;
+        Task? second = null;
+        try
+        {
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.That(await scope.Decision.WaitAsync(TimeSpan.FromSeconds(5)), Is.EqualTo(RuntimeActivityDisposition.Expired));
+            await cancelled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            first = scope.DisposeAsync().AsTask();
+            second = scope.DisposeAsync().AsTask();
+            Assert.Multiple(() =>
+            {
+                Assert.That(scope.Completion.IsCompleted, Is.False);
+                Assert.That(first.IsCompleted, Is.False);
+                Assert.That(second.IsCompleted, Is.False);
+            });
+        }
+        finally
+        {
+            release.TrySetResult(RuntimeActivityOutcome.Applied);
+            await Task.WhenAll(first ?? scope.DisposeAsync().AsTask(), second ?? scope.DisposeAsync().AsTask());
+        }
+
+        Assert.That(await scope.Completion, Is.EqualTo(RuntimeActivityDisposition.Expired));
+        Assert.That(scope.Decision.Result, Is.EqualTo(RuntimeActivityDisposition.Expired));
+        Assert.That(sink.Observations, Is.EqualTo(new[] { Observation() }));
+    }
+
+    [Test]
+    public async Task AcceptedDecisionRemainsAcceptedWhenTheOwnerLaterStops()
+    {
+        var sink = new RecordingSink((_, _) => Task.FromResult(RuntimeActivityOutcome.Applied));
+        var scope = new RuntimeActivityScope(Observation(), sink, TimeSpan.FromSeconds(5));
+        scope.Signal();
+        Assert.That(await scope.Decision.WaitAsync(TimeSpan.FromSeconds(5)), Is.EqualTo(RuntimeActivityDisposition.Accepted));
+        await scope.DisposeAsync();
+        Assert.That(await scope.Completion, Is.EqualTo(RuntimeActivityDisposition.Accepted));
+    }
+
     private sealed class RecordingSink(Func<RuntimeActivityObservation, CancellationToken, Task<RuntimeActivityOutcome>> report) : IRuntimeActivitySink
     {
         public List<RuntimeActivityObservation> Observations { get; } = [];

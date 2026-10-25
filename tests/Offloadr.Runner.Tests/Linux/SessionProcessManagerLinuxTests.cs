@@ -178,7 +178,7 @@ public class SessionProcessManagerLinuxTests
             Directory.CreateDirectory(options.BundledCustomNodesSeedPath);
             Directory.CreateDirectory(options.BundledInputSeedPath);
 
-            using var manager = new SessionProcessManager(
+            await using var manager = new SessionProcessManager(TestRuntimeActivitySink.Accepted,
                 options,
                 new NoOpIsolationStrategy(),
                 new RunnerVfsEnvironmentBuilder(),

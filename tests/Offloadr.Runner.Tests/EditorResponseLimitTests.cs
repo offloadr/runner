@@ -48,7 +48,7 @@ public class EditorResponseLimitTests
                 ShutdownGracePeriod = TimeSpan.FromSeconds(1),
                 ReadyTimeout = TimeSpan.FromSeconds(1),
             };
-            using var manager = new SessionProcessManager(
+            await using var manager = new SessionProcessManager(TestRuntimeActivitySink.Accepted,
                 options,
                 new LinuxUserIsolationStrategy(new LinuxCommandRunner()),
                 new RunnerVfsEnvironmentBuilder(),

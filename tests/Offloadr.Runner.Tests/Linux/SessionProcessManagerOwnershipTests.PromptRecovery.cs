@@ -521,7 +521,7 @@ public partial class SessionProcessManagerOwnershipTests
             // This fixture tests process/HTTP fencing, not OS user isolation.
             // Empty UserName inherits the test account; setting even the current
             // name asks .NET to set Unix credentials and requires privileges.
-            var manager = new SessionProcessManager(options,
+            var manager = new SessionProcessManager(TestRuntimeActivitySink.Accepted, options,
                 new RecordingIsolationStrategy(string.Empty, Path.Combine(options.SessionRoot, start.SessionId)) { Cleanup = cleanup },
                 new RunnerVfsEnvironmentBuilder(), new PromptSignalRunner(), httpMessageHandler: http);
             var fixture = new PromptRuntimeFixture(root, manager, http, start);
@@ -531,8 +531,7 @@ public partial class SessionProcessManagerOwnershipTests
 
         public async ValueTask DisposeAsync()
         {
-            await Manager.StopAllAsync(CancellationToken.None);
-            Manager.Dispose();
+            await Manager.DisposeAsync();
             TryDelete(root);
         }
     }

@@ -53,6 +53,11 @@ internal sealed class RuntimeActivityScope : IAsyncDisposable
     private readonly TimeSpan _retryDelay;
     private readonly TaskCompletionSource<long> _observed = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly CancellationTokenSource _stopping = new();
+    private readonly CancellationTokenSource _admission = new();
+    private readonly CancellationTokenRegistration _admissionRegistration;
+    private readonly object _decisionGate = new();
+    private readonly TaskCompletionSource<RuntimeActivityDisposition> _decision = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private long _firstObserved = -1;
     private readonly object _disposeGate = new();
     private readonly Task<RuntimeActivityDisposition> _completion;
     private Task? _disposal;
@@ -76,17 +81,42 @@ internal sealed class RuntimeActivityScope : IAsyncDisposable
         _observation = observation;
         _sink = sink;
         _deliveryBudget = deliveryBudget;
+        _admissionRegistration = _admission.Token.Register(() => Decide(RuntimeActivityDisposition.Expired));
         _completion = DeliverAsync();
     }
 
+    /// <summary>The finite admission decision; does not imply the original transport has ended.</summary>
+    public Task<RuntimeActivityDisposition> Decision => _decision.Task;
+
+    /// <summary>Completes only after the original delivery task has ended.</summary>
     public Task<RuntimeActivityDisposition> Completion => _completion;
 
     // Signal at native observation, before any optional queue, log or parser.
     // The monotonic deadline starts here and is never renewed by a retry.
     public void Signal()
     {
-        if (!_stopping.IsCancellationRequested)
-            _observed.TrySetResult(Stopwatch.GetTimestamp());
+        lock (_decisionGate)
+        {
+            if (_stopping.IsCancellationRequested || _decision.Task.IsCompleted || _firstObserved >= 0) return;
+            _firstObserved = Stopwatch.GetTimestamp();
+            _admission.CancelAfter(_deliveryBudget);
+            _observed.TrySetResult(_firstObserved);
+        }
+    }
+
+    private RuntimeActivityDisposition Decide(RuntimeActivityDisposition disposition)
+    {
+        lock (_decisionGate)
+        {
+            if (_decision.Task.IsCompleted) return _decision.Task.Result;
+            if (_stopping.IsCancellationRequested) disposition = RuntimeActivityDisposition.Cancelled;
+            else if (_firstObserved >= 0 && Stopwatch.GetElapsedTime(_firstObserved) >= _deliveryBudget)
+                disposition = RuntimeActivityDisposition.Expired;
+            _decision.TrySetResult(disposition);
+            if (disposition != RuntimeActivityDisposition.Expired)
+                _admission.CancelAfter(Timeout.InfiniteTimeSpan);
+            return disposition;
+        }
     }
 
     private async Task<RuntimeActivityDisposition> DeliverAsync()
@@ -95,32 +125,31 @@ internal sealed class RuntimeActivityScope : IAsyncDisposable
         {
             var observedAt = await _observed.Task.WaitAsync(_stopping.Token).ConfigureAwait(false);
             var remaining = _deliveryBudget - Stopwatch.GetElapsedTime(observedAt);
-            if (remaining <= TimeSpan.Zero) return RuntimeActivityDisposition.Expired;
-            using var admission = CancellationTokenSource.CreateLinkedTokenSource(_stopping.Token);
-            admission.CancelAfter(remaining);
+            if (remaining <= TimeSpan.Zero) return Decide(RuntimeActivityDisposition.Expired);
+            using var admission = CancellationTokenSource.CreateLinkedTokenSource(_stopping.Token, _admission.Token);
             var delay = _retryDelay;
             while (true)
             {
                 if (admission.IsCancellationRequested)
-                    return _stopping.IsCancellationRequested ? RuntimeActivityDisposition.Cancelled : RuntimeActivityDisposition.Expired;
+                    return Decide(_stopping.IsCancellationRequested ? RuntimeActivityDisposition.Cancelled : RuntimeActivityDisposition.Expired);
                 using var attempt = CancellationTokenSource.CreateLinkedTokenSource(admission.Token);
                 attempt.CancelAfter(_attemptTimeout);
                 try
                 {
                     var outcome = await _sink.ReportAsync(_observation, attempt.Token).ConfigureAwait(false);
-                    if (_stopping.IsCancellationRequested) return RuntimeActivityDisposition.Cancelled;
-                    if (admission.IsCancellationRequested) return RuntimeActivityDisposition.Expired;
+                    if (_stopping.IsCancellationRequested) return Decide(RuntimeActivityDisposition.Cancelled);
+                    if (admission.IsCancellationRequested) return Decide(RuntimeActivityDisposition.Expired);
                     switch (outcome)
                     {
                         case RuntimeActivityOutcome.Applied:
                         case RuntimeActivityOutcome.AlreadyAppliedExactly:
-                            return RuntimeActivityDisposition.Accepted;
+                            return Decide(RuntimeActivityDisposition.Accepted);
                         case RuntimeActivityOutcome.ObsoleteOrPreempted:
-                            return RuntimeActivityDisposition.Retired;
+                            return Decide(RuntimeActivityDisposition.Retired);
                         case RuntimeActivityOutcome.NotReady:
                             break;
                         default:
-                            return RuntimeActivityDisposition.Rejected;
+                            return Decide(RuntimeActivityDisposition.Rejected);
                     }
                 }
                 catch (OperationCanceledException) when (attempt.IsCancellationRequested)
@@ -134,7 +163,7 @@ internal sealed class RuntimeActivityScope : IAsyncDisposable
                 catch (Exception exception)
                 {
                     RunnerLog.Warning<RuntimeActivityScope>($"Runtime activity rejected; errorClass={exception.GetType().Name}.");
-                    return _stopping.IsCancellationRequested ? RuntimeActivityDisposition.Cancelled : RuntimeActivityDisposition.Rejected;
+                    return Decide(_stopping.IsCancellationRequested ? RuntimeActivityDisposition.Cancelled : RuntimeActivityDisposition.Rejected);
                 }
 
                 await Task.Delay(delay, admission.Token).ConfigureAwait(false);
@@ -143,7 +172,7 @@ internal sealed class RuntimeActivityScope : IAsyncDisposable
         }
         catch (OperationCanceledException)
         {
-            return _stopping.IsCancellationRequested ? RuntimeActivityDisposition.Cancelled : RuntimeActivityDisposition.Expired;
+            return Decide(_stopping.IsCancellationRequested ? RuntimeActivityDisposition.Cancelled : RuntimeActivityDisposition.Expired);
         }
     }
 
@@ -161,12 +190,19 @@ internal sealed class RuntimeActivityScope : IAsyncDisposable
     {
         try
         {
-            await _stopping.CancelAsync().ConfigureAwait(false);
+            var cancellation = _stopping.CancelAsync();
+            Decide(RuntimeActivityDisposition.Cancelled);
+            await cancellation.ConfigureAwait(false);
         }
         finally
         {
             try { await _completion.ConfigureAwait(false); }
-            finally { _stopping.Dispose(); }
+            finally
+            {
+                _admissionRegistration.Dispose();
+                _admission.Dispose();
+                _stopping.Dispose();
+            }
         }
     }
 }

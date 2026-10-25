@@ -34,7 +34,7 @@ public partial class SessionProcessManagerOwnershipTests
                     await release.Task;
                 }
             };
-            using var manager = new SessionProcessManager(options, isolation, new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
+            await using var manager = new SessionProcessManager(TestRuntimeActivitySink.Accepted, options, isolation, new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
             var sync = manager.RunManagerUvSyncOnceAsync("sync-lifetime", identity, paths, stopping.Token);
             try
             {
@@ -112,7 +112,7 @@ public partial class SessionProcessManagerOwnershipTests
             {
                 Quiesce = () => throw new InvalidOperationException("controlled surviving process")
             };
-            using var manager = new SessionProcessManager(options, isolation, new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
+            await using var manager = new SessionProcessManager(TestRuntimeActivitySink.Accepted, options, isolation, new RunnerVfsEnvironmentBuilder(), new RecordingCommandRunner(string.Empty));
 
             Assert.That(async () => await manager.RunManagerUvSyncOnceAsync("sync-reap-failure", identity, paths, CancellationToken.None),
                 Throws.InvalidOperationException.With.Message.EqualTo("controlled surviving process"));

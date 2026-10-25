@@ -17,11 +17,21 @@ Disposal cancels and joins the original delivery task, including an uncooperativ
 attempt that has not yet returned. The process lifetime must consume rejection
 or expiry and stop only its captured child.
 
-These primitives are not yet wired into process launch, output pumps or bridge
-observations. The independent channel, process/reader/monitor/root joins and
-retirement of activity authority from diagnostic routes still require coordinated
-integration and qualification. No native, GPU, deployment or release completion
-follows from this source preparation.
+The session manager captures this scope and the original transfer-sealing flags
+before starting readers. The first nonempty read signals it before line buffering;
+a bridge data frame signals only its matching current runtime before size limits,
+parsing, suppression or optional enqueueing. Program owns a separate physical
+channel, using the same runner-secret interceptor factory as the other control
+lanes, and joins the asynchronous session manager before disposing the channel.
+The existing ready timeout bounds activity admission from its first observation;
+it remains separate from the physical readiness clock, heartbeat and prompt authority.
+
+Admission has a separate decision and original-transport completion. Expiry can
+stop the captured child while an uncooperative call remains pending, but cleanup
+still cancels and joins that call. An accepted decision remains immutable during
+later Stop. The candidate still requires native account/descendant, actual wire,
+GPU and release qualification, plus coordinated retirement of diagnostic activity
+authority. Source wiring alone proves none of those acceptance gates.
 
 ## Process retirement preparation
 
@@ -37,9 +47,18 @@ The bounded output reader passes cancellation to its original read and discards
 late output after cancellation. Its returned task still owns that read until
 it ends; callers must join it rather than cancel only a waiting wrapper. These
 operations prepare the required order: stop writers, join readers and activity,
-then retire the account, data and keys. The session manager has not yet been
-converted to that complete lifetime, including inherited pipe writers and root
-shutdown. The prepared operations alone do not prove that order at runtime.
+then retire the account, data and keys. The manager retains pending starts and
+exit monitors, rejects starts during Stop/shutdown, and coalesces cleanup so a
+concurrent caller waits for its owner. Stop joins the captured monitor; that
+monitor never joins itself. Shutdown cancels and joins original starts, stops
+and monitors before releasing dependencies. Once the account is retired, a
+failed sealed-data deletion retains its key and pending context; retries remove
+the remaining data without reaping or retiring that uid again. A pinned Linux
+pidfd targets the
+original child for TERM/KILL, with no numeric-pid fallback. Kernels and container
+policies must allow pidfd_open and pidfd_send_signal. Real account/descendant
+teardown, publication failures, all sidecar owners and deployed kernels still
+require qualification; controlled process tests alone cannot establish them.
 
 The prelaunch dependency-sync helper uses the process-only phase before waiting
 for output EOF. Its success, failure and cancellation paths join the original

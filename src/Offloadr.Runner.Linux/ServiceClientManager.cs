@@ -8,7 +8,6 @@ using Offloadr.EditorRuntime.V1;
 using Google.Protobuf;
 using Google.Protobuf.WellKnownTypes;
 using Grpc.Core;
-using Grpc.Core.Interceptors;
 using Grpc.Net.Client;
 
 namespace Offloadr.Runner.Linux;
@@ -964,10 +963,10 @@ internal static class ServiceClientManager
         using var sessionEventChannel = GrpcChannelManager.CreateChannel(offloadrApiUrl, traceHttp);
         using var opsChannel = GrpcChannelManager.CreateChannel(offloadrApiUrl, traceHttp);
 
-        var statusClient = CreateAuthenticatedClient(statusChannel, runnerSecret);
-        var commandClient = CreateAuthenticatedClient(commandChannel, runnerSecret);
-        var sessionEventClient = CreateAuthenticatedClient(sessionEventChannel, runnerSecret);
-        var opsClient = CreateAuthenticatedClient(opsChannel, runnerSecret);
+        var statusClient = GrpcChannelManager.CreateAuthenticatedControlClient(statusChannel, runnerSecret);
+        var commandClient = GrpcChannelManager.CreateAuthenticatedControlClient(commandChannel, runnerSecret);
+        var sessionEventClient = GrpcChannelManager.CreateAuthenticatedControlClient(sessionEventChannel, runnerSecret);
+        var opsClient = GrpcChannelManager.CreateAuthenticatedControlClient(opsChannel, runnerSecret);
 
         await using var sessionSink = new GrpcRunnerControlSink(
             statusClient,
@@ -4128,14 +4127,6 @@ internal static class ServiceClientManager
             request.SelectionHashes.AddRange(snapshot.SelectionHashes);
         }
         return request;
-    }
-
-    private static RunnerControlService.RunnerControlServiceClient CreateAuthenticatedClient(
-        GrpcChannel channel,
-        string runnerSecret)
-    {
-        var callInvoker = channel.Intercept(new RunnerSecretClientInterceptor(runnerSecret));
-        return new RunnerControlService.RunnerControlServiceClient(callInvoker);
     }
 
     private sealed class RunnerSessionRejectedException(string message)
