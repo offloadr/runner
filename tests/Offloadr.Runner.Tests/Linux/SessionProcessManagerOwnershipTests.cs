@@ -1695,6 +1695,9 @@ public partial class SessionProcessManagerOwnershipTests
             return Task.FromResult(new PreparedSessionIdentity(userName, homeDirectory, CleanupIdentity: true));
         }
 
+        public Task StopProcessesAsync(PreparedSessionIdentity identity, CancellationToken cancellationToken)
+            => Task.CompletedTask;
+
         public Task CleanupAsync(PreparedSessionIdentity identity, CancellationToken cancellationToken)
         {
             CleanupCallCount++;

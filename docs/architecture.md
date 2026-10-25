@@ -23,6 +23,24 @@ retirement of activity authority from diagnostic routes still require coordinate
 integration and qualification. No native, GPU, deployment or release completion
 follows from this source preparation.
 
+## Process retirement preparation
+
+The isolation strategy exposes a process-only quiescence phase. It reaps the
+session's processes while retaining its account, home, shared residue and IPC.
+Final cleanup repeats the ownership check and reaping before removing data and
+the account. Both phases resolve the current account uid, reject a changed,
+root or invalid uid, and avoid acting on a remembered uid when the account is
+already gone. This does not protect against arbitrary concurrent host-root
+account changes.
+
+The bounded output reader passes cancellation to its original read and discards
+late output after cancellation. Its returned task still owns that read until
+it ends; callers must join it rather than cancel only a waiting wrapper. These
+operations prepare the required order: stop writers, join readers and activity,
+then retire the account, data and keys. The session manager has not yet been
+converted to that complete lifetime, including inherited pipe writers and root
+shutdown. The prepared operations alone do not prove that order at runtime.
+
 ## Expired prompt receipts
 
 Prompt execution permission includes explicit content availability. An expired

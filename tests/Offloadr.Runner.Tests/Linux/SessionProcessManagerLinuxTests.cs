@@ -220,6 +220,9 @@ public class SessionProcessManagerLinuxTests
         public Task<PreparedSessionIdentity> PrepareAsync(string sessionId, string sessionRoot, CancellationToken cancellationToken)
             => throw new NotSupportedException();
 
+        public Task StopProcessesAsync(PreparedSessionIdentity identity, CancellationToken cancellationToken)
+            => Task.CompletedTask;
+
         public Task CleanupAsync(PreparedSessionIdentity identity, CancellationToken cancellationToken)
             => Task.CompletedTask;
     }

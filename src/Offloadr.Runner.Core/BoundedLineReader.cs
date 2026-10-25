@@ -18,9 +18,15 @@ internal static class BoundedLineReader
     /// <summary>
     /// Delivers each line of <paramref name="reader"/> to <paramref name="onLine"/> until end of
     /// stream. '\n', '\r' and "\r\n" end a line, as with <see cref="TextReader.ReadLine"/>.
-    /// The returned task completes when the stream ends or is closed and never faults.
+    /// Cancellation is passed to the original read. The caller must still join the returned
+    /// task: a reader that ignores cancellation can keep it pending until that read ends.
+    /// Stream closure and cancellation discard an unfinished line and do not fault the pump.
     /// </summary>
-    public static async Task PumpAsync(TextReader reader, Action<string> onLine, int maxLineChars = DefaultMaxLineChars)
+    public static async Task PumpAsync(
+        TextReader reader,
+        Action<string> onLine,
+        int maxLineChars = DefaultMaxLineChars,
+        CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(reader);
         ArgumentNullException.ThrowIfNull(onLine);
@@ -31,16 +37,16 @@ internal static class BoundedLineReader
         var continued = false;
         var previousWasCarriageReturn = false;
 
-        while (true)
+        while (!cancellationToken.IsCancellationRequested)
         {
             int read;
             try
             {
-                read = await reader.ReadAsync(buffer.AsMemory()).ConfigureAwait(false);
+                read = await reader.ReadAsync(buffer.AsMemory(), cancellationToken).ConfigureAwait(false);
             }
             catch (Exception ex) when (ex is IOException or ObjectDisposedException or OperationCanceledException)
             {
-                break;
+                return;
             }
 
             if (read == 0)
@@ -50,6 +56,11 @@ internal static class BoundedLineReader
 
             for (var i = 0; i < read; i++)
             {
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    return;
+                }
+
                 var c = buffer[i];
                 if (c == '\n' && previousWasCarriageReturn)
                 {
@@ -78,7 +89,7 @@ internal static class BoundedLineReader
             }
         }
 
-        if (line.Length > 0)
+        if (!cancellationToken.IsCancellationRequested && line.Length > 0)
         {
             Deliver(line, continued, onLine);
         }

@@ -112,6 +112,89 @@ public class BoundedLineReaderTests
         Assert.That(calls, Is.EqualTo(2));
     }
 
+    [Test]
+    public async Task PumpAsync_PreCancelledTokenDoesNotReadOrDeliver()
+    {
+        using var stopping = new CancellationTokenSource();
+        stopping.Cancel();
+        var reader = new HeldReader();
+        var lines = new List<string>();
+
+        await BoundedLineReader.PumpAsync(reader, lines.Add, cancellationToken: stopping.Token);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(reader.Entered.Task.IsCompleted, Is.False);
+            Assert.That(lines, Is.Empty);
+        });
+    }
+
+    [Test]
+    public async Task PumpAsync_CancellationFromConsumerDiscardsRemainingBufferedLines()
+    {
+        using var stopping = new CancellationTokenSource();
+        var lines = new List<string>();
+
+        await BoundedLineReader.PumpAsync(new StringReader("first\nsecond\npartial"), line =>
+        {
+            lines.Add(line);
+            stopping.Cancel();
+        }, cancellationToken: stopping.Token);
+
+        Assert.That(lines, Is.EqualTo(new[] { "first" }));
+    }
+
+    [Test]
+    public async Task PumpAsync_CancellationJoinsTheOriginalReadAndDiscardsItsLateOutput()
+    {
+        using var stopping = new CancellationTokenSource();
+        var reader = new HeldReader();
+        var lines = new List<string>();
+        var pump = BoundedLineReader.PumpAsync(reader, lines.Add, cancellationToken: stopping.Token);
+        try
+        {
+            await reader.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await stopping.CancelAsync();
+            await reader.Cancelled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(pump.IsCompleted, Is.False, "cancelling a wait must not abandon the original read");
+                Assert.That(reader.Returned.Task.IsCompleted, Is.False);
+            });
+        }
+        finally
+        {
+            reader.Release.TrySetResult();
+            await pump.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(reader.Returned.Task.IsCompletedSuccessfully, Is.True);
+            Assert.That(lines, Is.Empty);
+        });
+    }
+
+    private sealed class HeldReader : TextReader
+    {
+        public TaskCompletionSource Entered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource Cancelled { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource Returned { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public override async ValueTask<int> ReadAsync(Memory<char> buffer, CancellationToken cancellationToken = default)
+        {
+            using var registration = cancellationToken.Register(() => Cancelled.TrySetResult());
+            Entered.TrySetResult();
+            // Deliberately ignore cancellation until the producer is released.
+            await Release.Task;
+            "late\n".AsMemory().CopyTo(buffer);
+            Returned.TrySetResult();
+            return 5;
+        }
+    }
+
     private sealed class ChunkedReader : TextReader
     {
         private readonly Channel<string> _chunks = Channel.CreateUnbounded<string>();

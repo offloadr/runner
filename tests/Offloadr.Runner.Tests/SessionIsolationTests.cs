@@ -2,7 +2,7 @@ using System.Collections.Concurrent;
 
 namespace Offloadr.Runner.Tests;
 
-public class SessionIsolationTests
+public partial class SessionIsolationTests
 {
     private const string SessionId = "6f1c2d3e-4b5a-4c6d-8e7f-a0b1c2d3e4f5";
 
