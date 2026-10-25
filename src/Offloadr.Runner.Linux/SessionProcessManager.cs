@@ -460,11 +460,14 @@ internal sealed partial class SessionProcessManager : IAsyncDisposable
         }
 
         _ = context.CancelAsync();
+        var quiesced = false;
         var beforeCleanupCompleted = false;
         var cleanedUp = false;
         try
         {
             await TerminateProcessAsync(context, CancellationToken.None).ConfigureAwait(false);
+            await QuiesceContextAsync(context).ConfigureAwait(false);
+            quiesced = true;
             if (beforeCleanup is not null)
             {
                 await beforeCleanup(sessionId, cancellationToken).ConfigureAwait(false);
@@ -487,7 +490,7 @@ internal sealed partial class SessionProcessManager : IAsyncDisposable
             {
                 // After its cleanup the process handle is disposed; what is left is retried as a
                 // pending teardown by the next Stop.
-                if (!cleanedUp && context.ExitTask.IsCompleted)
+                if (!cleanedUp && quiesced && context.ExitTask.IsCompleted)
                 {
                     if (!beforeCleanupCompleted)
                     {
@@ -1871,6 +1874,7 @@ internal sealed partial class SessionProcessManager : IAsyncDisposable
             return;
         }
 
+        await QuiesceContextAsync(context).ConfigureAwait(false);
         await RunBestEffortUnexpectedExitCleanupAsync(context.SessionId, context.RuntimeIdentity, exitCode, cancellationToken).ConfigureAwait(false);
         await CleanupTrackedContextAsync(context, cancellationToken).ConfigureAwait(false);
     }
@@ -1941,23 +1945,46 @@ internal sealed partial class SessionProcessManager : IAsyncDisposable
         }
     }
 
-    private async Task CleanupContextAsync(SessionContext context, CancellationToken cancellationToken)
+    private async Task QuiesceContextAsync(SessionContext context)
     {
-        if (!context.IdentityRetired)
+        if (context.IdentityRetired) return;
+        if (!context.TryBeginQuiescence(out var completion))
         {
-            foreach (var prepared in _preparedIdentities.Where(pair => pair.Value == context.Identity).ToArray())
-                ((ICollection<KeyValuePair<string, PreparedSessionIdentity>>)_preparedIdentities).Remove(prepared);
+            await completion.Task.ConfigureAwait(false);
+            return;
+        }
+        try
+        {
             var cancellation = context.CancelAsync();
             var activityJoin = context.Activity.DisposeAsync().AsTask();
             try
             {
-                // Inherited pipe writers must be stopped while the account and its uid are retained.
+                // No descendant may write while sidecars take their final snapshot.
+                // Retain the account, uid and data until those sidecars have joined.
                 await _sessionIsolationStrategy.StopProcessesAsync(context.Identity, CancellationToken.None).ConfigureAwait(false);
             }
             finally
             {
                 await Task.WhenAll(cancellation, activityJoin, context.Stdout, context.Stderr, context.ActivitySupervisor).ConfigureAwait(false);
             }
+            completion.TrySetResult();
+        }
+        catch (Exception error)
+        {
+            context.ResetQuiescence(completion);
+            completion.TrySetException(error);
+            _ = completion.Task.Exception;
+            throw;
+        }
+    }
+
+    private async Task CleanupContextAsync(SessionContext context, CancellationToken cancellationToken)
+    {
+        if (!context.IdentityRetired)
+        {
+            foreach (var prepared in _preparedIdentities.Where(pair => pair.Value == context.Identity).ToArray())
+                ((ICollection<KeyValuePair<string, PreparedSessionIdentity>>)_preparedIdentities).Remove(prepared);
+            await QuiesceContextAsync(context).ConfigureAwait(false);
             context.IdentityRetired = await CleanupPreparedStartupAsync(context.Identity, context.SessionId).ConfigureAwait(false);
         }
         else
@@ -3724,6 +3751,8 @@ internal sealed partial class SessionProcessManager : IAsyncDisposable
         private int _stopState;
         private readonly object _cleanupGate = new();
         private TaskCompletionSource? _cleanupCompletion;
+        private readonly object _quiescenceGate = new();
+        private TaskCompletionSource? _quiescenceCompletion;
         private readonly object _cancelGate = new();
         private Task? _cancellationTask;
 
@@ -3772,6 +3801,21 @@ internal sealed partial class SessionProcessManager : IAsyncDisposable
         private readonly TaskCompletionSource _untracked = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public void MarkUntracked() => _untracked.TrySetResult();
+
+        public bool TryBeginQuiescence(out TaskCompletionSource completion)
+        {
+            lock (_quiescenceGate)
+            {
+                if (_quiescenceCompletion is not null) { completion = _quiescenceCompletion; return false; }
+                completion = _quiescenceCompletion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                return true;
+            }
+        }
+        public void ResetQuiescence(TaskCompletionSource completion)
+        {
+            lock (_quiescenceGate)
+                if (ReferenceEquals(_quiescenceCompletion, completion)) _quiescenceCompletion = null;
+        }
 
         public bool TryBeginCleanup(out TaskCompletionSource completion)
         {

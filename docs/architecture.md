@@ -129,6 +129,11 @@ authority. Source wiring alone proves none of those acceptance gates.
 
 The isolation strategy exposes a process-only quiescence phase. It reaps the
 session's processes while retaining its account, home, shared residue and IPC.
+For a tracked runtime, both Stop and unexpected exit join one context-owned
+quiescence operation before invoking the final sidecar snapshot hook. The account
+and data remain available to that hook. A failed quiescence skips the hook and
+retirement, retains the context, and allows a later retry; successful quiescence
+is reused by final cleanup rather than starting a concurrent reaper.
 Final cleanup repeats the ownership check and reaping before removing data and
 the account. Both phases resolve the current account uid, reject a changed,
 root or invalid uid, and avoid acting on a remembered uid when the account is
