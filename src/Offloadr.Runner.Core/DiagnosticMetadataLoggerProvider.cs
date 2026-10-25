@@ -15,7 +15,7 @@ internal sealed class DiagnosticMetadataLoggerProvider(Action<string> write, Tim
 
     public void Dispose() { }
 
-    private void Write(string component, LogLevel level, Exception? error)
+    private void Write(string component, LogLevel level, EventId eventId, Exception? error)
     {
         var severity = level switch
         {
@@ -43,7 +43,10 @@ internal sealed class DiagnosticMetadataLoggerProvider(Action<string> write, Tim
         var timestamp = _clock.GetUtcNow().ToString("O", CultureInfo.InvariantCulture);
         try
         {
-            write($"{timestamp} severity={severity} component={component} errorClass={errorClass}");
+            var startup = component == "agent" && eventId.Id == RunnerDiagnosticEvents.StartupValidationFailed.Id
+                ? " event=startup-validation-failed Runner startup validation failed."
+                : string.Empty;
+            write($"{timestamp} severity={severity} component={component} errorClass={errorClass}{startup}");
         }
         catch (Exception ex) when (ex is IOException or ObjectDisposedException or UnauthorizedAccessException)
         {
@@ -75,6 +78,11 @@ internal sealed class DiagnosticMetadataLoggerProvider(Action<string> write, Tim
         public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
         public bool IsEnabled(LogLevel level) => level is >= LogLevel.Information and <= LogLevel.Critical;
         public void Log<TState>(LogLevel level, EventId eventId, TState state, Exception? error, Func<TState, Exception?, string> formatter)
-            => provider.Write(component, level, error);
+            => provider.Write(component, level, eventId, error);
     }
+}
+
+internal static class RunnerDiagnosticEvents
+{
+    public static readonly EventId StartupValidationFailed = new(9001);
 }

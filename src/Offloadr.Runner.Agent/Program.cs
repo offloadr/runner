@@ -48,7 +48,8 @@ static async Task<int> RunAgentAsync()
     catch (Exception ex)
     {
         // Exit non-zero so supervisors and restart policies see a failed start.
-        RunnerLog.Error(ex.Message);
+        loggerFactory.CreateLogger("RunnerAgent").LogError(
+            RunnerDiagnosticEvents.StartupValidationFailed, ex, "Runner startup validation failed.");
         return 1;
     }
 

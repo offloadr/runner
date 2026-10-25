@@ -22,6 +22,19 @@ public sealed class DiagnosticMetadataProjectionTests
         Assert.That(lines[0], Does.Not.Contain("synthetic-private"));
     }
 
+    [Test]
+    public void StartupValidationRetainsItsFixedDiagnosticWithoutExceptionText()
+    {
+        var lines = new List<string>();
+        using var provider = new DiagnosticMetadataLoggerProvider(lines.Add);
+        provider.CreateLogger("RunnerAgent").Log(LogLevel.Error,
+            new EventId(RunnerDiagnosticEvents.StartupValidationFailed.Id, "synthetic-private-event"),
+            new DangerousState(), new DangerousException(), (_, _) => throw new InvalidOperationException());
+        Assert.That(lines, Has.Count.EqualTo(1));
+        Assert.That(lines[0], Does.Contain("event=startup-validation-failed Runner startup validation failed."));
+        Assert.That(lines[0], Does.Not.Contain("synthetic-private"));
+    }
+
     [TestCase(LogLevel.Trace)]
     [TestCase(LogLevel.Debug)]
     [TestCase(LogLevel.None)]
