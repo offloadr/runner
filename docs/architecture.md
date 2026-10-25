@@ -1,5 +1,28 @@
 # Architecture
 
+## Runtime activity delivery preparation
+
+The required activity report carries only captured process/runtime identity and
+three sealing flags. Its transport constructs a fresh request for each attempt
+and requires an accepted server timestamp for success. No output line, prompt,
+result, exception detail or client timestamp belongs to this fact.
+
+The process-scoped delivery primitive latches the first observation before
+optional work. Concurrent signals share one fact. Transient transport failures
+and NotReady retry the original values with capped backoff; exact success ends
+delivery, while retired, invalid, conflicting or unknown outcomes fail closed.
+Each attempt has a finite deadline. A separate finite admission budget starts at
+the first observation using a monotonic clock and is never renewed by retries.
+Disposal cancels and joins the original delivery task, including an uncooperative
+attempt that has not yet returned. The process lifetime must consume rejection
+or expiry and stop only its captured child.
+
+These primitives are not yet wired into process launch, output pumps or bridge
+observations. The independent channel, process/reader/monitor/root joins and
+retirement of activity authority from diagnostic routes still require coordinated
+integration and qualification. No native, GPU, deployment or release completion
+follows from this source preparation.
+
 ## Expired prompt receipts
 
 Prompt execution permission includes explicit content availability. An expired
