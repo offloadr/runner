@@ -3,7 +3,7 @@ using Offloadr.Runner.V1;
 
 namespace Offloadr.Runner.Tests;
 
-public sealed class PromptCommandWorkSetTests
+public sealed partial class PromptCommandWorkSetTests
 {
     [Test]
     public async Task HeldModelDemandDoesNotRetainCompletedCommandOrPromptBody()

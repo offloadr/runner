@@ -123,6 +123,20 @@ its cancellation/settling tasks. It does not retain the command or prompt body.
 Queue probes capture only the queue reader, session/runtime and accepted prompt
 ID, independently from the command callback's closure.
 
+Prompt work retains the original execution and held-demand release tasks. Task
+publication only wakes joiners, which then await those originals. Stop closes
+matching admission until its join ends, requests each physical/demand cancellation
+outside the admission lock, and joins the original cancellation callbacks even
+when one fails. Concurrent Stops share those original callback tasks. A demand
+handoff during Stop and a held demand replaced by recovery both remain owned.
+Execution drops its command and callback references before joining cleanup, so a
+held cancellation callback need not retain completed prompt content. Once settling
+ends, the registry drops that task reference as well, since a faulted task can
+retain arbitrary exception data. Host shutdown
+refuses new work; interrupt still preserves queued demand until terminal withdrawal
+or Stop. Controlled task/reference tests do not establish native queue cancellation,
+transport delivery, complete data deletion or physical memory erasure.
+
 An accepted prompt keeps model demand while queued or while its queue cannot be
 read. Terminal withdrawal, Stop, replacement and shutdown keep their existing
 ownership and joining rules. This change releases these runner-owned references;
