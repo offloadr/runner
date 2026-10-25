@@ -33,6 +33,7 @@ internal static partial class ServiceClientManager
             public Key Key { get; }
             public CancellationToken Token => _cancellation.Token;
             public bool IsCompleted => Volatile.Read(ref _completion)?.IsCompleted == true;
+            public bool CleanupFailed { get; private set; }
             public void RequestCancellation() => _ = _cancellation.RequestAsync();
 
             public ValueTask DisposeAsync()
@@ -65,10 +66,16 @@ internal static partial class ServiceClientManager
                 {
                     await _cancellation.CompleteAsync().ConfigureAwait(false);
                     if (_cancellation.CallbackFailed)
-                        _owner.NoteFailure(new InvalidOperationException("Transient cancellation callback failed."));
+                        NoteFailure(new InvalidOperationException("Transient cancellation callback failed."));
                 }
-                catch (Exception error) { _owner.NoteFailure(error); }
+                catch (Exception error) { NoteFailure(error); }
                 finally { _owner.Release(this); }
+            }
+
+            private void NoteFailure(Exception error)
+            {
+                CleanupFailed = true;
+                TransientCancellationRegistry.ReportFailure(error);
             }
         }
 
@@ -87,7 +94,6 @@ internal static partial class ServiceClientManager
         private readonly HashSet<Drain> _blocks = [];
         private Task? _close;
         private bool _closed;
-        private bool _failed;
 
         public int Count { get { lock (_gate) return _entries.Count; } }
 
@@ -99,7 +105,7 @@ internal static partial class ServiceClientManager
             {
                 // Retain original completion roots until they actually finish,
                 // even after removal from the active runtime map.
-                _owned.RemoveWhere(lease => lease.IsCompleted);
+                _owned.RemoveWhere(lease => lease.IsCompleted && !lease.CleanupFailed);
                 if (_closed || shutdown.IsCancellationRequested || _blocks.Any(drain => drain.Scope.Matches(key)))
                     throw new OperationCanceledException("Transient request admission is closed.", shutdown);
                 var lease = new Lease(this, key, shutdown);
@@ -123,7 +129,7 @@ internal static partial class ServiceClientManager
         {
             // Caller holds _gate. Already retired leases remain owned and must
             // also be signalled and joined by a later Stop or host shutdown.
-            _owned.RemoveWhere(lease => lease.IsCompleted);
+            _owned.RemoveWhere(lease => lease.IsCompleted && !lease.CleanupFailed);
             foreach (var key in _entries.Keys.Where(scope.Matches).ToArray()) _entries.Remove(key);
             return _owned.Where(lease => scope.Matches(lease.Key)).ToArray();
         }
@@ -154,12 +160,19 @@ internal static partial class ServiceClientManager
 
         private async Task JoinAsync(Lease[] leases)
         {
-            await Task.WhenAll(leases.Select(lease => lease.JoinAsync())).ConfigureAwait(false);
-            lock (_gate)
+            bool failed;
+            try
             {
-                _owned.RemoveWhere(lease => lease.IsCompleted);
-                if (_failed) throw new InvalidOperationException("Transient request cleanup failed.");
+                await Task.WhenAll(leases.Select(lease => lease.JoinAsync())).ConfigureAwait(false);
+                failed = leases.Any(lease => lease.CleanupFailed);
             }
+            finally
+            {
+                // These original roots have ended. Each capturing drain observes
+                // their outcome; a later cleanup attempt may proceed without them.
+                lock (_gate) foreach (var lease in leases) _owned.Remove(lease);
+            }
+            if (failed) throw new InvalidOperationException("Transient request cleanup failed.");
         }
 
         private void Release(Lease lease)
@@ -171,9 +184,8 @@ internal static partial class ServiceClientManager
             }
         }
 
-        private void NoteFailure(Exception error)
+        private static void ReportFailure(Exception error)
         {
-            lock (_gate) _failed = true;
             RunnerLog.Warning(nameof(TransientCancellationRegistry), $"Request cleanup failed; errorClass={error.GetType().Name}.");
         }
 

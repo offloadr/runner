@@ -264,8 +264,10 @@ Each admitted transient request owns its cancellation source and the original
 callback task until its physical execution and asynchronous lease completion
 finish. Cancellation retires matching active entries without dropping these
 owners. A failed or held callback cannot skip cancellation of other requests;
-the registry retains callback failure after completion, so Stop cannot acknowledge
-cleanup success and quiesce reports failure when a request callback fails.
+the affected request retains callback failure after completion, so its capturing
+drain makes Stop fail and quiesce report failure. A completed failed request stays
+owned until a matching drain observes it. That drain joins and consumes only its
+captured roots; unrelated sessions and later teardown attempts remain usable.
 Callback failures are observed with class-only diagnostics. Registry shutdown
 closes admission and joins current and retired original completion roots.
 
