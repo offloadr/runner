@@ -548,35 +548,68 @@ static int read_exact(int fd, void *buffer, size_t length) {
 }
 
 /*
- * A request's socket is close-on-exec, and tracked while the request is in flight so a fork
- * child that keeps running without exec closes its copy too. Either way the fetch service sees
- * the hangup when the requesting process abandons a request, which cancels its demand and
- * releases a lease it could not deliver. Slots hold the descriptor plus one; a socket leaves its
- * slot before it is closed, so a child never closes a number the parent has already reused.
+ * A request's socket is close-on-exec, and a fork child that keeps running without exec closes
+ * its copies of in-flight requests, so the fetch service sees the hangup when the requesting
+ * process abandons a request: that cancels its demand and releases a lease it could not deliver.
+ * The child asks the kernel rather than a table the parent kept, which a request opening or
+ * closing its socket at the instant of fork could leave behind: it lists its own descriptors
+ * and closes each socket whose peer is the fetch service. Raw syscalls and a stack buffer keep
+ * this async-signal-safe. Without /proc, close-on-exec still covers children that exec.
  */
-#define VFS_TRACKED_IPC_SOCKETS 64
-static int ipc_socket_slots[VFS_TRACKED_IPC_SOCKETS];
+static char fetch_service_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
+static int fetch_service_used = 0;
 
-static int track_ipc_socket(int socket_fd) {
-    for (int slot = 0; slot < VFS_TRACKED_IPC_SOCKETS; slot++) {
-        int empty = 0;
-        if (__atomic_compare_exchange_n(
-                &ipc_socket_slots[slot], &empty, socket_fd + 1, 0,
-                __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) return slot;
-    }
-    return -1;
+static void remember_fetch_service(const char *socket_path) {
+    if (__atomic_load_n(&fetch_service_used, __ATOMIC_ACQUIRE)) return;
+    snprintf(fetch_service_path, sizeof(fetch_service_path), "%s", socket_path);
+    __atomic_store_n(&fetch_service_used, 1, __ATOMIC_RELEASE);
 }
 
-static void close_ipc_socket(int slot, int socket_fd) {
-    if (slot >= 0) __atomic_store_n(&ipc_socket_slots[slot], 0, __ATOMIC_RELEASE);
-    syscall(SYS_close, socket_fd);
+static int descriptor_is_fetch_connection(int fd) {
+    struct stat status;
+    if (fstat(fd, &status) != 0 || !S_ISSOCK(status.st_mode)) return 0;
+    struct sockaddr_un peer;
+    memset(&peer, 0, sizeof(peer));
+    socklen_t length = sizeof(peer);
+    if (getpeername(fd, (struct sockaddr *)&peer, &length) != 0 || peer.sun_family != AF_UNIX) {
+        return 0;
+    }
+    size_t path_length = length > offsetof(struct sockaddr_un, sun_path)
+        ? length - offsetof(struct sockaddr_un, sun_path)
+        : 0;
+    size_t expected_length = strlen(fetch_service_path);
+    while (path_length > 0 && peer.sun_path[path_length - 1] == '\0') path_length--;
+    return path_length == expected_length &&
+           memcmp(peer.sun_path, fetch_service_path, expected_length) == 0;
 }
 
-static void close_inherited_ipc_sockets_in_child(void) {
-    for (int slot = 0; slot < VFS_TRACKED_IPC_SOCKETS; slot++) {
-        int tracked = __atomic_exchange_n(&ipc_socket_slots[slot], 0, __ATOMIC_ACQ_REL);
-        if (tracked > 0) syscall(SYS_close, tracked - 1);
+struct vfs_dirent64 {
+    uint64_t d_ino;
+    int64_t d_off;
+    unsigned short d_reclen;
+    unsigned char d_type;
+    char d_name[];
+};
+
+static void close_inherited_fetch_connections_in_child(void) {
+    if (!__atomic_load_n(&fetch_service_used, __ATOMIC_ACQUIRE) || !real_openat_fn) return;
+    int directory = real_openat_fn(AT_FDCWD, "/proc/self/fd", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (directory < 0) return;
+    char buffer[4096] __attribute__((aligned(8)));
+    for (;;) {
+        long count = syscall(SYS_getdents64, directory, buffer, sizeof(buffer));
+        if (count <= 0) break;
+        for (long offset = 0; offset < count;) {
+            struct vfs_dirent64 *entry = (struct vfs_dirent64 *)(buffer + offset);
+            offset += entry->d_reclen;
+            int fd = 0;
+            const char *digit = entry->d_name;
+            if (*digit < '0' || *digit > '9') continue;
+            while (*digit >= '0' && *digit <= '9') fd = fd * 10 + (*digit++ - '0');
+            if (fd != directory && descriptor_is_fetch_connection(fd)) syscall(SYS_close, fd);
+        }
     }
+    syscall(SYS_close, directory);
 }
 
 static int ipc_roundtrip(
@@ -587,21 +620,21 @@ static int ipc_roundtrip(
     const char *socket_path = getenv("VFS_SOCKET");
     if (!socket_path || !*socket_path || payload_length > VFS_MAX_PAYLOAD) return -1;
 
+    remember_fetch_service(socket_path);
     int socket_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (socket_fd < 0) return -1;
-    int socket_slot = track_ipc_socket(socket_fd);
 
     struct sockaddr_un address;
     memset(&address, 0, sizeof(address));
     address.sun_family = AF_UNIX;
     if (strlen(socket_path) >= sizeof(address.sun_path)) {
-        close_ipc_socket(socket_slot, socket_fd);
+        syscall(SYS_close, socket_fd);
         return -1;
     }
     snprintf(address.sun_path, sizeof(address.sun_path), "%s", socket_path);
 
     if (connect(socket_fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
-        close_ipc_socket(socket_slot, socket_fd);
+        syscall(SYS_close, socket_fd);
         return -1;
     }
 
@@ -612,16 +645,16 @@ static int ipc_roundtrip(
     write_u32_be(header + 8, payload_length);
     if (write_exact(socket_fd, header, sizeof(header)) != 0 ||
         (payload_length > 0 && write_exact(socket_fd, payload, payload_length) != 0)) {
-        close_ipc_socket(socket_slot, socket_fd);
+        syscall(SYS_close, socket_fd);
         return -1;
     }
 
     uint8_t response_buffer[VFS_RESPONSE_LENGTH];
     if (read_exact(socket_fd, response_buffer, sizeof(response_buffer)) != 0) {
-        close_ipc_socket(socket_slot, socket_fd);
+        syscall(SYS_close, socket_fd);
         return -1;
     }
-    close_ipc_socket(socket_slot, socket_fd);
+    syscall(SYS_close, socket_fd);
 
     uint32_t magic;
     memcpy(&magic, response_buffer, sizeof(magic));
@@ -2540,7 +2573,7 @@ static void drop_inherited_descriptors_in_child(void) {
     if (inherited_descriptors_dropped) return;
     inherited_descriptors_dropped = 1;
     int saved_errno = errno;
-    close_inherited_ipc_sockets_in_child();
+    close_inherited_fetch_connections_in_child();
 
     struct rlimit limit;
     int limit_known = getrlimit(RLIMIT_NOFILE, &limit) == 0;
@@ -2613,8 +2646,8 @@ static void reset_shim_locks_in_child(void) {
 /*
  * Forking stays possible after models are open, so subprocess launchers that fork and exec
  * (CPython's subprocess, for one) keep working. Only inheritance_lock is held across the real
- * fork, as before: it keeps model opens and spawns out, and no common wrapper takes it, so other
- * libraries' fork handlers cannot invert lock order through it.
+ * fork, as before: it keeps managed descriptor changes out, and no common wrapper takes it, so
+ * other libraries' fork handlers cannot invert lock order through it.
  */
 pid_t fork(void) {
     init_syms();

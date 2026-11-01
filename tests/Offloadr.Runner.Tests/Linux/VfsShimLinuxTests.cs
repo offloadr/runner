@@ -3626,7 +3626,7 @@ public class VfsShimLinuxTests
 
         var root = Path.Combine(Path.GetTempPath(), "runneragent-vfs-shim-tests", Guid.NewGuid().ToString("n"));
         Directory.CreateDirectory(root);
-        int? orphan = null;
+        var orphans = new List<int>();
 
         try
         {
@@ -3641,8 +3641,9 @@ public class VfsShimLinuxTests
             var socketPath = Path.Combine(root, "model-fetch.sock");
 
             await CompileShimAsync(shimPath);
-            // A reader waits on a fetch while the process starts a long-running program and then
-            // exits: the program must not keep the abandoned request's connection open.
+            // A reader waits on a fetch while the process starts a long-running program and a
+            // long-running fork child, then exits: neither may keep the abandoned request's
+            // connection open.
             await File.WriteAllTextAsync(probeSourcePath, """
                 #define _GNU_SOURCE
                 #include <fcntl.h>
@@ -3674,7 +3675,16 @@ public class VfsShimLinuxTests
                         execl("/bin/sleep", "sleep", "30", (char *)NULL);
                         _exit(127);
                     }
-                    printf("%d\n", (int)child);
+                    /* A child that keeps running without exec. */
+                    pid_t worker = fork();
+                    if (worker < 0) return 14;
+                    if (worker == 0) {
+                        close(STDOUT_FILENO);
+                        close(STDERR_FILENO);
+                        sleep(30);
+                        _exit(0);
+                    }
+                    printf("%d %d\n", (int)child, (int)worker);
                     fflush(stdout);
                     _exit(0);
                 }
@@ -3725,14 +3735,15 @@ public class VfsShimLinuxTests
                     ["VFS_SESSION_ID"] = "hangup-session",
                     ["VFS_LOG"] = "0"
                 });
-            orphan = int.Parse(result.Stdout.Trim(), System.Globalization.CultureInfo.InvariantCulture);
+            orphans.AddRange(result.Stdout.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Select(value => int.Parse(value, System.Globalization.CultureInfo.InvariantCulture)));
 
             Assert.That(fetchStarted.Task.IsCompleted, Is.True);
             await hangupSeen.Task.WaitAsync(TimeSpan.FromSeconds(5));
         }
         finally
         {
-            if (orphan is { } processId)
+            foreach (var processId in orphans)
             {
                 try
                 {
