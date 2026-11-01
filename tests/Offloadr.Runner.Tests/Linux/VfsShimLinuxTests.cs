@@ -3258,6 +3258,125 @@ public class VfsShimLinuxTests
             """);
     }
 
+    [Test]
+    public async Task RangeManaged_ForkChildHandlers_DoNotWaitOnReadsInFlightInTheParent()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        LinuxTestPrerequisites.RequireUnixDomainSockets();
+        LinuxTestPrerequisites.RequireCommand("/usr/bin/gcc");
+
+        var root = Path.Combine(Path.GetTempPath(), "runneragent-vfs-shim-tests", Guid.NewGuid().ToString("n"));
+        Directory.CreateDirectory(root);
+
+        try
+        {
+            var modelsRoot = Path.Combine(root, "models");
+            Directory.CreateDirectory(modelsRoot);
+            var modelPath = Path.Combine(modelsRoot, "busy.bin");
+            await File.WriteAllBytesAsync(modelPath, new byte[8]);
+
+            var shimPath = Path.Combine(root, "liboffloadr_model_vfs.so");
+            var probeSourcePath = Path.Combine(root, "busy-fork-probe.c");
+            var probePath = Path.Combine(root, "busy-fork-probe");
+            var socketPath = Path.Combine(root, "model-fetch.sock");
+
+            await CompileShimAsync(shimPath);
+            // A reader thread holds the file's lock while the fetch service is slow to answer; the
+            // fork child's own handler then reads the same descriptor. That thread does not exist
+            // in the child, so the handler must not wait on its lock.
+            await File.WriteAllTextAsync(probeSourcePath, """
+                #define _GNU_SOURCE
+                #include <errno.h>
+                #include <fcntl.h>
+                #include <pthread.h>
+                #include <stdio.h>
+                #include <sys/wait.h>
+                #include <unistd.h>
+
+                static int managed = -1;
+                static int child_read_errno = 0;
+
+                static void *read_slowly(void *argument) {
+                    (void)argument;
+                    char byte;
+                    (void)pread(managed, &byte, 1, 0);
+                    return NULL;
+                }
+
+                static void read_managed_in_child(void) {
+                    char byte;
+                    errno = 0;
+                    if (read(managed, &byte, 1) == -1) child_read_errno = errno;
+                }
+
+                int main(int argc, char **argv) {
+                    if (argc != 2) return 10;
+                    managed = open(argv[1], O_RDONLY);
+                    if (managed < 0) return 11;
+                    pthread_t reader;
+                    if (pthread_create(&reader, NULL, read_slowly, NULL) != 0) return 12;
+                    usleep(300000);
+                    if (pthread_atfork(NULL, NULL, read_managed_in_child) != 0) return 13;
+                    pid_t child = fork();
+                    if (child < 0) return 14;
+                    if (child == 0) _exit(child_read_errno == EISDIR ? 0 : 2);
+                    int status = 0;
+                    if (waitpid(child, &status, 0) != child ||
+                        !WIFEXITED(status) || WEXITSTATUS(status) != 0) return 15;
+                    if (pthread_join(reader, NULL) != 0) return 16;
+                    close(managed);
+                    puts("ok");
+                    return 0;
+                }
+                """);
+            await RunProcessAsync(
+                "/usr/bin/gcc",
+                [probeSourcePath, "-o", probePath, "-pthread"],
+                root);
+
+            await using var server = new VfsIpcServer(socketPath, async (request, _) =>
+            {
+                switch (request.Operation)
+                {
+                    case VfsIpcOperation.Open:
+                        return RangeManagedResponse(modelPath, leaseId: 913, transferEpoch: 1, expectedLength: 8);
+                    case VfsIpcOperation.EnsureRange:
+                        await Task.Delay(TimeSpan.FromSeconds(3));
+                        return VfsIpcResponse.Error(VfsIpcStatus.ServerError);
+                    case VfsIpcOperation.Release:
+                        return VfsIpcResponse.Success(transferEpoch: 1);
+                    default:
+                        return VfsIpcResponse.Error(VfsIpcStatus.ServerError);
+                }
+            });
+            server.Start();
+
+            var result = await RunProcessAsync(
+                probePath,
+                [modelPath],
+                root,
+                new Dictionary<string, string?>
+                {
+                    ["LD_PRELOAD"] = shimPath,
+                    ["VFS_SOCKET"] = socketPath,
+                    ["VFS_ROOTS"] = modelsRoot,
+                    ["VFS_EXTS"] = ".bin",
+                    ["VFS_SESSION_ID"] = "busy-fork-session",
+                    ["VFS_LOG"] = "0"
+                },
+                timeout: TimeSpan.FromSeconds(15));
+
+            Assert.That(result.Stdout.Trim(), Is.EqualTo("ok"));
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
     private static async Task WriteInheritanceProbeAsync(string probeSourcePath)
     {
         await File.WriteAllTextAsync(probeSourcePath, """

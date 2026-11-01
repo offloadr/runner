@@ -249,9 +249,23 @@ static int log_state = -1;
  * For that thread the locks are already held and the shim state cannot change under it, so
  * taking them again is skipped rather than deadlocking; other threads still wait for the fork. */
 static __thread int fork_locks_held = 0;
+static pid_t forking_process_id = 0;
+static int inherited_descriptors_dropped = 0;
+
+static void drop_inherited_descriptors_in_child(void);
 
 static void shim_lock(pthread_mutex_t *mutex) {
-    if (!fork_locks_held) pthread_mutex_lock(mutex);
+    if (!fork_locks_held) {
+        pthread_mutex_lock(mutex);
+        return;
+    }
+    /* A fork child runs its own fork handlers before fork returns, while managed descriptors
+     * are still mapped and their per-file locks may belong to parent threads that do not exist
+     * here. Every descriptor lookup takes the map lock first, so drop them right there, as fork
+     * does on return: the handler then sees only placeholders and never waits on such a lock. */
+    if (mutex == &fd_map_lock && getpid() != forking_process_id) {
+        drop_inherited_descriptors_in_child();
+    }
 }
 
 static void shim_unlock(pthread_mutex_t *mutex) {
@@ -2377,8 +2391,13 @@ static int open_descriptor_placeholder(void) {
  * since open returns the lowest free number. The leases and any pending releases stay the
  * parent's to release, so the child forgets them without IPC. Only async-signal-safe work,
  * through the real functions: the forgotten entries are left allocated rather than freed.
+ * It runs once per child: at the first descriptor lookup of a child fork handler, or else when
+ * fork returns. It may run inside a wrapped call, so it leaves errno as it found it.
  */
 static void drop_inherited_descriptors_in_child(void) {
+    if (inherited_descriptors_dropped) return;
+    inherited_descriptors_dropped = 1;
+    int saved_errno = errno;
     int placeholder = -1;
     if (real_openat_fn && real_dup3_fn) {
         placeholder = open_descriptor_placeholder();
@@ -2403,6 +2422,7 @@ static void drop_inherited_descriptors_in_child(void) {
     pending_releases = NULL;
     pending_release_worker_started = 0;
     pending_release_ready = (pthread_cond_t)PTHREAD_COND_INITIALIZER;
+    errno = saved_errno;
 }
 
 /*
@@ -2422,6 +2442,8 @@ pid_t fork(void) {
     pthread_mutex_lock(&spawn_actions_lock);
     pthread_mutex_lock(&fd_map_lock);
     pthread_mutex_lock(&pending_release_lock);
+    forking_process_id = getpid();
+    inherited_descriptors_dropped = 0;
     fork_locks_held = 1;
     pid_t result = real_fork_fn();
     int saved_errno = errno;
