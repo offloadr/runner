@@ -2350,6 +2350,29 @@ int posix_spawnp(
         environment);
 }
 
+/*
+ * Runs in a fork child before fork returns, while the forking thread still holds every shim
+ * lock. Managed descriptors never reach another process: they are close-on-exec, and a child
+ * that has not exec'd yet closes them here. Their leases and any pending releases stay the
+ * parent's to release, so the child forgets them without IPC. Only async-signal-safe work:
+ * the forgotten entries are left allocated rather than freed.
+ */
+static void drop_inherited_descriptors_in_child(void) {
+    for (fd_entry_t *entry = fd_entries; entry; entry = entry->next) {
+        real_close_fn(entry->fd);
+    }
+    fd_entries = NULL;
+    managed_descriptor_seen = 0;
+    pending_releases = NULL;
+    pending_release_worker_started = 0;
+    pending_release_ready = (pthread_cond_t)PTHREAD_COND_INITIALIZER;
+}
+
+/*
+ * Forking stays possible after models are open, so subprocess launchers that fork and exec
+ * (CPython's subprocess, for one) keep working. Holding every shim lock across the fork gives
+ * the child consistent, unlocked copies; the order matches spawn_process.
+ */
 pid_t fork(void) {
     init_syms();
     if (!real_fork_fn) {
@@ -2358,14 +2381,17 @@ pid_t fork(void) {
     }
 
     pthread_mutex_lock(&inheritance_lock);
-    if (managed_descriptor_seen) {
-        pthread_mutex_unlock(&inheritance_lock);
-        errno = EOPNOTSUPP;
-        return -1;
-    }
-
+    pthread_mutex_lock(&spawn_actions_lock);
+    pthread_mutex_lock(&fd_map_lock);
+    pthread_mutex_lock(&pending_release_lock);
     pid_t result = real_fork_fn();
+    int saved_errno = errno;
+    if (result == 0) drop_inherited_descriptors_in_child();
+    pthread_mutex_unlock(&pending_release_lock);
+    pthread_mutex_unlock(&fd_map_lock);
+    pthread_mutex_unlock(&spawn_actions_lock);
     pthread_mutex_unlock(&inheritance_lock);
+    errno = saved_errno;
     return result;
 }
 
@@ -2373,7 +2399,8 @@ pid_t fork(void) {
  * A vfork child shares the parent's stack until it execs or exits, so it must never return
  * from the function that called vfork. A C wrapper around the real vfork does exactly that,
  * which corrupts the parent's stack. POSIX allows vfork to behave like fork, so route it
- * through the fork wrapper: same gating, and the child gets its own address space.
+ * through the fork wrapper: the child gets its own address space and drops managed
+ * descriptors the same way.
  */
 pid_t vfork(void) {
     return fork();
@@ -2386,6 +2413,8 @@ int clone(int (*function)(void *), void *child_stack, int flags, void *argument,
         return -1;
     }
 
+    /* Unlike fork, a clone child may share the parent's memory, so it cannot drop its copy of
+     * the managed descriptors without corrupting the parent's state; refuse an unshared table. */
     pthread_mutex_lock(&inheritance_lock);
     const int shared_process_flags = CLONE_VM | CLONE_FILES | CLONE_THREAD;
     if (managed_descriptor_seen &&

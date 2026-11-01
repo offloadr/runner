@@ -764,7 +764,7 @@ public class VfsShimLinuxTests
     }
 
     [Test]
-    public async Task RangeManaged_DescriptorInheritance_IsRejectedOrCloseOnExec()
+    public async Task RangeManaged_DescriptorInheritance_IsRejectedClosedInForkChildrenOrCloseOnExec()
     {
         LinuxTestPrerequisites.RequireLinux();
         LinuxTestPrerequisites.RequireUnixDomainSockets();
@@ -3401,10 +3401,38 @@ public class VfsShimLinuxTests
                 if (waitpid(child, &child_status, 0) != child ||
                     !WIFEXITED(child_status) || WEXITSTATUS(child_status) != 0) return 46;
 
-                errno = 0;
-                if (fork() != -1 || errno != EOPNOTSUPP) return 47;
-                errno = 0;
-                if (vfork() != -1 || errno != EOPNOTSUPP) return 48;
+                /* A forked child that never execs gets no managed descriptor: the shim closes
+                 * every copy before fork returns, and the lease stays the parent's to release. */
+                int unmanaged = open("/dev/null", O_RDONLY);
+                if (unmanaged < 0) return 47;
+                pid_t forked = fork();
+                if (forked < 0) return 47;
+                if (forked == 0) {
+                    int descriptors[] = {managed, duplicate, target, fcntl_duplicate};
+                    for (size_t index = 0; index < sizeof(descriptors) / sizeof(descriptors[0]); index++) {
+                        errno = 0;
+                        if (fcntl(descriptors[index], F_GETFD) != -1 || errno != EBADF) _exit(2);
+                    }
+                    if (fcntl(unmanaged, F_GETFD) < 0) _exit(3);
+                    _exit(0);
+                }
+                int forked_status = 0;
+                if (waitpid(forked, &forked_status, 0) != forked ||
+                    !WIFEXITED(forked_status) || WEXITSTATUS(forked_status) != 0) return 48;
+                close(unmanaged);
+
+                /* Fork and exec after a model is open, the way CPython's subprocess runs a tool. */
+                pid_t exec_child = vfork();
+                if (exec_child < 0) return 51;
+                if (exec_child == 0) {
+                    execve("/bin/true", spawn_arguments, environ);
+                    _exit(127);
+                }
+                int exec_status = 0;
+                if (waitpid(exec_child, &exec_status, 0) != exec_child ||
+                    !WIFEXITED(exec_status) || WEXITSTATUS(exec_status) != 0) return 52;
+                if (!is_close_on_exec(managed)) return 53;
+
                 errno = 0;
                 if (clone(
                         clone_child,
