@@ -3377,6 +3377,126 @@ public class VfsShimLinuxTests
         }
     }
 
+    [Test]
+    public async Task Fork_DoesNotHoldDescriptorLocksWhileOtherLibrariesForkHandlersRun()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        LinuxTestPrerequisites.RequireUnixDomainSockets();
+        LinuxTestPrerequisites.RequireCommand("/usr/bin/gcc");
+
+        var root = Path.Combine(Path.GetTempPath(), "runneragent-vfs-shim-tests", Guid.NewGuid().ToString("n"));
+        Directory.CreateDirectory(root);
+
+        try
+        {
+            var modelsRoot = Path.Combine(root, "models");
+            Directory.CreateDirectory(modelsRoot);
+            var modelPath = Path.Combine(modelsRoot, "allocator.bin");
+            await File.WriteAllBytesAsync(modelPath, new byte[8]);
+
+            var shimPath = Path.Combine(root, "liboffloadr_model_vfs.so");
+            var probeSourcePath = Path.Combine(root, "allocator-fork-probe.c");
+            var probePath = Path.Combine(root, "allocator-fork-probe");
+            var socketPath = Path.Combine(root, "model-fetch.sock");
+
+            await CompileShimAsync(shimPath);
+            // Like an allocator: a library holds its own lock while it maps memory and reads a
+            // descriptor on one thread, and its prepare handler takes that lock on the forking one.
+            await File.WriteAllTextAsync(probeSourcePath, """
+                #define _GNU_SOURCE
+                #include <fcntl.h>
+                #include <pthread.h>
+                #include <stdio.h>
+                #include <sys/mman.h>
+                #include <sys/wait.h>
+                #include <unistd.h>
+
+                static pthread_mutex_t library_lock = PTHREAD_MUTEX_INITIALIZER;
+                static volatile int stopping = 0;
+
+                static void take_library_lock(void) {
+                    pthread_mutex_lock(&library_lock);
+                }
+
+                static void release_library_lock(void) {
+                    pthread_mutex_unlock(&library_lock);
+                }
+
+                static void *allocate_constantly(void *argument) {
+                    (void)argument;
+                    int zero = open("/dev/zero", O_RDONLY);
+                    char byte;
+                    while (!stopping) {
+                        pthread_mutex_lock(&library_lock);
+                        void *page = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                        if (page != MAP_FAILED) munmap(page, 4096);
+                        (void)read(zero, &byte, 1);
+                        pthread_mutex_unlock(&library_lock);
+                    }
+                    close(zero);
+                    return NULL;
+                }
+
+                int main(int argc, char **argv) {
+                    if (argc != 2) return 10;
+                    int managed = open(argv[1], O_RDONLY);
+                    if (managed < 0) return 11;
+                    if (pthread_atfork(take_library_lock, release_library_lock, release_library_lock) != 0) return 12;
+                    pthread_t allocator;
+                    if (pthread_create(&allocator, NULL, allocate_constantly, NULL) != 0) return 13;
+                    for (int round = 0; round < 200; round++) {
+                        pid_t child = fork();
+                        if (child < 0) return 14;
+                        if (child == 0) _exit(0);
+                        int status = 0;
+                        if (waitpid(child, &status, 0) != child || !WIFEXITED(status)) return 15;
+                    }
+                    stopping = 1;
+                    if (pthread_join(allocator, NULL) != 0) return 16;
+                    close(managed);
+                    puts("ok");
+                    return 0;
+                }
+                """);
+            await RunProcessAsync(
+                "/usr/bin/gcc",
+                [probeSourcePath, "-o", probePath, "-pthread"],
+                root);
+
+            await using var server = new VfsIpcServer(socketPath, (request, _) => Task.FromResult(request.Operation switch
+            {
+                VfsIpcOperation.Open => RangeManagedResponse(modelPath, leaseId: 914, transferEpoch: 1, expectedLength: 8),
+                VfsIpcOperation.Release => VfsIpcResponse.Success(transferEpoch: 1),
+                _ => VfsIpcResponse.Error(VfsIpcStatus.ServerError)
+            }));
+            server.Start();
+
+            var result = await RunProcessAsync(
+                probePath,
+                [modelPath],
+                root,
+                new Dictionary<string, string?>
+                {
+                    ["LD_PRELOAD"] = shimPath,
+                    ["VFS_SOCKET"] = socketPath,
+                    ["VFS_ROOTS"] = modelsRoot,
+                    ["VFS_EXTS"] = ".bin",
+                    ["VFS_SESSION_ID"] = "allocator-fork-session",
+                    ["VFS_LOG"] = "0"
+                },
+                timeout: TimeSpan.FromSeconds(20));
+
+            Assert.That(result.Stdout.Trim(), Is.EqualTo("ok"));
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
     private static async Task WriteInheritanceProbeAsync(string probeSourcePath)
     {
         await File.WriteAllTextAsync(probeSourcePath, """

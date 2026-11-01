@@ -77,6 +77,8 @@ typedef struct shared_state {
     uint64_t lease_id;
     int64_t epoch;
     int64_t expected_length;
+    uint64_t device_id;
+    uint64_t inode;
     int complete;
     interval_t *readable;
 } shared_state_t;
@@ -244,18 +246,23 @@ static int pending_release_worker_started = 0;
 static __thread int reentry = 0;
 static int log_state = -1;
 
-/* The thread inside the fork wrapper holds all four shim locks while glibc runs fork handlers,
- * and any handler may call a wrapped function, whichever library registered it and whenever.
- * For that thread the locks are already held and the shim state cannot change under it, so
- * taking them again is skipped rather than deadlocking; other threads still wait for the fork. */
-static __thread int fork_locks_held = 0;
+/* The thread inside the fork wrapper holds inheritance_lock while glibc runs fork handlers, and
+ * any handler may call a wrapped function, whichever library registered it and whenever. That
+ * thread skips taking inheritance_lock again. In the child, before fork returns, every shim lock
+ * is skipped: a parent thread that does not exist there may have held its copy. */
+static __thread int fork_in_progress = 0;
 static pid_t forking_process_id = 0;
 static int inherited_descriptors_dropped = 0;
 
 static void drop_inherited_descriptors_in_child(void);
 
+static int skips_shim_lock(pthread_mutex_t *mutex) {
+    if (!fork_in_progress) return 0;
+    return mutex == &inheritance_lock || getpid() != forking_process_id;
+}
+
 static void shim_lock(pthread_mutex_t *mutex) {
-    if (!fork_locks_held) {
+    if (!skips_shim_lock(mutex)) {
         pthread_mutex_lock(mutex);
         return;
     }
@@ -269,7 +276,7 @@ static void shim_lock(pthread_mutex_t *mutex) {
 }
 
 static void shim_unlock(pthread_mutex_t *mutex) {
-    if (!fork_locks_held) pthread_mutex_unlock(mutex);
+    if (!skips_shim_lock(mutex)) pthread_mutex_unlock(mutex);
 }
 
 #if defined(__x86_64__)
@@ -1012,6 +1019,8 @@ static shared_state_t *create_state(const ipc_response_t *response) {
     state->lease_id = response->lease_id;
     state->epoch = response->epoch;
     state->expected_length = response->expected_length;
+    state->device_id = response->device_id;
+    state->inode = response->inode;
     return state;
 }
 
@@ -2393,7 +2402,21 @@ static int open_descriptor_placeholder(void) {
  * through the real functions: the forgotten entries are left allocated rather than freed.
  * It runs once per child: at the first descriptor lookup of a child fork handler, or else when
  * fork returns. It may run inside a wrapped call, so it leaves errno as it found it.
+ *
+ * Fork does not hold the descriptor map lock (common wrappers take it, and holding it across
+ * other libraries' fork handlers would invert their lock order), so the child's copy of the map
+ * is checked against the kernel: a number is replaced only while it still names its model file.
+ * The map stays a well-formed list throughout, since entries are published whole and unlinked
+ * before they are freed. A managed descriptor that another thread is closing or duplicating at
+ * the very instant of fork can still reach a child that never execs as a close-on-exec copy.
  */
+static int descriptor_names_state(int fd, const shared_state_t *state) {
+    struct stat status;
+    if (fstat(fd, &status) != 0) return 0;
+    uint64_t device_id = ((uint64_t)major(status.st_dev) << 32) | (uint64_t)minor(status.st_dev);
+    return device_id == state->device_id && (uint64_t)status.st_ino == state->inode;
+}
+
 static void drop_inherited_descriptors_in_child(void) {
     if (inherited_descriptors_dropped) return;
     inherited_descriptors_dropped = 1;
@@ -2401,9 +2424,13 @@ static void drop_inherited_descriptors_in_child(void) {
     int placeholder = -1;
     if (real_openat_fn && real_dup3_fn) {
         placeholder = open_descriptor_placeholder();
-        if (placeholder < 0 && errno == EMFILE && fd_entries) {
-            real_close_fn(fd_entries->fd);
-            placeholder = open_descriptor_placeholder();
+        if (placeholder < 0 && errno == EMFILE) {
+            for (fd_entry_t *entry = fd_entries; entry; entry = entry->next) {
+                if (!descriptor_names_state(entry->fd, entry->state)) continue;
+                real_close_fn(entry->fd);
+                placeholder = open_descriptor_placeholder();
+                break;
+            }
         }
     }
 
@@ -2411,6 +2438,9 @@ static void drop_inherited_descriptors_in_child(void) {
     for (fd_entry_t *entry = fd_entries; entry; entry = entry->next) {
         if (entry->fd == placeholder) {
             placeholder_fills_managed_slot = 1;
+        }
+        else if (!descriptor_names_state(entry->fd, entry->state)) {
+            continue;
         }
         else if (placeholder < 0 || real_dup3_fn(placeholder, entry->fd, O_CLOEXEC) < 0) {
             real_close_fn(entry->fd);
@@ -2425,11 +2455,18 @@ static void drop_inherited_descriptors_in_child(void) {
     errno = saved_errno;
 }
 
+/* A parent thread that does not exist in the child may have held any of these at the fork. */
+static void reset_shim_locks_in_child(void) {
+    fd_map_lock = (pthread_mutex_t)PTHREAD_MUTEX_INITIALIZER;
+    spawn_actions_lock = (pthread_mutex_t)PTHREAD_MUTEX_INITIALIZER;
+    pending_release_lock = (pthread_mutex_t)PTHREAD_MUTEX_INITIALIZER;
+}
+
 /*
  * Forking stays possible after models are open, so subprocess launchers that fork and exec
- * (CPython's subprocess, for one) keep working. Every shim lock is taken before the real fork,
- * in spawn_process's order, so the child gets consistent copies; glibc's fork handlers then run
- * on this thread, where fork_locks_held lets the wrappers they call proceed under those locks.
+ * (CPython's subprocess, for one) keep working. Only inheritance_lock is held across the real
+ * fork, as before: it keeps model opens and spawns out, and no common wrapper takes it, so other
+ * libraries' fork handlers cannot invert lock order through it.
  */
 pid_t fork(void) {
     init_syms();
@@ -2439,19 +2476,16 @@ pid_t fork(void) {
     }
 
     pthread_mutex_lock(&inheritance_lock);
-    pthread_mutex_lock(&spawn_actions_lock);
-    pthread_mutex_lock(&fd_map_lock);
-    pthread_mutex_lock(&pending_release_lock);
     forking_process_id = getpid();
     inherited_descriptors_dropped = 0;
-    fork_locks_held = 1;
+    fork_in_progress = 1;
     pid_t result = real_fork_fn();
     int saved_errno = errno;
-    if (result == 0) drop_inherited_descriptors_in_child();
-    fork_locks_held = 0;
-    pthread_mutex_unlock(&pending_release_lock);
-    pthread_mutex_unlock(&fd_map_lock);
-    pthread_mutex_unlock(&spawn_actions_lock);
+    if (result == 0) {
+        reset_shim_locks_in_child();
+        drop_inherited_descriptors_in_child();
+    }
+    fork_in_progress = 0;
     pthread_mutex_unlock(&inheritance_lock);
     errno = saved_errno;
     return result;
