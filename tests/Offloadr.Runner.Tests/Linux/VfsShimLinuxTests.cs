@@ -785,12 +785,38 @@ public class VfsShimLinuxTests
             var probeSourcePath = Path.Combine(root, "inheritance-probe.c");
             var probePath = Path.Combine(root, "inheritance-probe");
             var socketPath = Path.Combine(root, "model-fetch.sock");
+            var earlyHandlersSourcePath = Path.Combine(root, "early-fork-handlers.c");
+            var earlyHandlersPath = Path.Combine(root, "libearlyforkhandlers.so");
 
             await CompileShimAsync(shimPath);
+            // A library the probe links (kept as DT_NEEDED although the probe uses none of its symbols):
+            // its constructor runs before the preloaded shim's, so its fork handlers are registered first
+            // and run while the forking thread holds the shim locks.
+            await File.WriteAllTextAsync(earlyHandlersSourcePath, """
+                #include <fcntl.h>
+                #include <pthread.h>
+                #include <unistd.h>
+
+                static void touch_descriptors_early(void) {
+                    int descriptor = open("/dev/null", O_RDONLY);
+                    if (descriptor >= 0) {
+                        (void)fcntl(descriptor, F_GETFD);
+                        close(descriptor);
+                    }
+                }
+
+                __attribute__((constructor)) static void register_early_fork_handlers(void) {
+                    pthread_atfork(touch_descriptors_early, touch_descriptors_early, touch_descriptors_early);
+                }
+                """);
+            await RunProcessAsync(
+                "/usr/bin/gcc",
+                ["-fPIC", "-shared", "-o", earlyHandlersPath, earlyHandlersSourcePath],
+                root);
             await WriteInheritanceProbeAsync(probeSourcePath);
             await RunProcessAsync(
                 "/usr/bin/gcc",
-                [probeSourcePath, "-o", probePath],
+                [probeSourcePath, "-o", probePath, "-Wl,--no-as-needed", earlyHandlersPath, $"-Wl,-rpath,{root}"],
                 root);
 
             var requests = new List<VfsIpcRequest>();
@@ -3244,6 +3270,7 @@ public class VfsShimLinuxTests
             #include <spawn.h>
             #include <stdio.h>
             #include <sys/ioctl.h>
+            #include <sys/resource.h>
             #include <sys/wait.h>
             #include <unistd.h>
 
@@ -3442,6 +3469,41 @@ public class VfsShimLinuxTests
                 if (waitpid(forked, &forked_status, 0) != forked ||
                     !WIFEXITED(forked_status) || WEXITSTATUS(forked_status) != 0) return 48;
                 close(unmanaged);
+
+                /* At the descriptor limit there is no free number for the placeholder; the child
+                 * still keeps every managed number taken. */
+                struct rlimit original_limit;
+                if (getrlimit(RLIMIT_NOFILE, &original_limit) != 0) return 54;
+                struct rlimit lowered_limit = original_limit;
+                lowered_limit.rlim_cur = 64;
+                if (setrlimit(RLIMIT_NOFILE, &lowered_limit) != 0) return 54;
+                int fillers[64];
+                int filler_count = 0;
+                for (;;) {
+                    int filler = open("/dev/null", O_RDONLY);
+                    if (filler < 0) break;
+                    fillers[filler_count++] = filler;
+                }
+                if (errno != EMFILE) return 55;
+                pid_t limited = fork();
+                if (limited < 0) return 56;
+                if (limited == 0) {
+                    int descriptors[] = {managed, duplicate, target, fcntl_duplicate};
+                    char byte;
+                    for (size_t index = 0; index < sizeof(descriptors) / sizeof(descriptors[0]); index++) {
+                        errno = 0;
+                        if (read(descriptors[index], &byte, 1) != -1 || errno != EISDIR) _exit(2);
+                        if (!is_close_on_exec(descriptors[index])) _exit(3);
+                    }
+                    errno = 0;
+                    if (open("/dev/null", O_RDONLY) != -1 || errno != EMFILE) _exit(4);
+                    _exit(0);
+                }
+                int limited_status = 0;
+                if (waitpid(limited, &limited_status, 0) != limited ||
+                    !WIFEXITED(limited_status) || WEXITSTATUS(limited_status) != 0) return 57;
+                for (int index = 0; index < filler_count; index++) close(fillers[index]);
+                if (setrlimit(RLIMIT_NOFILE, &original_limit) != 0) return 58;
 
                 /* Fork and exec after a model is open, the way CPython's subprocess runs a tool. */
                 pid_t exec_child = vfork();

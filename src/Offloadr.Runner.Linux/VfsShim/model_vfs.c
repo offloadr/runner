@@ -244,6 +244,20 @@ static int pending_release_worker_started = 0;
 static __thread int reentry = 0;
 static int log_state = -1;
 
+/* The thread inside the fork wrapper holds all four shim locks while glibc runs fork handlers,
+ * and any handler may call a wrapped function, whichever library registered it and whenever.
+ * For that thread the locks are already held and the shim state cannot change under it, so
+ * taking them again is skipped rather than deadlocking; other threads still wait for the fork. */
+static __thread int fork_locks_held = 0;
+
+static void shim_lock(pthread_mutex_t *mutex) {
+    if (!fork_locks_held) pthread_mutex_lock(mutex);
+}
+
+static void shim_unlock(pthread_mutex_t *mutex) {
+    if (!fork_locks_held) pthread_mutex_unlock(mutex);
+}
+
 #if defined(__x86_64__)
 #define VFS_AUDIT_ARCH AUDIT_ARCH_X86_64
 #elif defined(__aarch64__)
@@ -651,15 +665,15 @@ static int send_release_once(uint64_t lease_id) {
 static void *pending_release_worker(void *unused) {
     (void)unused;
     for (;;) {
-        pthread_mutex_lock(&pending_release_lock);
+        shim_lock(&pending_release_lock);
         while (!pending_releases) {
             pthread_cond_wait(&pending_release_ready, &pending_release_lock);
         }
         uint64_t lease_id = pending_releases->lease_id;
-        pthread_mutex_unlock(&pending_release_lock);
+        shim_unlock(&pending_release_lock);
 
         if (send_release_once(lease_id) == 0) {
-            pthread_mutex_lock(&pending_release_lock);
+            shim_lock(&pending_release_lock);
             pending_release_t **position = &pending_releases;
             while (*position && (*position)->lease_id != lease_id) {
                 position = &(*position)->next;
@@ -669,7 +683,7 @@ static void *pending_release_worker(void *unused) {
                 *position = released->next;
                 free(released);
             }
-            pthread_mutex_unlock(&pending_release_lock);
+            shim_unlock(&pending_release_lock);
             continue;
         }
 
@@ -693,13 +707,13 @@ static void retain_failed_release(uint64_t lease_id) {
     if (!pending) return;
     pending->lease_id = lease_id;
 
-    pthread_mutex_lock(&pending_release_lock);
+    shim_lock(&pending_release_lock);
     pending_release_t **position = &pending_releases;
     while (*position) {
         if ((*position)->lease_id == lease_id) {
             start_pending_release_worker_locked();
             pthread_cond_signal(&pending_release_ready);
-            pthread_mutex_unlock(&pending_release_lock);
+            shim_unlock(&pending_release_lock);
             free(pending);
             return;
         }
@@ -709,7 +723,7 @@ static void retain_failed_release(uint64_t lease_id) {
 
     start_pending_release_worker_locked();
     pthread_cond_signal(&pending_release_ready);
-    pthread_mutex_unlock(&pending_release_lock);
+    shim_unlock(&pending_release_lock);
 }
 
 static void request_release(uint64_t lease_id) {
@@ -1012,15 +1026,15 @@ static int attach_fd_locked(int fd, shared_state_t *state, int add_reference) {
 }
 
 static int attach_fd(int fd, shared_state_t *state, int add_reference) {
-    pthread_mutex_lock(&fd_map_lock);
+    shim_lock(&fd_map_lock);
     int result = attach_fd_locked(fd, state, add_reference);
-    pthread_mutex_unlock(&fd_map_lock);
+    shim_unlock(&fd_map_lock);
     return result;
 }
 
 static shared_state_t *acquire_fd_state(int fd) {
     shared_state_t *state = NULL;
-    pthread_mutex_lock(&fd_map_lock);
+    shim_lock(&fd_map_lock);
     for (fd_entry_t *entry = fd_entries; entry; entry = entry->next) {
         if (entry->fd == fd) {
             state = entry->state;
@@ -1028,13 +1042,13 @@ static shared_state_t *acquire_fd_state(int fd) {
             break;
         }
     }
-    pthread_mutex_unlock(&fd_map_lock);
+    shim_unlock(&fd_map_lock);
     return state;
 }
 
 static shared_state_t *acquire_fd_state_for_io(int fd) {
     shared_state_t *state = NULL;
-    pthread_mutex_lock(&fd_map_lock);
+    shim_lock(&fd_map_lock);
     for (fd_entry_t *entry = fd_entries; entry; entry = entry->next) {
         if (entry->fd == fd) {
             state = entry->state;
@@ -1046,7 +1060,7 @@ static shared_state_t *acquire_fd_state_for_io(int fd) {
             break;
         }
     }
-    pthread_mutex_unlock(&fd_map_lock);
+    shim_unlock(&fd_map_lock);
     return state;
 }
 
@@ -1070,7 +1084,7 @@ static shared_state_t *lock_and_detach_fd_for_close(int fd) {
     // Match the map -> open-file-description lock order used by reads and
     // descriptor replacement. Keep both locks until the kernel close returns
     // so the numeric fd cannot be reused underneath an in-flight managed read.
-    pthread_mutex_lock(&fd_map_lock);
+    shim_lock(&fd_map_lock);
     fd_entry_t **position = &fd_entries;
     while (*position) {
         if ((*position)->fd == fd) {
@@ -1088,7 +1102,7 @@ static shared_state_t *lock_and_detach_fd_for_close(int fd) {
 
 static void unlock_after_close(shared_state_t *state) {
     if (state) pthread_mutex_unlock(&state->io_lock);
-    pthread_mutex_unlock(&fd_map_lock);
+    shim_unlock(&fd_map_lock);
     if (state) state_release_reference(state);
 }
 
@@ -1315,10 +1329,10 @@ int openat(int directory_fd, const char *pathname, int flags, ...) {
         sizeof(absolute_path));
     if (disposition < 0) return -1;
     if (disposition != 2) return real_openat_fn(directory_fd, pathname, flags, mode);
-    pthread_mutex_lock(&inheritance_lock);
+    shim_lock(&inheritance_lock);
     int fd = real_openat_fn(directory_fd, pathname, flags, mode);
     int result = attach_opened_fd(fd, &response, 1);
-    pthread_mutex_unlock(&inheritance_lock);
+    shim_unlock(&inheritance_lock);
     return result;
 }
 
@@ -1362,7 +1376,7 @@ FILE *fopen(const char *pathname, const char *mode) {
         absolute_path,
         sizeof(absolute_path));
     if (disposition < 0) return NULL;
-    if (disposition == 2) pthread_mutex_lock(&inheritance_lock);
+    if (disposition == 2) shim_lock(&inheritance_lock);
     reentry++;
     FILE *file = real_fopen_fn(pathname, mode);
     reentry--;
@@ -1370,18 +1384,18 @@ FILE *fopen(const char *pathname, const char *mode) {
     if (!file) {
         int saved_errno = errno;
         request_release(response.lease_id);
-        pthread_mutex_unlock(&inheritance_lock);
+        shim_unlock(&inheritance_lock);
         errno = saved_errno;
         return NULL;
     }
     if (attach_opened_fd(fileno(file), &response, 0) < 0) {
         int saved_errno = errno;
         real_fclose_fn(file);
-        pthread_mutex_unlock(&inheritance_lock);
+        shim_unlock(&inheritance_lock);
         errno = saved_errno;
         return NULL;
     }
-    pthread_mutex_unlock(&inheritance_lock);
+    shim_unlock(&inheritance_lock);
     setvbuf(file, NULL, _IONBF, 0);
     return file;
 }
@@ -1400,7 +1414,7 @@ FILE *fopen64(const char *pathname, const char *mode) {
         absolute_path,
         sizeof(absolute_path));
     if (disposition < 0) return NULL;
-    if (disposition == 2) pthread_mutex_lock(&inheritance_lock);
+    if (disposition == 2) shim_lock(&inheritance_lock);
     reentry++;
     FILE *file = real_fopen64_fn(pathname, mode);
     reentry--;
@@ -1408,18 +1422,18 @@ FILE *fopen64(const char *pathname, const char *mode) {
     if (!file) {
         int saved_errno = errno;
         request_release(response.lease_id);
-        pthread_mutex_unlock(&inheritance_lock);
+        shim_unlock(&inheritance_lock);
         errno = saved_errno;
         return NULL;
     }
     if (attach_opened_fd(fileno(file), &response, 0) < 0) {
         int saved_errno = errno;
         real_fclose_fn(file);
-        pthread_mutex_unlock(&inheritance_lock);
+        shim_unlock(&inheritance_lock);
         errno = saved_errno;
         return NULL;
     }
-    pthread_mutex_unlock(&inheritance_lock);
+    shim_unlock(&inheritance_lock);
     setvbuf(file, NULL, _IONBF, 0);
     return file;
 }
@@ -1444,13 +1458,13 @@ static FILE *freopen_managed(
               sizeof(absolute_path))
         : 0;
     if (disposition < 0) return NULL;
-    pthread_mutex_lock(&inheritance_lock);
+    shim_lock(&inheritance_lock);
     flockfile(file);
 
     // freopen replaces the descriptor underneath the FILE. Serialize that
     // replacement with managed I/O and update the descriptor map before any
     // blocked reader can observe the replacement.
-    pthread_mutex_lock(&fd_map_lock);
+    shim_lock(&fd_map_lock);
     fd_entry_t **old_position = &fd_entries;
     while (*old_position && (*old_position)->fd != old_fd) {
         old_position = &(*old_position)->next;
@@ -1458,9 +1472,9 @@ static FILE *freopen_managed(
     fd_entry_t *old_entry = *old_position;
     shared_state_t *old_state = old_entry ? old_entry->state : NULL;
     if (!pathname && old_state && !mode_is_read_only(mode)) {
-        pthread_mutex_unlock(&fd_map_lock);
+        shim_unlock(&fd_map_lock);
         funlockfile(file);
-        pthread_mutex_unlock(&inheritance_lock);
+        shim_unlock(&inheritance_lock);
         errno = EROFS;
         return NULL;
     }
@@ -1512,7 +1526,7 @@ static FILE *freopen_managed(
         }
     }
     if (old_state) pthread_mutex_unlock(&old_state->io_lock);
-    pthread_mutex_unlock(&fd_map_lock);
+    shim_unlock(&fd_map_lock);
     if (old_state && !preserve_old_state) state_release_reference(old_state);
     if (replacement_state && !replacement_state_attached) {
         state_release_reference(replacement_state);
@@ -1522,13 +1536,13 @@ static FILE *freopen_managed(
     }
 
     if (!result) {
-        pthread_mutex_unlock(&inheritance_lock);
+        shim_unlock(&inheritance_lock);
         errno = result_errno;
         return NULL;
     }
 
     funlockfile(result);
-    pthread_mutex_unlock(&inheritance_lock);
+    shim_unlock(&inheritance_lock);
     if (preserve_old_state || disposition == 2) setvbuf(result, NULL, _IONBF, 0);
     return result;
 }
@@ -1594,7 +1608,7 @@ int close_range(unsigned int first, unsigned int last, int flags) {
         return call_real_close_range(first, last, flags);
     }
 
-    pthread_mutex_lock(&fd_map_lock);
+    shim_lock(&fd_map_lock);
     size_t matching_count = 0;
     for (fd_entry_t *entry = fd_entries; entry; entry = entry->next) {
         unsigned int descriptor = (unsigned int)entry->fd;
@@ -1610,7 +1624,7 @@ int close_range(unsigned int first, unsigned int last, int flags) {
     if (matching_count && (!unique_states || !removed_states)) {
         free(unique_states);
         free(removed_states);
-        pthread_mutex_unlock(&fd_map_lock);
+        shim_unlock(&fd_map_lock);
         errno = ENOMEM;
         return -1;
     }
@@ -1649,7 +1663,7 @@ int close_range(unsigned int first, unsigned int last, int flags) {
     for (size_t state_index = 0; state_index < unique_count; state_index++) {
         pthread_mutex_unlock(&unique_states[state_index]->io_lock);
     }
-    pthread_mutex_unlock(&fd_map_lock);
+    shim_unlock(&fd_map_lock);
     for (size_t state_index = 0; state_index < removed_count; state_index++) {
         state_release_reference(removed_states[state_index]);
     }
@@ -1665,7 +1679,7 @@ void closefrom(int low_fd) {
 
 static void detach_closed_descriptors(void) {
     fd_entry_t *removed_entries = NULL;
-    pthread_mutex_lock(&fd_map_lock);
+    shim_lock(&fd_map_lock);
     fd_entry_t **position = &fd_entries;
     while (*position) {
         errno = 0;
@@ -1678,7 +1692,7 @@ static void detach_closed_descriptors(void) {
         }
         position = &(*position)->next;
     }
-    pthread_mutex_unlock(&fd_map_lock);
+    shim_unlock(&fd_map_lock);
 
     while (removed_entries) {
         fd_entry_t *next = removed_entries->next;
@@ -1767,7 +1781,7 @@ void setlinebuf(FILE *file) {
 
 int dup(int old_fd) {
     init_syms();
-    pthread_mutex_lock(&fd_map_lock);
+    shim_lock(&fd_map_lock);
     shared_state_t *state = NULL;
     for (fd_entry_t *entry = fd_entries; entry; entry = entry->next) {
         if (entry->fd == old_fd) {
@@ -1777,7 +1791,7 @@ int dup(int old_fd) {
     }
     fd_entry_t *new_entry = state ? calloc(1, sizeof(*new_entry)) : NULL;
     if (state && !new_entry) {
-        pthread_mutex_unlock(&fd_map_lock);
+        shim_unlock(&fd_map_lock);
         errno = ENOMEM;
         return -1;
     }
@@ -1798,7 +1812,7 @@ int dup(int old_fd) {
         new_entry = NULL;
     }
     if (state) pthread_mutex_unlock(&state->io_lock);
-    pthread_mutex_unlock(&fd_map_lock);
+    shim_unlock(&fd_map_lock);
     free(new_entry);
     return new_fd;
 }
@@ -1811,7 +1825,7 @@ static int duplicate_to(int old_fd, int new_fd, int flags, int use_dup3) {
     }
     if (old_fd == new_fd) return real_dup2_fn(old_fd, new_fd);
 
-    pthread_mutex_lock(&fd_map_lock);
+    shim_lock(&fd_map_lock);
     fd_entry_t *source_entry = NULL;
     fd_entry_t **target_position = &fd_entries;
     while (*target_position) {
@@ -1832,7 +1846,7 @@ static int duplicate_to(int old_fd, int new_fd, int flags, int use_dup3) {
     shared_state_t *source_state = source_entry ? source_entry->state : NULL;
     shared_state_t *old_target_state = target_entry ? target_entry->state : NULL;
     if (source_state && !target_entry && real_fcntl_fn(new_fd, F_GETFD) >= 0) {
-        pthread_mutex_unlock(&fd_map_lock);
+        shim_unlock(&fd_map_lock);
         errno = EOPNOTSUPP;
         return -1;
     }
@@ -1840,7 +1854,7 @@ static int duplicate_to(int old_fd, int new_fd, int flags, int use_dup3) {
     if (source_state) {
         replacement_entry = calloc(1, sizeof(*replacement_entry));
         if (!replacement_entry) {
-            pthread_mutex_unlock(&fd_map_lock);
+            shim_unlock(&fd_map_lock);
             errno = ENOMEM;
             return -1;
         }
@@ -1858,7 +1872,7 @@ static int duplicate_to(int old_fd, int new_fd, int flags, int use_dup3) {
             pthread_mutex_unlock(&old_target_state->io_lock);
         }
         if (source_state) pthread_mutex_unlock(&source_state->io_lock);
-        pthread_mutex_unlock(&fd_map_lock);
+        shim_unlock(&fd_map_lock);
         free(replacement_entry);
         return result;
     }
@@ -1884,7 +1898,7 @@ static int duplicate_to(int old_fd, int new_fd, int flags, int use_dup3) {
         pthread_mutex_unlock(&old_target_state->io_lock);
     }
     if (source_state) pthread_mutex_unlock(&source_state->io_lock);
-    pthread_mutex_unlock(&fd_map_lock);
+    shim_unlock(&fd_map_lock);
     if (old_target_state) state_release_reference(old_target_state);
     if (cloexec_error) {
         free(replacement_entry);
@@ -1909,7 +1923,7 @@ static int fcntl_with_arguments(
     int (*real_function)(int, int, ...)) {
     if (command == F_DUPFD || command == F_DUPFD_CLOEXEC) {
         int minimum_fd = va_arg(arguments, int);
-        pthread_mutex_lock(&fd_map_lock);
+        shim_lock(&fd_map_lock);
         shared_state_t *state = NULL;
         for (fd_entry_t *entry = fd_entries; entry; entry = entry->next) {
             if (entry->fd == fd) {
@@ -1919,7 +1933,7 @@ static int fcntl_with_arguments(
         }
         fd_entry_t *new_entry = state ? calloc(1, sizeof(*new_entry)) : NULL;
         if (state && !new_entry) {
-            pthread_mutex_unlock(&fd_map_lock);
+            shim_unlock(&fd_map_lock);
             errno = ENOMEM;
             return -1;
         }
@@ -1940,7 +1954,7 @@ static int fcntl_with_arguments(
             new_entry = NULL;
         }
         if (state) pthread_mutex_unlock(&state->io_lock);
-        pthread_mutex_unlock(&fd_map_lock);
+        shim_unlock(&fd_map_lock);
         free(new_entry);
         return result;
     }
@@ -1983,7 +1997,7 @@ static int fcntl_with_arguments(
         case F_SETFD:
         {
             int value = va_arg(arguments, int);
-            pthread_mutex_lock(&fd_map_lock);
+            shim_lock(&fd_map_lock);
             int managed = 0;
             for (fd_entry_t *entry = fd_entries; entry; entry = entry->next) {
                 if (entry->fd == fd) {
@@ -1992,7 +2006,7 @@ static int fcntl_with_arguments(
                 }
             }
             int result = real_function(fd, command, managed ? value | FD_CLOEXEC : value);
-            pthread_mutex_unlock(&fd_map_lock);
+            shim_unlock(&fd_map_lock);
             return result;
         }
         default:
@@ -2054,10 +2068,10 @@ int posix_spawn_file_actions_init(posix_spawn_file_actions_t *actions) {
     }
 
     entry->actions = actions;
-    pthread_mutex_lock(&spawn_actions_lock);
+    shim_lock(&spawn_actions_lock);
     entry->next = spawn_actions_entries;
     spawn_actions_entries = entry;
-    pthread_mutex_unlock(&spawn_actions_lock);
+    shim_unlock(&spawn_actions_lock);
     return 0;
 }
 
@@ -2065,12 +2079,12 @@ int posix_spawn_file_actions_destroy(posix_spawn_file_actions_t *actions) {
     init_syms();
     if (!real_posix_spawn_file_actions_destroy_fn) return ENOSYS;
 
-    pthread_mutex_lock(&spawn_actions_lock);
+    shim_lock(&spawn_actions_lock);
     spawn_actions_entry_t **position = find_spawn_actions_position_locked(actions);
     spawn_actions_entry_t *entry = *position;
     int result = real_posix_spawn_file_actions_destroy_fn(actions);
     if (result == 0 && entry) *position = entry->next;
-    pthread_mutex_unlock(&spawn_actions_lock);
+    shim_unlock(&spawn_actions_lock);
     if (result != 0 || !entry) return result;
 
     spawn_dup_action_t *action = entry->dup_actions;
@@ -2105,13 +2119,13 @@ int posix_spawn_file_actions_adddup2(
         return ENOMEM;
     }
 
-    pthread_mutex_lock(&inheritance_lock);
-    pthread_mutex_lock(&spawn_actions_lock);
-    pthread_mutex_lock(&fd_map_lock);
+    shim_lock(&inheritance_lock);
+    shim_lock(&spawn_actions_lock);
+    shim_lock(&fd_map_lock);
     if (descriptor_is_managed_locked(source_fd)) {
-        pthread_mutex_unlock(&fd_map_lock);
-        pthread_mutex_unlock(&spawn_actions_lock);
-        pthread_mutex_unlock(&inheritance_lock);
+        shim_unlock(&fd_map_lock);
+        shim_unlock(&spawn_actions_lock);
+        shim_unlock(&inheritance_lock);
         free(dup_action);
         free(new_entry);
         return EOPNOTSUPP;
@@ -2133,9 +2147,9 @@ int posix_spawn_file_actions_adddup2(
         entry->dup_actions = dup_action;
         dup_action = NULL;
     }
-    pthread_mutex_unlock(&fd_map_lock);
-    pthread_mutex_unlock(&spawn_actions_lock);
-    pthread_mutex_unlock(&inheritance_lock);
+    shim_unlock(&fd_map_lock);
+    shim_unlock(&spawn_actions_lock);
+    shim_unlock(&inheritance_lock);
     free(dup_action);
     free(new_entry);
     return result;
@@ -2150,8 +2164,8 @@ int posix_spawn_file_actions_addchdir_np(
     spawn_actions_entry_t *new_entry = calloc(1, sizeof(*new_entry));
     if (!new_entry) return ENOMEM;
 
-    pthread_mutex_lock(&inheritance_lock);
-    pthread_mutex_lock(&spawn_actions_lock);
+    shim_lock(&inheritance_lock);
+    shim_lock(&spawn_actions_lock);
     spawn_actions_entry_t **position = find_spawn_actions_position_locked(actions);
     spawn_actions_entry_t *entry = *position;
     int result = real_posix_spawn_file_actions_addchdir_np_fn(actions, path);
@@ -2165,8 +2179,8 @@ int posix_spawn_file_actions_addchdir_np(
         }
         entry->directory_changed = 1;
     }
-    pthread_mutex_unlock(&spawn_actions_lock);
-    pthread_mutex_unlock(&inheritance_lock);
+    shim_unlock(&spawn_actions_lock);
+    shim_unlock(&inheritance_lock);
     free(new_entry);
     return result;
 }
@@ -2180,8 +2194,8 @@ int posix_spawn_file_actions_addfchdir_np(
     spawn_actions_entry_t *new_entry = calloc(1, sizeof(*new_entry));
     if (!new_entry) return ENOMEM;
 
-    pthread_mutex_lock(&inheritance_lock);
-    pthread_mutex_lock(&spawn_actions_lock);
+    shim_lock(&inheritance_lock);
+    shim_lock(&spawn_actions_lock);
     spawn_actions_entry_t **position = find_spawn_actions_position_locked(actions);
     spawn_actions_entry_t *entry = *position;
     int result = real_posix_spawn_file_actions_addfchdir_np_fn(actions, directory_fd);
@@ -2195,8 +2209,8 @@ int posix_spawn_file_actions_addfchdir_np(
         }
         entry->directory_changed = 1;
     }
-    pthread_mutex_unlock(&spawn_actions_lock);
-    pthread_mutex_unlock(&inheritance_lock);
+    shim_unlock(&spawn_actions_lock);
+    shim_unlock(&inheritance_lock);
     free(new_entry);
     return result;
 }
@@ -2221,13 +2235,13 @@ int posix_spawn_file_actions_addopen(
         return ENOMEM;
     }
 
-    pthread_mutex_lock(&inheritance_lock);
-    pthread_mutex_lock(&spawn_actions_lock);
+    shim_lock(&inheritance_lock);
+    shim_lock(&spawn_actions_lock);
     spawn_actions_entry_t **position = find_spawn_actions_position_locked(actions);
     spawn_actions_entry_t *entry = *position;
     if (entry && entry->directory_changed && path[0] != '/') {
-        pthread_mutex_unlock(&spawn_actions_lock);
-        pthread_mutex_unlock(&inheritance_lock);
+        shim_unlock(&spawn_actions_lock);
+        shim_unlock(&inheritance_lock);
         free(open_action);
         free(new_entry);
         free(path_copy);
@@ -2253,8 +2267,8 @@ int posix_spawn_file_actions_addopen(
         entry->open_actions = open_action;
         open_action = NULL;
     }
-    pthread_mutex_unlock(&spawn_actions_lock);
-    pthread_mutex_unlock(&inheritance_lock);
+    shim_unlock(&spawn_actions_lock);
+    shim_unlock(&inheritance_lock);
     free(open_action);
     free(new_entry);
     free(path_copy);
@@ -2291,13 +2305,13 @@ static int spawn_process(
     char *const environment[]) {
     if (!real_function) return ENOSYS;
 
-    pthread_mutex_lock(&inheritance_lock);
-    pthread_mutex_lock(&spawn_actions_lock);
-    pthread_mutex_lock(&fd_map_lock);
+    shim_lock(&inheritance_lock);
+    shim_lock(&spawn_actions_lock);
+    shim_lock(&fd_map_lock);
     if (spawn_actions_export_managed_descriptor_locked(actions)) {
-        pthread_mutex_unlock(&fd_map_lock);
-        pthread_mutex_unlock(&spawn_actions_lock);
-        pthread_mutex_unlock(&inheritance_lock);
+        shim_unlock(&fd_map_lock);
+        shim_unlock(&spawn_actions_lock);
+        shim_unlock(&inheritance_lock);
         return EOPNOTSUPP;
     }
 
@@ -2308,9 +2322,9 @@ static int spawn_process(
         attributes,
         arguments,
         environment);
-    pthread_mutex_unlock(&fd_map_lock);
-    pthread_mutex_unlock(&spawn_actions_lock);
-    pthread_mutex_unlock(&inheritance_lock);
+    shim_unlock(&fd_map_lock);
+    shim_unlock(&spawn_actions_lock);
+    shim_unlock(&inheritance_lock);
     return result;
 }
 
@@ -2350,27 +2364,8 @@ int posix_spawnp(
         environment);
 }
 
-/*
- * Forking stays possible after models are open, so subprocess launchers that fork and exec
- * (CPython's subprocess, for one) keep working. The shim's own fork handlers take every shim
- * lock just before the fork and release them on both sides, so the child gets consistent,
- * unlocked copies. They are registered from a constructor, ahead of any library loaded later:
- * glibc runs prepare handlers in reverse registration order and child handlers in order, so
- * the shim's prepare runs last and its child handler first, and no other library's handler
- * runs while the shim holds its locks. The order matches spawn_process.
- */
-static void lock_shim_before_fork(void) {
-    pthread_mutex_lock(&inheritance_lock);
-    pthread_mutex_lock(&spawn_actions_lock);
-    pthread_mutex_lock(&fd_map_lock);
-    pthread_mutex_lock(&pending_release_lock);
-}
-
-static void unlock_shim_after_fork(void) {
-    pthread_mutex_unlock(&pending_release_lock);
-    pthread_mutex_unlock(&fd_map_lock);
-    pthread_mutex_unlock(&spawn_actions_lock);
-    pthread_mutex_unlock(&inheritance_lock);
+static int open_descriptor_placeholder(void) {
+    return real_openat_fn(AT_FDCWD, "/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
 }
 
 /*
@@ -2378,42 +2373,66 @@ static void unlock_shim_after_fork(void) {
  * that has not exec'd yet loses them here. Each number stays taken by a close-on-exec directory
  * placeholder, so stale file objects in a child that keeps running (a fork-based worker pool,
  * say) fail loudly with EISDIR instead of reaching whatever file would reuse a freed number.
- * The leases and any pending releases stay the parent's to release, so the child forgets them
- * without IPC. Only async-signal-safe work, through the real functions: the forgotten entries
- * are left allocated rather than freed.
+ * At the descriptor limit one managed slot is freed first and the placeholder opens into it,
+ * since open returns the lowest free number. The leases and any pending releases stay the
+ * parent's to release, so the child forgets them without IPC. Only async-signal-safe work,
+ * through the real functions: the forgotten entries are left allocated rather than freed.
  */
 static void drop_inherited_descriptors_in_child(void) {
-    int saved_errno = errno;
-    int placeholder = real_openat_fn && real_dup3_fn
-        ? real_openat_fn(AT_FDCWD, "/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
-        : -1;
+    int placeholder = -1;
+    if (real_openat_fn && real_dup3_fn) {
+        placeholder = open_descriptor_placeholder();
+        if (placeholder < 0 && errno == EMFILE && fd_entries) {
+            real_close_fn(fd_entries->fd);
+            placeholder = open_descriptor_placeholder();
+        }
+    }
+
+    int placeholder_fills_managed_slot = 0;
     for (fd_entry_t *entry = fd_entries; entry; entry = entry->next) {
-        if (placeholder < 0 || real_dup3_fn(placeholder, entry->fd, O_CLOEXEC) < 0) {
+        if (entry->fd == placeholder) {
+            placeholder_fills_managed_slot = 1;
+        }
+        else if (placeholder < 0 || real_dup3_fn(placeholder, entry->fd, O_CLOEXEC) < 0) {
             real_close_fn(entry->fd);
         }
     }
-    if (placeholder >= 0) real_close_fn(placeholder);
+    if (placeholder >= 0 && !placeholder_fills_managed_slot) real_close_fn(placeholder);
     fd_entries = NULL;
     managed_descriptor_seen = 0;
     pending_releases = NULL;
     pending_release_worker_started = 0;
     pending_release_ready = (pthread_cond_t)PTHREAD_COND_INITIALIZER;
-    unlock_shim_after_fork();
-    errno = saved_errno;
 }
 
-__attribute__((constructor)) static void register_fork_handlers(void) {
-    init_syms();
-    pthread_atfork(lock_shim_before_fork, unlock_shim_after_fork, drop_inherited_descriptors_in_child);
-}
-
+/*
+ * Forking stays possible after models are open, so subprocess launchers that fork and exec
+ * (CPython's subprocess, for one) keep working. Every shim lock is taken before the real fork,
+ * in spawn_process's order, so the child gets consistent copies; glibc's fork handlers then run
+ * on this thread, where fork_locks_held lets the wrappers they call proceed under those locks.
+ */
 pid_t fork(void) {
     init_syms();
     if (!real_fork_fn) {
         errno = ENOSYS;
         return -1;
     }
-    return real_fork_fn();
+
+    pthread_mutex_lock(&inheritance_lock);
+    pthread_mutex_lock(&spawn_actions_lock);
+    pthread_mutex_lock(&fd_map_lock);
+    pthread_mutex_lock(&pending_release_lock);
+    fork_locks_held = 1;
+    pid_t result = real_fork_fn();
+    int saved_errno = errno;
+    if (result == 0) drop_inherited_descriptors_in_child();
+    fork_locks_held = 0;
+    pthread_mutex_unlock(&pending_release_lock);
+    pthread_mutex_unlock(&fd_map_lock);
+    pthread_mutex_unlock(&spawn_actions_lock);
+    pthread_mutex_unlock(&inheritance_lock);
+    errno = saved_errno;
+    return result;
 }
 
 /*
@@ -2436,11 +2455,11 @@ int clone(int (*function)(void *), void *child_stack, int flags, void *argument,
 
     /* Unlike fork, a clone child may share the parent's memory, so it cannot drop its copy of
      * the managed descriptors without corrupting the parent's state; refuse an unshared table. */
-    pthread_mutex_lock(&inheritance_lock);
+    shim_lock(&inheritance_lock);
     const int shared_process_flags = CLONE_VM | CLONE_FILES | CLONE_THREAD;
     if (managed_descriptor_seen &&
         (flags & shared_process_flags) != shared_process_flags) {
-        pthread_mutex_unlock(&inheritance_lock);
+        shim_unlock(&inheritance_lock);
         errno = EOPNOTSUPP;
         return -1;
     }
@@ -2472,7 +2491,7 @@ int clone(int (*function)(void *), void *child_stack, int flags, void *argument,
         parent_tid,
         tls,
         child_tid);
-    pthread_mutex_unlock(&inheritance_lock);
+    shim_unlock(&inheritance_lock);
     return result;
 }
 
@@ -2520,18 +2539,18 @@ ssize_t sendmsg(int socket_fd, const struct msghdr *message, int flags) {
         return -1;
     }
 
-    pthread_mutex_lock(&inheritance_lock);
-    pthread_mutex_lock(&fd_map_lock);
+    shim_lock(&inheritance_lock);
+    shim_lock(&fd_map_lock);
     int exports_managed = message_exports_managed_descriptor_locked(message);
-    pthread_mutex_unlock(&fd_map_lock);
+    shim_unlock(&fd_map_lock);
     if (exports_managed) {
-        pthread_mutex_unlock(&inheritance_lock);
+        shim_unlock(&inheritance_lock);
         errno = EOPNOTSUPP;
         return -1;
     }
 
     ssize_t result = real_sendmsg_fn(socket_fd, message, flags);
-    pthread_mutex_unlock(&inheritance_lock);
+    shim_unlock(&inheritance_lock);
     return result;
 }
 
@@ -2546,8 +2565,8 @@ int sendmmsg(
         return -1;
     }
 
-    pthread_mutex_lock(&inheritance_lock);
-    pthread_mutex_lock(&fd_map_lock);
+    shim_lock(&inheritance_lock);
+    shim_lock(&fd_map_lock);
     int exports_managed = 0;
     for (unsigned int index = 0; index < message_count; index++) {
         if (message_exports_managed_descriptor_locked(&messages[index].msg_hdr)) {
@@ -2555,15 +2574,15 @@ int sendmmsg(
             break;
         }
     }
-    pthread_mutex_unlock(&fd_map_lock);
+    shim_unlock(&fd_map_lock);
     if (exports_managed) {
-        pthread_mutex_unlock(&inheritance_lock);
+        shim_unlock(&inheritance_lock);
         errno = EOPNOTSUPP;
         return -1;
     }
 
     int result = real_sendmmsg_fn(socket_fd, messages, message_count, flags);
-    pthread_mutex_unlock(&inheritance_lock);
+    shim_unlock(&inheritance_lock);
     return result;
 }
 
@@ -2885,9 +2904,9 @@ int ioctl(int fd, unsigned long request, ...) {
 
     if (request == FIONCLEX || request == FIOCLEX) {
         if (request == FIONCLEX) {
-            pthread_mutex_lock(&fd_map_lock);
+            shim_lock(&fd_map_lock);
             int managed = descriptor_is_managed_locked(fd);
-            pthread_mutex_unlock(&fd_map_lock);
+            shim_unlock(&fd_map_lock);
             if (managed) {
                 errno = EOPNOTSUPP;
                 return -1;
