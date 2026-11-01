@@ -3497,6 +3497,125 @@ public class VfsShimLinuxTests
         }
     }
 
+    [Test]
+    public async Task RangeManaged_ForkChildren_GetNoRawCopyOfDescriptorsClosedOrDuplicatedDuringFork()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        LinuxTestPrerequisites.RequireUnixDomainSockets();
+        LinuxTestPrerequisites.RequireCommand("/usr/bin/gcc");
+
+        var root = Path.Combine(Path.GetTempPath(), "runneragent-vfs-shim-tests", Guid.NewGuid().ToString("n"));
+        Directory.CreateDirectory(root);
+
+        try
+        {
+            var modelsRoot = Path.Combine(root, "models");
+            Directory.CreateDirectory(modelsRoot);
+            var modelPath = Path.Combine(modelsRoot, "churn.bin");
+            await File.WriteAllBytesAsync(modelPath, new byte[8]);
+
+            var shimPath = Path.Combine(root, "liboffloadr_model_vfs.so");
+            var probeSourcePath = Path.Combine(root, "churn-fork-probe.c");
+            var probePath = Path.Combine(root, "churn-fork-probe");
+            var socketPath = Path.Combine(root, "model-fetch.sock");
+
+            await CompileShimAsync(shimPath);
+            // One thread keeps duplicating and closing managed descriptors while another forks;
+            // every child checks that no descriptor still names the model file.
+            await File.WriteAllTextAsync(probeSourcePath, """
+                #define _GNU_SOURCE
+                #include <fcntl.h>
+                #include <pthread.h>
+                #include <stdio.h>
+                #include <sys/stat.h>
+                #include <sys/wait.h>
+                #include <unistd.h>
+
+                static int managed = -1;
+                static volatile int stopping = 0;
+
+                static void *churn_descriptors(void *argument) {
+                    (void)argument;
+                    while (!stopping) {
+                        int duplicate = dup(managed);
+                        if (duplicate >= 0) close(duplicate);
+                        int target = open("/dev/null", O_RDONLY);
+                        if (target < 0) continue;
+                        close(target);
+                        if (dup3(managed, target, O_CLOEXEC) == target) close(target);
+                    }
+                    return NULL;
+                }
+
+                int main(int argc, char **argv) {
+                    if (argc != 2) return 10;
+                    managed = open(argv[1], O_RDONLY);
+                    if (managed < 0) return 11;
+                    struct stat model;
+                    if (fstat(managed, &model) != 0) return 12;
+                    pthread_t churner;
+                    if (pthread_create(&churner, NULL, churn_descriptors, NULL) != 0) return 13;
+                    for (int round = 0; round < 300; round++) {
+                        pid_t child = fork();
+                        if (child < 0) return 14;
+                        if (child == 0) {
+                            for (int descriptor = 0; descriptor < 256; descriptor++) {
+                                struct stat status;
+                                if (fstat(descriptor, &status) == 0 &&
+                                    status.st_dev == model.st_dev && status.st_ino == model.st_ino) _exit(2);
+                            }
+                            _exit(0);
+                        }
+                        int status = 0;
+                        if (waitpid(child, &status, 0) != child) return 15;
+                        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return 16;
+                    }
+                    stopping = 1;
+                    if (pthread_join(churner, NULL) != 0) return 17;
+                    close(managed);
+                    puts("ok");
+                    return 0;
+                }
+                """);
+            await RunProcessAsync(
+                "/usr/bin/gcc",
+                [probeSourcePath, "-o", probePath, "-pthread"],
+                root);
+
+            await using var server = new VfsIpcServer(socketPath, (request, _) => Task.FromResult(request.Operation switch
+            {
+                VfsIpcOperation.Open => RangeManagedResponse(modelPath, leaseId: 915, transferEpoch: 1, expectedLength: 8),
+                VfsIpcOperation.Release => VfsIpcResponse.Success(transferEpoch: 1),
+                _ => VfsIpcResponse.Error(VfsIpcStatus.ServerError)
+            }));
+            server.Start();
+
+            var result = await RunProcessAsync(
+                probePath,
+                [modelPath],
+                root,
+                new Dictionary<string, string?>
+                {
+                    ["LD_PRELOAD"] = shimPath,
+                    ["VFS_SOCKET"] = socketPath,
+                    ["VFS_ROOTS"] = modelsRoot,
+                    ["VFS_EXTS"] = ".bin",
+                    ["VFS_SESSION_ID"] = "churn-fork-session",
+                    ["VFS_LOG"] = "0"
+                },
+                timeout: TimeSpan.FromSeconds(30));
+
+            Assert.That(result.Stdout.Trim(), Is.EqualTo("ok"));
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
     private static async Task WriteInheritanceProbeAsync(string probeSourcePath)
     {
         await File.WriteAllTextAsync(probeSourcePath, """

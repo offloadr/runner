@@ -1102,12 +1102,43 @@ static void release_stream_state_after_io(FILE *file, shared_state_t *state) {
     funlockfile(file);
 }
 
-static shared_state_t *lock_and_detach_fd_for_close(int fd) {
-    shared_state_t *state = NULL;
-    // Match the map -> open-file-description lock order used by reads and
-    // descriptor replacement. Keep both locks until the kernel close returns
-    // so the numeric fd cannot be reused underneath an in-flight managed read.
+static int map_has_descriptor_in_locked(int first, int last) {
+    if (last < 0) return 0;
+    for (fd_entry_t *entry = fd_entries; entry; entry = entry->next) {
+        if (entry->fd >= first && entry->fd <= last) return 1;
+    }
+    return 0;
+}
+
+/*
+ * Managed descriptors are closed and duplicated only under inheritance_lock, which fork holds,
+ * so the descriptor table a fork child copies always agrees with the map. A transition takes it
+ * only when a managed descriptor is involved: plain closes and duplicates never wait for a fork,
+ * and other libraries' fork handlers cannot invert lock order through them. A descriptor becomes
+ * managed only under the map lock, so a transition that finds none involved while holding that
+ * lock can go ahead as it is; otherwise it relocks in lock order, inheritance_lock first.
+ * Returns with fd_map_lock held, and whether inheritance_lock is held as well.
+ */
+static int lock_map_for_transition(int first, int last, int other_fd) {
     shim_lock(&fd_map_lock);
+    if (!map_has_descriptor_in_locked(first, last) &&
+        !map_has_descriptor_in_locked(other_fd, other_fd)) return 0;
+    shim_unlock(&fd_map_lock);
+    shim_lock(&inheritance_lock);
+    shim_lock(&fd_map_lock);
+    return 1;
+}
+
+static void unlock_map_after_transition(int serialized) {
+    shim_unlock(&fd_map_lock);
+    if (serialized) shim_unlock(&inheritance_lock);
+}
+
+// Match the map -> open-file-description lock order used by reads and
+// descriptor replacement. Keep both locks until the kernel close returns
+// so the numeric fd cannot be reused underneath an in-flight managed read.
+static shared_state_t *detach_fd_for_close_locked(int fd) {
+    shared_state_t *state = NULL;
     fd_entry_t **position = &fd_entries;
     while (*position) {
         if ((*position)->fd == fd) {
@@ -1123,9 +1154,14 @@ static shared_state_t *lock_and_detach_fd_for_close(int fd) {
     return state;
 }
 
-static void unlock_after_close(shared_state_t *state) {
+static shared_state_t *lock_and_detach_fd_for_close(int fd, int *serialized) {
+    *serialized = lock_map_for_transition(fd, fd, -1);
+    return detach_fd_for_close_locked(fd);
+}
+
+static void unlock_after_close(shared_state_t *state, int serialized) {
     if (state) pthread_mutex_unlock(&state->io_lock);
-    shim_unlock(&fd_map_lock);
+    unlock_map_after_transition(serialized);
     if (state) state_release_reference(state);
 }
 
@@ -1640,11 +1676,12 @@ FILE *fdopen(int fd, const char *mode) {
 int close(int fd) {
     init_syms();
     if (reentry) return real_close_fn(fd);
-    shared_state_t *state = lock_and_detach_fd_for_close(fd);
+    int serialized = 0;
+    shared_state_t *state = lock_and_detach_fd_for_close(fd, &serialized);
     reentry++;
     int result = real_close_fn(fd);
     reentry--;
-    unlock_after_close(state);
+    unlock_after_close(state, serialized);
     return result;
 }
 
@@ -1672,7 +1709,10 @@ int close_range(unsigned int first, unsigned int last, int flags) {
         return call_real_close_range(first, last, flags);
     }
 
-    shim_lock(&fd_map_lock);
+    int serialized = lock_map_for_transition(
+        first > INT_MAX ? INT_MAX : (int)first,
+        last > INT_MAX ? INT_MAX : (int)last,
+        -1);
     size_t matching_count = 0;
     for (fd_entry_t *entry = fd_entries; entry; entry = entry->next) {
         unsigned int descriptor = (unsigned int)entry->fd;
@@ -1688,7 +1728,7 @@ int close_range(unsigned int first, unsigned int last, int flags) {
     if (matching_count && (!unique_states || !removed_states)) {
         free(unique_states);
         free(removed_states);
-        shim_unlock(&fd_map_lock);
+        unlock_map_after_transition(serialized);
         errno = ENOMEM;
         return -1;
     }
@@ -1727,7 +1767,7 @@ int close_range(unsigned int first, unsigned int last, int flags) {
     for (size_t state_index = 0; state_index < unique_count; state_index++) {
         pthread_mutex_unlock(&unique_states[state_index]->io_lock);
     }
-    shim_unlock(&fd_map_lock);
+    unlock_map_after_transition(serialized);
     for (size_t state_index = 0; state_index < removed_count; state_index++) {
         state_release_reference(removed_states[state_index]);
     }
@@ -1773,11 +1813,15 @@ int fcloseall(void) {
         return EOF;
     }
 
+    // glibc closes the streams itself, before the map learns of it, so the whole call is
+    // serialized with fork; it is rare enough not to tell managed streams apart first.
+    shim_lock(&inheritance_lock);
     reentry++;
     int result = real_fcloseall_fn();
     reentry--;
     int saved_errno = errno;
     detach_closed_descriptors();
+    shim_unlock(&inheritance_lock);
     errno = saved_errno;
     return result;
 }
@@ -1788,12 +1832,16 @@ int fclose(FILE *file) {
     shared_state_t *observed = acquire_fd_state(fd);
     if (!observed) return real_fclose_fn(file);
     state_release_reference(observed);
+    // A managed stream: serialize with fork before taking the stream lock, the order fcloseall
+    // uses, since glibc locks streams while fcloseall holds inheritance_lock.
+    shim_lock(&inheritance_lock);
     flockfile(file);
-    shared_state_t *state = lock_and_detach_fd_for_close(fd);
+    shim_lock(&fd_map_lock);
+    shared_state_t *state = detach_fd_for_close_locked(fd);
     reentry++;
     int result = real_fclose_fn(file);
     reentry--;
-    unlock_after_close(state);
+    unlock_after_close(state, 1);
     return result;
 }
 
@@ -1845,7 +1893,7 @@ void setlinebuf(FILE *file) {
 
 int dup(int old_fd) {
     init_syms();
-    shim_lock(&fd_map_lock);
+    int serialized = lock_map_for_transition(old_fd, old_fd, -1);
     shared_state_t *state = NULL;
     for (fd_entry_t *entry = fd_entries; entry; entry = entry->next) {
         if (entry->fd == old_fd) {
@@ -1855,7 +1903,7 @@ int dup(int old_fd) {
     }
     fd_entry_t *new_entry = state ? calloc(1, sizeof(*new_entry)) : NULL;
     if (state && !new_entry) {
-        shim_unlock(&fd_map_lock);
+        unlock_map_after_transition(serialized);
         errno = ENOMEM;
         return -1;
     }
@@ -1876,7 +1924,7 @@ int dup(int old_fd) {
         new_entry = NULL;
     }
     if (state) pthread_mutex_unlock(&state->io_lock);
-    shim_unlock(&fd_map_lock);
+    unlock_map_after_transition(serialized);
     free(new_entry);
     return new_fd;
 }
@@ -1889,7 +1937,7 @@ static int duplicate_to(int old_fd, int new_fd, int flags, int use_dup3) {
     }
     if (old_fd == new_fd) return real_dup2_fn(old_fd, new_fd);
 
-    shim_lock(&fd_map_lock);
+    int serialized = lock_map_for_transition(old_fd, old_fd, new_fd);
     fd_entry_t *source_entry = NULL;
     fd_entry_t **target_position = &fd_entries;
     while (*target_position) {
@@ -1910,7 +1958,7 @@ static int duplicate_to(int old_fd, int new_fd, int flags, int use_dup3) {
     shared_state_t *source_state = source_entry ? source_entry->state : NULL;
     shared_state_t *old_target_state = target_entry ? target_entry->state : NULL;
     if (source_state && !target_entry && real_fcntl_fn(new_fd, F_GETFD) >= 0) {
-        shim_unlock(&fd_map_lock);
+        unlock_map_after_transition(serialized);
         errno = EOPNOTSUPP;
         return -1;
     }
@@ -1918,7 +1966,7 @@ static int duplicate_to(int old_fd, int new_fd, int flags, int use_dup3) {
     if (source_state) {
         replacement_entry = calloc(1, sizeof(*replacement_entry));
         if (!replacement_entry) {
-            shim_unlock(&fd_map_lock);
+            unlock_map_after_transition(serialized);
             errno = ENOMEM;
             return -1;
         }
@@ -1936,7 +1984,7 @@ static int duplicate_to(int old_fd, int new_fd, int flags, int use_dup3) {
             pthread_mutex_unlock(&old_target_state->io_lock);
         }
         if (source_state) pthread_mutex_unlock(&source_state->io_lock);
-        shim_unlock(&fd_map_lock);
+        unlock_map_after_transition(serialized);
         free(replacement_entry);
         return result;
     }
@@ -1962,7 +2010,7 @@ static int duplicate_to(int old_fd, int new_fd, int flags, int use_dup3) {
         pthread_mutex_unlock(&old_target_state->io_lock);
     }
     if (source_state) pthread_mutex_unlock(&source_state->io_lock);
-    shim_unlock(&fd_map_lock);
+    unlock_map_after_transition(serialized);
     if (old_target_state) state_release_reference(old_target_state);
     if (cloexec_error) {
         free(replacement_entry);
@@ -1987,7 +2035,7 @@ static int fcntl_with_arguments(
     int (*real_function)(int, int, ...)) {
     if (command == F_DUPFD || command == F_DUPFD_CLOEXEC) {
         int minimum_fd = va_arg(arguments, int);
-        shim_lock(&fd_map_lock);
+        int serialized = lock_map_for_transition(fd, fd, -1);
         shared_state_t *state = NULL;
         for (fd_entry_t *entry = fd_entries; entry; entry = entry->next) {
             if (entry->fd == fd) {
@@ -1997,7 +2045,7 @@ static int fcntl_with_arguments(
         }
         fd_entry_t *new_entry = state ? calloc(1, sizeof(*new_entry)) : NULL;
         if (state && !new_entry) {
-            shim_unlock(&fd_map_lock);
+            unlock_map_after_transition(serialized);
             errno = ENOMEM;
             return -1;
         }
@@ -2018,7 +2066,7 @@ static int fcntl_with_arguments(
             new_entry = NULL;
         }
         if (state) pthread_mutex_unlock(&state->io_lock);
-        shim_unlock(&fd_map_lock);
+        unlock_map_after_transition(serialized);
         free(new_entry);
         return result;
     }
@@ -2443,11 +2491,10 @@ int posix_spawnp(
  * fork returns. It may run inside a wrapped call, so it leaves errno as it found it.
  *
  * Fork does not hold the descriptor map lock (common wrappers take it, and holding it across
- * other libraries' fork handlers would invert their lock order), so the child's copy of the map
- * is checked against the kernel: a number is replaced only while it still names its model file.
- * The map stays a well-formed list throughout, since entries are published whole and unlinked
- * before they are freed. A managed descriptor that another thread is closing or duplicating at
- * the very instant of fork can still reach a child that never execs as a close-on-exec copy.
+ * other libraries' fork handlers would invert their lock order). It holds inheritance_lock,
+ * under which every managed open, close and duplication happens, so the child's copy of the map
+ * agrees with its descriptor table. A number is still replaced only while it names its model
+ * file, which covers descriptors closed behind the shim's back (a raw close syscall, say).
  */
 static int descriptor_names_state(int fd, const shared_state_t *state) {
     struct stat status;
