@@ -554,7 +554,9 @@ static int read_exact(int fd, void *buffer, size_t length) {
  * The child asks the kernel rather than a table the parent kept, which a request opening or
  * closing its socket at the instant of fork could leave behind: it lists its own descriptors
  * and closes each socket whose peer is the fetch service. Raw syscalls and a stack buffer keep
- * this async-signal-safe. Without /proc, close-on-exec still covers children that exec.
+ * this async-signal-safe. When /proc/self/fd cannot be opened (the child is at its descriptor
+ * limit, or /proc is not mounted), it probes every number below the soft limit instead, capped
+ * so an unlimited soft limit cannot make a fork crawl; close-on-exec covers children that exec.
  */
 static char fetch_service_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
 static int fetch_service_used = 0;
@@ -591,10 +593,26 @@ struct vfs_dirent64 {
     char d_name[];
 };
 
+#define VFS_FETCH_PROBE_LIMIT (1 << 20)
+
+static void probe_inherited_fetch_connections_in_child(void) {
+    struct rlimit limit;
+    rlim_t highest = VFS_FETCH_PROBE_LIMIT;
+    if (getrlimit(RLIMIT_NOFILE, &limit) == 0 && limit.rlim_cur < highest) highest = limit.rlim_cur;
+    for (rlim_t fd = 0; fd < highest; fd++) {
+        if (descriptor_is_fetch_connection((int)fd)) syscall(SYS_close, (int)fd);
+    }
+}
+
 static void close_inherited_fetch_connections_in_child(void) {
-    if (!__atomic_load_n(&fetch_service_used, __ATOMIC_ACQUIRE) || !real_openat_fn) return;
-    int directory = real_openat_fn(AT_FDCWD, "/proc/self/fd", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (directory < 0) return;
+    if (!__atomic_load_n(&fetch_service_used, __ATOMIC_ACQUIRE)) return;
+    int directory = real_openat_fn
+        ? real_openat_fn(AT_FDCWD, "/proc/self/fd", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        : -1;
+    if (directory < 0) {
+        probe_inherited_fetch_connections_in_child();
+        return;
+    }
     char buffer[4096] __attribute__((aligned(8)));
     for (;;) {
         long count = syscall(SYS_getdents64, directory, buffer, sizeof(buffer));

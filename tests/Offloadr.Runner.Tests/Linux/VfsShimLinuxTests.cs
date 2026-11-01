@@ -3649,6 +3649,7 @@ public class VfsShimLinuxTests
                 #include <fcntl.h>
                 #include <pthread.h>
                 #include <stdio.h>
+                #include <sys/resource.h>
                 #include <unistd.h>
 
                 static int managed = -1;
@@ -3675,7 +3676,13 @@ public class VfsShimLinuxTests
                         execl("/bin/sleep", "sleep", "30", (char *)NULL);
                         _exit(127);
                     }
-                    /* A child that keeps running without exec. */
+                    /* A child that keeps running without exec, forked with no descriptor to spare. */
+                    struct rlimit lowered = {64, 64};
+                    if (getrlimit(RLIMIT_NOFILE, &lowered) != 0) return 15;
+                    lowered.rlim_cur = 64;
+                    if (setrlimit(RLIMIT_NOFILE, &lowered) != 0) return 15;
+                    while (open("/dev/null", O_RDONLY) >= 0) {
+                    }
                     pid_t worker = fork();
                     if (worker < 0) return 14;
                     if (worker == 0) {
