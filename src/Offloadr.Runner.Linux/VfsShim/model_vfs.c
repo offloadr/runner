@@ -1266,6 +1266,45 @@ static shared_state_t *create_opened_fd_state(
     return state;
 }
 
+static int open_descriptor_placeholder(void) {
+    return real_openat_fn ? real_openat_fn(AT_FDCWD, "/", O_RDONLY | O_DIRECTORY | O_CLOEXEC) : -1;
+}
+
+static uint64_t device_number(dev_t device) {
+    return ((uint64_t)major(device) << 32) | (uint64_t)minor(device);
+}
+
+/* Opened alongside the first managed descriptor, under inheritance_lock, and kept: a fork child
+ * then reserves managed numbers with dup3 alone, which needs neither a free descriptor number
+ * (EMFILE) nor a free system-wide file (ENFILE). Its identity is recorded so the child can tell
+ * whether the application has since closed or reused the number. */
+static int kept_placeholder = -1;
+static uint64_t kept_placeholder_device = 0;
+static uint64_t kept_placeholder_inode = 0;
+
+static void keep_descriptor_placeholder(void) {
+    if (kept_placeholder >= 0) return;
+    int placeholder = open_descriptor_placeholder();
+    if (placeholder < 0) return;
+    struct stat status;
+    if (fstat(placeholder, &status) != 0) {
+        real_close_fn(placeholder);
+        return;
+    }
+    kept_placeholder_device = device_number(status.st_dev);
+    kept_placeholder_inode = (uint64_t)status.st_ino;
+    kept_placeholder = placeholder;
+}
+
+static int kept_placeholder_is_intact(void) {
+    struct stat status;
+    return kept_placeholder >= 0 &&
+           fstat(kept_placeholder, &status) == 0 &&
+           S_ISDIR(status.st_mode) &&
+           device_number(status.st_dev) == kept_placeholder_device &&
+           (uint64_t)status.st_ino == kept_placeholder_inode;
+}
+
 static int attach_opened_fd(int fd, const ipc_response_t *response, int close_on_failure) {
     if (response->disposition != VFS_OPEN_RANGE_MANAGED) return fd;
     shared_state_t *state = create_opened_fd_state(fd, response, close_on_failure);
@@ -1277,6 +1316,7 @@ static int attach_opened_fd(int fd, const ipc_response_t *response, int close_on
         return -1;
     }
     managed_descriptor_seen = 1;
+    keep_descriptor_placeholder();
     return fd;
 }
 
@@ -1541,6 +1581,7 @@ static FILE *freopen_managed(
         if (attach_fd_locked(fileno(result), replacement_state, 0) == 0) {
             replacement_state_attached = 1;
             managed_descriptor_seen = 1;
+            keep_descriptor_placeholder();
         }
         else {
             result_errno = ENOMEM;
@@ -2387,19 +2428,17 @@ int posix_spawnp(
         environment);
 }
 
-static int open_descriptor_placeholder(void) {
-    return real_openat_fn(AT_FDCWD, "/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-}
-
 /*
  * Managed descriptors never reach another process: they are close-on-exec, and a fork child
  * that has not exec'd yet loses them here. Each number stays taken by a close-on-exec directory
  * placeholder, so stale file objects in a child that keeps running (a fork-based worker pool,
  * say) fail loudly with EISDIR instead of reaching whatever file would reuse a freed number.
- * At the descriptor limit one managed slot is freed first and the placeholder opens into it,
- * since open returns the lowest free number. The leases and any pending releases stay the
- * parent's to release, so the child forgets them without IPC. Only async-signal-safe work,
- * through the real functions: the forgotten entries are left allocated rather than freed.
+ * The placeholder is the one kept since the first managed open. If the application has closed
+ * or reused that number, a fresh one is opened; at the descriptor limit one managed slot is
+ * freed first and it opens into that slot, since open returns the lowest free number. Only when
+ * no placeholder can be had at all are the numbers closed. The leases and any pending releases
+ * stay the parent's to release, so the child forgets them without IPC. Only async-signal-safe
+ * work, through the real functions: the forgotten entries are left allocated rather than freed.
  * It runs once per child: at the first descriptor lookup of a child fork handler, or else when
  * fork returns. It may run inside a wrapped call, so it leaves errno as it found it.
  *
@@ -2413,8 +2452,8 @@ static int open_descriptor_placeholder(void) {
 static int descriptor_names_state(int fd, const shared_state_t *state) {
     struct stat status;
     if (fstat(fd, &status) != 0) return 0;
-    uint64_t device_id = ((uint64_t)major(status.st_dev) << 32) | (uint64_t)minor(status.st_dev);
-    return device_id == state->device_id && (uint64_t)status.st_ino == state->inode;
+    return device_number(status.st_dev) == state->device_id &&
+           (uint64_t)status.st_ino == state->inode;
 }
 
 static void drop_inherited_descriptors_in_child(void) {
@@ -2422,7 +2461,12 @@ static void drop_inherited_descriptors_in_child(void) {
     inherited_descriptors_dropped = 1;
     int saved_errno = errno;
     int placeholder = -1;
-    if (real_openat_fn && real_dup3_fn) {
+    int placeholder_is_kept = 0;
+    if (real_dup3_fn && kept_placeholder_is_intact()) {
+        placeholder = kept_placeholder;
+        placeholder_is_kept = 1;
+    }
+    else if (real_dup3_fn) {
         placeholder = open_descriptor_placeholder();
         if (placeholder < 0 && errno == EMFILE) {
             for (fd_entry_t *entry = fd_entries; entry; entry = entry->next) {
@@ -2446,7 +2490,9 @@ static void drop_inherited_descriptors_in_child(void) {
             real_close_fn(entry->fd);
         }
     }
-    if (placeholder >= 0 && !placeholder_fills_managed_slot) real_close_fn(placeholder);
+    if (placeholder >= 0 && !placeholder_is_kept && !placeholder_fills_managed_slot) {
+        real_close_fn(placeholder);
+    }
     fd_entries = NULL;
     managed_descriptor_seen = 0;
     pending_releases = NULL;

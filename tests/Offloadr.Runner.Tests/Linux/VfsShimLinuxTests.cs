@@ -3510,6 +3510,7 @@ public class VfsShimLinuxTests
             #include <stdio.h>
             #include <sys/ioctl.h>
             #include <sys/resource.h>
+            #include <sys/stat.h>
             #include <sys/wait.h>
             #include <unistd.h>
 
@@ -3547,6 +3548,11 @@ public class VfsShimLinuxTests
                     !WIFEXITED(clone_status) || WEXITSTATUS(clone_status) != 0) return 50;
                 int managed = open(argv[1], O_RDONLY);
                 if (managed < 0 || !is_close_on_exec(managed)) return 11;
+                /* The shim keeps a directory placeholder from the first managed open on. */
+                int kept_placeholder = managed + 1;
+                struct stat kept_status;
+                if (fstat(kept_placeholder, &kept_status) != 0 || !S_ISDIR(kept_status.st_mode) ||
+                    !is_close_on_exec(kept_placeholder)) return 59;
                 if (fcntl(managed, F_SETFD, 0) != 0 || !is_close_on_exec(managed)) return 12;
                 errno = 0;
                 if (ioctl(managed, FIONCLEX) != -1 || errno != EOPNOTSUPP ||
@@ -3709,8 +3715,12 @@ public class VfsShimLinuxTests
                     !WIFEXITED(forked_status) || WEXITSTATUS(forked_status) != 0) return 48;
                 close(unmanaged);
 
-                /* At the descriptor limit there is no free number for the placeholder; the child
-                 * still keeps every managed number taken. */
+                /* The application reuses the kept placeholder's number, and the descriptor limit
+                 * leaves no free number for a fresh one: the child leaves the reused descriptor
+                 * alone and still keeps every managed number taken. */
+                close(kept_placeholder);
+                int reused = open("/dev/null", O_RDONLY);
+                if (reused != kept_placeholder) return 60;
                 struct rlimit original_limit;
                 if (getrlimit(RLIMIT_NOFILE, &original_limit) != 0) return 54;
                 struct rlimit lowered_limit = original_limit;
@@ -3736,6 +3746,7 @@ public class VfsShimLinuxTests
                     }
                     errno = 0;
                     if (open("/dev/null", O_RDONLY) != -1 || errno != EMFILE) _exit(4);
+                    if (read(reused, &byte, 1) != 0) _exit(5);
                     _exit(0);
                 }
                 int limited_status = 0;
@@ -3743,6 +3754,7 @@ public class VfsShimLinuxTests
                     !WIFEXITED(limited_status) || WEXITSTATUS(limited_status) != 0) return 57;
                 for (int index = 0; index < filler_count; index++) close(fillers[index]);
                 if (setrlimit(RLIMIT_NOFILE, &original_limit) != 0) return 58;
+                close(reused);
 
                 /* Fork and exec after a model is open, the way CPython's subprocess runs a tool. */
                 pid_t exec_child = vfork();
