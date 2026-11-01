@@ -3238,6 +3238,7 @@ public class VfsShimLinuxTests
             #define _GNU_SOURCE
             #include <errno.h>
             #include <fcntl.h>
+            #include <pthread.h>
             #include <sched.h>
             #include <signal.h>
             #include <spawn.h>
@@ -3251,6 +3252,14 @@ public class VfsShimLinuxTests
             static int clone_child(void *argument) {
                 (void)argument;
                 return 0;
+            }
+
+            static void touch_descriptors(void) {
+                int descriptor = open("/dev/null", O_RDONLY);
+                if (descriptor >= 0) {
+                    (void)fcntl(descriptor, F_GETFD);
+                    close(descriptor);
+                }
             }
 
             static int is_close_on_exec(int fd) {
@@ -3401,19 +3410,32 @@ public class VfsShimLinuxTests
                 if (waitpid(child, &child_status, 0) != child ||
                     !WIFEXITED(child_status) || WEXITSTATUS(child_status) != 0) return 46;
 
-                /* A forked child that never execs gets no managed descriptor: the shim closes
-                 * every copy before fork returns, and the lease stays the parent's to release. */
+                /* Fork handlers that call wrapped functions run while the shim is not holding
+                 * its locks, in the parent and in the child. */
+                if (pthread_atfork(touch_descriptors, touch_descriptors, touch_descriptors) != 0) return 47;
+
+                /* A forked child that never execs gets no managed descriptor: each copy becomes
+                 * a placeholder whose reads fail, its number stays taken, and the lease stays
+                 * the parent's to release. */
                 int unmanaged = open("/dev/null", O_RDONLY);
                 if (unmanaged < 0) return 47;
                 pid_t forked = fork();
                 if (forked < 0) return 47;
                 if (forked == 0) {
                     int descriptors[] = {managed, duplicate, target, fcntl_duplicate};
-                    for (size_t index = 0; index < sizeof(descriptors) / sizeof(descriptors[0]); index++) {
+                    size_t count = sizeof(descriptors) / sizeof(descriptors[0]);
+                    char byte;
+                    for (size_t index = 0; index < count; index++) {
                         errno = 0;
-                        if (fcntl(descriptors[index], F_GETFD) != -1 || errno != EBADF) _exit(2);
+                        if (read(descriptors[index], &byte, 1) != -1 || errno != EISDIR) _exit(2);
+                        if (!is_close_on_exec(descriptors[index])) _exit(3);
                     }
-                    if (fcntl(unmanaged, F_GETFD) < 0) _exit(3);
+                    int fresh = open("/dev/null", O_RDONLY);
+                    if (fresh < 0) _exit(4);
+                    for (size_t index = 0; index < count; index++) {
+                        if (fresh == descriptors[index]) _exit(5);
+                    }
+                    if (fcntl(unmanaged, F_GETFD) < 0) _exit(6);
                     _exit(0);
                 }
                 int forked_status = 0;

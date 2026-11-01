@@ -2351,48 +2351,69 @@ int posix_spawnp(
 }
 
 /*
- * Runs in a fork child before fork returns, while the forking thread still holds every shim
- * lock. Managed descriptors never reach another process: they are close-on-exec, and a child
- * that has not exec'd yet closes them here. Their leases and any pending releases stay the
- * parent's to release, so the child forgets them without IPC. Only async-signal-safe work:
- * the forgotten entries are left allocated rather than freed.
+ * Forking stays possible after models are open, so subprocess launchers that fork and exec
+ * (CPython's subprocess, for one) keep working. The shim's own fork handlers take every shim
+ * lock just before the fork and release them on both sides, so the child gets consistent,
+ * unlocked copies. They are registered from a constructor, ahead of any library loaded later:
+ * glibc runs prepare handlers in reverse registration order and child handlers in order, so
+ * the shim's prepare runs last and its child handler first, and no other library's handler
+ * runs while the shim holds its locks. The order matches spawn_process.
+ */
+static void lock_shim_before_fork(void) {
+    pthread_mutex_lock(&inheritance_lock);
+    pthread_mutex_lock(&spawn_actions_lock);
+    pthread_mutex_lock(&fd_map_lock);
+    pthread_mutex_lock(&pending_release_lock);
+}
+
+static void unlock_shim_after_fork(void) {
+    pthread_mutex_unlock(&pending_release_lock);
+    pthread_mutex_unlock(&fd_map_lock);
+    pthread_mutex_unlock(&spawn_actions_lock);
+    pthread_mutex_unlock(&inheritance_lock);
+}
+
+/*
+ * Managed descriptors never reach another process: they are close-on-exec, and a fork child
+ * that has not exec'd yet loses them here. Each number stays taken by a close-on-exec directory
+ * placeholder, so stale file objects in a child that keeps running (a fork-based worker pool,
+ * say) fail loudly with EISDIR instead of reaching whatever file would reuse a freed number.
+ * The leases and any pending releases stay the parent's to release, so the child forgets them
+ * without IPC. Only async-signal-safe work, through the real functions: the forgotten entries
+ * are left allocated rather than freed.
  */
 static void drop_inherited_descriptors_in_child(void) {
+    int saved_errno = errno;
+    int placeholder = real_openat_fn && real_dup3_fn
+        ? real_openat_fn(AT_FDCWD, "/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        : -1;
     for (fd_entry_t *entry = fd_entries; entry; entry = entry->next) {
-        real_close_fn(entry->fd);
+        if (placeholder < 0 || real_dup3_fn(placeholder, entry->fd, O_CLOEXEC) < 0) {
+            real_close_fn(entry->fd);
+        }
     }
+    if (placeholder >= 0) real_close_fn(placeholder);
     fd_entries = NULL;
     managed_descriptor_seen = 0;
     pending_releases = NULL;
     pending_release_worker_started = 0;
     pending_release_ready = (pthread_cond_t)PTHREAD_COND_INITIALIZER;
+    unlock_shim_after_fork();
+    errno = saved_errno;
 }
 
-/*
- * Forking stays possible after models are open, so subprocess launchers that fork and exec
- * (CPython's subprocess, for one) keep working. Holding every shim lock across the fork gives
- * the child consistent, unlocked copies; the order matches spawn_process.
- */
+__attribute__((constructor)) static void register_fork_handlers(void) {
+    init_syms();
+    pthread_atfork(lock_shim_before_fork, unlock_shim_after_fork, drop_inherited_descriptors_in_child);
+}
+
 pid_t fork(void) {
     init_syms();
     if (!real_fork_fn) {
         errno = ENOSYS;
         return -1;
     }
-
-    pthread_mutex_lock(&inheritance_lock);
-    pthread_mutex_lock(&spawn_actions_lock);
-    pthread_mutex_lock(&fd_map_lock);
-    pthread_mutex_lock(&pending_release_lock);
-    pid_t result = real_fork_fn();
-    int saved_errno = errno;
-    if (result == 0) drop_inherited_descriptors_in_child();
-    pthread_mutex_unlock(&pending_release_lock);
-    pthread_mutex_unlock(&fd_map_lock);
-    pthread_mutex_unlock(&spawn_actions_lock);
-    pthread_mutex_unlock(&inheritance_lock);
-    errno = saved_errno;
-    return result;
+    return real_fork_fn();
 }
 
 /*
