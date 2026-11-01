@@ -3616,6 +3616,140 @@ public class VfsShimLinuxTests
         }
     }
 
+    [Test]
+    public async Task RangeManaged_ForkAndExecDuringAFetch_LeavesTheFetchServiceToSeeTheHangup()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        LinuxTestPrerequisites.RequireUnixDomainSockets();
+        LinuxTestPrerequisites.RequireCommand("/usr/bin/gcc");
+        LinuxTestPrerequisites.RequireCommand("/bin/sleep");
+
+        var root = Path.Combine(Path.GetTempPath(), "runneragent-vfs-shim-tests", Guid.NewGuid().ToString("n"));
+        Directory.CreateDirectory(root);
+        int? orphan = null;
+
+        try
+        {
+            var modelsRoot = Path.Combine(root, "models");
+            Directory.CreateDirectory(modelsRoot);
+            var modelPath = Path.Combine(modelsRoot, "hangup.bin");
+            await File.WriteAllBytesAsync(modelPath, new byte[8]);
+
+            var shimPath = Path.Combine(root, "liboffloadr_model_vfs.so");
+            var probeSourcePath = Path.Combine(root, "hangup-probe.c");
+            var probePath = Path.Combine(root, "hangup-probe");
+            var socketPath = Path.Combine(root, "model-fetch.sock");
+
+            await CompileShimAsync(shimPath);
+            // A reader waits on a fetch while the process starts a long-running program and then
+            // exits: the program must not keep the abandoned request's connection open.
+            await File.WriteAllTextAsync(probeSourcePath, """
+                #define _GNU_SOURCE
+                #include <fcntl.h>
+                #include <pthread.h>
+                #include <stdio.h>
+                #include <unistd.h>
+
+                static int managed = -1;
+
+                static void *read_slowly(void *argument) {
+                    (void)argument;
+                    char byte;
+                    (void)pread(managed, &byte, 1, 0);
+                    return NULL;
+                }
+
+                int main(int argc, char **argv) {
+                    if (argc != 2) return 10;
+                    managed = open(argv[1], O_RDONLY);
+                    if (managed < 0) return 11;
+                    pthread_t reader;
+                    if (pthread_create(&reader, NULL, read_slowly, NULL) != 0) return 12;
+                    usleep(300000);
+                    pid_t child = fork();
+                    if (child < 0) return 13;
+                    if (child == 0) {
+                        int quiet = open("/dev/null", O_WRONLY);
+                        if (quiet < 0 || dup2(quiet, STDOUT_FILENO) < 0 || dup2(quiet, STDERR_FILENO) < 0) _exit(126);
+                        execl("/bin/sleep", "sleep", "30", (char *)NULL);
+                        _exit(127);
+                    }
+                    printf("%d\n", (int)child);
+                    fflush(stdout);
+                    _exit(0);
+                }
+                """);
+            await RunProcessAsync(
+                "/usr/bin/gcc",
+                [probeSourcePath, "-o", probePath, "-pthread"],
+                root);
+
+            var fetchStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var hangupSeen = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            await using var server = new VfsIpcServer(socketPath, async (request, cancellationToken) =>
+            {
+                switch (request.Operation)
+                {
+                    case VfsIpcOperation.Open:
+                        return RangeManagedResponse(modelPath, leaseId: 916, transferEpoch: 1, expectedLength: 8);
+                    case VfsIpcOperation.EnsureRange:
+                        fetchStarted.TrySetResult();
+                        try
+                        {
+                            await Task.Delay(TimeSpan.FromSeconds(30), cancellationToken);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            hangupSeen.TrySetResult();
+                            throw;
+                        }
+                        return VfsIpcResponse.Error(VfsIpcStatus.ServerError);
+                    case VfsIpcOperation.Release:
+                        return VfsIpcResponse.Success(transferEpoch: 1);
+                    default:
+                        return VfsIpcResponse.Error(VfsIpcStatus.ServerError);
+                }
+            });
+            server.Start();
+
+            var result = await RunProcessAsync(
+                probePath,
+                [modelPath],
+                root,
+                new Dictionary<string, string?>
+                {
+                    ["LD_PRELOAD"] = shimPath,
+                    ["VFS_SOCKET"] = socketPath,
+                    ["VFS_ROOTS"] = modelsRoot,
+                    ["VFS_EXTS"] = ".bin",
+                    ["VFS_SESSION_ID"] = "hangup-session",
+                    ["VFS_LOG"] = "0"
+                });
+            orphan = int.Parse(result.Stdout.Trim(), System.Globalization.CultureInfo.InvariantCulture);
+
+            Assert.That(fetchStarted.Task.IsCompleted, Is.True);
+            await hangupSeen.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+        finally
+        {
+            if (orphan is { } processId)
+            {
+                try
+                {
+                    System.Diagnostics.Process.GetProcessById(processId).Kill();
+                }
+                catch (ArgumentException)
+                {
+                }
+            }
+
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
     private static async Task WriteInheritanceProbeAsync(string probeSourcePath)
     {
         await File.WriteAllTextAsync(probeSourcePath, """
@@ -3840,6 +3974,9 @@ public class VfsShimLinuxTests
                 close(kept_placeholder);
                 int reused = open("/dev/null", O_RDONLY);
                 if (reused != kept_placeholder) return 60;
+                /* A managed copy above the soft limit the application lowers below it. */
+                int high = fcntl(managed, F_DUPFD_CLOEXEC, 100);
+                if (high < 100) return 61;
                 struct rlimit original_limit;
                 if (getrlimit(RLIMIT_NOFILE, &original_limit) != 0) return 54;
                 struct rlimit lowered_limit = original_limit;
@@ -3866,6 +4003,8 @@ public class VfsShimLinuxTests
                     errno = 0;
                     if (open("/dev/null", O_RDONLY) != -1 || errno != EMFILE) _exit(4);
                     if (read(reused, &byte, 1) != 0) _exit(5);
+                    errno = 0;
+                    if (read(high, &byte, 1) != -1 || errno != EISDIR || !is_close_on_exec(high)) _exit(6);
                     _exit(0);
                 }
                 int limited_status = 0;
@@ -3874,6 +4013,7 @@ public class VfsShimLinuxTests
                 for (int index = 0; index < filler_count; index++) close(fillers[index]);
                 if (setrlimit(RLIMIT_NOFILE, &original_limit) != 0) return 58;
                 close(reused);
+                close(high);
 
                 /* Fork and exec after a model is open, the way CPython's subprocess runs a tool. */
                 pid_t exec_child = vfork();

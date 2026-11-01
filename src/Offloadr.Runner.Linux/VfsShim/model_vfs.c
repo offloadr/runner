@@ -547,6 +547,38 @@ static int read_exact(int fd, void *buffer, size_t length) {
     return 0;
 }
 
+/*
+ * A request's socket is close-on-exec, and tracked while the request is in flight so a fork
+ * child that keeps running without exec closes its copy too. Either way the fetch service sees
+ * the hangup when the requesting process abandons a request, which cancels its demand and
+ * releases a lease it could not deliver. Slots hold the descriptor plus one; a socket leaves its
+ * slot before it is closed, so a child never closes a number the parent has already reused.
+ */
+#define VFS_TRACKED_IPC_SOCKETS 64
+static int ipc_socket_slots[VFS_TRACKED_IPC_SOCKETS];
+
+static int track_ipc_socket(int socket_fd) {
+    for (int slot = 0; slot < VFS_TRACKED_IPC_SOCKETS; slot++) {
+        int empty = 0;
+        if (__atomic_compare_exchange_n(
+                &ipc_socket_slots[slot], &empty, socket_fd + 1, 0,
+                __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) return slot;
+    }
+    return -1;
+}
+
+static void close_ipc_socket(int slot, int socket_fd) {
+    if (slot >= 0) __atomic_store_n(&ipc_socket_slots[slot], 0, __ATOMIC_RELEASE);
+    syscall(SYS_close, socket_fd);
+}
+
+static void close_inherited_ipc_sockets_in_child(void) {
+    for (int slot = 0; slot < VFS_TRACKED_IPC_SOCKETS; slot++) {
+        int tracked = __atomic_exchange_n(&ipc_socket_slots[slot], 0, __ATOMIC_ACQ_REL);
+        if (tracked > 0) syscall(SYS_close, tracked - 1);
+    }
+}
+
 static int ipc_roundtrip(
     uint8_t operation,
     const uint8_t *payload,
@@ -555,20 +587,21 @@ static int ipc_roundtrip(
     const char *socket_path = getenv("VFS_SOCKET");
     if (!socket_path || !*socket_path || payload_length > VFS_MAX_PAYLOAD) return -1;
 
-    int socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    int socket_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (socket_fd < 0) return -1;
+    int socket_slot = track_ipc_socket(socket_fd);
 
     struct sockaddr_un address;
     memset(&address, 0, sizeof(address));
     address.sun_family = AF_UNIX;
     if (strlen(socket_path) >= sizeof(address.sun_path)) {
-        syscall(SYS_close, socket_fd);
+        close_ipc_socket(socket_slot, socket_fd);
         return -1;
     }
     snprintf(address.sun_path, sizeof(address.sun_path), "%s", socket_path);
 
     if (connect(socket_fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
-        syscall(SYS_close, socket_fd);
+        close_ipc_socket(socket_slot, socket_fd);
         return -1;
     }
 
@@ -579,16 +612,16 @@ static int ipc_roundtrip(
     write_u32_be(header + 8, payload_length);
     if (write_exact(socket_fd, header, sizeof(header)) != 0 ||
         (payload_length > 0 && write_exact(socket_fd, payload, payload_length) != 0)) {
-        syscall(SYS_close, socket_fd);
+        close_ipc_socket(socket_slot, socket_fd);
         return -1;
     }
 
     uint8_t response_buffer[VFS_RESPONSE_LENGTH];
     if (read_exact(socket_fd, response_buffer, sizeof(response_buffer)) != 0) {
-        syscall(SYS_close, socket_fd);
+        close_ipc_socket(socket_slot, socket_fd);
         return -1;
     }
-    syscall(SYS_close, socket_fd);
+    close_ipc_socket(socket_slot, socket_fd);
 
     uint32_t magic;
     memcpy(&magic, response_buffer, sizeof(magic));
@@ -2507,6 +2540,10 @@ static void drop_inherited_descriptors_in_child(void) {
     if (inherited_descriptors_dropped) return;
     inherited_descriptors_dropped = 1;
     int saved_errno = errno;
+    close_inherited_ipc_sockets_in_child();
+
+    struct rlimit limit;
+    int limit_known = getrlimit(RLIMIT_NOFILE, &limit) == 0;
     int placeholder = -1;
     int placeholder_is_kept = 0;
     if (real_dup3_fn && kept_placeholder_is_intact()) {
@@ -2517,11 +2554,28 @@ static void drop_inherited_descriptors_in_child(void) {
         placeholder = open_descriptor_placeholder();
         if (placeholder < 0 && errno == EMFILE) {
             for (fd_entry_t *entry = fd_entries; entry; entry = entry->next) {
+                if (limit_known && (rlim_t)entry->fd >= limit.rlim_cur) continue;
                 if (!descriptor_names_state(entry->fd, entry->state)) continue;
                 real_close_fn(entry->fd);
                 placeholder = open_descriptor_placeholder();
                 break;
             }
+        }
+    }
+
+    /* dup3 refuses a target at or above the soft limit, which the application may have lowered
+     * below managed descriptors that are still open; raise it just enough while replacing them. */
+    int limit_raised = 0;
+    if (placeholder >= 0 && limit_known) {
+        int highest_fd = -1;
+        for (fd_entry_t *entry = fd_entries; entry; entry = entry->next) {
+            if (entry->fd > highest_fd) highest_fd = entry->fd;
+        }
+        if (highest_fd >= 0 && (rlim_t)highest_fd >= limit.rlim_cur &&
+            (rlim_t)highest_fd < limit.rlim_max) {
+            struct rlimit raised = limit;
+            raised.rlim_cur = (rlim_t)highest_fd + 1;
+            limit_raised = setrlimit(RLIMIT_NOFILE, &raised) == 0;
         }
     }
 
@@ -2537,6 +2591,7 @@ static void drop_inherited_descriptors_in_child(void) {
             real_close_fn(entry->fd);
         }
     }
+    if (limit_raised) setrlimit(RLIMIT_NOFILE, &limit);
     if (placeholder >= 0 && !placeholder_is_kept && !placeholder_fills_managed_slot) {
         real_close_fn(placeholder);
     }
