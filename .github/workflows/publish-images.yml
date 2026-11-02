@@ -4,9 +4,9 @@ run-name: Publish ${{ inputs.targets || 'all runner images' }}
 # Builds the runner images from this repository and pushes them to ghcr.io/offloadr. These are
 # the images personal and hosted runners run.
 #
-# A run builds the targets it is given, or all of them. The in-cluster image watcher dispatches
-# a run for each target whose editor image has moved; the run name tells it which targets a
-# queued or running publication covers. Each image is built on its editor image's current digest
+# A run builds the targets it is given, or all of them. An automated dispatch requests the
+# targets whose editor image has moved; the run name tells it which targets a queued or running
+# publication covers. Each image is built on its editor image's current digest
 # and records it in the org.opencontainers.image.base.* labels.
 #
 # A run counts as a release only when the verify step passes: a green build step is not proof
@@ -115,7 +115,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # Build on the editor image's current digest, so the image records exactly what it was
-      # built from and the watcher can tell when that has moved.
+      # built from and a later dispatch can tell when that has moved.
       - name: Pin the editor image
         id: base
         env:
