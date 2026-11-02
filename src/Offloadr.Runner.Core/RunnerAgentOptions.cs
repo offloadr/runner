@@ -102,6 +102,7 @@ public sealed class RunnerAgentOptions
     public required TimeSpan RuntimeTelemetryInterval { get; init; }
     public required SessionProcessOptions Session { get; init; }
     public required Aria2Settings Aria2 { get; init; }
+    public required ConsoleLogOptions ConsoleLogs { get; init; }
 
     public static RunnerAgentOptions FromEnvironment(
         Func<string, string?>? env = null,
@@ -131,6 +132,7 @@ public sealed class RunnerAgentOptions
             }
         }
 
+        var session = SessionProcessOptions.FromEnvironment(env);
         return new RunnerAgentOptions
         {
             RunnerSecret = runnerSecret,
@@ -145,8 +147,9 @@ public sealed class RunnerAgentOptions
             SupportedEditorTemplates = ParseSupportedEditorTemplates(env),
             LocalModelsScanInterval = TimeSpan.FromSeconds(ParseInt(env, "RUNNER_LOCAL_MODELS_SCAN_INTERVAL_SEC", 15, 5, 600)),
             RuntimeTelemetryInterval = TimeSpan.FromSeconds(ParseInt(env, "RUNNER_GPU_STATS_INTERVAL_SEC", 5, 0, 300)),
-            Session = SessionProcessOptions.FromEnvironment(env),
-            Aria2 = Aria2Settings.FromEnvironment(env)
+            Session = session,
+            Aria2 = Aria2Settings.FromEnvironment(env),
+            ConsoleLogs = ConsoleLogOptions.FromEnvironment(env, session.Sealing)
         };
     }
 

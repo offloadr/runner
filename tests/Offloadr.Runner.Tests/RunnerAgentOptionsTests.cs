@@ -228,6 +228,29 @@ public class RunnerAgentOptionsTests
         Assert.That(options.RuntimeTelemetryInterval, Is.EqualTo(TimeSpan.Zero));
     }
 
+    [Test]
+    public void FromEnvironment_LogsInFullOnTheConsoleByDefault()
+    {
+        var options = RunnerAgentOptions.FromEnvironment(GetEnv(new Dictionary<string, string?>()));
+
+        Assert.That(options.ConsoleLogs.Mode, Is.EqualTo(ConsoleLogMode.Full));
+    }
+
+    [Test]
+    public void FromEnvironment_KeepsTheConsoleToMetadataWhenSealedStorageIsRequired()
+    {
+        var env = new Dictionary<string, string?>
+        {
+            ["RUNNER_SEALED_STORAGE"] = "required",
+            ["RUNNER_CONSOLE_LOGS"] = "full"
+        };
+
+        var options = RunnerAgentOptions.FromEnvironment(GetEnv(env));
+
+        Assert.That(options.ConsoleLogs.Mode, Is.EqualTo(ConsoleLogMode.Metadata));
+        Assert.That(options.ConsoleLogs.FullRefused, Is.True);
+    }
+
     private static Func<string, string?> GetEnv(IReadOnlyDictionary<string, string?> values)
     {
         return key => values.TryGetValue(key, out var value) ? value : null;

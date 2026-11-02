@@ -95,6 +95,8 @@ own CUDA environment. Continue to use appropriate host/container isolation.
   - `RUNNER_UV_BINARY` (runner-owned `uv` executable used to create session virtualenvs, default `/usr/local/bin/uv`)
   - `RUNNER_PERSISTENT_RANGE_HYDRATION` (image-owned runtime capability; `1` for persistent ComfyUI model roots and `0` for Forge Neo)
   - `RUNNER_VFS_LOG` (`1` enables verbose native shim and VFS IPC tracing; default `0`)
+- Optional console logging (see [Console Logs](#console-logs))
+  - `RUNNER_CONSOLE_LOGS` (`full` or `metadata`; default `full`, and always `metadata` with `RUNNER_SEALED_STORAGE=required`. Any other value fails startup)
 - Optional sealed storage (see [Sealed Storage](#sealed-storage))
   - `RUNNER_SEALED_STORAGE` (`off`, `auto` or `required`; default `auto`. Any other value fails startup)
   - `RUNNER_SEALED_ROOT` (memory-backed directory for sealed session data, default `/dev/shm/offloadr`)
@@ -233,7 +235,28 @@ For a personal runner, add `--shm-size` to `docker run` together with `-e RUNNER
 
 ## Startup Validation Behavior
 
-Runner startup fails fast with a clear aggregated error list when prerequisites are missing or invalid (for example: bad URLs, non-writable directories, missing `aria2c`, missing `COMFY_ENTRYPOINT`, missing `RUNNER_SEED_VENV_PATH`, missing `RUNNER_UV_BINARY`, or missing user-management binaries).
+Runner startup fails fast with a clear aggregated error list when prerequisites are missing or invalid (for example: bad URLs, non-writable directories, missing `aria2c`, missing `COMFY_ENTRYPOINT`, missing `RUNNER_SEED_VENV_PATH`, missing `RUNNER_UV_BINARY`, or missing user-management binaries). With metadata-only console logs the list is not printed: the console shows only `event=startup-validation-failed`.
+
+## Console Logs
+
+A runner you start yourself logs in full to its console (`docker logs`, or the Logs page of the desktop app): the agent's messages with exception details and stack traces, and the output of the editor and its dependency sync, each line after a UTC timestamp, a severity and a component (`agent`, `editor`, `session-process`, `workspace`, `artifacts`, `model-transfer`):
+
+```text
+2026-11-02T18:18:22.4170000+00:00 information agent: Runner starting id=... version=... offloadr-api=https://offloadr.studio ...
+2026-11-02T18:19:05.0310000+00:00 information session-process: [session:...] Started pid=... user=... port=8188.
+2026-11-02T18:19:21.8820000+00:00 information editor: To see the GUI go to: http://127.0.0.1:8188
+2026-11-02T18:19:22.0040000+00:00 information session-process: [session:...] Ready on port 8188.
+```
+
+The output of a sealed session's editor stays off the console in either mode, and the agent's own lines for sealed sessions name no files (see [Sealed Storage](#sealed-storage)). The same messages and editor output are also relayed to the control plane.
+
+`RUNNER_CONSOLE_LOGS=metadata` reduces each line to its timestamp, severity, component and a fixed failure class, with no message, exception text or editor output:
+
+```text
+2026-11-02T18:18:22.4170000+00:00 severity=information component=agent errorClass=none
+```
+
+With `RUNNER_SEALED_STORAGE=required` the console is always metadata only, and `RUNNER_CONSOLE_LOGS=full` fails startup. Offloadr launches every hosted runner that way, because a rented host's console output can reach its provider's infrastructure, outside the account-protected path. A personal runner with `RUNNER_SEALED_STORAGE=required` gets the same console; use `auto` (the default) to see full logs.
 
 ## Status File
 

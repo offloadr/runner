@@ -494,7 +494,8 @@ public partial class RunnerStartupValidatorTests
         string? seedVirtualEnvPath = null,
         string? uvBinaryPath = null,
         bool requireAria2User = false,
-        SealedStorageOptions? sealing = null)
+        SealedStorageOptions? sealing = null,
+        ConsoleLogOptions? consoleLogs = null)
     {
         var sessionRoot = Path.Combine(tempRoot, "sessions");
         var workingDirectory = Path.Combine(tempRoot, "comfy");
@@ -549,7 +550,8 @@ public partial class RunnerStartupValidatorTests
                 "ARIA2_STATE_DIR" => stateDirectory,
                 "ARIA2_REQUIRE_USER" => requireAria2User ? "1" : null,
                 _ => null
-            })
+            }),
+            ConsoleLogs = consoleLogs ?? new ConsoleLogOptions()
         };
     }
 
