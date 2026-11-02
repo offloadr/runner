@@ -240,15 +240,18 @@ static int managed_descriptor_seen = 0;
 static pthread_mutex_t spawn_actions_lock = PTHREAD_MUTEX_INITIALIZER;
 static spawn_actions_entry_t *spawn_actions_entries = NULL;
 static pthread_mutex_t pending_release_lock = PTHREAD_MUTEX_INITIALIZER;
+/* Held from creating a request's socket until it is connected, and across fork, so a fork
+ * child never inherits a socket that becomes a fetch connection only after its scan. */
+static pthread_mutex_t connection_setup_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t pending_release_ready = PTHREAD_COND_INITIALIZER;
 static pending_release_t *pending_releases = NULL;
 static int pending_release_worker_started = 0;
 static __thread int reentry = 0;
 static int log_state = -1;
 
-/* The thread inside the fork wrapper holds inheritance_lock while glibc runs fork handlers, and
- * any handler may call a wrapped function, whichever library registered it and whenever. That
- * thread skips taking inheritance_lock again. In the child, before fork returns, every shim lock
+/* The thread inside the fork wrapper holds inheritance_lock and connection_setup_lock while
+ * glibc runs fork handlers, and any handler may call a wrapped function, whichever library
+ * registered it and whenever. That thread skips taking either again. In the child, before fork returns, every shim lock
  * is skipped: a parent thread that does not exist there may have held its copy. */
 static __thread int fork_in_progress = 0;
 static pid_t forking_process_id = 0;
@@ -258,7 +261,8 @@ static void drop_inherited_descriptors_in_child(void);
 
 static int skips_shim_lock(pthread_mutex_t *mutex) {
     if (!fork_in_progress) return 0;
-    return mutex == &inheritance_lock || getpid() != forking_process_id;
+    return mutex == &inheritance_lock || mutex == &connection_setup_lock ||
+           getpid() != forking_process_id;
 }
 
 static void shim_lock(pthread_mutex_t *mutex) {
@@ -652,23 +656,25 @@ static int ipc_roundtrip(
     const char *socket_path = getenv("VFS_SOCKET");
     if (!socket_path || !*socket_path || payload_length > VFS_MAX_PAYLOAD) return -1;
 
-    remember_fetch_service(socket_path);
-    int socket_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (socket_fd < 0) return -1;
-
     struct sockaddr_un address;
     memset(&address, 0, sizeof(address));
     address.sun_family = AF_UNIX;
-    if (strlen(socket_path) >= sizeof(address.sun_path)) {
-        syscall(SYS_close, socket_fd);
-        return -1;
-    }
+    if (strlen(socket_path) >= sizeof(address.sun_path)) return -1;
     snprintf(address.sun_path, sizeof(address.sun_path), "%s", socket_path);
 
-    if (connect(socket_fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
-        syscall(SYS_close, socket_fd);
+    remember_fetch_service(socket_path);
+    shim_lock(&connection_setup_lock);
+    int socket_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (socket_fd < 0) {
+        shim_unlock(&connection_setup_lock);
         return -1;
     }
+    if (connect(socket_fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
+        syscall(SYS_close, socket_fd);
+        shim_unlock(&connection_setup_lock);
+        return -1;
+    }
+    shim_unlock(&connection_setup_lock);
 
     uint8_t header[VFS_HEADER_LENGTH] = {0};
     write_u32_be(header, VFS_MAGIC);
@@ -2677,9 +2683,11 @@ static void reset_shim_locks_in_child(void) {
 
 /*
  * Forking stays possible after models are open, so subprocess launchers that fork and exec
- * (CPython's subprocess, for one) keep working. Only inheritance_lock is held across the real
- * fork, as before: it keeps managed descriptor changes out, and no common wrapper takes it, so
- * other libraries' fork handlers cannot invert lock order through it.
+ * (CPython's subprocess, for one) keep working. Two shim locks are held across the real fork.
+ * inheritance_lock keeps managed descriptor changes out, and no common wrapper takes it, so
+ * other libraries' fork handlers cannot invert lock order through it. connection_setup_lock
+ * keeps a request's socket from being created but not yet connected; no lock is taken while it
+ * is held, so it cannot invert lock order either.
  */
 pid_t fork(void) {
     init_syms();
@@ -2689,6 +2697,7 @@ pid_t fork(void) {
     }
 
     pthread_mutex_lock(&inheritance_lock);
+    pthread_mutex_lock(&connection_setup_lock);
     forking_process_id = getpid();
     inherited_descriptors_dropped = 0;
     fork_in_progress = 1;
@@ -2699,6 +2708,7 @@ pid_t fork(void) {
         drop_inherited_descriptors_in_child();
     }
     fork_in_progress = 0;
+    pthread_mutex_unlock(&connection_setup_lock);
     pthread_mutex_unlock(&inheritance_lock);
     errno = saved_errno;
     return result;

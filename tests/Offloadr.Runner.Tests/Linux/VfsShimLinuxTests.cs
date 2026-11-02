@@ -3776,6 +3776,157 @@ public class VfsShimLinuxTests
         }
     }
 
+    [Test]
+    public async Task RangeManaged_ForkWhileARequestConnects_LeavesTheFetchServiceToSeeTheHangup()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        LinuxTestPrerequisites.RequireUnixDomainSockets();
+        LinuxTestPrerequisites.RequireCommand("/usr/bin/gcc");
+
+        var root = Path.Combine(Path.GetTempPath(), "runneragent-vfs-shim-tests", Guid.NewGuid().ToString("n"));
+        Directory.CreateDirectory(root);
+        var orphans = new List<int>();
+
+        try
+        {
+            var modelsRoot = Path.Combine(root, "models");
+            Directory.CreateDirectory(modelsRoot);
+            var modelPath = Path.Combine(modelsRoot, "connecting.bin");
+            await File.WriteAllBytesAsync(modelPath, new byte[8]);
+
+            var shimPath = Path.Combine(root, "liboffloadr_model_vfs.so");
+            var probeSourcePath = Path.Combine(root, "connecting-probe.c");
+            var probePath = Path.Combine(root, "connecting-probe");
+            var socketPath = Path.Combine(root, "model-fetch.sock");
+
+            await CompileShimAsync(shimPath);
+            // The probe's own connect stalls a reader's fetch request between creating its socket
+            // and connecting it while the main thread forks a long-running child, then the
+            // process exits: the child may not keep the abandoned request's connection open.
+            await File.WriteAllTextAsync(probeSourcePath, """
+                #define _GNU_SOURCE
+                #include <dlfcn.h>
+                #include <fcntl.h>
+                #include <pthread.h>
+                #include <stdio.h>
+                #include <sys/socket.h>
+                #include <unistd.h>
+
+                static int managed = -1;
+                static volatile int stall_connect = 0;
+                static volatile int connecting = 0;
+
+                int connect(int fd, const struct sockaddr *address, socklen_t length) {
+                    int (*real_connect)(int, const struct sockaddr *, socklen_t) =
+                        (int (*)(int, const struct sockaddr *, socklen_t))dlsym(RTLD_NEXT, "connect");
+                    if (stall_connect) {
+                        stall_connect = 0;
+                        connecting = 1;
+                        usleep(300000);
+                    }
+                    return real_connect(fd, address, length);
+                }
+
+                static void *read_slowly(void *argument) {
+                    (void)argument;
+                    char byte;
+                    (void)pread(managed, &byte, 1, 0);
+                    return NULL;
+                }
+
+                int main(int argc, char **argv) {
+                    if (argc != 2) return 10;
+                    managed = open(argv[1], O_RDONLY);
+                    if (managed < 0) return 11;
+                    stall_connect = 1;
+                    pthread_t reader;
+                    if (pthread_create(&reader, NULL, read_slowly, NULL) != 0) return 12;
+                    while (!connecting) usleep(1000);
+                    pid_t worker = fork();
+                    if (worker < 0) return 13;
+                    if (worker == 0) {
+                        close(STDOUT_FILENO);
+                        close(STDERR_FILENO);
+                        sleep(30);
+                        _exit(0);
+                    }
+                    usleep(600000);
+                    printf("%d\n", (int)worker);
+                    fflush(stdout);
+                    _exit(0);
+                }
+                """);
+            await RunProcessAsync(
+                "/usr/bin/gcc",
+                [probeSourcePath, "-o", probePath, "-pthread", "-rdynamic", "-ldl"],
+                root);
+
+            var fetchStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var hangupSeen = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            await using var server = new VfsIpcServer(socketPath, async (request, cancellationToken) =>
+            {
+                switch (request.Operation)
+                {
+                    case VfsIpcOperation.Open:
+                        return RangeManagedResponse(modelPath, leaseId: 917, transferEpoch: 1, expectedLength: 8);
+                    case VfsIpcOperation.EnsureRange:
+                        fetchStarted.TrySetResult();
+                        try
+                        {
+                            await Task.Delay(TimeSpan.FromSeconds(30), cancellationToken);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            hangupSeen.TrySetResult();
+                            throw;
+                        }
+                        return VfsIpcResponse.Error(VfsIpcStatus.ServerError);
+                    case VfsIpcOperation.Release:
+                        return VfsIpcResponse.Success(transferEpoch: 1);
+                    default:
+                        return VfsIpcResponse.Error(VfsIpcStatus.ServerError);
+                }
+            });
+            server.Start();
+
+            var result = await RunProcessAsync(
+                probePath,
+                [modelPath],
+                root,
+                new Dictionary<string, string?>
+                {
+                    ["LD_PRELOAD"] = shimPath,
+                    ["VFS_SOCKET"] = socketPath,
+                    ["VFS_ROOTS"] = modelsRoot,
+                    ["VFS_EXTS"] = ".bin",
+                    ["VFS_SESSION_ID"] = "connecting-session",
+                    ["VFS_LOG"] = "0"
+                });
+            orphans.Add(int.Parse(result.Stdout.Trim(), System.Globalization.CultureInfo.InvariantCulture));
+
+            Assert.That(fetchStarted.Task.IsCompleted, Is.True);
+            await hangupSeen.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+        finally
+        {
+            foreach (var processId in orphans)
+            {
+                try
+                {
+                    System.Diagnostics.Process.GetProcessById(processId).Kill();
+                }
+                catch (ArgumentException)
+                {
+                }
+            }
+
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
     private static async Task WriteInheritanceProbeAsync(string probeSourcePath)
     {
         await File.WriteAllTextAsync(probeSourcePath, """
