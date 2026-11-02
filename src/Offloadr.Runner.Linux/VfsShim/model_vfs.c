@@ -77,6 +77,8 @@ typedef struct shared_state {
     uint64_t lease_id;
     int64_t epoch;
     int64_t expected_length;
+    uint64_t device_id;
+    uint64_t inode;
     int complete;
     interval_t *readable;
 } shared_state_t;
@@ -238,11 +240,48 @@ static int managed_descriptor_seen = 0;
 static pthread_mutex_t spawn_actions_lock = PTHREAD_MUTEX_INITIALIZER;
 static spawn_actions_entry_t *spawn_actions_entries = NULL;
 static pthread_mutex_t pending_release_lock = PTHREAD_MUTEX_INITIALIZER;
+/* Held from creating a request's socket until it is connected, and across fork, so a fork
+ * child never inherits a socket that becomes a fetch connection only after its scan. */
+static pthread_mutex_t connection_setup_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t pending_release_ready = PTHREAD_COND_INITIALIZER;
 static pending_release_t *pending_releases = NULL;
 static int pending_release_worker_started = 0;
 static __thread int reentry = 0;
 static int log_state = -1;
+
+/* The thread inside the fork wrapper holds inheritance_lock and connection_setup_lock while
+ * glibc runs fork handlers, and any handler may call a wrapped function, whichever library
+ * registered it and whenever. That thread skips taking either again. In the child, before fork returns, every shim lock
+ * is skipped: a parent thread that does not exist there may have held its copy. */
+static __thread int fork_in_progress = 0;
+static pid_t forking_process_id = 0;
+static int inherited_descriptors_dropped = 0;
+
+static void drop_inherited_descriptors_in_child(void);
+
+static int skips_shim_lock(pthread_mutex_t *mutex) {
+    if (!fork_in_progress) return 0;
+    return mutex == &inheritance_lock || mutex == &connection_setup_lock ||
+           getpid() != forking_process_id;
+}
+
+static void shim_lock(pthread_mutex_t *mutex) {
+    if (!skips_shim_lock(mutex)) {
+        pthread_mutex_lock(mutex);
+        return;
+    }
+    /* A fork child runs its own fork handlers before fork returns, while managed descriptors
+     * are still mapped and their per-file locks may belong to parent threads that do not exist
+     * here. Every descriptor lookup takes the map lock first, so drop them right there, as fork
+     * does on return: the handler then sees only placeholders and never waits on such a lock. */
+    if (mutex == &fd_map_lock && getpid() != forking_process_id) {
+        drop_inherited_descriptors_in_child();
+    }
+}
+
+static void shim_unlock(pthread_mutex_t *mutex) {
+    if (!skips_shim_lock(mutex)) pthread_mutex_unlock(mutex);
+}
 
 #if defined(__x86_64__)
 #define VFS_AUDIT_ARCH AUDIT_ARCH_X86_64
@@ -512,6 +551,103 @@ static int read_exact(int fd, void *buffer, size_t length) {
     return 0;
 }
 
+/*
+ * A request's socket is close-on-exec, and a fork child that keeps running without exec closes
+ * its copies of in-flight requests, so the fetch service sees the hangup when the requesting
+ * process abandons a request: that cancels its demand and releases a lease it could not deliver.
+ * The child asks the kernel rather than a table the parent kept, which a request opening or
+ * closing its socket at the instant of fork could leave behind: it lists its own descriptors
+ * and closes each socket whose peer is the fetch service. Raw syscalls and a stack buffer keep
+ * this async-signal-safe. A descriptor opened before the soft limit was lowered can sit above
+ * it, so a child whose table is full below the soft limit raises it to the hard limit for the
+ * moment it takes to open /proc/self/fd. When that still fails (the table is full up to the
+ * hard limit, which may also have been lowered, or /proc is not mounted), it probes every
+ * number up to the kernel's default ceiling on descriptor numbers (fs.nr_open) instead; close-
+ * on-exec covers children that exec.
+ */
+static char fetch_service_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
+static int fetch_service_used = 0;
+
+static void remember_fetch_service(const char *socket_path) {
+    if (__atomic_load_n(&fetch_service_used, __ATOMIC_ACQUIRE)) return;
+    snprintf(fetch_service_path, sizeof(fetch_service_path), "%s", socket_path);
+    __atomic_store_n(&fetch_service_used, 1, __ATOMIC_RELEASE);
+}
+
+static int descriptor_is_fetch_connection(int fd) {
+    struct stat status;
+    if (fstat(fd, &status) != 0 || !S_ISSOCK(status.st_mode)) return 0;
+    struct sockaddr_un peer;
+    memset(&peer, 0, sizeof(peer));
+    socklen_t length = sizeof(peer);
+    if (getpeername(fd, (struct sockaddr *)&peer, &length) != 0 || peer.sun_family != AF_UNIX) {
+        return 0;
+    }
+    size_t path_length = length > offsetof(struct sockaddr_un, sun_path)
+        ? length - offsetof(struct sockaddr_un, sun_path)
+        : 0;
+    size_t expected_length = strlen(fetch_service_path);
+    while (path_length > 0 && peer.sun_path[path_length - 1] == '\0') path_length--;
+    return path_length == expected_length &&
+           memcmp(peer.sun_path, fetch_service_path, expected_length) == 0;
+}
+
+struct vfs_dirent64 {
+    uint64_t d_ino;
+    int64_t d_off;
+    unsigned short d_reclen;
+    unsigned char d_type;
+    char d_name[];
+};
+
+#define VFS_FETCH_PROBE_LIMIT (1 << 20)
+
+static void probe_inherited_fetch_connections_in_child(void) {
+    for (int fd = 0; fd < VFS_FETCH_PROBE_LIMIT; fd++) {
+        if (descriptor_is_fetch_connection(fd)) syscall(SYS_close, fd);
+    }
+}
+
+static int open_own_descriptor_directory(void) {
+    if (!real_openat_fn) return -1;
+    int directory = real_openat_fn(AT_FDCWD, "/proc/self/fd", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    struct rlimit limit;
+    if (directory >= 0 || errno != EMFILE || getrlimit(RLIMIT_NOFILE, &limit) != 0 ||
+        limit.rlim_cur >= limit.rlim_max) {
+        return directory;
+    }
+    struct rlimit raised = limit;
+    raised.rlim_cur = limit.rlim_max;
+    if (setrlimit(RLIMIT_NOFILE, &raised) != 0) return -1;
+    directory = real_openat_fn(AT_FDCWD, "/proc/self/fd", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    setrlimit(RLIMIT_NOFILE, &limit);
+    return directory;
+}
+
+static void close_inherited_fetch_connections_in_child(void) {
+    if (!__atomic_load_n(&fetch_service_used, __ATOMIC_ACQUIRE)) return;
+    int directory = open_own_descriptor_directory();
+    if (directory < 0) {
+        probe_inherited_fetch_connections_in_child();
+        return;
+    }
+    char buffer[4096] __attribute__((aligned(8)));
+    for (;;) {
+        long count = syscall(SYS_getdents64, directory, buffer, sizeof(buffer));
+        if (count <= 0) break;
+        for (long offset = 0; offset < count;) {
+            struct vfs_dirent64 *entry = (struct vfs_dirent64 *)(buffer + offset);
+            offset += entry->d_reclen;
+            int fd = 0;
+            const char *digit = entry->d_name;
+            if (*digit < '0' || *digit > '9') continue;
+            while (*digit >= '0' && *digit <= '9') fd = fd * 10 + (*digit++ - '0');
+            if (fd != directory && descriptor_is_fetch_connection(fd)) syscall(SYS_close, fd);
+        }
+    }
+    syscall(SYS_close, directory);
+}
+
 static int ipc_roundtrip(
     uint8_t operation,
     const uint8_t *payload,
@@ -520,22 +656,25 @@ static int ipc_roundtrip(
     const char *socket_path = getenv("VFS_SOCKET");
     if (!socket_path || !*socket_path || payload_length > VFS_MAX_PAYLOAD) return -1;
 
-    int socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (socket_fd < 0) return -1;
-
     struct sockaddr_un address;
     memset(&address, 0, sizeof(address));
     address.sun_family = AF_UNIX;
-    if (strlen(socket_path) >= sizeof(address.sun_path)) {
-        syscall(SYS_close, socket_fd);
-        return -1;
-    }
+    if (strlen(socket_path) >= sizeof(address.sun_path)) return -1;
     snprintf(address.sun_path, sizeof(address.sun_path), "%s", socket_path);
 
-    if (connect(socket_fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
-        syscall(SYS_close, socket_fd);
+    remember_fetch_service(socket_path);
+    shim_lock(&connection_setup_lock);
+    int socket_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (socket_fd < 0) {
+        shim_unlock(&connection_setup_lock);
         return -1;
     }
+    if (connect(socket_fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
+        syscall(SYS_close, socket_fd);
+        shim_unlock(&connection_setup_lock);
+        return -1;
+    }
+    shim_unlock(&connection_setup_lock);
 
     uint8_t header[VFS_HEADER_LENGTH] = {0};
     write_u32_be(header, VFS_MAGIC);
@@ -651,15 +790,15 @@ static int send_release_once(uint64_t lease_id) {
 static void *pending_release_worker(void *unused) {
     (void)unused;
     for (;;) {
-        pthread_mutex_lock(&pending_release_lock);
+        shim_lock(&pending_release_lock);
         while (!pending_releases) {
             pthread_cond_wait(&pending_release_ready, &pending_release_lock);
         }
         uint64_t lease_id = pending_releases->lease_id;
-        pthread_mutex_unlock(&pending_release_lock);
+        shim_unlock(&pending_release_lock);
 
         if (send_release_once(lease_id) == 0) {
-            pthread_mutex_lock(&pending_release_lock);
+            shim_lock(&pending_release_lock);
             pending_release_t **position = &pending_releases;
             while (*position && (*position)->lease_id != lease_id) {
                 position = &(*position)->next;
@@ -669,7 +808,7 @@ static void *pending_release_worker(void *unused) {
                 *position = released->next;
                 free(released);
             }
-            pthread_mutex_unlock(&pending_release_lock);
+            shim_unlock(&pending_release_lock);
             continue;
         }
 
@@ -693,13 +832,13 @@ static void retain_failed_release(uint64_t lease_id) {
     if (!pending) return;
     pending->lease_id = lease_id;
 
-    pthread_mutex_lock(&pending_release_lock);
+    shim_lock(&pending_release_lock);
     pending_release_t **position = &pending_releases;
     while (*position) {
         if ((*position)->lease_id == lease_id) {
             start_pending_release_worker_locked();
             pthread_cond_signal(&pending_release_ready);
-            pthread_mutex_unlock(&pending_release_lock);
+            shim_unlock(&pending_release_lock);
             free(pending);
             return;
         }
@@ -709,7 +848,7 @@ static void retain_failed_release(uint64_t lease_id) {
 
     start_pending_release_worker_locked();
     pthread_cond_signal(&pending_release_ready);
-    pthread_mutex_unlock(&pending_release_lock);
+    shim_unlock(&pending_release_lock);
 }
 
 static void request_release(uint64_t lease_id) {
@@ -984,6 +1123,8 @@ static shared_state_t *create_state(const ipc_response_t *response) {
     state->lease_id = response->lease_id;
     state->epoch = response->epoch;
     state->expected_length = response->expected_length;
+    state->device_id = response->device_id;
+    state->inode = response->inode;
     return state;
 }
 
@@ -1012,15 +1153,15 @@ static int attach_fd_locked(int fd, shared_state_t *state, int add_reference) {
 }
 
 static int attach_fd(int fd, shared_state_t *state, int add_reference) {
-    pthread_mutex_lock(&fd_map_lock);
+    shim_lock(&fd_map_lock);
     int result = attach_fd_locked(fd, state, add_reference);
-    pthread_mutex_unlock(&fd_map_lock);
+    shim_unlock(&fd_map_lock);
     return result;
 }
 
 static shared_state_t *acquire_fd_state(int fd) {
     shared_state_t *state = NULL;
-    pthread_mutex_lock(&fd_map_lock);
+    shim_lock(&fd_map_lock);
     for (fd_entry_t *entry = fd_entries; entry; entry = entry->next) {
         if (entry->fd == fd) {
             state = entry->state;
@@ -1028,13 +1169,13 @@ static shared_state_t *acquire_fd_state(int fd) {
             break;
         }
     }
-    pthread_mutex_unlock(&fd_map_lock);
+    shim_unlock(&fd_map_lock);
     return state;
 }
 
 static shared_state_t *acquire_fd_state_for_io(int fd) {
     shared_state_t *state = NULL;
-    pthread_mutex_lock(&fd_map_lock);
+    shim_lock(&fd_map_lock);
     for (fd_entry_t *entry = fd_entries; entry; entry = entry->next) {
         if (entry->fd == fd) {
             state = entry->state;
@@ -1046,7 +1187,7 @@ static shared_state_t *acquire_fd_state_for_io(int fd) {
             break;
         }
     }
-    pthread_mutex_unlock(&fd_map_lock);
+    shim_unlock(&fd_map_lock);
     return state;
 }
 
@@ -1065,12 +1206,43 @@ static void release_stream_state_after_io(FILE *file, shared_state_t *state) {
     funlockfile(file);
 }
 
-static shared_state_t *lock_and_detach_fd_for_close(int fd) {
+static int map_has_descriptor_in_locked(int first, int last) {
+    if (last < 0) return 0;
+    for (fd_entry_t *entry = fd_entries; entry; entry = entry->next) {
+        if (entry->fd >= first && entry->fd <= last) return 1;
+    }
+    return 0;
+}
+
+/*
+ * Managed descriptors are closed and duplicated only under inheritance_lock, which fork holds,
+ * so the descriptor table a fork child copies always agrees with the map. A transition takes it
+ * only when a managed descriptor is involved: plain closes and duplicates never wait for a fork,
+ * and other libraries' fork handlers cannot invert lock order through them. A descriptor becomes
+ * managed only under the map lock, so a transition that finds none involved while holding that
+ * lock can go ahead as it is; otherwise it relocks in lock order, inheritance_lock first.
+ * Returns with fd_map_lock held, and whether inheritance_lock is held as well.
+ */
+static int lock_map_for_transition(int first, int last, int other_fd) {
+    shim_lock(&fd_map_lock);
+    if (!map_has_descriptor_in_locked(first, last) &&
+        !map_has_descriptor_in_locked(other_fd, other_fd)) return 0;
+    shim_unlock(&fd_map_lock);
+    shim_lock(&inheritance_lock);
+    shim_lock(&fd_map_lock);
+    return 1;
+}
+
+static void unlock_map_after_transition(int serialized) {
+    shim_unlock(&fd_map_lock);
+    if (serialized) shim_unlock(&inheritance_lock);
+}
+
+// Match the map -> open-file-description lock order used by reads and
+// descriptor replacement. Keep both locks until the kernel close returns
+// so the numeric fd cannot be reused underneath an in-flight managed read.
+static shared_state_t *detach_fd_for_close_locked(int fd) {
     shared_state_t *state = NULL;
-    // Match the map -> open-file-description lock order used by reads and
-    // descriptor replacement. Keep both locks until the kernel close returns
-    // so the numeric fd cannot be reused underneath an in-flight managed read.
-    pthread_mutex_lock(&fd_map_lock);
     fd_entry_t **position = &fd_entries;
     while (*position) {
         if ((*position)->fd == fd) {
@@ -1086,9 +1258,14 @@ static shared_state_t *lock_and_detach_fd_for_close(int fd) {
     return state;
 }
 
-static void unlock_after_close(shared_state_t *state) {
+static shared_state_t *lock_and_detach_fd_for_close(int fd, int *serialized) {
+    *serialized = lock_map_for_transition(fd, fd, -1);
+    return detach_fd_for_close_locked(fd);
+}
+
+static void unlock_after_close(shared_state_t *state, int serialized) {
     if (state) pthread_mutex_unlock(&state->io_lock);
-    pthread_mutex_unlock(&fd_map_lock);
+    unlock_map_after_transition(serialized);
     if (state) state_release_reference(state);
 }
 
@@ -1229,6 +1406,45 @@ static shared_state_t *create_opened_fd_state(
     return state;
 }
 
+static int open_descriptor_placeholder(void) {
+    return real_openat_fn ? real_openat_fn(AT_FDCWD, "/", O_RDONLY | O_DIRECTORY | O_CLOEXEC) : -1;
+}
+
+static uint64_t device_number(dev_t device) {
+    return ((uint64_t)major(device) << 32) | (uint64_t)minor(device);
+}
+
+/* Opened alongside the first managed descriptor, under inheritance_lock, and kept: a fork child
+ * then reserves managed numbers with dup3 alone, which needs neither a free descriptor number
+ * (EMFILE) nor a free system-wide file (ENFILE). Its identity is recorded so the child can tell
+ * whether the application has since closed or reused the number. */
+static int kept_placeholder = -1;
+static uint64_t kept_placeholder_device = 0;
+static uint64_t kept_placeholder_inode = 0;
+
+static void keep_descriptor_placeholder(void) {
+    if (kept_placeholder >= 0) return;
+    int placeholder = open_descriptor_placeholder();
+    if (placeholder < 0) return;
+    struct stat status;
+    if (fstat(placeholder, &status) != 0) {
+        real_close_fn(placeholder);
+        return;
+    }
+    kept_placeholder_device = device_number(status.st_dev);
+    kept_placeholder_inode = (uint64_t)status.st_ino;
+    kept_placeholder = placeholder;
+}
+
+static int kept_placeholder_is_intact(void) {
+    struct stat status;
+    return kept_placeholder >= 0 &&
+           fstat(kept_placeholder, &status) == 0 &&
+           S_ISDIR(status.st_mode) &&
+           device_number(status.st_dev) == kept_placeholder_device &&
+           (uint64_t)status.st_ino == kept_placeholder_inode;
+}
+
 static int attach_opened_fd(int fd, const ipc_response_t *response, int close_on_failure) {
     if (response->disposition != VFS_OPEN_RANGE_MANAGED) return fd;
     shared_state_t *state = create_opened_fd_state(fd, response, close_on_failure);
@@ -1240,6 +1456,7 @@ static int attach_opened_fd(int fd, const ipc_response_t *response, int close_on
         return -1;
     }
     managed_descriptor_seen = 1;
+    keep_descriptor_placeholder();
     return fd;
 }
 
@@ -1315,10 +1532,10 @@ int openat(int directory_fd, const char *pathname, int flags, ...) {
         sizeof(absolute_path));
     if (disposition < 0) return -1;
     if (disposition != 2) return real_openat_fn(directory_fd, pathname, flags, mode);
-    pthread_mutex_lock(&inheritance_lock);
+    shim_lock(&inheritance_lock);
     int fd = real_openat_fn(directory_fd, pathname, flags, mode);
     int result = attach_opened_fd(fd, &response, 1);
-    pthread_mutex_unlock(&inheritance_lock);
+    shim_unlock(&inheritance_lock);
     return result;
 }
 
@@ -1362,7 +1579,7 @@ FILE *fopen(const char *pathname, const char *mode) {
         absolute_path,
         sizeof(absolute_path));
     if (disposition < 0) return NULL;
-    if (disposition == 2) pthread_mutex_lock(&inheritance_lock);
+    if (disposition == 2) shim_lock(&inheritance_lock);
     reentry++;
     FILE *file = real_fopen_fn(pathname, mode);
     reentry--;
@@ -1370,18 +1587,18 @@ FILE *fopen(const char *pathname, const char *mode) {
     if (!file) {
         int saved_errno = errno;
         request_release(response.lease_id);
-        pthread_mutex_unlock(&inheritance_lock);
+        shim_unlock(&inheritance_lock);
         errno = saved_errno;
         return NULL;
     }
     if (attach_opened_fd(fileno(file), &response, 0) < 0) {
         int saved_errno = errno;
         real_fclose_fn(file);
-        pthread_mutex_unlock(&inheritance_lock);
+        shim_unlock(&inheritance_lock);
         errno = saved_errno;
         return NULL;
     }
-    pthread_mutex_unlock(&inheritance_lock);
+    shim_unlock(&inheritance_lock);
     setvbuf(file, NULL, _IONBF, 0);
     return file;
 }
@@ -1400,7 +1617,7 @@ FILE *fopen64(const char *pathname, const char *mode) {
         absolute_path,
         sizeof(absolute_path));
     if (disposition < 0) return NULL;
-    if (disposition == 2) pthread_mutex_lock(&inheritance_lock);
+    if (disposition == 2) shim_lock(&inheritance_lock);
     reentry++;
     FILE *file = real_fopen64_fn(pathname, mode);
     reentry--;
@@ -1408,18 +1625,18 @@ FILE *fopen64(const char *pathname, const char *mode) {
     if (!file) {
         int saved_errno = errno;
         request_release(response.lease_id);
-        pthread_mutex_unlock(&inheritance_lock);
+        shim_unlock(&inheritance_lock);
         errno = saved_errno;
         return NULL;
     }
     if (attach_opened_fd(fileno(file), &response, 0) < 0) {
         int saved_errno = errno;
         real_fclose_fn(file);
-        pthread_mutex_unlock(&inheritance_lock);
+        shim_unlock(&inheritance_lock);
         errno = saved_errno;
         return NULL;
     }
-    pthread_mutex_unlock(&inheritance_lock);
+    shim_unlock(&inheritance_lock);
     setvbuf(file, NULL, _IONBF, 0);
     return file;
 }
@@ -1444,13 +1661,13 @@ static FILE *freopen_managed(
               sizeof(absolute_path))
         : 0;
     if (disposition < 0) return NULL;
-    pthread_mutex_lock(&inheritance_lock);
+    shim_lock(&inheritance_lock);
     flockfile(file);
 
     // freopen replaces the descriptor underneath the FILE. Serialize that
     // replacement with managed I/O and update the descriptor map before any
     // blocked reader can observe the replacement.
-    pthread_mutex_lock(&fd_map_lock);
+    shim_lock(&fd_map_lock);
     fd_entry_t **old_position = &fd_entries;
     while (*old_position && (*old_position)->fd != old_fd) {
         old_position = &(*old_position)->next;
@@ -1458,9 +1675,9 @@ static FILE *freopen_managed(
     fd_entry_t *old_entry = *old_position;
     shared_state_t *old_state = old_entry ? old_entry->state : NULL;
     if (!pathname && old_state && !mode_is_read_only(mode)) {
-        pthread_mutex_unlock(&fd_map_lock);
+        shim_unlock(&fd_map_lock);
         funlockfile(file);
-        pthread_mutex_unlock(&inheritance_lock);
+        shim_unlock(&inheritance_lock);
         errno = EROFS;
         return NULL;
     }
@@ -1504,6 +1721,7 @@ static FILE *freopen_managed(
         if (attach_fd_locked(fileno(result), replacement_state, 0) == 0) {
             replacement_state_attached = 1;
             managed_descriptor_seen = 1;
+            keep_descriptor_placeholder();
         }
         else {
             result_errno = ENOMEM;
@@ -1512,7 +1730,7 @@ static FILE *freopen_managed(
         }
     }
     if (old_state) pthread_mutex_unlock(&old_state->io_lock);
-    pthread_mutex_unlock(&fd_map_lock);
+    shim_unlock(&fd_map_lock);
     if (old_state && !preserve_old_state) state_release_reference(old_state);
     if (replacement_state && !replacement_state_attached) {
         state_release_reference(replacement_state);
@@ -1522,13 +1740,13 @@ static FILE *freopen_managed(
     }
 
     if (!result) {
-        pthread_mutex_unlock(&inheritance_lock);
+        shim_unlock(&inheritance_lock);
         errno = result_errno;
         return NULL;
     }
 
     funlockfile(result);
-    pthread_mutex_unlock(&inheritance_lock);
+    shim_unlock(&inheritance_lock);
     if (preserve_old_state || disposition == 2) setvbuf(result, NULL, _IONBF, 0);
     return result;
 }
@@ -1562,11 +1780,12 @@ FILE *fdopen(int fd, const char *mode) {
 int close(int fd) {
     init_syms();
     if (reentry) return real_close_fn(fd);
-    shared_state_t *state = lock_and_detach_fd_for_close(fd);
+    int serialized = 0;
+    shared_state_t *state = lock_and_detach_fd_for_close(fd, &serialized);
     reentry++;
     int result = real_close_fn(fd);
     reentry--;
-    unlock_after_close(state);
+    unlock_after_close(state, serialized);
     return result;
 }
 
@@ -1594,7 +1813,10 @@ int close_range(unsigned int first, unsigned int last, int flags) {
         return call_real_close_range(first, last, flags);
     }
 
-    pthread_mutex_lock(&fd_map_lock);
+    int serialized = lock_map_for_transition(
+        first > INT_MAX ? INT_MAX : (int)first,
+        last > INT_MAX ? INT_MAX : (int)last,
+        -1);
     size_t matching_count = 0;
     for (fd_entry_t *entry = fd_entries; entry; entry = entry->next) {
         unsigned int descriptor = (unsigned int)entry->fd;
@@ -1610,7 +1832,7 @@ int close_range(unsigned int first, unsigned int last, int flags) {
     if (matching_count && (!unique_states || !removed_states)) {
         free(unique_states);
         free(removed_states);
-        pthread_mutex_unlock(&fd_map_lock);
+        unlock_map_after_transition(serialized);
         errno = ENOMEM;
         return -1;
     }
@@ -1649,7 +1871,7 @@ int close_range(unsigned int first, unsigned int last, int flags) {
     for (size_t state_index = 0; state_index < unique_count; state_index++) {
         pthread_mutex_unlock(&unique_states[state_index]->io_lock);
     }
-    pthread_mutex_unlock(&fd_map_lock);
+    unlock_map_after_transition(serialized);
     for (size_t state_index = 0; state_index < removed_count; state_index++) {
         state_release_reference(removed_states[state_index]);
     }
@@ -1665,7 +1887,7 @@ void closefrom(int low_fd) {
 
 static void detach_closed_descriptors(void) {
     fd_entry_t *removed_entries = NULL;
-    pthread_mutex_lock(&fd_map_lock);
+    shim_lock(&fd_map_lock);
     fd_entry_t **position = &fd_entries;
     while (*position) {
         errno = 0;
@@ -1678,7 +1900,7 @@ static void detach_closed_descriptors(void) {
         }
         position = &(*position)->next;
     }
-    pthread_mutex_unlock(&fd_map_lock);
+    shim_unlock(&fd_map_lock);
 
     while (removed_entries) {
         fd_entry_t *next = removed_entries->next;
@@ -1695,11 +1917,15 @@ int fcloseall(void) {
         return EOF;
     }
 
+    // glibc closes the streams itself, before the map learns of it, so the whole call is
+    // serialized with fork; it is rare enough not to tell managed streams apart first.
+    shim_lock(&inheritance_lock);
     reentry++;
     int result = real_fcloseall_fn();
     reentry--;
     int saved_errno = errno;
     detach_closed_descriptors();
+    shim_unlock(&inheritance_lock);
     errno = saved_errno;
     return result;
 }
@@ -1710,12 +1936,16 @@ int fclose(FILE *file) {
     shared_state_t *observed = acquire_fd_state(fd);
     if (!observed) return real_fclose_fn(file);
     state_release_reference(observed);
+    // A managed stream: serialize with fork before taking the stream lock, the order fcloseall
+    // uses, since glibc locks streams while fcloseall holds inheritance_lock.
+    shim_lock(&inheritance_lock);
     flockfile(file);
-    shared_state_t *state = lock_and_detach_fd_for_close(fd);
+    shim_lock(&fd_map_lock);
+    shared_state_t *state = detach_fd_for_close_locked(fd);
     reentry++;
     int result = real_fclose_fn(file);
     reentry--;
-    unlock_after_close(state);
+    unlock_after_close(state, 1);
     return result;
 }
 
@@ -1767,7 +1997,7 @@ void setlinebuf(FILE *file) {
 
 int dup(int old_fd) {
     init_syms();
-    pthread_mutex_lock(&fd_map_lock);
+    int serialized = lock_map_for_transition(old_fd, old_fd, -1);
     shared_state_t *state = NULL;
     for (fd_entry_t *entry = fd_entries; entry; entry = entry->next) {
         if (entry->fd == old_fd) {
@@ -1777,7 +2007,7 @@ int dup(int old_fd) {
     }
     fd_entry_t *new_entry = state ? calloc(1, sizeof(*new_entry)) : NULL;
     if (state && !new_entry) {
-        pthread_mutex_unlock(&fd_map_lock);
+        unlock_map_after_transition(serialized);
         errno = ENOMEM;
         return -1;
     }
@@ -1798,7 +2028,7 @@ int dup(int old_fd) {
         new_entry = NULL;
     }
     if (state) pthread_mutex_unlock(&state->io_lock);
-    pthread_mutex_unlock(&fd_map_lock);
+    unlock_map_after_transition(serialized);
     free(new_entry);
     return new_fd;
 }
@@ -1811,7 +2041,7 @@ static int duplicate_to(int old_fd, int new_fd, int flags, int use_dup3) {
     }
     if (old_fd == new_fd) return real_dup2_fn(old_fd, new_fd);
 
-    pthread_mutex_lock(&fd_map_lock);
+    int serialized = lock_map_for_transition(old_fd, old_fd, new_fd);
     fd_entry_t *source_entry = NULL;
     fd_entry_t **target_position = &fd_entries;
     while (*target_position) {
@@ -1832,7 +2062,7 @@ static int duplicate_to(int old_fd, int new_fd, int flags, int use_dup3) {
     shared_state_t *source_state = source_entry ? source_entry->state : NULL;
     shared_state_t *old_target_state = target_entry ? target_entry->state : NULL;
     if (source_state && !target_entry && real_fcntl_fn(new_fd, F_GETFD) >= 0) {
-        pthread_mutex_unlock(&fd_map_lock);
+        unlock_map_after_transition(serialized);
         errno = EOPNOTSUPP;
         return -1;
     }
@@ -1840,7 +2070,7 @@ static int duplicate_to(int old_fd, int new_fd, int flags, int use_dup3) {
     if (source_state) {
         replacement_entry = calloc(1, sizeof(*replacement_entry));
         if (!replacement_entry) {
-            pthread_mutex_unlock(&fd_map_lock);
+            unlock_map_after_transition(serialized);
             errno = ENOMEM;
             return -1;
         }
@@ -1858,7 +2088,7 @@ static int duplicate_to(int old_fd, int new_fd, int flags, int use_dup3) {
             pthread_mutex_unlock(&old_target_state->io_lock);
         }
         if (source_state) pthread_mutex_unlock(&source_state->io_lock);
-        pthread_mutex_unlock(&fd_map_lock);
+        unlock_map_after_transition(serialized);
         free(replacement_entry);
         return result;
     }
@@ -1884,7 +2114,7 @@ static int duplicate_to(int old_fd, int new_fd, int flags, int use_dup3) {
         pthread_mutex_unlock(&old_target_state->io_lock);
     }
     if (source_state) pthread_mutex_unlock(&source_state->io_lock);
-    pthread_mutex_unlock(&fd_map_lock);
+    unlock_map_after_transition(serialized);
     if (old_target_state) state_release_reference(old_target_state);
     if (cloexec_error) {
         free(replacement_entry);
@@ -1909,7 +2139,7 @@ static int fcntl_with_arguments(
     int (*real_function)(int, int, ...)) {
     if (command == F_DUPFD || command == F_DUPFD_CLOEXEC) {
         int minimum_fd = va_arg(arguments, int);
-        pthread_mutex_lock(&fd_map_lock);
+        int serialized = lock_map_for_transition(fd, fd, -1);
         shared_state_t *state = NULL;
         for (fd_entry_t *entry = fd_entries; entry; entry = entry->next) {
             if (entry->fd == fd) {
@@ -1919,7 +2149,7 @@ static int fcntl_with_arguments(
         }
         fd_entry_t *new_entry = state ? calloc(1, sizeof(*new_entry)) : NULL;
         if (state && !new_entry) {
-            pthread_mutex_unlock(&fd_map_lock);
+            unlock_map_after_transition(serialized);
             errno = ENOMEM;
             return -1;
         }
@@ -1940,7 +2170,7 @@ static int fcntl_with_arguments(
             new_entry = NULL;
         }
         if (state) pthread_mutex_unlock(&state->io_lock);
-        pthread_mutex_unlock(&fd_map_lock);
+        unlock_map_after_transition(serialized);
         free(new_entry);
         return result;
     }
@@ -1983,7 +2213,7 @@ static int fcntl_with_arguments(
         case F_SETFD:
         {
             int value = va_arg(arguments, int);
-            pthread_mutex_lock(&fd_map_lock);
+            shim_lock(&fd_map_lock);
             int managed = 0;
             for (fd_entry_t *entry = fd_entries; entry; entry = entry->next) {
                 if (entry->fd == fd) {
@@ -1992,7 +2222,7 @@ static int fcntl_with_arguments(
                 }
             }
             int result = real_function(fd, command, managed ? value | FD_CLOEXEC : value);
-            pthread_mutex_unlock(&fd_map_lock);
+            shim_unlock(&fd_map_lock);
             return result;
         }
         default:
@@ -2054,10 +2284,10 @@ int posix_spawn_file_actions_init(posix_spawn_file_actions_t *actions) {
     }
 
     entry->actions = actions;
-    pthread_mutex_lock(&spawn_actions_lock);
+    shim_lock(&spawn_actions_lock);
     entry->next = spawn_actions_entries;
     spawn_actions_entries = entry;
-    pthread_mutex_unlock(&spawn_actions_lock);
+    shim_unlock(&spawn_actions_lock);
     return 0;
 }
 
@@ -2065,12 +2295,12 @@ int posix_spawn_file_actions_destroy(posix_spawn_file_actions_t *actions) {
     init_syms();
     if (!real_posix_spawn_file_actions_destroy_fn) return ENOSYS;
 
-    pthread_mutex_lock(&spawn_actions_lock);
+    shim_lock(&spawn_actions_lock);
     spawn_actions_entry_t **position = find_spawn_actions_position_locked(actions);
     spawn_actions_entry_t *entry = *position;
     int result = real_posix_spawn_file_actions_destroy_fn(actions);
     if (result == 0 && entry) *position = entry->next;
-    pthread_mutex_unlock(&spawn_actions_lock);
+    shim_unlock(&spawn_actions_lock);
     if (result != 0 || !entry) return result;
 
     spawn_dup_action_t *action = entry->dup_actions;
@@ -2105,13 +2335,13 @@ int posix_spawn_file_actions_adddup2(
         return ENOMEM;
     }
 
-    pthread_mutex_lock(&inheritance_lock);
-    pthread_mutex_lock(&spawn_actions_lock);
-    pthread_mutex_lock(&fd_map_lock);
+    shim_lock(&inheritance_lock);
+    shim_lock(&spawn_actions_lock);
+    shim_lock(&fd_map_lock);
     if (descriptor_is_managed_locked(source_fd)) {
-        pthread_mutex_unlock(&fd_map_lock);
-        pthread_mutex_unlock(&spawn_actions_lock);
-        pthread_mutex_unlock(&inheritance_lock);
+        shim_unlock(&fd_map_lock);
+        shim_unlock(&spawn_actions_lock);
+        shim_unlock(&inheritance_lock);
         free(dup_action);
         free(new_entry);
         return EOPNOTSUPP;
@@ -2133,9 +2363,9 @@ int posix_spawn_file_actions_adddup2(
         entry->dup_actions = dup_action;
         dup_action = NULL;
     }
-    pthread_mutex_unlock(&fd_map_lock);
-    pthread_mutex_unlock(&spawn_actions_lock);
-    pthread_mutex_unlock(&inheritance_lock);
+    shim_unlock(&fd_map_lock);
+    shim_unlock(&spawn_actions_lock);
+    shim_unlock(&inheritance_lock);
     free(dup_action);
     free(new_entry);
     return result;
@@ -2150,8 +2380,8 @@ int posix_spawn_file_actions_addchdir_np(
     spawn_actions_entry_t *new_entry = calloc(1, sizeof(*new_entry));
     if (!new_entry) return ENOMEM;
 
-    pthread_mutex_lock(&inheritance_lock);
-    pthread_mutex_lock(&spawn_actions_lock);
+    shim_lock(&inheritance_lock);
+    shim_lock(&spawn_actions_lock);
     spawn_actions_entry_t **position = find_spawn_actions_position_locked(actions);
     spawn_actions_entry_t *entry = *position;
     int result = real_posix_spawn_file_actions_addchdir_np_fn(actions, path);
@@ -2165,8 +2395,8 @@ int posix_spawn_file_actions_addchdir_np(
         }
         entry->directory_changed = 1;
     }
-    pthread_mutex_unlock(&spawn_actions_lock);
-    pthread_mutex_unlock(&inheritance_lock);
+    shim_unlock(&spawn_actions_lock);
+    shim_unlock(&inheritance_lock);
     free(new_entry);
     return result;
 }
@@ -2180,8 +2410,8 @@ int posix_spawn_file_actions_addfchdir_np(
     spawn_actions_entry_t *new_entry = calloc(1, sizeof(*new_entry));
     if (!new_entry) return ENOMEM;
 
-    pthread_mutex_lock(&inheritance_lock);
-    pthread_mutex_lock(&spawn_actions_lock);
+    shim_lock(&inheritance_lock);
+    shim_lock(&spawn_actions_lock);
     spawn_actions_entry_t **position = find_spawn_actions_position_locked(actions);
     spawn_actions_entry_t *entry = *position;
     int result = real_posix_spawn_file_actions_addfchdir_np_fn(actions, directory_fd);
@@ -2195,8 +2425,8 @@ int posix_spawn_file_actions_addfchdir_np(
         }
         entry->directory_changed = 1;
     }
-    pthread_mutex_unlock(&spawn_actions_lock);
-    pthread_mutex_unlock(&inheritance_lock);
+    shim_unlock(&spawn_actions_lock);
+    shim_unlock(&inheritance_lock);
     free(new_entry);
     return result;
 }
@@ -2221,13 +2451,13 @@ int posix_spawn_file_actions_addopen(
         return ENOMEM;
     }
 
-    pthread_mutex_lock(&inheritance_lock);
-    pthread_mutex_lock(&spawn_actions_lock);
+    shim_lock(&inheritance_lock);
+    shim_lock(&spawn_actions_lock);
     spawn_actions_entry_t **position = find_spawn_actions_position_locked(actions);
     spawn_actions_entry_t *entry = *position;
     if (entry && entry->directory_changed && path[0] != '/') {
-        pthread_mutex_unlock(&spawn_actions_lock);
-        pthread_mutex_unlock(&inheritance_lock);
+        shim_unlock(&spawn_actions_lock);
+        shim_unlock(&inheritance_lock);
         free(open_action);
         free(new_entry);
         free(path_copy);
@@ -2253,8 +2483,8 @@ int posix_spawn_file_actions_addopen(
         entry->open_actions = open_action;
         open_action = NULL;
     }
-    pthread_mutex_unlock(&spawn_actions_lock);
-    pthread_mutex_unlock(&inheritance_lock);
+    shim_unlock(&spawn_actions_lock);
+    shim_unlock(&inheritance_lock);
     free(open_action);
     free(new_entry);
     free(path_copy);
@@ -2291,13 +2521,13 @@ static int spawn_process(
     char *const environment[]) {
     if (!real_function) return ENOSYS;
 
-    pthread_mutex_lock(&inheritance_lock);
-    pthread_mutex_lock(&spawn_actions_lock);
-    pthread_mutex_lock(&fd_map_lock);
+    shim_lock(&inheritance_lock);
+    shim_lock(&spawn_actions_lock);
+    shim_lock(&fd_map_lock);
     if (spawn_actions_export_managed_descriptor_locked(actions)) {
-        pthread_mutex_unlock(&fd_map_lock);
-        pthread_mutex_unlock(&spawn_actions_lock);
-        pthread_mutex_unlock(&inheritance_lock);
+        shim_unlock(&fd_map_lock);
+        shim_unlock(&spawn_actions_lock);
+        shim_unlock(&inheritance_lock);
         return EOPNOTSUPP;
     }
 
@@ -2308,9 +2538,9 @@ static int spawn_process(
         attributes,
         arguments,
         environment);
-    pthread_mutex_unlock(&fd_map_lock);
-    pthread_mutex_unlock(&spawn_actions_lock);
-    pthread_mutex_unlock(&inheritance_lock);
+    shim_unlock(&fd_map_lock);
+    shim_unlock(&spawn_actions_lock);
+    shim_unlock(&inheritance_lock);
     return result;
 }
 
@@ -2350,6 +2580,115 @@ int posix_spawnp(
         environment);
 }
 
+/*
+ * Managed descriptors never reach another process: they are close-on-exec, and a fork child
+ * that has not exec'd yet loses them here. Each number stays taken by a close-on-exec directory
+ * placeholder, so stale file objects in a child that keeps running (a fork-based worker pool,
+ * say) fail loudly with EISDIR instead of reaching whatever file would reuse a freed number.
+ * The placeholder is the one kept since the first managed open. If the application has closed
+ * or reused that number, a fresh one is opened; at the descriptor limit one managed slot is
+ * freed first and it opens into that slot, since open returns the lowest free number. Only when
+ * no placeholder can be had at all are the numbers closed. The leases and any pending releases
+ * stay the parent's to release, so the child forgets them without IPC. Only async-signal-safe
+ * work, through the real functions: the forgotten entries are left allocated rather than freed.
+ * It runs once per child: at the first descriptor lookup of a child fork handler, or else when
+ * fork returns. It may run inside a wrapped call, so it leaves errno as it found it.
+ *
+ * Fork does not hold the descriptor map lock (common wrappers take it, and holding it across
+ * other libraries' fork handlers would invert their lock order). It holds inheritance_lock,
+ * under which every managed open, close and duplication happens, so the child's copy of the map
+ * agrees with its descriptor table. A number is still replaced only while it names its model
+ * file, which covers descriptors closed behind the shim's back (a raw close syscall, say).
+ */
+static int descriptor_names_state(int fd, const shared_state_t *state) {
+    struct stat status;
+    if (fstat(fd, &status) != 0) return 0;
+    return device_number(status.st_dev) == state->device_id &&
+           (uint64_t)status.st_ino == state->inode;
+}
+
+static void drop_inherited_descriptors_in_child(void) {
+    if (inherited_descriptors_dropped) return;
+    inherited_descriptors_dropped = 1;
+    int saved_errno = errno;
+    close_inherited_fetch_connections_in_child();
+
+    struct rlimit limit;
+    int limit_known = getrlimit(RLIMIT_NOFILE, &limit) == 0;
+    int placeholder = -1;
+    int placeholder_is_kept = 0;
+    if (real_dup3_fn && kept_placeholder_is_intact()) {
+        placeholder = kept_placeholder;
+        placeholder_is_kept = 1;
+    }
+    else if (real_dup3_fn) {
+        placeholder = open_descriptor_placeholder();
+        if (placeholder < 0 && errno == EMFILE) {
+            for (fd_entry_t *entry = fd_entries; entry; entry = entry->next) {
+                if (limit_known && (rlim_t)entry->fd >= limit.rlim_cur) continue;
+                if (!descriptor_names_state(entry->fd, entry->state)) continue;
+                real_close_fn(entry->fd);
+                placeholder = open_descriptor_placeholder();
+                break;
+            }
+        }
+    }
+
+    /* dup3 refuses a target at or above the soft limit, which the application may have lowered
+     * below managed descriptors that are still open; raise it just enough while replacing them. */
+    int limit_raised = 0;
+    if (placeholder >= 0 && limit_known) {
+        int highest_fd = -1;
+        for (fd_entry_t *entry = fd_entries; entry; entry = entry->next) {
+            if (entry->fd > highest_fd) highest_fd = entry->fd;
+        }
+        if (highest_fd >= 0 && (rlim_t)highest_fd >= limit.rlim_cur &&
+            (rlim_t)highest_fd < limit.rlim_max) {
+            struct rlimit raised = limit;
+            raised.rlim_cur = (rlim_t)highest_fd + 1;
+            limit_raised = setrlimit(RLIMIT_NOFILE, &raised) == 0;
+        }
+    }
+
+    int placeholder_fills_managed_slot = 0;
+    for (fd_entry_t *entry = fd_entries; entry; entry = entry->next) {
+        if (entry->fd == placeholder) {
+            placeholder_fills_managed_slot = 1;
+        }
+        else if (!descriptor_names_state(entry->fd, entry->state)) {
+            continue;
+        }
+        else if (placeholder < 0 || real_dup3_fn(placeholder, entry->fd, O_CLOEXEC) < 0) {
+            real_close_fn(entry->fd);
+        }
+    }
+    if (limit_raised) setrlimit(RLIMIT_NOFILE, &limit);
+    if (placeholder >= 0 && !placeholder_is_kept && !placeholder_fills_managed_slot) {
+        real_close_fn(placeholder);
+    }
+    fd_entries = NULL;
+    managed_descriptor_seen = 0;
+    pending_releases = NULL;
+    pending_release_worker_started = 0;
+    pending_release_ready = (pthread_cond_t)PTHREAD_COND_INITIALIZER;
+    errno = saved_errno;
+}
+
+/* A parent thread that does not exist in the child may have held any of these at the fork. */
+static void reset_shim_locks_in_child(void) {
+    fd_map_lock = (pthread_mutex_t)PTHREAD_MUTEX_INITIALIZER;
+    spawn_actions_lock = (pthread_mutex_t)PTHREAD_MUTEX_INITIALIZER;
+    pending_release_lock = (pthread_mutex_t)PTHREAD_MUTEX_INITIALIZER;
+}
+
+/*
+ * Forking stays possible after models are open, so subprocess launchers that fork and exec
+ * (CPython's subprocess, for one) keep working. Two shim locks are held across the real fork.
+ * inheritance_lock keeps managed descriptor changes out, and no common wrapper takes it, so
+ * other libraries' fork handlers cannot invert lock order through it. connection_setup_lock
+ * keeps a request's socket from being created but not yet connected; no lock is taken while it
+ * is held, so it cannot invert lock order either.
+ */
 pid_t fork(void) {
     init_syms();
     if (!real_fork_fn) {
@@ -2358,14 +2697,20 @@ pid_t fork(void) {
     }
 
     pthread_mutex_lock(&inheritance_lock);
-    if (managed_descriptor_seen) {
-        pthread_mutex_unlock(&inheritance_lock);
-        errno = EOPNOTSUPP;
-        return -1;
-    }
-
+    pthread_mutex_lock(&connection_setup_lock);
+    forking_process_id = getpid();
+    inherited_descriptors_dropped = 0;
+    fork_in_progress = 1;
     pid_t result = real_fork_fn();
+    int saved_errno = errno;
+    if (result == 0) {
+        reset_shim_locks_in_child();
+        drop_inherited_descriptors_in_child();
+    }
+    fork_in_progress = 0;
+    pthread_mutex_unlock(&connection_setup_lock);
     pthread_mutex_unlock(&inheritance_lock);
+    errno = saved_errno;
     return result;
 }
 
@@ -2373,7 +2718,8 @@ pid_t fork(void) {
  * A vfork child shares the parent's stack until it execs or exits, so it must never return
  * from the function that called vfork. A C wrapper around the real vfork does exactly that,
  * which corrupts the parent's stack. POSIX allows vfork to behave like fork, so route it
- * through the fork wrapper: same gating, and the child gets its own address space.
+ * through the fork wrapper: the child gets its own address space and drops managed
+ * descriptors the same way.
  */
 pid_t vfork(void) {
     return fork();
@@ -2386,11 +2732,13 @@ int clone(int (*function)(void *), void *child_stack, int flags, void *argument,
         return -1;
     }
 
-    pthread_mutex_lock(&inheritance_lock);
+    /* Unlike fork, a clone child may share the parent's memory, so it cannot drop its copy of
+     * the managed descriptors without corrupting the parent's state; refuse an unshared table. */
+    shim_lock(&inheritance_lock);
     const int shared_process_flags = CLONE_VM | CLONE_FILES | CLONE_THREAD;
     if (managed_descriptor_seen &&
         (flags & shared_process_flags) != shared_process_flags) {
-        pthread_mutex_unlock(&inheritance_lock);
+        shim_unlock(&inheritance_lock);
         errno = EOPNOTSUPP;
         return -1;
     }
@@ -2422,7 +2770,7 @@ int clone(int (*function)(void *), void *child_stack, int flags, void *argument,
         parent_tid,
         tls,
         child_tid);
-    pthread_mutex_unlock(&inheritance_lock);
+    shim_unlock(&inheritance_lock);
     return result;
 }
 
@@ -2470,18 +2818,18 @@ ssize_t sendmsg(int socket_fd, const struct msghdr *message, int flags) {
         return -1;
     }
 
-    pthread_mutex_lock(&inheritance_lock);
-    pthread_mutex_lock(&fd_map_lock);
+    shim_lock(&inheritance_lock);
+    shim_lock(&fd_map_lock);
     int exports_managed = message_exports_managed_descriptor_locked(message);
-    pthread_mutex_unlock(&fd_map_lock);
+    shim_unlock(&fd_map_lock);
     if (exports_managed) {
-        pthread_mutex_unlock(&inheritance_lock);
+        shim_unlock(&inheritance_lock);
         errno = EOPNOTSUPP;
         return -1;
     }
 
     ssize_t result = real_sendmsg_fn(socket_fd, message, flags);
-    pthread_mutex_unlock(&inheritance_lock);
+    shim_unlock(&inheritance_lock);
     return result;
 }
 
@@ -2496,8 +2844,8 @@ int sendmmsg(
         return -1;
     }
 
-    pthread_mutex_lock(&inheritance_lock);
-    pthread_mutex_lock(&fd_map_lock);
+    shim_lock(&inheritance_lock);
+    shim_lock(&fd_map_lock);
     int exports_managed = 0;
     for (unsigned int index = 0; index < message_count; index++) {
         if (message_exports_managed_descriptor_locked(&messages[index].msg_hdr)) {
@@ -2505,15 +2853,15 @@ int sendmmsg(
             break;
         }
     }
-    pthread_mutex_unlock(&fd_map_lock);
+    shim_unlock(&fd_map_lock);
     if (exports_managed) {
-        pthread_mutex_unlock(&inheritance_lock);
+        shim_unlock(&inheritance_lock);
         errno = EOPNOTSUPP;
         return -1;
     }
 
     int result = real_sendmmsg_fn(socket_fd, messages, message_count, flags);
-    pthread_mutex_unlock(&inheritance_lock);
+    shim_unlock(&inheritance_lock);
     return result;
 }
 
@@ -2835,9 +3183,9 @@ int ioctl(int fd, unsigned long request, ...) {
 
     if (request == FIONCLEX || request == FIOCLEX) {
         if (request == FIONCLEX) {
-            pthread_mutex_lock(&fd_map_lock);
+            shim_lock(&fd_map_lock);
             int managed = descriptor_is_managed_locked(fd);
-            pthread_mutex_unlock(&fd_map_lock);
+            shim_unlock(&fd_map_lock);
             if (managed) {
                 errno = EOPNOTSUPP;
                 return -1;

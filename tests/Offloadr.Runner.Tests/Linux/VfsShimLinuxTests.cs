@@ -764,7 +764,7 @@ public class VfsShimLinuxTests
     }
 
     [Test]
-    public async Task RangeManaged_DescriptorInheritance_IsRejectedOrCloseOnExec()
+    public async Task RangeManaged_DescriptorInheritance_IsRejectedClosedInForkChildrenOrCloseOnExec()
     {
         LinuxTestPrerequisites.RequireLinux();
         LinuxTestPrerequisites.RequireUnixDomainSockets();
@@ -785,12 +785,38 @@ public class VfsShimLinuxTests
             var probeSourcePath = Path.Combine(root, "inheritance-probe.c");
             var probePath = Path.Combine(root, "inheritance-probe");
             var socketPath = Path.Combine(root, "model-fetch.sock");
+            var earlyHandlersSourcePath = Path.Combine(root, "early-fork-handlers.c");
+            var earlyHandlersPath = Path.Combine(root, "libearlyforkhandlers.so");
 
             await CompileShimAsync(shimPath);
+            // A library the probe links (kept as DT_NEEDED although the probe uses none of its symbols):
+            // its constructor runs before the preloaded shim's, so its fork handlers are registered first
+            // and run while the forking thread holds the shim locks.
+            await File.WriteAllTextAsync(earlyHandlersSourcePath, """
+                #include <fcntl.h>
+                #include <pthread.h>
+                #include <unistd.h>
+
+                static void touch_descriptors_early(void) {
+                    int descriptor = open("/dev/null", O_RDONLY);
+                    if (descriptor >= 0) {
+                        (void)fcntl(descriptor, F_GETFD);
+                        close(descriptor);
+                    }
+                }
+
+                __attribute__((constructor)) static void register_early_fork_handlers(void) {
+                    pthread_atfork(touch_descriptors_early, touch_descriptors_early, touch_descriptors_early);
+                }
+                """);
+            await RunProcessAsync(
+                "/usr/bin/gcc",
+                ["-fPIC", "-shared", "-o", earlyHandlersPath, earlyHandlersSourcePath],
+                root);
             await WriteInheritanceProbeAsync(probeSourcePath);
             await RunProcessAsync(
                 "/usr/bin/gcc",
-                [probeSourcePath, "-o", probePath],
+                [probeSourcePath, "-o", probePath, "-Wl,--no-as-needed", earlyHandlersPath, $"-Wl,-rpath,{root}"],
                 root);
 
             var requests = new List<VfsIpcRequest>();
@@ -3232,17 +3258,689 @@ public class VfsShimLinuxTests
             """);
     }
 
+    [Test]
+    public async Task RangeManaged_ForkChildHandlers_DoNotWaitOnReadsInFlightInTheParent()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        LinuxTestPrerequisites.RequireUnixDomainSockets();
+        LinuxTestPrerequisites.RequireCommand("/usr/bin/gcc");
+
+        var root = Path.Combine(Path.GetTempPath(), "runneragent-vfs-shim-tests", Guid.NewGuid().ToString("n"));
+        Directory.CreateDirectory(root);
+
+        try
+        {
+            var modelsRoot = Path.Combine(root, "models");
+            Directory.CreateDirectory(modelsRoot);
+            var modelPath = Path.Combine(modelsRoot, "busy.bin");
+            await File.WriteAllBytesAsync(modelPath, new byte[8]);
+
+            var shimPath = Path.Combine(root, "liboffloadr_model_vfs.so");
+            var probeSourcePath = Path.Combine(root, "busy-fork-probe.c");
+            var probePath = Path.Combine(root, "busy-fork-probe");
+            var socketPath = Path.Combine(root, "model-fetch.sock");
+
+            await CompileShimAsync(shimPath);
+            // A reader thread holds the file's lock while the fetch service is slow to answer; the
+            // fork child's own handler then reads the same descriptor. That thread does not exist
+            // in the child, so the handler must not wait on its lock.
+            await File.WriteAllTextAsync(probeSourcePath, """
+                #define _GNU_SOURCE
+                #include <errno.h>
+                #include <fcntl.h>
+                #include <pthread.h>
+                #include <stdio.h>
+                #include <sys/wait.h>
+                #include <unistd.h>
+
+                static int managed = -1;
+                static int child_read_errno = 0;
+
+                static void *read_slowly(void *argument) {
+                    (void)argument;
+                    char byte;
+                    (void)pread(managed, &byte, 1, 0);
+                    return NULL;
+                }
+
+                static void read_managed_in_child(void) {
+                    char byte;
+                    errno = 0;
+                    if (read(managed, &byte, 1) == -1) child_read_errno = errno;
+                }
+
+                int main(int argc, char **argv) {
+                    if (argc != 2) return 10;
+                    managed = open(argv[1], O_RDONLY);
+                    if (managed < 0) return 11;
+                    pthread_t reader;
+                    if (pthread_create(&reader, NULL, read_slowly, NULL) != 0) return 12;
+                    usleep(300000);
+                    if (pthread_atfork(NULL, NULL, read_managed_in_child) != 0) return 13;
+                    pid_t child = fork();
+                    if (child < 0) return 14;
+                    if (child == 0) _exit(child_read_errno == EISDIR ? 0 : 2);
+                    int status = 0;
+                    if (waitpid(child, &status, 0) != child ||
+                        !WIFEXITED(status) || WEXITSTATUS(status) != 0) return 15;
+                    if (pthread_join(reader, NULL) != 0) return 16;
+                    close(managed);
+                    puts("ok");
+                    return 0;
+                }
+                """);
+            await RunProcessAsync(
+                "/usr/bin/gcc",
+                [probeSourcePath, "-o", probePath, "-pthread"],
+                root);
+
+            await using var server = new VfsIpcServer(socketPath, async (request, _) =>
+            {
+                switch (request.Operation)
+                {
+                    case VfsIpcOperation.Open:
+                        return RangeManagedResponse(modelPath, leaseId: 913, transferEpoch: 1, expectedLength: 8);
+                    case VfsIpcOperation.EnsureRange:
+                        await Task.Delay(TimeSpan.FromSeconds(3));
+                        return VfsIpcResponse.Error(VfsIpcStatus.ServerError);
+                    case VfsIpcOperation.Release:
+                        return VfsIpcResponse.Success(transferEpoch: 1);
+                    default:
+                        return VfsIpcResponse.Error(VfsIpcStatus.ServerError);
+                }
+            });
+            server.Start();
+
+            var result = await RunProcessAsync(
+                probePath,
+                [modelPath],
+                root,
+                new Dictionary<string, string?>
+                {
+                    ["LD_PRELOAD"] = shimPath,
+                    ["VFS_SOCKET"] = socketPath,
+                    ["VFS_ROOTS"] = modelsRoot,
+                    ["VFS_EXTS"] = ".bin",
+                    ["VFS_SESSION_ID"] = "busy-fork-session",
+                    ["VFS_LOG"] = "0"
+                },
+                timeout: TimeSpan.FromSeconds(15));
+
+            Assert.That(result.Stdout.Trim(), Is.EqualTo("ok"));
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [Test]
+    public async Task Fork_DoesNotHoldDescriptorLocksWhileOtherLibrariesForkHandlersRun()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        LinuxTestPrerequisites.RequireUnixDomainSockets();
+        LinuxTestPrerequisites.RequireCommand("/usr/bin/gcc");
+
+        var root = Path.Combine(Path.GetTempPath(), "runneragent-vfs-shim-tests", Guid.NewGuid().ToString("n"));
+        Directory.CreateDirectory(root);
+
+        try
+        {
+            var modelsRoot = Path.Combine(root, "models");
+            Directory.CreateDirectory(modelsRoot);
+            var modelPath = Path.Combine(modelsRoot, "allocator.bin");
+            await File.WriteAllBytesAsync(modelPath, new byte[8]);
+
+            var shimPath = Path.Combine(root, "liboffloadr_model_vfs.so");
+            var probeSourcePath = Path.Combine(root, "allocator-fork-probe.c");
+            var probePath = Path.Combine(root, "allocator-fork-probe");
+            var socketPath = Path.Combine(root, "model-fetch.sock");
+
+            await CompileShimAsync(shimPath);
+            // Like an allocator: a library holds its own lock while it maps memory and reads a
+            // descriptor on one thread, and its prepare handler takes that lock on the forking one.
+            await File.WriteAllTextAsync(probeSourcePath, """
+                #define _GNU_SOURCE
+                #include <fcntl.h>
+                #include <pthread.h>
+                #include <stdio.h>
+                #include <sys/mman.h>
+                #include <sys/wait.h>
+                #include <unistd.h>
+
+                static pthread_mutex_t library_lock = PTHREAD_MUTEX_INITIALIZER;
+                static volatile int stopping = 0;
+
+                static void take_library_lock(void) {
+                    pthread_mutex_lock(&library_lock);
+                }
+
+                static void release_library_lock(void) {
+                    pthread_mutex_unlock(&library_lock);
+                }
+
+                static void *allocate_constantly(void *argument) {
+                    (void)argument;
+                    int zero = open("/dev/zero", O_RDONLY);
+                    char byte;
+                    while (!stopping) {
+                        pthread_mutex_lock(&library_lock);
+                        void *page = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                        if (page != MAP_FAILED) munmap(page, 4096);
+                        (void)read(zero, &byte, 1);
+                        pthread_mutex_unlock(&library_lock);
+                    }
+                    close(zero);
+                    return NULL;
+                }
+
+                int main(int argc, char **argv) {
+                    if (argc != 2) return 10;
+                    int managed = open(argv[1], O_RDONLY);
+                    if (managed < 0) return 11;
+                    if (pthread_atfork(take_library_lock, release_library_lock, release_library_lock) != 0) return 12;
+                    pthread_t allocator;
+                    if (pthread_create(&allocator, NULL, allocate_constantly, NULL) != 0) return 13;
+                    for (int round = 0; round < 200; round++) {
+                        pid_t child = fork();
+                        if (child < 0) return 14;
+                        if (child == 0) _exit(0);
+                        int status = 0;
+                        if (waitpid(child, &status, 0) != child || !WIFEXITED(status)) return 15;
+                    }
+                    stopping = 1;
+                    if (pthread_join(allocator, NULL) != 0) return 16;
+                    close(managed);
+                    puts("ok");
+                    return 0;
+                }
+                """);
+            await RunProcessAsync(
+                "/usr/bin/gcc",
+                [probeSourcePath, "-o", probePath, "-pthread"],
+                root);
+
+            await using var server = new VfsIpcServer(socketPath, (request, _) => Task.FromResult(request.Operation switch
+            {
+                VfsIpcOperation.Open => RangeManagedResponse(modelPath, leaseId: 914, transferEpoch: 1, expectedLength: 8),
+                VfsIpcOperation.Release => VfsIpcResponse.Success(transferEpoch: 1),
+                _ => VfsIpcResponse.Error(VfsIpcStatus.ServerError)
+            }));
+            server.Start();
+
+            var result = await RunProcessAsync(
+                probePath,
+                [modelPath],
+                root,
+                new Dictionary<string, string?>
+                {
+                    ["LD_PRELOAD"] = shimPath,
+                    ["VFS_SOCKET"] = socketPath,
+                    ["VFS_ROOTS"] = modelsRoot,
+                    ["VFS_EXTS"] = ".bin",
+                    ["VFS_SESSION_ID"] = "allocator-fork-session",
+                    ["VFS_LOG"] = "0"
+                },
+                timeout: TimeSpan.FromSeconds(20));
+
+            Assert.That(result.Stdout.Trim(), Is.EqualTo("ok"));
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [Test]
+    public async Task RangeManaged_ForkChildren_GetNoRawCopyOfDescriptorsClosedOrDuplicatedDuringFork()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        LinuxTestPrerequisites.RequireUnixDomainSockets();
+        LinuxTestPrerequisites.RequireCommand("/usr/bin/gcc");
+
+        var root = Path.Combine(Path.GetTempPath(), "runneragent-vfs-shim-tests", Guid.NewGuid().ToString("n"));
+        Directory.CreateDirectory(root);
+
+        try
+        {
+            var modelsRoot = Path.Combine(root, "models");
+            Directory.CreateDirectory(modelsRoot);
+            var modelPath = Path.Combine(modelsRoot, "churn.bin");
+            await File.WriteAllBytesAsync(modelPath, new byte[8]);
+
+            var shimPath = Path.Combine(root, "liboffloadr_model_vfs.so");
+            var probeSourcePath = Path.Combine(root, "churn-fork-probe.c");
+            var probePath = Path.Combine(root, "churn-fork-probe");
+            var socketPath = Path.Combine(root, "model-fetch.sock");
+
+            await CompileShimAsync(shimPath);
+            // One thread keeps duplicating and closing managed descriptors while another forks;
+            // every child checks that no descriptor still names the model file.
+            await File.WriteAllTextAsync(probeSourcePath, """
+                #define _GNU_SOURCE
+                #include <fcntl.h>
+                #include <pthread.h>
+                #include <stdio.h>
+                #include <sys/stat.h>
+                #include <sys/wait.h>
+                #include <unistd.h>
+
+                static int managed = -1;
+                static volatile int stopping = 0;
+
+                static void *churn_descriptors(void *argument) {
+                    (void)argument;
+                    while (!stopping) {
+                        int duplicate = dup(managed);
+                        if (duplicate >= 0) close(duplicate);
+                        int target = open("/dev/null", O_RDONLY);
+                        if (target < 0) continue;
+                        close(target);
+                        if (dup3(managed, target, O_CLOEXEC) == target) close(target);
+                    }
+                    return NULL;
+                }
+
+                int main(int argc, char **argv) {
+                    if (argc != 2) return 10;
+                    managed = open(argv[1], O_RDONLY);
+                    if (managed < 0) return 11;
+                    struct stat model;
+                    if (fstat(managed, &model) != 0) return 12;
+                    pthread_t churner;
+                    if (pthread_create(&churner, NULL, churn_descriptors, NULL) != 0) return 13;
+                    for (int round = 0; round < 300; round++) {
+                        pid_t child = fork();
+                        if (child < 0) return 14;
+                        if (child == 0) {
+                            for (int descriptor = 0; descriptor < 256; descriptor++) {
+                                struct stat status;
+                                if (fstat(descriptor, &status) == 0 &&
+                                    status.st_dev == model.st_dev && status.st_ino == model.st_ino) _exit(2);
+                            }
+                            _exit(0);
+                        }
+                        int status = 0;
+                        if (waitpid(child, &status, 0) != child) return 15;
+                        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return 16;
+                    }
+                    stopping = 1;
+                    if (pthread_join(churner, NULL) != 0) return 17;
+                    close(managed);
+                    puts("ok");
+                    return 0;
+                }
+                """);
+            await RunProcessAsync(
+                "/usr/bin/gcc",
+                [probeSourcePath, "-o", probePath, "-pthread"],
+                root);
+
+            await using var server = new VfsIpcServer(socketPath, (request, _) => Task.FromResult(request.Operation switch
+            {
+                VfsIpcOperation.Open => RangeManagedResponse(modelPath, leaseId: 915, transferEpoch: 1, expectedLength: 8),
+                VfsIpcOperation.Release => VfsIpcResponse.Success(transferEpoch: 1),
+                _ => VfsIpcResponse.Error(VfsIpcStatus.ServerError)
+            }));
+            server.Start();
+
+            var result = await RunProcessAsync(
+                probePath,
+                [modelPath],
+                root,
+                new Dictionary<string, string?>
+                {
+                    ["LD_PRELOAD"] = shimPath,
+                    ["VFS_SOCKET"] = socketPath,
+                    ["VFS_ROOTS"] = modelsRoot,
+                    ["VFS_EXTS"] = ".bin",
+                    ["VFS_SESSION_ID"] = "churn-fork-session",
+                    ["VFS_LOG"] = "0"
+                },
+                timeout: TimeSpan.FromSeconds(30));
+
+            Assert.That(result.Stdout.Trim(), Is.EqualTo("ok"));
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [Test]
+    public async Task RangeManaged_ForkAndExecDuringAFetch_LeavesTheFetchServiceToSeeTheHangup()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        LinuxTestPrerequisites.RequireUnixDomainSockets();
+        LinuxTestPrerequisites.RequireCommand("/usr/bin/gcc");
+        LinuxTestPrerequisites.RequireCommand("/bin/sleep");
+
+        var root = Path.Combine(Path.GetTempPath(), "runneragent-vfs-shim-tests", Guid.NewGuid().ToString("n"));
+        Directory.CreateDirectory(root);
+        var orphans = new List<int>();
+
+        try
+        {
+            var modelsRoot = Path.Combine(root, "models");
+            Directory.CreateDirectory(modelsRoot);
+            var modelPath = Path.Combine(modelsRoot, "hangup.bin");
+            await File.WriteAllBytesAsync(modelPath, new byte[8]);
+
+            var shimPath = Path.Combine(root, "liboffloadr_model_vfs.so");
+            var probeSourcePath = Path.Combine(root, "hangup-probe.c");
+            var probePath = Path.Combine(root, "hangup-probe");
+            var socketPath = Path.Combine(root, "model-fetch.sock");
+
+            await CompileShimAsync(shimPath);
+            // A reader waits on a fetch while the process starts a long-running program and a
+            // long-running fork child, then exits: neither may keep the abandoned request's
+            // connection open.
+            await File.WriteAllTextAsync(probeSourcePath, """
+                #define _GNU_SOURCE
+                #include <fcntl.h>
+                #include <pthread.h>
+                #include <stdio.h>
+                #include <sys/resource.h>
+                #include <unistd.h>
+
+                static int managed = -1;
+
+                static void *read_slowly(void *argument) {
+                    (void)argument;
+                    char byte;
+                    (void)pread(managed, &byte, 1, 0);
+                    return NULL;
+                }
+
+                int main(int argc, char **argv) {
+                    if (argc != 2) return 10;
+                    managed = open(argv[1], O_RDONLY);
+                    if (managed < 0) return 11;
+                    /* The request's socket lands above the soft limit lowered below. */
+                    int spacers[100];
+                    for (int index = 0; index < 100; index++) {
+                        spacers[index] = open("/dev/null", O_RDONLY);
+                        if (spacers[index] < 0) return 16;
+                    }
+                    pthread_t reader;
+                    if (pthread_create(&reader, NULL, read_slowly, NULL) != 0) return 12;
+                    usleep(300000);
+                    for (int index = 0; index < 100; index++) close(spacers[index]);
+                    pid_t child = fork();
+                    if (child < 0) return 13;
+                    if (child == 0) {
+                        int quiet = open("/dev/null", O_WRONLY);
+                        if (quiet < 0 || dup2(quiet, STDOUT_FILENO) < 0 || dup2(quiet, STDERR_FILENO) < 0) _exit(126);
+                        execl("/bin/sleep", "sleep", "30", (char *)NULL);
+                        _exit(127);
+                    }
+                    /* A child that keeps running without exec, forked with no descriptor to spare
+                       below the soft limit. */
+                    struct rlimit lowered = {64, 64};
+                    if (getrlimit(RLIMIT_NOFILE, &lowered) != 0) return 15;
+                    lowered.rlim_cur = 64;
+                    if (setrlimit(RLIMIT_NOFILE, &lowered) != 0) return 15;
+                    while (open("/dev/null", O_RDONLY) >= 0) {
+                    }
+                    pid_t worker = fork();
+                    if (worker < 0) return 14;
+                    if (worker == 0) {
+                        close(STDOUT_FILENO);
+                        close(STDERR_FILENO);
+                        sleep(30);
+                        _exit(0);
+                    }
+                    printf("%d %d\n", (int)child, (int)worker);
+                    fflush(stdout);
+                    _exit(0);
+                }
+                """);
+            await RunProcessAsync(
+                "/usr/bin/gcc",
+                [probeSourcePath, "-o", probePath, "-pthread"],
+                root);
+
+            var fetchStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var hangupSeen = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            await using var server = new VfsIpcServer(socketPath, async (request, cancellationToken) =>
+            {
+                switch (request.Operation)
+                {
+                    case VfsIpcOperation.Open:
+                        return RangeManagedResponse(modelPath, leaseId: 916, transferEpoch: 1, expectedLength: 8);
+                    case VfsIpcOperation.EnsureRange:
+                        fetchStarted.TrySetResult();
+                        try
+                        {
+                            await Task.Delay(TimeSpan.FromSeconds(30), cancellationToken);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            hangupSeen.TrySetResult();
+                            throw;
+                        }
+                        return VfsIpcResponse.Error(VfsIpcStatus.ServerError);
+                    case VfsIpcOperation.Release:
+                        return VfsIpcResponse.Success(transferEpoch: 1);
+                    default:
+                        return VfsIpcResponse.Error(VfsIpcStatus.ServerError);
+                }
+            });
+            server.Start();
+
+            var result = await RunProcessAsync(
+                probePath,
+                [modelPath],
+                root,
+                new Dictionary<string, string?>
+                {
+                    ["LD_PRELOAD"] = shimPath,
+                    ["VFS_SOCKET"] = socketPath,
+                    ["VFS_ROOTS"] = modelsRoot,
+                    ["VFS_EXTS"] = ".bin",
+                    ["VFS_SESSION_ID"] = "hangup-session",
+                    ["VFS_LOG"] = "0"
+                });
+            orphans.AddRange(result.Stdout.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Select(value => int.Parse(value, System.Globalization.CultureInfo.InvariantCulture)));
+
+            Assert.That(fetchStarted.Task.IsCompleted, Is.True);
+            await hangupSeen.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+        finally
+        {
+            foreach (var processId in orphans)
+            {
+                try
+                {
+                    System.Diagnostics.Process.GetProcessById(processId).Kill();
+                }
+                catch (ArgumentException)
+                {
+                }
+            }
+
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [Test]
+    public async Task RangeManaged_ForkWhileARequestConnects_LeavesTheFetchServiceToSeeTheHangup()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        LinuxTestPrerequisites.RequireUnixDomainSockets();
+        LinuxTestPrerequisites.RequireCommand("/usr/bin/gcc");
+
+        var root = Path.Combine(Path.GetTempPath(), "runneragent-vfs-shim-tests", Guid.NewGuid().ToString("n"));
+        Directory.CreateDirectory(root);
+        var orphans = new List<int>();
+
+        try
+        {
+            var modelsRoot = Path.Combine(root, "models");
+            Directory.CreateDirectory(modelsRoot);
+            var modelPath = Path.Combine(modelsRoot, "connecting.bin");
+            await File.WriteAllBytesAsync(modelPath, new byte[8]);
+
+            var shimPath = Path.Combine(root, "liboffloadr_model_vfs.so");
+            var probeSourcePath = Path.Combine(root, "connecting-probe.c");
+            var probePath = Path.Combine(root, "connecting-probe");
+            var socketPath = Path.Combine(root, "model-fetch.sock");
+
+            await CompileShimAsync(shimPath);
+            // The probe's own connect stalls a reader's fetch request between creating its socket
+            // and connecting it while the main thread forks a long-running child, then the
+            // process exits: the child may not keep the abandoned request's connection open.
+            await File.WriteAllTextAsync(probeSourcePath, """
+                #define _GNU_SOURCE
+                #include <dlfcn.h>
+                #include <fcntl.h>
+                #include <pthread.h>
+                #include <stdio.h>
+                #include <sys/socket.h>
+                #include <unistd.h>
+
+                static int managed = -1;
+                static volatile int stall_connect = 0;
+                static volatile int connecting = 0;
+
+                int connect(int fd, const struct sockaddr *address, socklen_t length) {
+                    int (*real_connect)(int, const struct sockaddr *, socklen_t) =
+                        (int (*)(int, const struct sockaddr *, socklen_t))dlsym(RTLD_NEXT, "connect");
+                    if (stall_connect) {
+                        stall_connect = 0;
+                        connecting = 1;
+                        usleep(300000);
+                    }
+                    return real_connect(fd, address, length);
+                }
+
+                static void *read_slowly(void *argument) {
+                    (void)argument;
+                    char byte;
+                    (void)pread(managed, &byte, 1, 0);
+                    return NULL;
+                }
+
+                int main(int argc, char **argv) {
+                    if (argc != 2) return 10;
+                    managed = open(argv[1], O_RDONLY);
+                    if (managed < 0) return 11;
+                    stall_connect = 1;
+                    pthread_t reader;
+                    if (pthread_create(&reader, NULL, read_slowly, NULL) != 0) return 12;
+                    while (!connecting) usleep(1000);
+                    pid_t worker = fork();
+                    if (worker < 0) return 13;
+                    if (worker == 0) {
+                        close(STDOUT_FILENO);
+                        close(STDERR_FILENO);
+                        sleep(30);
+                        _exit(0);
+                    }
+                    usleep(600000);
+                    printf("%d\n", (int)worker);
+                    fflush(stdout);
+                    _exit(0);
+                }
+                """);
+            await RunProcessAsync(
+                "/usr/bin/gcc",
+                [probeSourcePath, "-o", probePath, "-pthread", "-rdynamic", "-ldl"],
+                root);
+
+            var fetchStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var hangupSeen = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            await using var server = new VfsIpcServer(socketPath, async (request, cancellationToken) =>
+            {
+                switch (request.Operation)
+                {
+                    case VfsIpcOperation.Open:
+                        return RangeManagedResponse(modelPath, leaseId: 917, transferEpoch: 1, expectedLength: 8);
+                    case VfsIpcOperation.EnsureRange:
+                        fetchStarted.TrySetResult();
+                        try
+                        {
+                            await Task.Delay(TimeSpan.FromSeconds(30), cancellationToken);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            hangupSeen.TrySetResult();
+                            throw;
+                        }
+                        return VfsIpcResponse.Error(VfsIpcStatus.ServerError);
+                    case VfsIpcOperation.Release:
+                        return VfsIpcResponse.Success(transferEpoch: 1);
+                    default:
+                        return VfsIpcResponse.Error(VfsIpcStatus.ServerError);
+                }
+            });
+            server.Start();
+
+            var result = await RunProcessAsync(
+                probePath,
+                [modelPath],
+                root,
+                new Dictionary<string, string?>
+                {
+                    ["LD_PRELOAD"] = shimPath,
+                    ["VFS_SOCKET"] = socketPath,
+                    ["VFS_ROOTS"] = modelsRoot,
+                    ["VFS_EXTS"] = ".bin",
+                    ["VFS_SESSION_ID"] = "connecting-session",
+                    ["VFS_LOG"] = "0"
+                });
+            orphans.Add(int.Parse(result.Stdout.Trim(), System.Globalization.CultureInfo.InvariantCulture));
+
+            Assert.That(fetchStarted.Task.IsCompleted, Is.True);
+            await hangupSeen.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+        finally
+        {
+            foreach (var processId in orphans)
+            {
+                try
+                {
+                    System.Diagnostics.Process.GetProcessById(processId).Kill();
+                }
+                catch (ArgumentException)
+                {
+                }
+            }
+
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
     private static async Task WriteInheritanceProbeAsync(string probeSourcePath)
     {
         await File.WriteAllTextAsync(probeSourcePath, """
             #define _GNU_SOURCE
             #include <errno.h>
             #include <fcntl.h>
+            #include <pthread.h>
             #include <sched.h>
             #include <signal.h>
             #include <spawn.h>
             #include <stdio.h>
             #include <sys/ioctl.h>
+            #include <sys/resource.h>
+            #include <sys/stat.h>
             #include <sys/wait.h>
             #include <unistd.h>
 
@@ -3251,6 +3949,14 @@ public class VfsShimLinuxTests
             static int clone_child(void *argument) {
                 (void)argument;
                 return 0;
+            }
+
+            static void touch_descriptors(void) {
+                int descriptor = open("/dev/null", O_RDONLY);
+                if (descriptor >= 0) {
+                    (void)fcntl(descriptor, F_GETFD);
+                    close(descriptor);
+                }
             }
 
             static int is_close_on_exec(int fd) {
@@ -3272,6 +3978,11 @@ public class VfsShimLinuxTests
                     !WIFEXITED(clone_status) || WEXITSTATUS(clone_status) != 0) return 50;
                 int managed = open(argv[1], O_RDONLY);
                 if (managed < 0 || !is_close_on_exec(managed)) return 11;
+                /* The shim keeps a directory placeholder from the first managed open on. */
+                int kept_placeholder = managed + 1;
+                struct stat kept_status;
+                if (fstat(kept_placeholder, &kept_status) != 0 || !S_ISDIR(kept_status.st_mode) ||
+                    !is_close_on_exec(kept_placeholder)) return 59;
                 if (fcntl(managed, F_SETFD, 0) != 0 || !is_close_on_exec(managed)) return 12;
                 errno = 0;
                 if (ioctl(managed, FIONCLEX) != -1 || errno != EOPNOTSUPP ||
@@ -3401,10 +4112,98 @@ public class VfsShimLinuxTests
                 if (waitpid(child, &child_status, 0) != child ||
                     !WIFEXITED(child_status) || WEXITSTATUS(child_status) != 0) return 46;
 
-                errno = 0;
-                if (fork() != -1 || errno != EOPNOTSUPP) return 47;
-                errno = 0;
-                if (vfork() != -1 || errno != EOPNOTSUPP) return 48;
+                /* Fork handlers that call wrapped functions run while the shim is not holding
+                 * its locks, in the parent and in the child. */
+                if (pthread_atfork(touch_descriptors, touch_descriptors, touch_descriptors) != 0) return 47;
+
+                /* A forked child that never execs gets no managed descriptor: each copy becomes
+                 * a placeholder whose reads fail, its number stays taken, and the lease stays
+                 * the parent's to release. */
+                int unmanaged = open("/dev/null", O_RDONLY);
+                if (unmanaged < 0) return 47;
+                pid_t forked = fork();
+                if (forked < 0) return 47;
+                if (forked == 0) {
+                    int descriptors[] = {managed, duplicate, target, fcntl_duplicate};
+                    size_t count = sizeof(descriptors) / sizeof(descriptors[0]);
+                    char byte;
+                    for (size_t index = 0; index < count; index++) {
+                        errno = 0;
+                        if (read(descriptors[index], &byte, 1) != -1 || errno != EISDIR) _exit(2);
+                        if (!is_close_on_exec(descriptors[index])) _exit(3);
+                    }
+                    int fresh = open("/dev/null", O_RDONLY);
+                    if (fresh < 0) _exit(4);
+                    for (size_t index = 0; index < count; index++) {
+                        if (fresh == descriptors[index]) _exit(5);
+                    }
+                    if (fcntl(unmanaged, F_GETFD) < 0) _exit(6);
+                    _exit(0);
+                }
+                int forked_status = 0;
+                if (waitpid(forked, &forked_status, 0) != forked ||
+                    !WIFEXITED(forked_status) || WEXITSTATUS(forked_status) != 0) return 48;
+                close(unmanaged);
+
+                /* The application reuses the kept placeholder's number, and the descriptor limit
+                 * leaves no free number for a fresh one: the child leaves the reused descriptor
+                 * alone and still keeps every managed number taken. */
+                close(kept_placeholder);
+                int reused = open("/dev/null", O_RDONLY);
+                if (reused != kept_placeholder) return 60;
+                /* A managed copy above the soft limit the application lowers below it. */
+                int high = fcntl(managed, F_DUPFD_CLOEXEC, 100);
+                if (high < 100) return 61;
+                struct rlimit original_limit;
+                if (getrlimit(RLIMIT_NOFILE, &original_limit) != 0) return 54;
+                struct rlimit lowered_limit = original_limit;
+                lowered_limit.rlim_cur = 64;
+                if (setrlimit(RLIMIT_NOFILE, &lowered_limit) != 0) return 54;
+                int fillers[64];
+                int filler_count = 0;
+                for (;;) {
+                    int filler = open("/dev/null", O_RDONLY);
+                    if (filler < 0) break;
+                    fillers[filler_count++] = filler;
+                }
+                if (errno != EMFILE) return 55;
+                pid_t limited = fork();
+                if (limited < 0) return 56;
+                if (limited == 0) {
+                    int descriptors[] = {managed, duplicate, target, fcntl_duplicate};
+                    char byte;
+                    for (size_t index = 0; index < sizeof(descriptors) / sizeof(descriptors[0]); index++) {
+                        errno = 0;
+                        if (read(descriptors[index], &byte, 1) != -1 || errno != EISDIR) _exit(2);
+                        if (!is_close_on_exec(descriptors[index])) _exit(3);
+                    }
+                    errno = 0;
+                    if (open("/dev/null", O_RDONLY) != -1 || errno != EMFILE) _exit(4);
+                    if (read(reused, &byte, 1) != 0) _exit(5);
+                    errno = 0;
+                    if (read(high, &byte, 1) != -1 || errno != EISDIR || !is_close_on_exec(high)) _exit(6);
+                    _exit(0);
+                }
+                int limited_status = 0;
+                if (waitpid(limited, &limited_status, 0) != limited ||
+                    !WIFEXITED(limited_status) || WEXITSTATUS(limited_status) != 0) return 57;
+                for (int index = 0; index < filler_count; index++) close(fillers[index]);
+                if (setrlimit(RLIMIT_NOFILE, &original_limit) != 0) return 58;
+                close(reused);
+                close(high);
+
+                /* Fork and exec after a model is open, the way CPython's subprocess runs a tool. */
+                pid_t exec_child = vfork();
+                if (exec_child < 0) return 51;
+                if (exec_child == 0) {
+                    execve("/bin/true", spawn_arguments, environ);
+                    _exit(127);
+                }
+                int exec_status = 0;
+                if (waitpid(exec_child, &exec_status, 0) != exec_child ||
+                    !WIFEXITED(exec_status) || WEXITSTATUS(exec_status) != 0) return 52;
+                if (!is_close_on_exec(managed)) return 53;
+
                 errno = 0;
                 if (clone(
                         clone_child,
