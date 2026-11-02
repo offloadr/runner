@@ -5,6 +5,7 @@
 #
 # Usage: verify-published-image.sh <expected-digest> <expected-revision> <image-ref>...
 # Needs skopeo. Extra skopeo flags, such as --tls-verify=false for a local registry, go in SKOPEO_FLAGS.
+# When EXPECTED_BASE_NAME and EXPECTED_BASE_DIGEST are set, the image must record that base.
 set -euo pipefail
 
 if (( $# < 3 )); then
@@ -72,6 +73,14 @@ for ref in "$@"; do
   license="$(label "$ref" org.opencontainers.image.licenses)"
   [[ "$license" == "$expected_license" ]] \
     || fail "$ref: license label is '$license', expected '$expected_license'"
+  if [[ -n "${EXPECTED_BASE_NAME:-}" || -n "${EXPECTED_BASE_DIGEST:-}" ]]; then
+    base_name="$(label "$ref" org.opencontainers.image.base.name)"
+    [[ "$base_name" == "${EXPECTED_BASE_NAME:-}" ]] \
+      || fail "$ref: base name label is '$base_name', expected '${EXPECTED_BASE_NAME:-}'"
+    base_digest="$(label "$ref" org.opencontainers.image.base.digest)"
+    [[ "$base_digest" == "${EXPECTED_BASE_DIGEST:-}" ]] \
+      || fail "$ref: base digest label is '$base_digest', expected '${EXPECTED_BASE_DIGEST:-}'"
+  fi
 done
 
 if (( failures > 0 )); then

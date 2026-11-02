@@ -1,9 +1,12 @@
 # Publishing runner images
 
-`Publish runner images` builds all four channels from its exact source revision.
-It runs manually or after an `editor-image-updated` repository dispatch. A release
-is complete only after registry verification confirms the build digests, channel
-and commit tags, and source/revision/license labels.
+`Publish runner images` builds the channels it is given, or all four, from its
+exact source revision. It runs manually or when an automated dispatch requests
+the channels whose editor image moved. Each channel is built on
+its editor image's current digest, recorded in the `org.opencontainers.image.base.name`
+and `org.opencontainers.image.base.digest` labels. A release is complete only after
+registry verification confirms the build digests, channel and commit tags, the
+source/revision/license labels and the recorded editor image.
 
 Every publication, including automatic dispatches, first records the current
 digest of every channel in the **Record previous channel digests** job summary

@@ -2,7 +2,7 @@
 # Build all published variants with `docker buildx bake` (see docker-bake.hcl); the
 # defaults below produce the ComfyUI `latest` variant. Build context: repository root.
 
-ARG FINAL_BASE_IMAGE=ghcr.io/radiatingreverberations/comfyui-extensions:latest
+ARG FINAL_BASE_IMAGE=ghcr.io/offloadr/comfyui-extensions:latest
 ARG EDITOR_RUNTIME=comfyui
 ARG RUNNER_SUPPORTED_EDITOR_TEMPLATES=comfyui-latest
 ARG COMFY_ENTRYPOINT=/comfyui/entrypoint.base.sh
@@ -62,12 +62,18 @@ ARG RUNNER_PERSISTENT_RANGE_HYDRATION_VALUE
 ARG SOURCE_REVISION=
 # Release version of the image; empty for development builds. Replaces the base image's label.
 ARG IMAGE_VERSION=
+# The editor image this was built from, pinned by digest at publication; empty for local builds.
+# Replaces the labels the editor image carries about its own base.
+ARG BASE_IMAGE_NAME=
+ARG BASE_IMAGE_DIGEST=
 
 LABEL org.opencontainers.image.source="https://github.com/offloadr/runner" \
       org.opencontainers.image.revision="${SOURCE_REVISION}" \
       org.opencontainers.image.version="${IMAGE_VERSION}" \
       org.opencontainers.image.licenses="AGPL-3.0-only" \
-      org.opencontainers.image.title="Offloadr runner (${EDITOR_RUNTIME})"
+      org.opencontainers.image.title="Offloadr runner (${EDITOR_RUNTIME})" \
+      org.opencontainers.image.base.name="${BASE_IMAGE_NAME}" \
+      org.opencontainers.image.base.digest="${BASE_IMAGE_DIGEST}"
 
 WORKDIR /app
 
