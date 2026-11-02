@@ -1,19 +1,25 @@
 name: Publish runner images
+run-name: Publish ${{ inputs.targets || 'all runner images' }}
 
 # Builds the runner images from this repository and pushes them to ghcr.io/offloadr. These are
 # the images personal and hosted runners run.
 #
-# Manual publication builds directly from this repository.
-# The editor image repositories can trigger a rebuild after publishing a new editor release with
-# a repository_dispatch of type editor-image-updated.
+# A run builds the targets it is given, or all of them. The in-cluster image watcher dispatches
+# a run for each target whose editor image has moved; the run name tells it which targets a
+# queued or running publication covers. Each image is built on its editor image's current digest
+# and records it in the org.opencontainers.image.base.* labels.
 #
 # A run counts as a release only when the verify step passes: a green build step is not proof
 # that the registry holds the image this commit produced.
 
 on:
   workflow_dispatch:
-  repository_dispatch:
-    types: [editor-image-updated]
+    inputs:
+      targets:
+        description: "Comma-separated targets to publish; empty publishes all"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -25,6 +31,29 @@ concurrency:
   queue: max
 
 jobs:
+  plan:
+    name: Choose targets
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.targets.outputs.targets }}
+    steps:
+      - name: Choose targets
+        id: targets
+        env:
+          REQUESTED: ${{ inputs.targets }}
+        run: |
+          set -euo pipefail
+          all='["comfyui-latest","comfyui-master","forge-neo-neo","forge-neo-latest"]'
+          targets="$(jq -cn --arg requested "$REQUESTED" --argjson all "$all" '
+            [$requested | split(",")[] | gsub("^\\s+|\\s+$"; "") | select(. != "")] | unique
+            | if length == 0 then $all else . end')"
+          unknown="$(jq -rn --argjson targets "$targets" --argjson all "$all" '$targets - $all | join(", ")')"
+          if [ -n "$unknown" ]; then
+            echo "::error::Unknown targets: $unknown"
+            exit 1
+          fi
+          echo "targets=$targets" >> "$GITHUB_OUTPUT"
+
   record-channels:
     name: Record previous channel digests
     runs-on: ubuntu-latest
@@ -53,12 +82,12 @@ jobs:
 
   publish:
     name: Publish ${{ matrix.target }}
-    needs: record-channels
+    needs: [plan, record-channels]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        target: [comfyui-latest, comfyui-master, forge-neo-neo, forge-neo-latest]
+        target: ${{ fromJSON(needs.plan.outputs.targets) }}
     env:
       SOURCE_REVISION: ${{ github.sha }}
     steps:
@@ -85,6 +114,19 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Build on the editor image's current digest, so the image records exactly what it was
+      # built from and the watcher can tell when that has moved.
+      - name: Pin the editor image
+        id: base
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          ref="$(docker buildx bake --print "$TARGET" | jq -r --arg target "$TARGET" '.target[$target].args.FINAL_BASE_IMAGE')"
+          digest="$(docker buildx imagetools inspect "$ref" --format '{{json .Manifest}}' | jq -r .digest)"
+          echo "Editor image $ref at $digest"
+          printf 'ref=%s\ndigest=%s\n' "$ref" "$digest" >> "$GITHUB_OUTPUT"
+
       - name: Build and push ${{ matrix.target }}
         id: bake
         uses: docker/bake-action@v7
@@ -95,11 +137,21 @@ jobs:
           source: .
           targets: ${{ matrix.target }}
           push: true
+          # The registry cache keeps the agent build, and everything above the editor image while
+          # it is unchanged, across runs on fresh machines.
+          set: |
+            ${{ matrix.target }}.args.FINAL_BASE_IMAGE=${{ steps.base.outputs.ref }}@${{ steps.base.outputs.digest }}
+            ${{ matrix.target }}.args.BASE_IMAGE_NAME=${{ steps.base.outputs.ref }}
+            ${{ matrix.target }}.args.BASE_IMAGE_DIGEST=${{ steps.base.outputs.digest }}
+            ${{ matrix.target }}.cache-from=type=registry,ref=ghcr.io/offloadr/runner-build-cache:${{ matrix.target }}
+            ${{ matrix.target }}.cache-to=type=registry,ref=ghcr.io/offloadr/runner-build-cache:${{ matrix.target }},mode=max
 
       - name: Verify the registry holds this build
         env:
           METADATA: ${{ steps.bake.outputs.metadata }}
           TARGET: ${{ matrix.target }}
+          EXPECTED_BASE_NAME: ${{ steps.base.outputs.ref }}
+          EXPECTED_BASE_DIGEST: ${{ steps.base.outputs.digest }}
           REGISTRY_USER: ${{ github.actor }}
           REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
