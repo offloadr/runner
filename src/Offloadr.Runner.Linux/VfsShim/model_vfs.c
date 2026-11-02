@@ -554,9 +554,12 @@ static int read_exact(int fd, void *buffer, size_t length) {
  * The child asks the kernel rather than a table the parent kept, which a request opening or
  * closing its socket at the instant of fork could leave behind: it lists its own descriptors
  * and closes each socket whose peer is the fetch service. Raw syscalls and a stack buffer keep
- * this async-signal-safe. When /proc/self/fd cannot be opened (the child is at its descriptor
- * limit, or /proc is not mounted), it probes every number below the soft limit instead, capped
- * so an unlimited soft limit cannot make a fork crawl; close-on-exec covers children that exec.
+ * this async-signal-safe. A descriptor opened before the soft limit was lowered can sit above
+ * it, so a child whose table is full below the soft limit raises it to the hard limit for the
+ * moment it takes to open /proc/self/fd. When that still fails (the table is full up to the
+ * hard limit, which may also have been lowered, or /proc is not mounted), it probes every
+ * number up to the kernel's default ceiling on descriptor numbers (fs.nr_open) instead; close-
+ * on-exec covers children that exec.
  */
 static char fetch_service_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
 static int fetch_service_used = 0;
@@ -596,19 +599,30 @@ struct vfs_dirent64 {
 #define VFS_FETCH_PROBE_LIMIT (1 << 20)
 
 static void probe_inherited_fetch_connections_in_child(void) {
-    struct rlimit limit;
-    rlim_t highest = VFS_FETCH_PROBE_LIMIT;
-    if (getrlimit(RLIMIT_NOFILE, &limit) == 0 && limit.rlim_cur < highest) highest = limit.rlim_cur;
-    for (rlim_t fd = 0; fd < highest; fd++) {
-        if (descriptor_is_fetch_connection((int)fd)) syscall(SYS_close, (int)fd);
+    for (int fd = 0; fd < VFS_FETCH_PROBE_LIMIT; fd++) {
+        if (descriptor_is_fetch_connection(fd)) syscall(SYS_close, fd);
     }
+}
+
+static int open_own_descriptor_directory(void) {
+    if (!real_openat_fn) return -1;
+    int directory = real_openat_fn(AT_FDCWD, "/proc/self/fd", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    struct rlimit limit;
+    if (directory >= 0 || errno != EMFILE || getrlimit(RLIMIT_NOFILE, &limit) != 0 ||
+        limit.rlim_cur >= limit.rlim_max) {
+        return directory;
+    }
+    struct rlimit raised = limit;
+    raised.rlim_cur = limit.rlim_max;
+    if (setrlimit(RLIMIT_NOFILE, &raised) != 0) return -1;
+    directory = real_openat_fn(AT_FDCWD, "/proc/self/fd", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    setrlimit(RLIMIT_NOFILE, &limit);
+    return directory;
 }
 
 static void close_inherited_fetch_connections_in_child(void) {
     if (!__atomic_load_n(&fetch_service_used, __ATOMIC_ACQUIRE)) return;
-    int directory = real_openat_fn
-        ? real_openat_fn(AT_FDCWD, "/proc/self/fd", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
-        : -1;
+    int directory = open_own_descriptor_directory();
     if (directory < 0) {
         probe_inherited_fetch_connections_in_child();
         return;

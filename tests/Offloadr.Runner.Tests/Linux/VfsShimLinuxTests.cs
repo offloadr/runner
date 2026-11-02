@@ -3665,9 +3665,16 @@ public class VfsShimLinuxTests
                     if (argc != 2) return 10;
                     managed = open(argv[1], O_RDONLY);
                     if (managed < 0) return 11;
+                    /* The request's socket lands above the soft limit lowered below. */
+                    int spacers[100];
+                    for (int index = 0; index < 100; index++) {
+                        spacers[index] = open("/dev/null", O_RDONLY);
+                        if (spacers[index] < 0) return 16;
+                    }
                     pthread_t reader;
                     if (pthread_create(&reader, NULL, read_slowly, NULL) != 0) return 12;
                     usleep(300000);
+                    for (int index = 0; index < 100; index++) close(spacers[index]);
                     pid_t child = fork();
                     if (child < 0) return 13;
                     if (child == 0) {
@@ -3676,7 +3683,8 @@ public class VfsShimLinuxTests
                         execl("/bin/sleep", "sleep", "30", (char *)NULL);
                         _exit(127);
                     }
-                    /* A child that keeps running without exec, forked with no descriptor to spare. */
+                    /* A child that keeps running without exec, forked with no descriptor to spare
+                       below the soft limit. */
                     struct rlimit lowered = {64, 64};
                     if (getrlimit(RLIMIT_NOFILE, &lowered) != 0) return 15;
                     lowered.rlim_cur = 64;
