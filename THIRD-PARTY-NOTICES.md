@@ -20,8 +20,8 @@ Each image layers the agent, `aria2` and the model VFS shim (`liboffloadr_model_
 | --- | --- | --- |
 | Runner agent and VFS shim | this repository | AGPL-3.0-only |
 | aria2 (distribution package) | https://github.com/aria2/aria2 | GPL-2.0-or-later with OpenSSL exception |
-| ComfyUI images `comfyui-extensions` | https://github.com/radiatingreverberations/comfyui-docker (build), https://github.com/Comfy-Org/ComfyUI (application) | MIT (build files), GPL-3.0 (ComfyUI) |
-| Forge Neo images `sd-webui-forge-neo` | https://github.com/radiatingreverberations/sd-webui-forge-neo-docker (build), https://github.com/Haoming02/sd-webui-forge-classic (application, `neo` branch) | MIT (build files), AGPL-3.0 (Forge Neo) |
+| ComfyUI images `comfyui-extensions` | https://github.com/offloadr/comfyui-docker (build), https://github.com/Comfy-Org/ComfyUI (application) | MIT (build files), GPL-3.0 (ComfyUI) |
+| Forge Neo images `sd-webui-forge-neo` | https://github.com/offloadr/sd-webui-forge-neo-docker (build), https://github.com/Haoming02/sd-webui-forge-classic (application, `neo` branch) | MIT (build files), AGPL-3.0 (Forge Neo) |
 | CUDA, ROCm and CPU Python base images | https://github.com/offloadr/base | MIT (build files); bundled frameworks such as PyTorch keep their own licenses |
 
 The ComfyUI extension images also bundle custom nodes and Python packages; each keeps the license stated in its own repository or package metadata.

@@ -2,7 +2,7 @@
 # Build all published variants with `docker buildx bake` (see docker-bake.hcl); the
 # defaults below produce the ComfyUI `latest` variant. Build context: repository root.
 
-ARG FINAL_BASE_IMAGE=ghcr.io/radiatingreverberations/comfyui-extensions:latest
+ARG FINAL_BASE_IMAGE=ghcr.io/offloadr/comfyui-extensions:latest
 ARG EDITOR_RUNTIME=comfyui
 ARG RUNNER_SUPPORTED_EDITOR_TEMPLATES=comfyui-latest
 ARG COMFY_ENTRYPOINT=/comfyui/entrypoint.base.sh

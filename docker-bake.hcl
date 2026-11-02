@@ -7,7 +7,7 @@ variable "REGISTRY" {
 }
 
 variable "BASE_REGISTRY" {
-  default = "ghcr.io/radiatingreverberations"
+  default = "ghcr.io/offloadr"
 }
 
 variable "SOURCE_REVISION" {
