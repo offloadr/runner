@@ -17,14 +17,7 @@ internal sealed class DiagnosticMetadataLoggerProvider(Action<string> write, Tim
 
     private void Write(string component, LogLevel level, EventId eventId, Exception? error)
     {
-        var severity = level switch
-        {
-            LogLevel.Information => "information",
-            LogLevel.Warning => "warning",
-            LogLevel.Error => "error",
-            LogLevel.Critical => "critical",
-            _ => null
-        };
+        var severity = Severity(level);
         if (severity is null) return;
 
         var errorClass = error switch
@@ -54,7 +47,16 @@ internal sealed class DiagnosticMetadataLoggerProvider(Action<string> write, Tim
         }
     }
 
-    private static string Component(string category)
+    internal static string? Severity(LogLevel level) => level switch
+    {
+        LogLevel.Information => "information",
+        LogLevel.Warning => "warning",
+        LogLevel.Error => "error",
+        LogLevel.Critical => "critical",
+        _ => null
+    };
+
+    internal static string Component(string category)
     {
         if (category.StartsWith("session:", StringComparison.OrdinalIgnoreCase)) return "editor";
         return category switch

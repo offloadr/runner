@@ -10,7 +10,7 @@ public sealed class PlatformDiagnosticContentTests
     private const string Sentinel = "synthetic-prompt-email@example.invalid";
 
     [Test]
-    public async Task ConsoleOmitsContentWhileProtectedForwardingStillReceivesIt()
+    public async Task MetadataConsoleOmitsContentWhileProtectedForwardingStillReceivesIt()
     {
         var original = Console.Out;
         using var output = new StringWriter();
@@ -24,7 +24,7 @@ public sealed class PlatformDiagnosticContentTests
         try
         {
             Console.SetOut(output);
-            using (var factory = AgentLogging.CreateFactory(relay))
+            using (var factory = AgentLogging.CreateFactory(relay, ConsoleLogMode.Metadata))
             {
                 factory.CreateLogger("RunnerAgent").LogError(new IOException(Sentinel), "{Content}", Sentinel);
             }
@@ -44,7 +44,7 @@ public sealed class PlatformDiagnosticContentTests
     }
 
     [Test]
-    public async Task ProcessConsoleDoesNotInvokeTheArbitraryFormatterOrPrintIdentity()
+    public async Task MetadataProcessConsoleDoesNotInvokeTheArbitraryFormatterOrPrintIdentity()
     {
         var original = Console.Out;
         using var output = new StringWriter();
@@ -53,7 +53,7 @@ public sealed class PlatformDiagnosticContentTests
         try
         {
             Console.SetOut(output);
-            using (var factory = AgentLogging.CreateFactory(relay))
+            using (var factory = AgentLogging.CreateFactory(relay, ConsoleLogMode.Metadata))
             {
                 var logger = factory.CreateLogger("session:" + Sentinel);
                 using var scope = logger.BeginScope(Sentinel);
@@ -73,6 +73,55 @@ public sealed class PlatformDiagnosticContentTests
             Console.SetOut(original);
         }
     }
+    [Test]
+    public async Task FullConsolePrintsMessagesAndExceptionDetails()
+    {
+        var original = Console.Out;
+        using var output = new StringWriter();
+        await using var relay = new RunnerLogRelay("synthetic-runner");
+        try
+        {
+            Console.SetOut(output);
+            using (var factory = AgentLogging.CreateFactory(relay, ConsoleLogMode.Full))
+            {
+                factory.CreateLogger("RunnerAgent").LogError(new IOException("synthetic-failure"), "{Content}", "Session start failed");
+            }
+            Assert.Multiple(() =>
+            {
+                Assert.That(output.ToString(), Does.Contain(" error agent: Session start failed"));
+                Assert.That(output.ToString(), Does.Contain("System.IO.IOException: synthetic-failure"));
+                Assert.That(output.ToString(), Does.Not.Contain("errorClass="));
+            });
+        }
+        finally
+        {
+            Console.SetOut(original);
+        }
+    }
+
+    [Test]
+    public async Task FullConsolePrintsEditorOutput()
+    {
+        var original = Console.Out;
+        using var output = new StringWriter();
+        await using var relay = new RunnerLogRelay("synthetic-runner");
+        try
+        {
+            Console.SetOut(output);
+            using (var factory = AgentLogging.CreateFactory(relay, ConsoleLogMode.Full))
+            {
+                RunnerLog.Configure(factory);
+                RunnerLog.Info("session:synthetic-session", "To see the GUI go to: http://127.0.0.1:8188");
+            }
+            Assert.That(output.ToString(), Does.Contain(" information editor: To see the GUI go to: http://127.0.0.1:8188"));
+        }
+        finally
+        {
+            RunnerLog.Configure(null);
+            Console.SetOut(original);
+        }
+    }
+
     private sealed class DiagnosticSink : IRunnerSessionSink
     {
         public Func<ReportSessionLogsRequest, CancellationToken, Task> Session { get; init; } = (_, _) => throw new NotSupportedException();

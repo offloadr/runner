@@ -373,11 +373,15 @@ writing-runtime identity.
 Retry diagnostics retain only fixed counts and error classes, not exception
 objects or arbitrary detail. Optional log expiry does not admit runtime activity
 or complete a physical acknowledgement; those existing owners are independent.
-The log path remains a best-effort presentation lane. The agent console and
-Windows desktop diagnostic files emit only a UTC timestamp, severity, a fixed
-component label and a fixed failure class. These sinks never invoke the arbitrary
-message formatter or inspect state, scopes, event names, exception messages or
-stacks. Category strings are mapped to fixed component labels and are not retained.
+The log path remains a best-effort presentation lane. The Windows desktop
+diagnostic files, and the agent console with `RUNNER_SEALED_STORAGE=required` (as
+on every hosted runner) or `RUNNER_CONSOLE_LOGS=metadata`, emit only a UTC
+timestamp, severity, a fixed component label and a fixed failure class. These
+sinks never invoke the arbitrary message formatter or inspect state, scopes,
+event names, exception messages or stacks. Category strings are mapped to fixed
+component labels and are not retained. Otherwise the agent console, on its
+owner's machine, writes the formatted message and exception after the same
+labels; the output of sealed sessions' editors stays off it either way.
 The separate account-protected runner and session forwarding lanes keep their
 existing content delivery, limits and original capture deadlines.
 

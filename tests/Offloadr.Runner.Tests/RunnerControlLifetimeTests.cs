@@ -388,8 +388,28 @@ public sealed class RunnerControlLifetimeTests
         return reference;
     }
 
+    [TestCase("metadata", null)]
+    [TestCase(null, "required")]
+    public async Task ActualAgent_InvalidControlAddress_ExitsNonzeroWithOnlyAnErrorClass(string? consoleLogs, string? sealedStorage)
+    {
+        var (exitCode, stdout, stderr) = await RunAgentWithInvalidControlAddressAsync(consoleLogs, sealedStorage);
+        Assert.That(exitCode, Is.EqualTo(1));
+        Assert.That(stdout, Is.Empty);
+        Assert.That(stderr.Trim(), Is.EqualTo("Runner agent failed; errorClass=UriFormatException."));
+    }
+
     [Test]
-    public async Task ActualAgent_InvalidControlAddress_ExitsNonzeroWithOnlyAnErrorClass()
+    public async Task ActualAgent_InvalidControlAddress_PrintsTheExceptionWithFullConsoleLogsButNotTheKey()
+    {
+        var (exitCode, stdout, stderr) = await RunAgentWithInvalidControlAddressAsync(consoleLogs: null, sealedStorage: null);
+        Assert.That(exitCode, Is.EqualTo(1));
+        Assert.That(stdout, Is.Empty);
+        Assert.That(stderr, Does.StartWith("Runner agent failed: System.UriFormatException: "));
+        Assert.That(stderr, Does.Not.Contain("fixture-runner-key-must-not-be-printed"));
+    }
+
+    private static async Task<(int ExitCode, string Stdout, string Stderr)> RunAgentWithInvalidControlAddressAsync(
+        string? consoleLogs, string? sealedStorage)
     {
         var assembly = typeof(RunnerAgentLifetime).Assembly.Location;
         var start = new ProcessStartInfo(Environment.GetEnvironmentVariable("DOTNET_HOST_PATH") ?? "dotnet")
@@ -408,15 +428,15 @@ public sealed class RunnerControlLifetimeTests
             start.Environment.Remove(key);
         start.Environment["OFFLOADR_API_GRPC"] = "https://[fixture-content-must-not-be-printed";
         start.Environment["RUNNER_SECRET"] = "fixture-runner-key-must-not-be-printed";
+        if (consoleLogs is not null) start.Environment["RUNNER_CONSOLE_LOGS"] = consoleLogs;
+        if (sealedStorage is not null) start.Environment["RUNNER_SEALED_STORAGE"] = sealedStorage;
         using var process = Process.Start(start)!;
         var stdout = process.StandardOutput.ReadToEndAsync();
         var stderr = process.StandardError.ReadToEndAsync();
         try
         {
             await process.WaitForExitAsync().WaitAsync(Timeout);
-            Assert.That(process.ExitCode, Is.EqualTo(1));
-            Assert.That(await stdout, Is.Empty);
-            Assert.That((await stderr).Trim(), Is.EqualTo("Runner agent failed; errorClass=UriFormatException."));
+            return (process.ExitCode, await stdout, await stderr);
         }
         finally
         {

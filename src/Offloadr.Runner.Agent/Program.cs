@@ -12,9 +12,13 @@ try
 }
 catch (Exception error)
 {
-    // Do not print exception messages, nested exceptions or stacks: a failing
-    // producer may carry untrusted diagnostic, prompt or transport content.
-    Console.Error.WriteLine($"Runner agent failed; errorClass={error.GetType().Name}.");
+    // Outside full console logging, do not print exception messages, nested exceptions or
+    // stacks: a failing producer may carry untrusted diagnostic, prompt or transport content.
+    Func<string, string?> env = Environment.GetEnvironmentVariable;
+    var consoleMode = ConsoleLogOptions.FromEnvironment(env, SealedStorageOptions.FromEnvironment(env)).Mode;
+    Console.Error.WriteLine(consoleMode == ConsoleLogMode.Full
+        ? $"Runner agent failed: {error}"
+        : $"Runner agent failed; errorClass={error.GetType().Name}.");
     return 1;
 }
 
@@ -34,7 +38,7 @@ static async Task<int> RunAgentAsync()
         options.RegistrationRpcTimeout);
     await using var runnerLogRelay = new RunnerLogRelay(options.RunnerId);
 
-    using var loggerFactory = AgentLogging.CreateFactory(runnerLogRelay);
+    using var loggerFactory = AgentLogging.CreateFactory(runnerLogRelay, options.ConsoleLogs.Mode);
 
     RunnerLog.Configure(loggerFactory);
     var sessionIsolationStrategy = new LinuxUserIsolationStrategy(new LinuxCommandRunner());

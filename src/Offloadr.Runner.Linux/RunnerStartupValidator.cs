@@ -97,11 +97,25 @@ public sealed class RunnerStartupValidator
 
         ValidateBinary(options.Session.UvBinaryPath, "RUNNER_UV_BINARY", errors);
         ValidateSealedStorage(options.Session.Sealing, errors);
+        ValidateConsoleLogs(options.ConsoleLogs, errors);
         _sessionIsolationStrategy.ValidatePrerequisites(errors);
 
         if (errors.Count > 0)
         {
             throw new InvalidOperationException($"Runner startup validation failed:{Environment.NewLine} - {string.Join($"{Environment.NewLine} - ", errors)}");
+        }
+    }
+
+    private static void ValidateConsoleLogs(ConsoleLogOptions consoleLogs, ICollection<string> errors)
+    {
+        if (consoleLogs.InvalidMode is not null)
+        {
+            errors.Add($"RUNNER_CONSOLE_LOGS must be full or metadata, not '{consoleLogs.InvalidMode}'.");
+        }
+
+        if (consoleLogs.FullRefused)
+        {
+            errors.Add("RUNNER_CONSOLE_LOGS=full is refused with RUNNER_SEALED_STORAGE=required, whose console carries metadata only.");
         }
     }
 
