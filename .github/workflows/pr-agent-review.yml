@@ -1,0 +1,35 @@
+name: PR-Agent review
+
+# PR-Agent review with OpenAI gpt-6.1-sol, billed to the API organization that holds OPENAI_KEY.
+# The shared workflow fails its review job when the review does not complete and its
+# findings job while a finding is open; see offloadr/pr-agent-review for how findings clear.
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, synchronize]
+
+concurrency:
+  group: pr-agent-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  pr-agent:
+    uses: offloadr/pr-agent-review/.github/workflows/pr-agent-review.yml@4584049fd144ef6879d4490396a629c5cab4bf3f
+    # The findings job resolves PR-Agent's threads for fixed findings, which GitHub only
+    # allows with contents: write. Neither job checks out or runs pull request code.
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    secrets:
+      OPENAI_KEY: ${{ secrets.OPENAI_KEY }}
+    with:
+      model: gpt-6.1-sol
+      # A public repository, so the review runs on GitHub-hosted runners rather than offloadr-runners.
+      runs-on: ubuntu-latest
+      instructions: |
+        This is the Offloadr runner: a .NET agent that executes GPU work for the Offloadr control plane inside container images, with a desktop supervisor and UI. Core, Supervisor, UI and Desktop must never reference Offloadr.Runner.Linux.
+        Focus on command, session and runtime identity, stale or duplicate commands, acknowledgement replay, and cleanup after failed starts or unexpected exits; races, cancellation that is misclassified (host shutdown, workflow cancellation, Stop, failure) and lanes that can block one another; secrets, signed URLs or runner keys in code, logs or command lines, unsafe filesystem, process or container operations, and anything that exposes an inbound port; runtime-specific behavior not gated by runtime kind; and protobuf changes the control plane would not accept or hand edits to generated code.
