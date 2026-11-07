@@ -17,6 +17,9 @@ permissions:
 
 jobs:
   pr-agent:
+    # Fork pull requests get no secrets and a read-only token, so they are skipped here
+    # (the shared workflow skips them too) rather than reported as failures.
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
     uses: offloadr/pr-agent-review/.github/workflows/pr-agent-review.yml@4584049fd144ef6879d4490396a629c5cab4bf3f
     # The findings job resolves PR-Agent's threads for fixed findings, which GitHub only
     # allows with contents: write. Neither job checks out or runs pull request code.
