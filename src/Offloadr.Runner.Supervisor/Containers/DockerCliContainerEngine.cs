@@ -32,6 +32,7 @@ public sealed class DockerCliContainerEngine(IProcessRunner processes, Func<stri
                 string.IsNullOrWhiteSpace(configuredExecutable())
                     ? "Docker was not found. Install Docker Desktop (Windows, macOS) or Docker Engine with the NVIDIA Container Toolkit (Linux)."
                     : $"The container engine '{configuredExecutable()}' was not found.",
+                kind: configuredExecutable() is { Length: > 0 } configured ? ContainerEngineLocator.KindOf(configured) : ContainerEngineKind.Docker,
                 errorKind: FaultKind.EngineMissing);
         }
 

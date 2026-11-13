@@ -115,7 +115,28 @@ public class RunnerSupervisorTests
             Assert.That(supervisor.View.Fault?.Kind, Is.EqualTo(FaultKind.EngineNotRunning));
             Assert.That(supervisor.View.Fault?.Title, Is.EqualTo("Docker is not running"));
             Assert.That(supervisor.View.Fault?.Detail, Is.EqualTo(supervisor.View.Message));
-            Assert.That(supervisor.View.Fault?.Action, Is.EqualTo(FaultAction.StartDocker));
+            Assert.That(supervisor.View.Fault?.Action, Is.EqualTo(FaultAction.StartEngine));
+        });
+    }
+
+    [Test]
+    public async Task Start_WhenPodmanIsNotRunning_AdvisesStartingPodman()
+    {
+        _engine.Info = ContainerEngineInfo.Unavailable(
+            "Podman is installed but its engine is not running. Start podman and try again.",
+            "podman",
+            ContainerEngineKind.Podman,
+            FaultKind.EngineNotRunning);
+        var supervisor = await StartSupervisorAsync();
+
+        supervisor.RequestStart();
+        await WaitForStateAsync(SupervisorState.Faulted);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(supervisor.View.Fault?.Title, Is.EqualTo("Podman is not running"));
+            Assert.That(supervisor.View.Fault?.Message, Does.Contain("podman machine start"));
+            Assert.That(supervisor.View.Fault?.Message, Does.Not.Contain("Docker"));
         });
     }
 

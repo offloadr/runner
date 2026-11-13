@@ -272,7 +272,26 @@ public class DockerCliContainerEngineTests
 
         var info = await engine.ProbeAsync(CancellationToken.None);
 
-        Assert.That(info.Available, Is.False);
+        Assert.Multiple(() =>
+        {
+            Assert.That(info.Available, Is.False);
+            Assert.That(info.ErrorKind, Is.EqualTo(FaultKind.EngineMissing));
+        });
+    }
+
+    [Test]
+    public async Task Probe_AMissingPodmanIsReportedAsPodman()
+    {
+        var engine = new DockerCliContainerEngine(new FakeProcessRunner(), () => Path.Combine(Path.GetTempPath(), "no-such-dir", "podman"));
+
+        var info = await engine.ProbeAsync(CancellationToken.None);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(info.Kind, Is.EqualTo(ContainerEngineKind.Podman));
+            Assert.That(info.ErrorKind, Is.EqualTo(FaultKind.EngineMissing));
+            Assert.That(SupervisorFault.For(info.ErrorKind, info.Error!, info.Kind).Title, Is.EqualTo("Podman was not found"));
+        });
     }
 
     [Test]

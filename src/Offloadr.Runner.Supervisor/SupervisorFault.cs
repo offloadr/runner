@@ -1,3 +1,5 @@
+using Offloadr.Runner.Supervisor.Containers;
+
 namespace Offloadr.Runner.Supervisor;
 
 /// <summary>What went wrong, as far as the person needs to know to fix it.</summary>
@@ -56,8 +58,8 @@ public enum FaultKind
 public enum FaultAction
 {
     None,
-    InstallDocker,
-    StartDocker,
+    InstallEngine,
+    StartEngine,
     OpenSettings,
     SetUpGpu,
     FreeDiskSpace,
@@ -73,8 +75,8 @@ public sealed record SupervisorFault(FaultKind Kind, string Title, string Messag
 {
     public FaultAction Action => Kind switch
     {
-        FaultKind.EngineMissing => FaultAction.InstallDocker,
-        FaultKind.EngineNotRunning or FaultKind.EngineNotResponding or FaultKind.WindowsContainers or FaultKind.EngineUnreachable => FaultAction.StartDocker,
+        FaultKind.EngineMissing => FaultAction.InstallEngine,
+        FaultKind.EngineNotRunning or FaultKind.EngineNotResponding or FaultKind.WindowsContainers or FaultKind.EngineUnreachable => FaultAction.StartEngine,
         FaultKind.Settings or FaultKind.KeyRejected => FaultAction.OpenSettings,
         FaultKind.GpuUnavailable => FaultAction.SetUpGpu,
         FaultKind.DiskFull => FaultAction.FreeDiskSpace,
@@ -83,17 +85,36 @@ public sealed record SupervisorFault(FaultKind Kind, string Title, string Messag
     };
 
     /// <summary>
-    /// A fault of <paramref name="kind"/>. Kinds with advice of their own explain themselves, and the
-    /// supervisor's <paramref name="message"/> becomes the detail; the others show that message, which
-    /// already says what to do.
+    /// A fault of <paramref name="kind"/> on <paramref name="engine"/>. Kinds with advice of their own
+    /// explain themselves, and the supervisor's <paramref name="message"/> becomes the detail; the
+    /// others show that message, which already says what to do.
     /// </summary>
-    public static SupervisorFault For(FaultKind kind, string message)
+    public static SupervisorFault For(FaultKind kind, string message, ContainerEngineKind engine = ContainerEngineKind.Docker)
     {
-        var (title, advice) = Describe(kind);
+        var (title, advice) = engine == ContainerEngineKind.Podman ? DescribePodman(kind) ?? Describe(kind) : Describe(kind);
         return advice is null
             ? new SupervisorFault(kind, title, message, null)
             : new SupervisorFault(kind, title, advice, message);
     }
+
+    /// <summary>Podman's own advice where Docker's would send the person to the wrong program.</summary>
+    private static (string Title, string? Advice)? DescribePodman(FaultKind kind) => kind switch
+    {
+        FaultKind.EngineMissing => ("Podman was not found",
+            "Install Podman, or choose another container engine in Settings, then press Start."),
+        FaultKind.EngineNotRunning => ("Podman is not running",
+            "Start the Podman machine (podman machine start) and wait until it runs, then press Start."),
+        FaultKind.EngineNotResponding => ("Podman is not answering",
+            "Podman may still be starting. If this keeps happening, restart the Podman machine, then press Start."),
+        FaultKind.EnginePermission => ("No permission to use Podman",
+            "This account may not use the Podman socket. Use this account's own rootless Podman, or give it access to the socket, then press Start."),
+        FaultKind.GpuUnavailable => ("Podman cannot use the GPU",
+            "Update the NVIDIA driver and generate the NVIDIA Container Toolkit's CDI specification for Podman, then press Start."),
+        FaultKind.DiskFull => ("Podman is out of disk space",
+            "Free space where Podman keeps its images, or give the Podman machine a larger disk, then press Start."),
+        FaultKind.EngineUnreachable => ("The runner's Podman does not answer", null),
+        _ => null,
+    };
 
     private static (string Title, string? Advice) Describe(FaultKind kind) => kind switch
     {

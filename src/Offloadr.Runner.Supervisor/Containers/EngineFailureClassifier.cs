@@ -19,10 +19,12 @@ public static class EngineFailureClassifier
 
     // The engine did not answer at all: these come before everything else, since its socket or pipe
     // being unavailable says nothing about images or GPUs.
+    // "connect: permission denied" is a socket refusing this account, Docker's or Podman's.
     private static readonly string[] Permission =
     [
         "permission denied while trying to connect to the docker daemon",
         "permission denied while trying to connect to the docker api",
+        "connect: permission denied",
     ];
 
     // "error during connect" covers Docker Desktop's pipe missing (not started) and a DOCKER_HOST that

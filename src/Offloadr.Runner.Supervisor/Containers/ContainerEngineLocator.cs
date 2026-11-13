@@ -89,7 +89,7 @@ public static class ContainerEngineLocator
         return new LocatedEngine(absolute, KindOf(absolute));
     }
 
-    private static ContainerEngineKind KindOf(string executable)
+    internal static ContainerEngineKind KindOf(string executable)
         => Path.GetFileNameWithoutExtension(executable).Contains("podman", StringComparison.OrdinalIgnoreCase)
             ? ContainerEngineKind.Podman
             : ContainerEngineKind.Docker;

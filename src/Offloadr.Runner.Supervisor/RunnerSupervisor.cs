@@ -2146,7 +2146,7 @@ public sealed class RunnerSupervisor : BackgroundService
         {
             State = SupervisorState.WaitingToRestart,
             Message = $"{message} Trying again in {delay.TotalSeconds:0} seconds.",
-            Fault = SupervisorFault.For(kind, message),
+            Fault = SupervisorFault.For(kind, message, view.Engine?.Kind ?? ContainerEngineKind.Docker),
         });
     }
 
@@ -2167,7 +2167,7 @@ public sealed class RunnerSupervisor : BackgroundService
         Volatile.Write(ref _runnerWanted, false);
         _logger.LogWarning("Runner supervisor fault ({Kind}): {Message}", kind, message);
         AppendLog("supervisor: " + message);
-        Update(view => view with { State = SupervisorState.Faulted, Message = message, Fault = SupervisorFault.For(kind, message) });
+        Update(view => view with { State = SupervisorState.Faulted, Message = message, Fault = SupervisorFault.For(kind, message, view.Engine?.Kind ?? ContainerEngineKind.Docker) });
     }
 
     private void Update(Func<SupervisorView, SupervisorView> change)
