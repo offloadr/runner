@@ -1384,6 +1384,45 @@ public class ModelDownloadServiceTests
         }
     }
 
+    [Test]
+    public async Task ReleaseForLocalModels_LetsAFinishedCopyBeOpenedWhileAria2DropsIt()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var destinationPath = Path.Combine(root, "diffusion_models", "busy.safetensors");
+            var aria = new CompletingAria2Client(destinationPath, expectedBytes: 8);
+            await using var service = CreateRangeManagedService(aria, root);
+            await service.InitializeAsync(CancellationToken.None);
+            service.SetActiveSession("session-1");
+            service.SeedDownloads("session-1", [RemoteModel(destinationPath)]);
+            await ReadWholeModelAsync(service, destinationPath);
+
+            aria.BlockRemoval = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var release = service.ReleaseForLocalModelsAsync([LocalModel(destinationPath)], AnyLocalModel, CancellationToken.None);
+            await aria.BlockRemoval.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            // Another prompt starts loading the model meanwhile.
+            var opened = await service.OpenRangeManagedAsync(destinationPath, "session-1", CancellationToken.None);
+            await service.EnsureRangeAsync(opened.LeaseId, opened.TransferEpoch, offset: 0, length: 8, CancellationToken.None)
+                .WaitAsync(TimeSpan.FromSeconds(5));
+
+            aria.BlockRemoval = null;
+            aria.RemovalGate.TrySetResult();
+            var projected = await release.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Multiple(() =>
+            {
+                Assert.That(projected, Is.Empty, "The copy it opened is kept.");
+                Assert.That(File.Exists(destinationPath), Is.True);
+            });
+            await service.ReleaseAsync(opened.LeaseId);
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
     private static bool AnyLocalModel(ModelDownloadRequest _) => true;
 
     private static async Task ReadWholeModelAsync(ModelDownloadService service, string destinationPath)

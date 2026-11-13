@@ -2383,7 +2383,7 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
         var forget = deleteComplete || !record.Complete;
         if (forget && mayDelete?.Invoke() == false)
         {
-            throw new LocalReplacementGoneException(record.DestinationPath);
+            throw new ReleaseAbandonedException(record.DestinationPath);
         }
 
         if (record.PlaceholderOwned && forget)
@@ -2624,15 +2624,48 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
                         return LocalModelRelease.InUse;
                     }
 
-                    // Opens are refused from here until the state is gone.
                     wasPendingCleanup = state.PendingOrphanCleanup;
-                    state.PendingOrphanCleanup = true;
+                    if (!state.Complete)
+                    {
+                        // Its transfer is about to go: opens are refused from here until the state is gone.
+                        state.PendingOrphanCleanup = true;
+                    }
+                }
+            }
+
+            // A finished copy needs no transfer, so it stays open to readers while aria2 drops it. Only
+            // right before the file is deleted are opens refused, and only if none arrived meanwhile.
+            var claimed = state;
+            bool MayDelete()
+            {
+                if (canStillLink?.Invoke() == false)
+                {
+                    return false;
+                }
+
+                if (claimed is null)
+                {
+                    return true;
+                }
+
+                lock (_sync)
+                {
+                    if (claimed.DescriptorLeaseCount > 0 ||
+                        claimed.OpenReservationCount > 0 ||
+                        claimed.PromptWaiters.Count > 0 ||
+                        claimed.RangeWaiters.Count > 0)
+                    {
+                        return false;
+                    }
+
+                    claimed.PendingOrphanCleanup = true;
+                    return true;
                 }
             }
 
             try
             {
-                return await ReleaseLockedAsync(normalized, state, canStillLink, cancellationToken).ConfigureAwait(false);
+                return await ReleaseLockedAsync(normalized, state, MayDelete, cancellationToken).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -2723,7 +2756,7 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
 
             if (canStillLink?.Invoke() == false)
             {
-                throw new LocalReplacementGoneException(normalized);
+                throw new ReleaseAbandonedException(normalized);
             }
 
             if (state.PlaceholderOwned)
@@ -3565,11 +3598,14 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
         }
     }
 
-    /// <summary>A local-model release waiting for the scheduler loop. Started or abandoned, never both.</summary>
-    /// <summary>The local model left its folder while its release waited; the download is kept.</summary>
-    private sealed class LocalReplacementGoneException(string path)
-        : IOException($"The local model to be linked at '{path}' can no longer be linked.");
+    /// <summary>
+    /// A release stopped just before deleting: its local model can no longer be linked, or the editor opened
+    /// the copy meanwhile. The download is kept.
+    /// </summary>
+    private sealed class ReleaseAbandonedException(string path)
+        : IOException($"The download at '{path}' is kept: its local model cannot replace it now.");
 
+    /// <summary>A local-model release waiting for the scheduler loop. Started or abandoned, never both.</summary>
     private sealed class LocalReleaseRequest(string path, Func<bool>? canStillLink)
     {
         public Func<bool>? CanStillLink { get; } = canStillLink;
