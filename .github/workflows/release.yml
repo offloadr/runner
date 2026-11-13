@@ -42,15 +42,98 @@ jobs:
     with:
       version: ${{ inputs.version }}
 
-  release:
+  # Signs and packs the app CI published. Signing uses Azure Artifact Signing through OpenID Connect,
+  # so no signing secret is stored here: it runs when the `release` environment (or the repository)
+  # has the variables below, and the release is marked unsigned otherwise. See
+  # docs/release-checklist.md, "Signing the desktop app".
+  package:
+    name: Sign and pack the installer
     needs: build
+    runs-on: windows-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      signed: ${{ steps.signing.outputs.signed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+        with:
+          global-json-file: global.json
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: offloadr-runner-windows-x64-app
+          path: artifacts/packages/windows-win-x64
+
+      - name: Read the signing configuration
+        id: signing
+        shell: pwsh
+        env:
+          CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          ENDPOINT: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          ACCOUNT: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
+          CERTIFICATE_PROFILE: ${{ vars.ARTIFACT_SIGNING_PROFILE }}
+        run: |
+          if (-not $env:CLIENT_ID) {
+            'signed=false' >> $env:GITHUB_OUTPUT
+            '::warning::No signing configuration: this release is unsigned.'
+            return
+          }
+          if (-not ($env:ENDPOINT -and $env:ACCOUNT -and $env:CERTIFICATE_PROFILE)) {
+            throw 'AZURE_CLIENT_ID is set, but ARTIFACT_SIGNING_ENDPOINT, ARTIFACT_SIGNING_ACCOUNT and ARTIFACT_SIGNING_PROFILE are not all set.'
+          }
+          @{ Endpoint = $env:ENDPOINT; CodeSigningAccountName = $env:ACCOUNT; CertificateProfileName = $env:CERTIFICATE_PROFILE } |
+            ConvertTo-Json | Set-Content (Join-Path $env:RUNNER_TEMP 'artifact-signing.json')
+          'signed=true' >> $env:GITHUB_OUTPUT
+
+      - name: Sign in to Azure
+        if: steps.signing.outputs.signed == 'true'
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Pack the installer and update packages
+        shell: pwsh
+        env:
+          VERSION: ${{ inputs.version }}
+          SIGNED: ${{ steps.signing.outputs.signed }}
+        run: |
+          $signing = @{}
+          if ($env:SIGNED -eq 'true') { $signing.AzureTrustedSignFile = Join-Path $env:RUNNER_TEMP 'artifact-signing.json' }
+          ./build/publish-windows.ps1 -Version $env:VERSION -NoPublish -Pack -PreviousReleasesFrom "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY" @signing
+
+      - name: Check the signatures
+        shell: pwsh
+        env:
+          SIGNED: ${{ steps.signing.outputs.signed }}
+          SUBJECT: ${{ vars.ARTIFACT_SIGNING_SUBJECT }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          $expect = if ($env:SIGNED -eq 'true') { 'Signed' } else { 'Unsigned' }
+          ./build/verify-windows-signatures.ps1 -ReleasesDir artifacts/releases/windows-win-x64 -Version $env:VERSION -Expect $expect -Subject $env:SUBJECT |
+            Tee-Object -Variable report
+          "### Desktop app signatures`n`n``````text`n$($report -join "`n")`n``````" >> $env:GITHUB_STEP_SUMMARY
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: offloadr-runner-windows-x64-release
+          path: artifacts/releases/windows-win-x64/
+          if-no-files-found: error
+
+  release:
+    needs: package
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: offloadr-runner-windows-x64
+          name: offloadr-runner-windows-x64-release
           path: dist/offloadr-runner-windows-x64
 
       # The installer gets a name that stays the same across releases, so a download link can use
@@ -68,7 +151,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ inputs.version }}
+          SIGNED: ${{ needs.package.outputs.signed }}
         run: |
+          notes="**Windows:** run \`OffloadrRunner-Setup.exe\`. It installs for your account only, with no administrator rights. You also need Docker Desktop with the WSL 2 backend and an NVIDIA driver."
+          if [ "$SIGNED" != true ]; then
+            notes="$notes This build is unsigned, so Windows may ask you to confirm the first launch."
+          fi
           gh release create "v$VERSION" release/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-            --title "Offloadr Runner $VERSION" --generate-notes \
-            --notes "**Windows:** run \`OffloadrRunner-Setup.exe\`. It installs for your account only, with no administrator rights. You also need Docker Desktop with the WSL 2 backend and an NVIDIA driver. The build is unsigned, so Windows may ask you to confirm the first launch."
+            --title "Offloadr Runner $VERSION" --generate-notes --notes "$notes"
