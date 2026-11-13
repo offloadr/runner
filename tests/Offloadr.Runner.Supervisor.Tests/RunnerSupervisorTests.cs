@@ -2271,6 +2271,169 @@ public class RunnerSupervisorTests
     }
 
     [Test]
+    public async Task Shutdown_ForAnUpdate_LeavesTheRunnerForTheNextCopyToAdopt()
+    {
+        var supervisor = await StartSupervisorAsync();
+        supervisor.RequestStart();
+        await WaitForStateAsync(SupervisorState.Running);
+
+        supervisor.KeepRunnerOnShutdown();
+        await supervisor.StopAsync(CancellationToken.None);
+        _supervisor = null;
+        supervisor.Dispose();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(_engine.Exists(Name), Is.True);
+            Assert.That(_engine.Stops, Is.Zero);
+        });
+
+        var next = await StartSupervisorAsync();
+        await WaitForStateAsync(SupervisorState.Running);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(_engine.Runs, Has.Count.EqualTo(1), "The updated app adopts the runner instead of starting another.");
+            Assert.That(next.View.Message, Does.Contain("Reconnected"));
+        });
+    }
+
+    [Test]
+    public async Task ResumeAfterUpdate_WhenTheRunnerExitedDuringTheRestart_StartsItAgain()
+    {
+        // The previous version restarted to update just as its runner exited: nothing to reconnect to.
+        _engine.AddContainer(Name, "image", running: false, new Dictionary<string, string>
+        {
+            [RunnerSupervisor.ManagedLabel] = "true",
+            [RunnerSupervisor.OwnerLabel] = SupervisorOwner.Default.Id,
+        });
+
+        var supervisor = await StartSupervisorAsync();
+        supervisor.ResumeAfterUpdate();
+
+        await WaitForStateAsync(SupervisorState.Running);
+        Assert.That(_engine.Runs, Has.Count.EqualTo(1));
+    }
+
+    [Test]
+    public async Task RunnerWanted_FollowsStartAndStop_NotTheState()
+    {
+        var supervisor = await StartSupervisorAsync();
+        Assert.That(supervisor.RunnerWanted, Is.False, "Nothing was started.");
+
+        supervisor.RequestStart();
+        await WaitForStateAsync(SupervisorState.Running);
+        Assert.That(supervisor.RunnerWanted, Is.True);
+
+        // Cleared when the Stop is asked for, before it runs: a restart to update that begins
+        // now must not bring the runner back.
+        supervisor.RequestStop();
+        Assert.That(supervisor.RunnerWanted, Is.False);
+        await WaitForStateAsync(SupervisorState.Stopped);
+        Assert.That(supervisor.RunnerWanted, Is.False);
+    }
+
+    [Test]
+    public async Task RunnerWanted_StaysWhileAnExitedRunnerWaitsToRestart()
+    {
+        var supervisor = await StartSupervisorAsync(restartBackoff: TimeSpan.FromMinutes(5));
+        supervisor.RequestStart();
+        await WaitForStateAsync(SupervisorState.Running);
+
+        _engine.Exit(Name, 137);
+        await WaitForStateAsync(SupervisorState.WaitingToRestart);
+
+        Assert.That(supervisor.RunnerWanted, Is.True);
+    }
+
+    [Test]
+    public async Task AStopStillQueuedAsTheAppGoesDownToUpdate_StopsTheRunnerAnyway()
+    {
+        var supervisor = await StartSupervisorAsync();
+        supervisor.RequestStart();
+        await WaitForStateAsync(SupervisorState.Running);
+
+        // Hold the command loop in a plan refresh, which only the shutdown cancels, so the Stop
+        // asked for next (from the tray, say) is still queued when the app goes down to update.
+        var refreshing = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _plans.OnGet = async cancellationToken =>
+        {
+            refreshing.TrySetResult();
+            await Task.Delay(Timeout.Infinite, cancellationToken);
+        };
+        supervisor.RequestRefresh();
+        await refreshing.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        supervisor.RequestStop();
+
+        supervisor.KeepRunnerOnShutdown();
+        await supervisor.StopAsync(CancellationToken.None);
+        _supervisor = null;
+        supervisor.Dispose();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(supervisor.RunnerWanted, Is.False);
+            Assert.That(_engine.Exists(Name), Is.False, "The Stop wins: the new version must find no runner to reconnect to.");
+        });
+
+        _plans.OnGet = null;
+        var next = await StartSupervisorAsync();
+        await Task.Delay(200);
+        Assert.Multiple(() =>
+        {
+            Assert.That(next.View.State, Is.EqualTo(SupervisorState.Stopped));
+            Assert.That(_engine.Runs, Has.Count.EqualTo(1), "The new version starts nothing.");
+        });
+    }
+
+    [Test]
+    public async Task RunnerWanted_ForAStartStillQueuedAsTheAppGoesDownToUpdate_IsKept()
+    {
+        var supervisor = await StartSupervisorAsync();
+        supervisor.KeepRunnerOnShutdown();
+
+        supervisor.RequestStart();
+        await supervisor.StopAsync(CancellationToken.None);
+        _supervisor = null;
+        supervisor.Dispose();
+
+        Assert.That(supervisor.RunnerWanted, Is.True, "The new version starts it, though this one never got to.");
+    }
+
+    [Test]
+    public async Task RunnerWanted_WhenStartingFailsForGood_IsCleared()
+    {
+        _settings = new FakeSettingsStore(new RunnerSettings());
+        var supervisor = await StartSupervisorAsync();
+
+        supervisor.RequestStart();
+        await WaitForStateAsync(SupervisorState.Faulted);
+
+        Assert.That(supervisor.RunnerWanted, Is.False);
+    }
+
+    [Test]
+    public async Task ResumeAfterUpdate_WhenStartupReconnected_StartsNoSecondRunner()
+    {
+        var template = BuiltInLaunchPlanCatalog.Plan().Find(_settings.Current.SelectedEditorTemplate ?? "comfyui-latest")
+            ?? BuiltInLaunchPlanCatalog.Plan().Templates[0];
+        var earlier = new RunnerSupervisor(_settings, _engine, _plans, new FakeHostGpuProbe(), new SupervisorOptions(), TimeProvider.System, NullLogger<RunnerSupervisor>.Instance);
+        var spec = earlier.BuildSpec(_settings.Current, template);
+        _engine.AddContainer(Name, spec.Image, running: true, spec.Labels);
+
+        var supervisor = await StartSupervisorAsync();
+        supervisor.ResumeAfterUpdate();
+        await WaitForStateAsync(SupervisorState.Running);
+        await Task.Delay(200);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(_engine.Runs, Is.Empty);
+            Assert.That(supervisor.View.Message, Does.Contain("Reconnected"));
+        });
+    }
+
+    [Test]
     public async Task Logs_HideTheRunnerKey()
     {
         _engine.LogLine = $"echo {Key}";

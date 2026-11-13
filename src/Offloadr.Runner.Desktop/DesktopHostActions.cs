@@ -2,7 +2,7 @@ using Offloadr.Runner.Supervisor.Hosting;
 
 namespace Offloadr.Runner.Desktop;
 
-public sealed class DesktopHostActions : IHostActions
+public sealed class DesktopHostActions(MainPage page) : IHostActions
 {
     private readonly WindowsStartupRegistration _startup = new(MauiProgram.LaunchPath);
 
@@ -32,6 +32,8 @@ public sealed class DesktopHostActions : IHostActions
     }
 
     public Task<string?> PickFolderAsync() => MainThread.InvokeOnMainThreadAsync(PlatformFiles.PickFolderAsync);
+
+    public Task RestartToUpdateAsync() => MainThread.InvokeOnMainThreadAsync(page.RestartToUpdateAsync);
 
     public async Task OpenExternalAsync(string url)
     {

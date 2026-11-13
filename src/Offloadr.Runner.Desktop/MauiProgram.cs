@@ -46,7 +46,7 @@ public static class MauiProgram
         builder.Services.AddSingleton(new SingleInstanceLock(paths));
         builder.Services.AddHostedService(provider => provider.GetRequiredService<SingleInstanceLock>());
         builder.Services.AddRunnerSupervisor(paths).AddRunnerUI();
-        builder.Services.AddRunnerUpdateChecks(Offloadr.Runner.Supervisor.Hosting.UpdateChecker.VersionOf(typeof(MauiProgram).Assembly));
+        builder.Services.AddRunnerUpdates<Offloadr.Runner.Desktop.WinUI.VelopackUpdateSource>(AppUpdateService.VersionOf(typeof(MauiProgram).Assembly));
 
         builder.Logging.ClearProviders();
         builder.Logging.AddProvider(new Offloadr.Runner.Supervisor.Logging.DesktopDiagnosticLogProvider(paths.Logs));

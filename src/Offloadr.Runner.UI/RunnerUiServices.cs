@@ -24,6 +24,9 @@ public interface IHostActions
 
     /// <summary>Turns starting at sign-in on or off; throws when the host cannot change it.</summary>
     void SetStartAtSignIn(bool enabled) => throw new NotSupportedException("This host cannot start at sign-in.");
+
+    /// <summary>Closes the app to install a downloaded update and starts it again, leaving the runner running.</summary>
+    Task RestartToUpdateAsync() => Task.CompletedTask;
 }
 
 /// <summary>Fallback for hosts that render in a browser: no folder picker, links open in a new tab.</summary>

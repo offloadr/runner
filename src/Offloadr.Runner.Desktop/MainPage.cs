@@ -17,15 +17,21 @@ public sealed class MainPage : ContentPage
 {
     private readonly DesktopRuntime _runtime;
     private readonly RunnerSupervisor _supervisor;
+    private readonly AppUpdateService _updates;
+    private readonly ILogger<MainPage> _logger;
+    private readonly SupervisorPaths _paths;
     private readonly BlazorWebView _webView;
     private readonly TaskCompletionSource<bool> _started = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private bool _loaded;
     private bool _closing;
 
-    public MainPage(DesktopRuntime runtime, RunnerSupervisor supervisor)
+    public MainPage(DesktopRuntime runtime, RunnerSupervisor supervisor, AppUpdateService updates, SupervisorPaths paths, ILogger<MainPage> logger)
     {
         _runtime = runtime;
         _supervisor = supervisor;
+        _updates = updates;
+        _paths = paths;
+        _logger = logger;
         _webView = new BlazorWebView { HostPage = "wwwroot/index.html" };
         _webView.RootComponents.Add(new RootComponent { Selector = "#app", ComponentType = typeof(Offloadr.Runner.UI.Components.Routes) });
 
@@ -58,6 +64,12 @@ public sealed class MainPage : ContentPage
         try
         {
             await _runtime.StartAsync();
+            if (UpdateHandoff.TakeResume(_paths))
+            {
+                // Just updated with the runner wanted: start it unless startup reconnected to it.
+                _supervisor.ResumeAfterUpdate();
+            }
+
             Content = _webView;
             _started.TrySetResult(true);
         }
@@ -83,6 +95,76 @@ public sealed class MainPage : ContentPage
                     new Label { Text = ex.Message },
                 },
             };
+        }
+    }
+
+    /// <summary>
+    /// Closes the app so the installer can apply the downloaded update and start it again. The runner
+    /// keeps running meanwhile, session and all; the new version reconnects to it.
+    /// </summary>
+    public async Task RestartToUpdateAsync()
+    {
+        if (_closing || CanClose || !_updates.CanRestartNow(_supervisor.View))
+        {
+            return;
+        }
+
+        _closing = true;
+        try
+        {
+            Content = new Label { Text = "Restarting to install the update…", Margin = 32 };
+            _supervisor.KeepRunnerOnShutdown();
+
+            // The runner may exit, or start waiting to restart, until the supervisor has stopped;
+            // the new version then has nothing to reconnect to, so it is told the runner is wanted.
+            // A Stop pressed meanwhile clears that, and the shutdown then stops the runner after all,
+            // which can take longer than the minute the installer waits for the exit: so the
+            // installer is handed the update only now.
+            await _runtime.StopAsync();
+            UpdateHandoff.Save(_paths, _supervisor.RunnerWanted);
+            CanClose = true;
+            try
+            {
+                _updates.ApplyAfterExit(restart: true, []);
+            }
+            catch (Exception ex)
+            {
+                // Everything has stopped already, so the app closes anyway. The update stays
+                // downloaded, and the banner offers it again at the next start.
+                _logger.LogError(ex, "Could not hand the update to the installer.");
+                await DisplayAlertAsync(
+                    "Could not install the update",
+                    "Offloadr Runner closes now. Open it again from the Start menu; it offers the update again.",
+                    "OK");
+            }
+
+            Application.Current?.CloseWindow(Window);
+        }
+        finally
+        {
+            _closing = false;
+        }
+    }
+
+    /// <summary>
+    /// A downloaded update installs once the app has quit, so the next start (at sign-in, say) is the
+    /// new version. Called after the runner has stopped: the installer waits only a minute for the exit.
+    /// </summary>
+    private void InstallDownloadedUpdateAfterExit()
+    {
+        if (_updates.Status.State != AppUpdateState.Ready)
+        {
+            return;
+        }
+
+        try
+        {
+            _updates.ApplyAfterExit(restart: false, []);
+        }
+        catch (Exception ex)
+        {
+            // It is still downloaded; quitting again tries again.
+            _logger.LogError(ex, "Could not hand the update to the installer.");
         }
     }
 
@@ -116,6 +198,7 @@ public sealed class MainPage : ContentPage
 
             Content = new Label { Text = "Stopping the runner…", Margin = 32 };
             await _runtime.StopAsync();
+            InstallDownloadedUpdateAfterExit();
             CanClose = true;
             return true;
         }

@@ -19,7 +19,7 @@ public abstract class SupervisorComponent : ComponentBase, IDisposable
 
     protected SupervisorView View => Supervisor.View;
 
-    public void Dispose()
+    public virtual void Dispose()
     {
         Supervisor.Changed -= OnChanged;
         _disposed.Cancel();

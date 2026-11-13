@@ -27,19 +27,19 @@ public class ServiceRegistrationTests
     }
 
     [Test]
-    public void AddRunnerUpdateChecks_RegistersTheCheckerAsAHostedService()
+    public void AddRunnerUpdates_RegistersTheUpdateServiceAsAHostedService()
     {
         var services = new ServiceCollection();
         services.AddLogging();
-        services.AddRunnerUpdateChecks(new Version(1, 2, 3));
+        services.AddRunnerUpdates<FakeAppUpdateSource>(new Version(1, 2, 3));
 
         using var provider = services.BuildServiceProvider(new ServiceProviderOptions { ValidateOnBuild = true });
-        var checker = provider.GetRequiredService<Offloadr.Runner.Supervisor.Hosting.UpdateChecker>();
+        var updates = provider.GetRequiredService<Offloadr.Runner.Supervisor.Hosting.AppUpdateService>();
 
         Assert.Multiple(() =>
         {
-            Assert.That(provider.GetServices<IHostedService>().Single(), Is.SameAs(checker));
-            Assert.That(checker.CurrentVersion, Is.EqualTo(new Version(1, 2, 3)));
+            Assert.That(provider.GetServices<IHostedService>().Single(), Is.SameAs(updates));
+            Assert.That(updates.Status.Current, Is.EqualTo(new Version(1, 2, 3)));
         });
     }
 }

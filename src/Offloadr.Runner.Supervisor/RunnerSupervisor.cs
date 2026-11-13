@@ -226,7 +226,21 @@ public sealed class RunnerSupervisor : BackgroundService
     /// <summary>Raised after <see cref="View"/> or <see cref="LogLines"/> changed, on a background thread.</summary>
     public event Action? Changed;
 
-    public void RequestStart() => Enqueue(Command.Start);
+    public void RequestStart()
+    {
+        Volatile.Write(ref _runnerWanted, true);
+        Enqueue(Command.Start);
+    }
+
+    /// <summary>
+    /// True while the person wants the runner: since a Start (even one still queued), a start with
+    /// the app or reconnecting to a running runner, and until a Stop is asked for, which clears it at
+    /// once, before the stop even runs, or the runner needs attention. Unlike the state, this tells a
+    /// runner that exited (it is restarted) from one the person stopped.
+    /// </summary>
+    public bool RunnerWanted => Volatile.Read(ref _runnerWanted);
+
+    private bool _runnerWanted;
 
     /// <summary>
     /// Queues the start AutoStart asks for, stamped with the Stop generation from when the app opened:
@@ -236,6 +250,11 @@ public sealed class RunnerSupervisor : BackgroundService
     {
         lock (_gate)
         {
+            if (_stopGeneration == _startupGeneration)
+            {
+                Volatile.Write(ref _runnerWanted, true);
+            }
+
             _commands.Writer.TryWrite(new Request(Command.AutoStart, _startupGeneration));
         }
     }
@@ -250,6 +269,7 @@ public sealed class RunnerSupervisor : BackgroundService
             // Queued under the same lock as the count, so no request queued after it can carry the
             // older count, and none queued before it can pass a check against the newer one.
             var generation = ++_stopGeneration;
+            Volatile.Write(ref _runnerWanted, false);
             _operation?.Cancel();
             _imageDownload?.Cancellation.Cancel();
             _imageDownload = null;
@@ -559,6 +579,14 @@ public sealed class RunnerSupervisor : BackgroundService
                        !_engineSelection.Matches(settings.ContainerEngineExecutable) ||
                        (wanted is not null && !string.Equals(Fingerprint(BuildSpec(settings, wanted)), fingerprint, StringComparison.Ordinal));
         var reconnected = $"Reconnected to the runner that was already running{(template is null ? "." : $" ({template.Label}).")}";
+        lock (_gate)
+        {
+            // Wanted, unless a Stop was asked for since the app opened.
+            if (_stopGeneration == _startupGeneration)
+            {
+                Volatile.Write(ref _runnerWanted, true);
+            }
+        }
 
         if (startedWithCurrentSettings)
         {
@@ -748,6 +776,10 @@ public sealed class RunnerSupervisor : BackgroundService
             {
                 // Stop was pressed after this start was decided but before it could be cancelled.
                 operation.Cancel();
+            }
+            else
+            {
+                Volatile.Write(ref _runnerWanted, true);
             }
         }
 
@@ -1744,11 +1776,28 @@ public sealed class RunnerSupervisor : BackgroundService
         await base.StopAsync(budget.Token).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Makes the coming shutdown leave the runner container running, with the engine hint kept, so
+    /// the copy of the app that starts next (after an update) adopts it and no session is cut off.
+    /// </summary>
+    public void KeepRunnerOnShutdown() => Volatile.Write(ref _keepRunnerOnShutdown, true);
+
+    /// <summary>
+    /// Starts the runner after an update when the previous version wanted it, unless startup
+    /// reconnected to one: startup runs before this request, which does nothing while a runner is
+    /// active. Like starting with the app, Docker trouble is retried with the restart backoff.
+    /// </summary>
+    public void ResumeAfterUpdate() => RequestAutoStart();
+
+    private bool _keepRunnerOnShutdown;
+
     private async Task ShutdownAsync()
     {
         CancelImageDownload();
         await StopLogFollowerAsync().ConfigureAwait(false);
-        if (!_options.StopContainerOnShutdown || !_ownsContainer)
+        // Kept for an update only while still wanted: a Stop asked for as the app goes down (from the
+        // tray, say) may never have run, and the new version would otherwise reconnect to the runner.
+        if (!_options.StopContainerOnShutdown || !_ownsContainer || (Volatile.Read(ref _keepRunnerOnShutdown) && RunnerWanted))
         {
             return;
         }
@@ -2096,6 +2145,8 @@ public sealed class RunnerSupervisor : BackgroundService
 
     private void Fault(string message)
     {
+        // Needs attention: nothing runs or restarts it until the person starts it again.
+        Volatile.Write(ref _runnerWanted, false);
         _logger.LogWarning("Runner supervisor fault: {Message}", message);
         AppendLog("supervisor: " + message);
         Set(SupervisorState.Faulted, message);
