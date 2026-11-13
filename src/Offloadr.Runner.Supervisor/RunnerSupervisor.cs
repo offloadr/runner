@@ -1744,11 +1744,19 @@ public sealed class RunnerSupervisor : BackgroundService
         await base.StopAsync(budget.Token).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Makes the coming shutdown leave the runner container running, with the engine hint kept, so
+    /// the copy of the app that starts next (after an update) adopts it and no session is cut off.
+    /// </summary>
+    public void KeepRunnerOnShutdown() => Volatile.Write(ref _keepRunnerOnShutdown, true);
+
+    private bool _keepRunnerOnShutdown;
+
     private async Task ShutdownAsync()
     {
         CancelImageDownload();
         await StopLogFollowerAsync().ConfigureAwait(false);
-        if (!_options.StopContainerOnShutdown || !_ownsContainer)
+        if (!_options.StopContainerOnShutdown || !_ownsContainer || Volatile.Read(ref _keepRunnerOnShutdown))
         {
             return;
         }

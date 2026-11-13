@@ -38,11 +38,19 @@ public static class SupervisorServiceCollectionExtensions
         return services;
     }
 
-    /// <summary>Checks GitHub for a newer release of the app shortly after start and then daily.</summary>
-    public static IServiceCollection AddRunnerUpdateChecks(this IServiceCollection services, Version currentVersion)
+    /// <summary>
+    /// Keeps the app up to date from <typeparamref name="TSource"/>: checks shortly after start and then
+    /// daily, downloads a newer release in the background, and offers a restart to install it.
+    /// </summary>
+    public static IServiceCollection AddRunnerUpdates<TSource>(this IServiceCollection services, Version currentVersion)
+        where TSource : class, IAppUpdateSource
     {
-        services.AddSingleton(provider => new UpdateChecker(currentVersion, provider.GetRequiredService<ILogger<UpdateChecker>>()));
-        services.AddHostedService(provider => provider.GetRequiredService<UpdateChecker>());
+        services.AddSingleton<IAppUpdateSource, TSource>();
+        services.AddSingleton(provider => new AppUpdateService(
+            provider.GetRequiredService<IAppUpdateSource>(),
+            currentVersion,
+            provider.GetRequiredService<ILogger<AppUpdateService>>()));
+        services.AddHostedService(provider => provider.GetRequiredService<AppUpdateService>());
         return services;
     }
 }

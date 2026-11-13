@@ -608,3 +608,45 @@ internal sealed class ShiftedTimeProvider : TimeProvider
 
     public override DateTimeOffset GetUtcNow() => System.GetUtcNow() + Offset;
 }
+
+/// <summary>An update feed with one release, which downloads in three steps.</summary>
+internal sealed class FakeAppUpdateSource : Offloadr.Runner.Supervisor.Hosting.IAppUpdateSource
+{
+    public bool IsInstalled { get; set; } = true;
+
+    public Version? Pending { get; set; }
+
+    public Version? Latest { get; set; }
+
+    public Exception? CheckFailure { get; set; }
+
+    public int Checks { get; private set; }
+
+    public int Downloads { get; private set; }
+
+    public IReadOnlyList<string>? AppliedWith { get; private set; }
+
+    public bool? Restarts { get; private set; }
+
+    public Task<Version?> CheckAsync(CancellationToken cancellationToken)
+    {
+        Checks++;
+        return CheckFailure is { } failure ? Task.FromException<Version?>(failure) : Task.FromResult(Latest);
+    }
+
+    public Task DownloadAsync(Action<int> progress, CancellationToken cancellationToken)
+    {
+        Downloads++;
+        progress(1);
+        progress(3);
+        progress(50);
+        progress(100);
+        return Task.CompletedTask;
+    }
+
+    public void ApplyAfterExit(bool restart, IReadOnlyList<string> arguments)
+    {
+        Restarts = restart;
+        AppliedWith = arguments;
+    }
+}

@@ -153,7 +153,7 @@ jobs:
           VERSION: ${{ inputs.version }}
           SIGNED: ${{ needs.package.outputs.signed }}
         run: |
-          notes="**Windows:** run \`OffloadrRunner-Setup.exe\`. It installs for your account only, with no administrator rights. You also need Docker Desktop with the WSL 2 backend and an NVIDIA driver."
+          notes="**Windows:** run \`OffloadrRunner-Setup.exe\`. It installs for your account only, with no administrator rights, and keeps itself up to date. You also need Docker Desktop with the WSL 2 backend and an NVIDIA driver."
           if [ "$SIGNED" != true ]; then
             notes="$notes This build is unsigned, so Windows may ask you to confirm the first launch."
           fi

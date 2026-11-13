@@ -2271,6 +2271,34 @@ public class RunnerSupervisorTests
     }
 
     [Test]
+    public async Task Shutdown_ForAnUpdate_LeavesTheRunnerForTheNextCopyToAdopt()
+    {
+        var supervisor = await StartSupervisorAsync();
+        supervisor.RequestStart();
+        await WaitForStateAsync(SupervisorState.Running);
+
+        supervisor.KeepRunnerOnShutdown();
+        await supervisor.StopAsync(CancellationToken.None);
+        _supervisor = null;
+        supervisor.Dispose();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(_engine.Exists(Name), Is.True);
+            Assert.That(_engine.Stops, Is.Zero);
+        });
+
+        var next = await StartSupervisorAsync();
+        await WaitForStateAsync(SupervisorState.Running);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(_engine.Runs, Has.Count.EqualTo(1), "The updated app adopts the runner instead of starting another.");
+            Assert.That(next.View.Message, Does.Contain("Reconnected"));
+        });
+    }
+
+    [Test]
     public async Task Logs_HideTheRunnerKey()
     {
         _engine.LogLine = $"echo {Key}";

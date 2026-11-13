@@ -93,6 +93,13 @@ internal static class PlatformWindow
             ];
         }
 
+        // A window closed by the app (Quit, a restart to update) raises no Closing: remove the icon here too.
+        native.Closed += (_, _) =>
+        {
+            tray?.Dispose();
+            icons?.Dispose();
+        };
+
         native.AppWindow.Closing += (_, args) =>
         {
             if (page.CanClose)

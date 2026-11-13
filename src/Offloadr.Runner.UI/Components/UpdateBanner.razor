@@ -1,40 +1,73 @@
 @using Offloadr.Runner.Supervisor.Hosting
-@implements IDisposable
+@inherits SupervisorComponent
 @inject IServiceProvider Services
 @inject IHostActions Host
 
-@* Shown only when the host checks for updates and a newer release exists. *@
-@if (_checker?.Available is { } update && update.Version != _dismissed)
+@* Shown while a newer release downloads and once it is ready to install. *@
+@if (_updates?.Status is { State: AppUpdateState.Downloading or AppUpdateState.Ready, Available: { } version } status && version != _dismissed)
 {
-    <MudAlert Severity="Severity.Info" Variant="Variant.Outlined" Class="mb-4" ShowCloseIcon="true" CloseIconClicked="@(() => _dismissed = update.Version)">
-        <MudStack Row="true" AlignItems="AlignItems.Center" Spacing="3" Wrap="Wrap.Wrap">
-            <span>Offloadr Runner @update.Version.ToString(3) is available. You have @_checker.CurrentVersion.ToString(3).</span>
-            <MudButton Size="Size.Small" Variant="Variant.Text" EndIcon="@Icons.Material.Filled.OpenInNew"
-                       OnClick="@(() => Host.OpenExternalAsync(update.Url))">Download</MudButton>
-        </MudStack>
+    <MudAlert Severity="Severity.Info" Variant="Variant.Outlined" Class="mb-4" ShowCloseIcon="@(status.State == AppUpdateState.Ready)"
+              CloseIconClicked="@(() => _dismissed = version)">
+        @if (status.State == AppUpdateState.Downloading)
+        {
+            <span>Downloading Offloadr Runner @version.ToString(3)… @status.Percent%</span>
+        }
+        else
+        {
+            <MudStack Row="true" AlignItems="AlignItems.Center" Spacing="3" Wrap="Wrap.Wrap">
+                <span>
+                    Offloadr Runner @version.ToString(3) is ready to install. The runner keeps running while the app restarts;
+                    otherwise the update installs when you quit the app.
+                </span>
+                <MudButton Size="Size.Small" Variant="Variant.Filled" Color="Color.Primary"
+                           Disabled="@(_restarting || !_updates.CanRestartNow(View))"
+                           OnClick="RestartAsync">Restart to update</MudButton>
+            </MudStack>
+            @if (!_updates.CanRestartNow(View))
+            {
+                <MudText Typo="Typo.caption" Class="runner-check-detail">The restart waits until the runner has finished starting or stopping.</MudText>
+            }
+        }
     </MudAlert>
 }
 
 @code {
-    private UpdateChecker? _checker;
+    private AppUpdateService? _updates;
     private Version? _dismissed;
+    private bool _restarting;
 
     protected override void OnInitialized()
     {
-        _checker = Services.GetService(typeof(UpdateChecker)) as UpdateChecker;
-        if (_checker is not null)
+        base.OnInitialized();
+        _updates = Services.GetService(typeof(AppUpdateService)) as AppUpdateService;
+        if (_updates is not null)
         {
-            _checker.Changed += OnChanged;
+            _updates.Changed += OnUpdatesChanged;
         }
     }
 
-    public void Dispose()
+    public override void Dispose()
     {
-        if (_checker is not null)
+        if (_updates is not null)
         {
-            _checker.Changed -= OnChanged;
+            _updates.Changed -= OnUpdatesChanged;
         }
+
+        base.Dispose();
     }
 
-    private void OnChanged() => InvokeAsync(StateHasChanged);
+    private void OnUpdatesChanged() => InvokeAsync(StateHasChanged);
+
+    private async Task RestartAsync()
+    {
+        _restarting = true;
+        try
+        {
+            await Host.RestartToUpdateAsync();
+        }
+        finally
+        {
+            _restarting = false;
+        }
+    }
 }

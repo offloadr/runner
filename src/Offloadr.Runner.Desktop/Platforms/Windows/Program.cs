@@ -12,7 +12,10 @@ public static class Program
     [STAThread]
     private static void Main()
     {
+        // A downloaded update installs when the app restarts to update or quits, never at start: a
+        // second launch only brings up the open copy, and must not replace that copy's files.
         VelopackApp.Build()
+            .SetAutoApplyOnStartup(false)
             .OnBeforeUninstallFastCallback(_ => InstallerHooks.BeforeUninstall())
             .Run();
 
