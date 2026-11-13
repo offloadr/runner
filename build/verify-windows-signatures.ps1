@@ -3,8 +3,10 @@
 # stub). -Expect Signed requires a valid signature on each, from
 # -Subject when given; -Expect Unsigned requires none, so an unsigned release is never mistaken
 # for a signed one. Third-party files keep their own publishers' signatures and are not checked.
+# -Version picks that version's full package when the folder also holds earlier ones.
 param(
     [Parameter(Mandatory)][string]$ReleasesDir,
+    [string]$Version,
     [Parameter(Mandatory)][ValidateSet('Signed', 'Unsigned')][string]$Expect,
     [string]$Subject
 )
@@ -12,8 +14,11 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 $setup = @(Get-ChildItem $ReleasesDir -Filter '*-Setup.exe')
-$package = @(Get-ChildItem $ReleasesDir -Filter '*-full.nupkg')
-if ($setup.Count -ne 1 -or $package.Count -ne 1) { throw "Expected one installer and one full package in $ReleasesDir." }
+$package = @(Get-ChildItem $ReleasesDir -Filter $(if ($Version) { "*-$Version-*full.nupkg" } else { '*-full.nupkg' }))
+if ($setup.Count -ne 1) { throw "Expected one installer in $ReleasesDir." }
+if ($package.Count -ne 1) {
+    throw "Expected one full package$(if ($Version) { " of version $Version" }) in $ReleasesDir, found $($package.Count)$(if (-not $Version) { '; pass -Version to choose' })."
+}
 
 $extracted = Join-Path ([IO.Path]::GetTempPath()) ("offloadr-signatures-" + [Guid]::NewGuid().ToString('n'))
 New-Item -ItemType Directory $extracted | Out-Null

@@ -112,9 +112,10 @@ jobs:
         env:
           SIGNED: ${{ steps.signing.outputs.signed }}
           SUBJECT: ${{ vars.ARTIFACT_SIGNING_SUBJECT }}
+          VERSION: ${{ inputs.version }}
         run: |
           $expect = if ($env:SIGNED -eq 'true') { 'Signed' } else { 'Unsigned' }
-          ./build/verify-windows-signatures.ps1 -ReleasesDir artifacts/releases/windows-win-x64 -Expect $expect -Subject $env:SUBJECT |
+          ./build/verify-windows-signatures.ps1 -ReleasesDir artifacts/releases/windows-win-x64 -Version $env:VERSION -Expect $expect -Subject $env:SUBJECT |
             Tee-Object -Variable report
           "### Desktop app signatures`n`n``````text`n$($report -join "`n")`n``````" >> $env:GITHUB_STEP_SUMMARY
 

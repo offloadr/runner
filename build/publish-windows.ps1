@@ -2,7 +2,8 @@
 # Always produces a self-contained folder in artifacts/packages/windows-<runtime>.
 # -Pack turns it into an installer and update packages in artifacts/releases/windows-<runtime>
 # (Velopack; the vpk tool comes from dotnet-tools.json). -PreviousReleasesFrom fetches the latest
-# published release from that GitHub repository first, so the packages include a delta from it.
+# published release first, so the packages include a delta from it: from a GitHub repository URL,
+# or a folder an earlier -Pack produced (to try deltas locally).
 # -NoPublish packs a folder published earlier (a release signs and packs the folder CI built).
 # -AzureTrustedSignFile signs the app and installer with Azure Artifact Signing: the path of its
 # metadata.json, with an Azure sign-in already in place (az login, or azure/login in a workflow).
@@ -16,6 +17,14 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 if (-not $IsWindows) { throw 'Windows publishing requires Windows and the maui-windows workload.' }
+
+# Paths the caller gave are relative to their PowerShell location, which .NET does not know about.
+if ($AzureTrustedSignFile) {
+    if (-not (Test-Path -LiteralPath $AzureTrustedSignFile -PathType Leaf)) { throw "There is no signing metadata file at '$AzureTrustedSignFile'." }
+    $AzureTrustedSignFile = (Resolve-Path -LiteralPath $AzureTrustedSignFile).ProviderPath
+}
+$previousFolder = $PreviousReleasesFrom -and (Test-Path -LiteralPath $PreviousReleasesFrom -PathType Container)
+if ($previousFolder) { $PreviousReleasesFrom = (Resolve-Path -LiteralPath $PreviousReleasesFrom).ProviderPath }
 
 $repository = Split-Path $PSScriptRoot -Parent
 $publishDir = Join-Path $repository "artifacts/packages/windows-$Runtime"
@@ -57,14 +66,17 @@ try {
     New-Item -ItemType Directory $releasesDir | Out-Null
     # One update channel per architecture: an installed app only ever updates from its own.
     $channel = $Runtime
-    if ($PreviousReleasesFrom) {
+    if ($previousFolder) {
+        Copy-Item (Join-Path $PreviousReleasesFrom '*') $releasesDir
+    }
+    elseif ($PreviousReleasesFrom) {
         # There is nothing to download before the first release; packing then makes no delta.
         dotnet vpk download github --repoUrl $PreviousReleasesFrom --channel $channel -o $releasesDir
         if ($LASTEXITCODE) { Write-Warning 'No earlier release was downloaded, so no delta package is made.' }
     }
 
     $signing = @()
-    if ($AzureTrustedSignFile) { $signing = @('--azureTrustedSignFile', [IO.Path]::GetFullPath($AzureTrustedSignFile)) }
+    if ($AzureTrustedSignFile) { $signing = @('--azureTrustedSignFile', $AzureTrustedSignFile) }
 
     dotnet vpk pack @signing `
         --packId $packId `
@@ -86,7 +98,8 @@ finally {
     Pop-Location
 }
 
-# The downloaded earlier release only served to make the delta; it is already published.
+# The earlier release only served to make the delta; it is already published. Its installer was
+# replaced by this one, which has the same name.
 Get-ChildItem $releasesDir -Filter '*.nupkg' |
     Where-Object { $_.Name -notlike "$packId-$Version-*" } |
     Remove-Item
