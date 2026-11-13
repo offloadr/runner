@@ -120,6 +120,31 @@ public class PullProgressParserTests
     }
 
     [Test]
+    public void Podman_ThatOnlyAnnouncesBlobs_StaysUnmeasuredUntilTheManifest()
+    {
+        var parser = new PullProgressParser();
+        parser.Accept("Trying to pull ghcr.io/offloadr/runner-comfyui:latest...");
+        parser.Accept("Getting image source signatures");
+        parser.Accept("Copying blob sha256:f18232174bc91741fdf3da96d85011092101a032a93a388b79e99e69c2d5c870");
+        parser.Accept("Copying blob sha256:61ca4f733c802afd9e05a32f0de0361b6d713b8b53292dc15fb093229f648674");
+        parser.Accept("Copying config sha256:aaaaaaaaaaaa");
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(parser.Current.Layers, Is.EqualTo(2));
+            Assert.That(parser.Current.Fraction, Is.Null, "No bar that would sit at zero for the whole download.");
+            Assert.That(parser.Current.Summary, Is.EqualTo("Downloading 2 layers…"));
+        });
+
+        Assert.That(parser.Accept("Writing manifest to image destination"), Is.True);
+        Assert.Multiple(() =>
+        {
+            Assert.That(parser.Current, Is.EqualTo(new PullProgress(2, 2, 2)));
+            Assert.That(parser.Current.Fraction, Is.EqualTo(1.0));
+        });
+    }
+
+    [Test]
     public void OtherLines_AreIgnored()
     {
         var parser = new PullProgressParser();
