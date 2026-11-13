@@ -6,6 +6,10 @@
 # Usage: verify-published-image.sh <expected-digest> <expected-revision> <image-ref>...
 # Needs skopeo. Extra skopeo flags, such as --tls-verify=false for a local registry, go in SKOPEO_FLAGS.
 # When EXPECTED_BASE_NAME and EXPECTED_BASE_DIGEST are set, the image must record that base.
+# When EXPECTED_SIGNER_WORKFLOW is set (<owner>/<repo>/<path to workflow>@<ref>, as GitHub's
+# workflow_ref gives it), the digest must also carry a keyless cosign signature and a GitHub build
+# provenance attestation from that workflow, at that ref, for this revision. That needs cosign, and
+# gh with GH_TOKEN set.
 set -euo pipefail
 
 if (( $# < 3 )); then
@@ -82,6 +86,39 @@ for ref in "$@"; do
       || fail "$ref: base digest label is '$base_digest', expected '${EXPECTED_BASE_DIGEST:-}'"
   fi
 done
+
+# Signatures and attestations belong to the digest, so one check covers every tag.
+if [[ -n "${EXPECTED_SIGNER_WORKFLOW:-}" && "$expected_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+  signer_workflow="${EXPECTED_SIGNER_WORKFLOW%%@*}"
+  signer_ref="${EXPECTED_SIGNER_WORKFLOW#*@}"
+  if [[ "$signer_workflow" == "$EXPECTED_SIGNER_WORKFLOW" || -z "$signer_ref" ]]; then
+    fail "EXPECTED_SIGNER_WORKFLOW '$EXPECTED_SIGNER_WORKFLOW' names no ref"
+  else
+    # The first ref without its tag or digest; a registry port stays.
+    image="$(sed 's/:[^:/]*$//' <<< "${1%%@*}")@$expected_digest"
+    if with_retries cosign verify \
+        --certificate-identity "https://github.com/$EXPECTED_SIGNER_WORKFLOW" \
+        --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+        --certificate-github-workflow-sha "$expected_revision" \
+        "$image" > /dev/null; then
+      echo "ok   $image signed by $EXPECTED_SIGNER_WORKFLOW"
+    else
+      fail "$image: no valid cosign signature from $EXPECTED_SIGNER_WORKFLOW at $expected_revision"
+    fi
+
+    repository="$(cut -d/ -f1-2 <<< "$signer_workflow")"
+    if with_retries gh attestation verify "oci://$image" \
+        --repo "$repository" \
+        --signer-workflow "$signer_workflow" \
+        --source-ref "$signer_ref" \
+        --source-digest "$expected_revision" \
+        --deny-self-hosted-runners > /dev/null; then
+      echo "ok   $image has build provenance from $signer_workflow"
+    else
+      fail "$image: no valid build provenance from $signer_workflow at $expected_revision"
+    fi
+  fi
+fi
 
 if (( failures > 0 )); then
   echo "$failures check(s) failed; this publish does not count as a release." >&2

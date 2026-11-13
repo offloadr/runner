@@ -9,8 +9,12 @@ run-name: Publish ${{ inputs.targets || 'all runner images' }}
 # publication covers. Each image is built on its editor image's current digest
 # and records it in the org.opencontainers.image.base.* labels.
 #
+# Each pushed digest is signed keylessly with cosign and gets a GitHub build provenance
+# attestation, both bound to this workflow and commit; docs/image-publishing.md shows how to
+# check them.
+#
 # A run counts as a release only when the verify step passes: a green build step is not proof
-# that the registry holds the image this commit produced.
+# that the registry holds the image this commit produced, signed and attested.
 
 on:
   workflow_dispatch:
@@ -84,6 +88,14 @@ jobs:
     name: Publish ${{ matrix.target }}
     needs: [plan, record-channels]
     runs-on: ubuntu-latest
+    # id-token lets the job sign keylessly with its own workflow identity; attestations and
+    # artifact-metadata record the build provenance with GitHub.
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     strategy:
       fail-fast: false
       matrix:
@@ -146,12 +158,58 @@ jobs:
             ${{ matrix.target }}.cache-from=type=registry,ref=ghcr.io/offloadr/runner-build-cache:${{ matrix.target }}
             ${{ matrix.target }}.cache-to=type=registry,ref=ghcr.io/offloadr/runner-build-cache:${{ matrix.target }},mode=max
 
-      - name: Verify the registry holds this build
+      - name: Read what the build pushed
+        id: pushed
         env:
           METADATA: ${{ steps.bake.outputs.metadata }}
           TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          digest="$(jq -r --arg target "$TARGET" '.[$target]["containerimage.digest"] // empty' <<< "$METADATA")"
+          names="$(jq -r --arg target "$TARGET" '.[$target]["image.name"] // empty' <<< "$METADATA")"
+          if [ -z "$names" ]; then
+            echo "::error::The build reported no pushed tags for $TARGET."
+            exit 1
+          fi
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::The build reported no image digest for $TARGET ('$digest')."
+            exit 1
+          fi
+
+          # Every tag of a target names the same repository; signatures and provenance belong to
+          # the digest in it, so they hold for each tag and survive a channel being moved back.
+          repositories="$(tr ',' '\n' <<< "$names" | sed 's/:[^:/]*$//' | sort -u)"
+          if [ "$(wc -l <<< "$repositories")" -ne 1 ]; then
+            echo "::error::The tags of $TARGET name more than one repository: $names"
+            exit 1
+          fi
+          printf 'digest=%s\nrepository=%s\nnames=%s\n' "$digest" "$repositories" "$names" >> "$GITHUB_OUTPUT"
+
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+
+      # Keyless: the certificate names this workflow, its ref and the commit, and the signature
+      # is logged in the public Rekor transparency log. No key exists to leak or rotate.
+      - name: Sign the image
+        env:
+          IMAGE: ${{ steps.pushed.outputs.repository }}@${{ steps.pushed.outputs.digest }}
+        run: cosign sign --yes "$IMAGE"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.pushed.outputs.repository }}
+          subject-digest: ${{ steps.pushed.outputs.digest }}
+          push-to-registry: true
+
+      - name: Verify the registry holds this build
+        env:
+          DIGEST: ${{ steps.pushed.outputs.digest }}
+          NAMES: ${{ steps.pushed.outputs.names }}
+          TARGET: ${{ matrix.target }}
           EXPECTED_BASE_NAME: ${{ steps.base.outputs.ref }}
           EXPECTED_BASE_DIGEST: ${{ steps.base.outputs.digest }}
+          EXPECTED_SIGNER_WORKFLOW: ${{ github.workflow_ref }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REGISTRY_USER: ${{ github.actor }}
           REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -160,19 +218,12 @@ jobs:
           sudo apt-get install -y -qq skopeo jq
           echo "$REGISTRY_TOKEN" | skopeo login ghcr.io --username "$REGISTRY_USER" --password-stdin
 
-          digest="$(jq -r --arg target "$TARGET" '.[$target]["containerimage.digest"] // empty' <<< "$METADATA")"
-          names="$(jq -r --arg target "$TARGET" '.[$target]["image.name"] // empty' <<< "$METADATA")"
-          if [ -z "$names" ]; then
-            echo "::error::The build reported no pushed tags for $TARGET."
-            exit 1
-          fi
-          IFS=',' read -r -a refs <<< "$names"
-
-          ./build/verify-published-image.sh "$digest" "$SOURCE_REVISION" "${refs[@]}"
+          IFS=',' read -r -a refs <<< "$NAMES"
+          ./build/verify-published-image.sh "$DIGEST" "$SOURCE_REVISION" "${refs[@]}"
 
           {
             echo "### $TARGET"
             echo
-            echo "Revision \`$SOURCE_REVISION\`, digest \`$digest\`:"
+            echo "Revision \`$SOURCE_REVISION\`, digest \`$DIGEST\`, signed and attested:"
             for ref in "${refs[@]}"; do echo "- \`$ref\`"; done
           } >> "$GITHUB_STEP_SUMMARY"

@@ -1,6 +1,7 @@
 # Runner image variants. Local build of one variant:
 #   docker buildx bake comfyui-latest --load
-# CI sets REGISTRY, SOURCE_REVISION and PUSH_TAGS (see .github/workflows).
+# CI sets SOURCE_REVISION and pins each editor image by digest (see .github/workflows); REGISTRY
+# and BASE_REGISTRY default to ghcr.io/offloadr.
 
 variable "REGISTRY" {
   default = "ghcr.io/offloadr"
