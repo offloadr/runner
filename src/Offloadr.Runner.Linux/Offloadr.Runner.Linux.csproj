@@ -18,6 +18,9 @@
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="Google.Protobuf" />
+    <PackageReference Include="Grpc.Core.Api" />
+    <PackageReference Include="Grpc.Net.Client" />
     <InternalsVisibleTo Include="RunnerAgent" />
     <InternalsVisibleTo Include="Offloadr.Runner.Tests" />
   </ItemGroup>
