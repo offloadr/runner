@@ -2347,14 +2347,25 @@ public class RunnerSupervisorTests
     }
 
     [Test]
-    public async Task RunnerWanted_WhenAStopIsAskedForAsTheAppGoesDownToUpdate_IsCleared()
+    public async Task AStopStillQueuedAsTheAppGoesDownToUpdate_StopsTheRunnerAnyway()
     {
         var supervisor = await StartSupervisorAsync();
         supervisor.RequestStart();
         await WaitForStateAsync(SupervisorState.Running);
 
-        supervisor.KeepRunnerOnShutdown();
+        // Hold the command loop in a plan refresh, which only the shutdown cancels, so the Stop
+        // asked for next (from the tray, say) is still queued when the app goes down to update.
+        var refreshing = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _plans.OnGet = async cancellationToken =>
+        {
+            refreshing.TrySetResult();
+            await Task.Delay(Timeout.Infinite, cancellationToken);
+        };
+        supervisor.RequestRefresh();
+        await refreshing.Task.WaitAsync(TimeSpan.FromSeconds(10));
         supervisor.RequestStop();
+
+        supervisor.KeepRunnerOnShutdown();
         await supervisor.StopAsync(CancellationToken.None);
         _supervisor = null;
         supervisor.Dispose();
@@ -2363,6 +2374,15 @@ public class RunnerSupervisorTests
         {
             Assert.That(supervisor.RunnerWanted, Is.False);
             Assert.That(_engine.Exists(Name), Is.False, "The Stop wins: the new version must find no runner to reconnect to.");
+        });
+
+        _plans.OnGet = null;
+        var next = await StartSupervisorAsync();
+        await Task.Delay(200);
+        Assert.Multiple(() =>
+        {
+            Assert.That(next.View.State, Is.EqualTo(SupervisorState.Stopped));
+            Assert.That(_engine.Runs, Has.Count.EqualTo(1), "The new version starts nothing.");
         });
     }
 
