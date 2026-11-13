@@ -2461,6 +2461,23 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
     internal static TimeSpan LocalReleaseStartTimeout { get; set; } = TimeSpan.FromSeconds(5);
 
     /// <summary>Whether this coordinator has a registration or an index record for <paramref name="normalized"/>.</summary>
+    /// <summary>The length the download at <paramref name="path"/> was registered with, or null when there is none.</summary>
+    public long? ExpectedLengthAt(string path)
+    {
+        var normalized = NormalizePath(path);
+        lock (_sync)
+        {
+            if (_states.TryGetValue(normalized, out var state))
+            {
+                return state.Identity.ExpectedLength;
+            }
+        }
+
+        return _index.Snapshot()
+            .FirstOrDefault(record => string.Equals(NormalizePath(record.DestinationPath), normalized, StringComparison.Ordinal))
+            ?.ExpectedLength;
+    }
+
     private bool HasDownloadAt(string normalized)
     {
         lock (_sync)

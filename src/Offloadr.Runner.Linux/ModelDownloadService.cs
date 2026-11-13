@@ -458,7 +458,7 @@ internal sealed class ModelDownloadService : IAsyncDisposable
 
             // The copy keeps serving only as the same model: one of another size stays in the way, and
             // the projector refuses the request as it did before, rather than the editor using other weights.
-            if (download.SizeBytes > 0 && new FileInfo(path) is { Exists: true } copy && copy.Length != download.SizeBytes)
+            if (download.SizeBytes > 0 && ExpectedSizeOfDownloadAt(path) is { } downloadedSize && downloadedSize != download.SizeBytes)
             {
                 RunnerLog.Warning(
                     nameof(ModelDownloadService),
@@ -480,6 +480,10 @@ internal sealed class ModelDownloadService : IAsyncDisposable
                                    !inUse.Contains(path))
                 .ToArray();
     }
+
+    /// <summary>The size the download at <paramref name="path"/> was asked for with, not how far it has got.</summary>
+    private long? ExpectedSizeOfDownloadAt(string path)
+        => _hydrationCoordinator?.ExpectedLengthAt(path);
 
     private static void LinkFreed(Action<ModelDownloadRequest>? linkFreed, ModelDownloadRequest download)
     {
