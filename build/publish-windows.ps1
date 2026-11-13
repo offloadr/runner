@@ -62,12 +62,22 @@ try {
     dotnet tool restore
     if ($LASTEXITCODE) { throw 'Could not restore the vpk tool.' }
 
+    # The earlier release is copied aside first: it may be this script's own output folder, which
+    # is emptied next (pack one version, then the next from the same folder).
+    $staged = $null
+    if ($previousFolder) {
+        $staged = Join-Path ([IO.Path]::GetTempPath()) ("offloadr-previous-release-" + [Guid]::NewGuid().ToString('n'))
+        New-Item -ItemType Directory $staged | Out-Null
+        Copy-Item (Join-Path $PreviousReleasesFrom '*') $staged
+    }
+
     if (Test-Path $releasesDir) { Remove-Item $releasesDir -Recurse -Force }
     New-Item -ItemType Directory $releasesDir | Out-Null
     # One update channel per architecture: an installed app only ever updates from its own.
     $channel = $Runtime
-    if ($previousFolder) {
-        Copy-Item (Join-Path $PreviousReleasesFrom '*') $releasesDir
+    if ($staged) {
+        Copy-Item (Join-Path $staged '*') $releasesDir
+        Remove-Item $staged -Recurse -Force
     }
     elseif ($PreviousReleasesFrom) {
         # There is nothing to download before the first release; packing then makes no delta.
