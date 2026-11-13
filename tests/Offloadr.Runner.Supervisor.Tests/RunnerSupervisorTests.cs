@@ -94,10 +94,61 @@ public class RunnerSupervisorTests
         Assert.Multiple(() =>
         {
             Assert.That(supervisor.View.Message, Does.Contain("runner key"));
-            Assert.That(supervisor.View.Fault?.Kind, Is.EqualTo(FaultKind.Settings));
+            Assert.That(supervisor.View.Fault?.Kind, Is.EqualTo(FaultKind.KeyMissing));
             Assert.That(supervisor.View.Fault?.Action, Is.EqualTo(FaultAction.OpenSettings));
             Assert.That(_engine.Runs, Is.Empty);
+            Assert.That(_engine.Pulls, Is.Empty);
         });
+    }
+
+    [Test]
+    public async Task Start_WithoutAKeyAndWithABadAddress_AsksForTheKeyFirst()
+    {
+        _settings = new FakeSettingsStore(new RunnerSettings { OffloadrApiOrigin = "http://offloadr.example" });
+        var supervisor = await StartSupervisorAsync();
+
+        supervisor.RequestStart();
+        await WaitForStateAsync(SupervisorState.Faulted);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(supervisor.View.Message, Is.EqualTo(RunnerSettings.MissingKeyProblem));
+            Assert.That(supervisor.View.Fault?.Kind, Is.EqualTo(FaultKind.KeyMissing));
+        });
+    }
+
+    [Test]
+    public async Task Pulling_ShowsHowManyLayersAreDone()
+    {
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _engine.PullLines = ["latest: Pulling from offloadr/runner-comfyui", "f18232174bc9: Pulling fs layer", "61ca4f733c80: Pulling fs layer", "f18232174bc9: Download complete"];
+        _engine.OnPull = _ => release.Task;
+        var supervisor = await StartSupervisorAsync();
+
+        supervisor.RequestStart();
+        await WaitUntilAsync(() => supervisor.View.PullProgress is { Layers: 2, Downloaded: 1 }, "pull progress");
+        Assert.That(supervisor.View.State, Is.EqualTo(SupervisorState.Pulling));
+
+        release.SetResult();
+        await WaitForStateAsync(SupervisorState.Running);
+        Assert.That(supervisor.View.PullProgress, Is.Null, "Progress belongs to the download only.");
+    }
+
+    [Test]
+    public async Task FirstRunner_ChecksTheGpuInsideContainersOnItsOwn()
+    {
+        var supervisor = await StartSupervisorAsync();
+
+        supervisor.RequestStart();
+        await WaitForStateAsync(SupervisorState.Running);
+        await WaitUntilAsync(() => supervisor.View.GpuAccess is { Succeeded: true }, "the GPU check");
+
+        supervisor.RequestStop();
+        await WaitForStateAsync(SupervisorState.Stopped);
+        supervisor.RequestStart();
+        await WaitForStateAsync(SupervisorState.Running);
+
+        Assert.That(_engine.GpuChecks, Is.EqualTo(1), "Only a runner with no answer yet checks again.");
     }
 
     [Test]

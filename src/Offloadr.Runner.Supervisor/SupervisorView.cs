@@ -43,6 +43,9 @@ public sealed record SupervisorView(
     /// </summary>
     public SupervisorFault? Fault { get; init; }
 
+    /// <summary>How far the image download is while <see cref="SupervisorState.Pulling"/>; null otherwise.</summary>
+    public PullProgress? PullProgress { get; init; }
+
     public static SupervisorView Initial(DateTimeOffset now)
         => new(SupervisorState.Stopped, "The runner is stopped.", null, null, null, null, null, null, null, 0, now);
 

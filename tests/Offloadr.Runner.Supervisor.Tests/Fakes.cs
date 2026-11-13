@@ -105,6 +105,11 @@ internal sealed class FakeContainerEngine : IContainerEngine
         }
 
         onProgress($"{image}: Pulling");
+        foreach (var line in PullLines)
+        {
+            onProgress(line);
+        }
+
         if (OnPull is not null)
         {
             await OnPull(cancellationToken);
@@ -120,6 +125,9 @@ internal sealed class FakeContainerEngine : IContainerEngine
             _images.Add(image);
         }
     }
+
+    /// <summary>What a pull prints before OnPull runs.</summary>
+    public IReadOnlyList<string> PullLines { get; set; } = [];
 
     /// <summary>What a failing pull prints last.</summary>
     public string PullFailureOutput { get; set; } = "registry unreachable";
@@ -431,8 +439,16 @@ internal sealed class FakeContainerEngine : IContainerEngine
         return Task.CompletedTask;
     }
 
+    private int _gpuChecks;
+
+    /// <summary>How often the GPU check ran.</summary>
+    public int GpuChecks => Volatile.Read(ref _gpuChecks);
+
     public Task<GpuAccessCheck> CheckGpuAccessAsync(string image, CancellationToken cancellationToken)
-        => Task.FromResult(new GpuAccessCheck(true, "GPU 0: NVIDIA GeForce RTX 4090"));
+    {
+        Interlocked.Increment(ref _gpuChecks);
+        return Task.FromResult(new GpuAccessCheck(true, "GPU 0: NVIDIA GeForce RTX 4090"));
+    }
 
     /// <summary>The engine executable in use; each engine sees only the containers it created.</summary>
     public Func<string?> Executable { get; set; } = static () => null;

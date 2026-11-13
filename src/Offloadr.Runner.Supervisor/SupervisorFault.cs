@@ -44,6 +44,9 @@ public enum FaultKind
     /// <summary>A setting is missing or invalid.</summary>
     Settings,
 
+    /// <summary>No runner key is saved yet.</summary>
+    KeyMissing,
+
     /// <summary>Offloadr did not accept the runner key.</summary>
     KeyRejected,
 
@@ -77,7 +80,7 @@ public sealed record SupervisorFault(FaultKind Kind, string Title, string Messag
     {
         FaultKind.EngineMissing => FaultAction.InstallEngine,
         FaultKind.EngineNotRunning or FaultKind.EngineNotResponding or FaultKind.WindowsContainers or FaultKind.EngineUnreachable => FaultAction.StartEngine,
-        FaultKind.Settings or FaultKind.KeyRejected => FaultAction.OpenSettings,
+        FaultKind.Settings or FaultKind.KeyMissing or FaultKind.KeyRejected => FaultAction.OpenSettings,
         FaultKind.GpuUnavailable => FaultAction.SetUpGpu,
         FaultKind.DiskFull => FaultAction.FreeDiskSpace,
         FaultKind.RegistryUnreachable => FaultAction.CheckConnection,
@@ -139,6 +142,7 @@ public sealed record SupervisorFault(FaultKind Kind, string Title, string Messag
         FaultKind.EngineUnreachable => ("The runner's Docker does not answer", null),
         FaultKind.NoImageForEditor => ("No runner for this editor", null),
         FaultKind.Settings => ("Check your settings", null),
+        FaultKind.KeyMissing => ("Add your runner key", null),
         FaultKind.KeyRejected => ("Offloadr did not accept the runner key", null),
         FaultKind.NameTaken => ("The runner's container name is taken", null),
         FaultKind.AnotherCopy => ("Another copy of the app is open", null),
