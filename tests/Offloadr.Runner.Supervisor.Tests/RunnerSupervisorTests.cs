@@ -1337,6 +1337,8 @@ public class RunnerSupervisorTests
             Assert.Multiple(() =>
             {
                 Assert.That(supervisor.View.Message, Does.Contain("Access is denied"));
+                Assert.That(supervisor.View.Fault?.Kind, Is.EqualTo(FaultKind.Unknown), "The engine is there; installing it again would not help.");
+                Assert.That(supervisor.View.Fault?.Message, Does.Contain("Access is denied"));
                 Assert.That(File.Exists(statePath), Is.False);
             });
 

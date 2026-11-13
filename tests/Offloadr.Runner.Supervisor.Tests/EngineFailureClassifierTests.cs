@@ -28,6 +28,7 @@ public class EngineFailureClassifierTests
     [TestCase(EngineOperation.Pull, "Error response from daemon: Get \"https://ghcr.io/v2/\": net/http: TLS handshake timeout", FaultKind.RegistryUnreachable)]
     [TestCase(EngineOperation.Pull, "Error response from daemon: toomanyrequests: retry-after: 1.2ms, allowed: 44000/minute", FaultKind.RegistryUnreachable)]
     [TestCase(EngineOperation.Pull, "Error: initializing source docker://ghcr.io/offloadr/runner-comfyui:latest: pinging container registry ghcr.io: Get \"https://ghcr.io/v2/\": dial tcp 140.82.121.34:443: i/o timeout", FaultKind.RegistryUnreachable)]
+    [TestCase(EngineOperation.Pull, "Error response from daemon: Get \"https://ghcr.io/v2/\": dial tcp 140.82.121.34:443: connect: permission denied", FaultKind.RegistryUnreachable)]
     [TestCase(EngineOperation.Command, "Error response from daemon: Get \"https://ghcr.io/v2/\": dial tcp: lookup ghcr.io: no such host", FaultKind.Unknown)]
     [TestCase(EngineOperation.Run, "docker: Error response from daemon: Conflict. The container name \"/offloadr-runner\" is already in use.", FaultKind.Unknown)]
     [TestCase(EngineOperation.Pull, "", FaultKind.Unknown)]

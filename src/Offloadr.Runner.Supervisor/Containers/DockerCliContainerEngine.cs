@@ -243,7 +243,7 @@ public sealed class DockerCliContainerEngine(IProcessRunner processes, Func<stri
         }
         catch (ProcessStartException ex)
         {
-            throw new ContainerEngineException(ex.Message, kind: FaultKind.EngineMissing);
+            throw new ContainerEngineException(ex.Message);
         }
 
         if (!result.Succeeded && !IsNotFound(result))
@@ -431,7 +431,7 @@ public sealed class DockerCliContainerEngine(IProcessRunner processes, Func<stri
         {
             // Failing is the safe answer: unpinned commands could reach whichever daemon the default
             // points at by the time they run.
-            throw new ContainerEngineException(ex.Message, kind: FaultKind.EngineMissing);
+            throw new ContainerEngineException(ex.Message);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
@@ -513,7 +513,7 @@ public sealed class DockerCliContainerEngine(IProcessRunner processes, Func<stri
         }
         catch (ProcessStartException ex)
         {
-            throw new ContainerEngineException(ex.Message, kind: FaultKind.EngineMissing);
+            throw new ContainerEngineException(ex.Message);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
@@ -583,7 +583,7 @@ public sealed class DockerCliContainerEngine(IProcessRunner processes, Func<stri
         {
             // An executable that no longer starts (permissions, a broken replacement) is an engine
             // outage like any other: the runner stays supervised and the command is retried.
-            throw new ContainerEngineException(ex.Message, kind: FaultKind.EngineMissing);
+            throw new ContainerEngineException(ex.Message);
         }
     }
 
@@ -596,7 +596,7 @@ public sealed class DockerCliContainerEngine(IProcessRunner processes, Func<stri
         }
         catch (ProcessStartException ex)
         {
-            throw new ContainerEngineException(ex.Message, kind: FaultKind.EngineMissing);
+            throw new ContainerEngineException(ex.Message);
         }
     }
 

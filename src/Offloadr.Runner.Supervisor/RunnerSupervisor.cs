@@ -2156,7 +2156,6 @@ public sealed class RunnerSupervisor : BackgroundService
     private static FaultKind KindOf(Exception failure) => failure switch
     {
         ContainerEngineException engine => engine.Kind,
-        ProcessStartException => FaultKind.EngineMissing,
         LaunchPlanRejectedException => FaultKind.KeyRejected,
         _ => FaultKind.Unknown,
     };

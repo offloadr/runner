@@ -19,12 +19,10 @@ public static class EngineFailureClassifier
 
     // The engine did not answer at all: these come before everything else, since its socket or pipe
     // being unavailable says nothing about images or GPUs.
-    // "connect: permission denied" is a socket refusing this account, Docker's or Podman's.
     private static readonly string[] Permission =
     [
         "permission denied while trying to connect to the docker daemon",
         "permission denied while trying to connect to the docker api",
-        "connect: permission denied",
     ];
 
     // "error during connect" covers Docker Desktop's pipe missing (not started) and a DOCKER_HOST that
@@ -95,9 +93,12 @@ public static class EngineFailureClassifier
             return FaultKind.DiskFull;
         }
 
-        // Windows says so of the named pipe when the account is not in docker-users.
+        // Windows says so of the named pipe when the account is not in docker-users; a Unix socket
+        // (Docker's or Podman's) says "dial unix …: connect: permission denied". A TCP connection
+        // refused the same way is a network policy, not the engine.
         if (Has(output, Permission) ||
-            (output.Contains("//./pipe/", StringComparison.Ordinal) && output.Contains("access is denied", StringComparison.OrdinalIgnoreCase)))
+            (output.Contains("//./pipe/", StringComparison.Ordinal) && output.Contains("access is denied", StringComparison.OrdinalIgnoreCase)) ||
+            (output.Contains("dial unix ", StringComparison.Ordinal) && output.Contains("connect: permission denied", StringComparison.OrdinalIgnoreCase)))
         {
             return FaultKind.EnginePermission;
         }
