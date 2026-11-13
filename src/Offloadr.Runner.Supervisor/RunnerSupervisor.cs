@@ -310,6 +310,22 @@ public sealed class RunnerSupervisor : BackgroundService
         return result;
     }
 
+    private async Task CheckGpuAccessInBackgroundAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await CheckGpuAccessAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // The app is closing.
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "The automatic GPU check failed.");
+        }
+    }
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _stopping = stoppingToken;
@@ -814,6 +830,14 @@ public sealed class RunnerSupervisor : BackgroundService
             usedSettings = settings;
             Set(SupervisorState.Checking, "Checking Docker and your settings…");
             var problems = settings.Validate();
+            if (!settings.HasRunnerKey)
+            {
+                // What a first start most likely lacks: named before any other problem, and before
+                // Docker is asked anything.
+                Fault(RunnerSettings.MissingKeyProblem, FaultKind.KeyMissing);
+                return;
+            }
+
             if (problems.Count > 0)
             {
                 Fault(problems[0], FaultKind.Settings);
@@ -968,7 +992,20 @@ public sealed class RunnerSupervisor : BackgroundService
                 Set(SupervisorState.Pulling, $"Downloading {template.Image}. The first download is large and can take a while.");
                 try
                 {
-                    await _engine.PullAsync(template.Image, line => AppendLog("pull: " + line), cancellationToken).ConfigureAwait(false);
+                    var progress = new PullProgressParser();
+                    Update(view => view with { PullProgress = progress.Current });
+                    await _engine.PullAsync(
+                        template.Image,
+                        line =>
+                        {
+                            AppendLog("pull: " + line);
+                            if (progress.Accept(line))
+                            {
+                                var current = progress.Current;
+                                Update(view => view.State == SupervisorState.Pulling ? view with { PullProgress = current } : view);
+                            }
+                        },
+                        cancellationToken).ConfigureAwait(false);
                 }
                 catch (ContainerEngineException ex)
                 {
@@ -1134,6 +1171,13 @@ public sealed class RunnerSupervisor : BackgroundService
                 Message = $"Running {template.Label}. It shows up as your personal runner in Offloadr.",
                 RunnerStatus = null,
             });
+
+            if (View.GpuAccess is null)
+            {
+                // The first runner of this app run fills in the GPU check the person would otherwise
+                // have to press, now that the image is here; it does not hold up the start.
+                _ = CheckGpuAccessInBackgroundAsync(stoppingToken);
+            }
         }
         catch (OperationCanceledException) when (!stoppingToken.IsCancellationRequested)
         {
@@ -2179,6 +2223,11 @@ public sealed class RunnerSupervisor : BackgroundService
             if (next.Fault is not null && next.State is not (SupervisorState.Faulted or SupervisorState.WaitingToRestart))
             {
                 next = next with { Fault = null };
+            }
+
+            if (next.PullProgress is not null && next.State != SupervisorState.Pulling)
+            {
+                next = next with { PullProgress = null };
             }
 
             Volatile.Write(ref _view, next);

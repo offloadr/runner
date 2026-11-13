@@ -43,7 +43,12 @@
                 }
             </MudAlert>
         }
-        @if (View.State is SupervisorState.Pulling or SupervisorState.Checking or SupervisorState.ResolvingPlan or SupervisorState.Starting or SupervisorState.Stopping)
+        @if (View.PullProgress is { Fraction: { } fraction } pull)
+        {
+            <MudProgressLinear Value="@(fraction * 100)" Color="Color.Primary" Class="mt-4" />
+            <MudText Typo="Typo.caption" Class="mud-text-secondary">@pull.Summary</MudText>
+        }
+        else if (View.State is SupervisorState.Pulling or SupervisorState.Checking or SupervisorState.ResolvingPlan or SupervisorState.Starting or SupervisorState.Stopping)
         {
             <MudProgressLinear Indeterminate="true" Color="Color.Primary" Class="mt-4" />
         }

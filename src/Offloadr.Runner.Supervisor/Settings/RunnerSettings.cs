@@ -34,6 +34,8 @@ public sealed record RunnerSettings
            origin.Scheme == Uri.UriSchemeHttps &&
            origin.PathAndQuery is "" or "/";
 
+    public const string MissingKeyProblem = "Add your personal runner key. Create one under Settings in the Offloadr web app.";
+
     /// <summary>Problems that prevent the runner from starting with these settings, in display order.</summary>
     public IReadOnlyList<string> Validate(Func<string, bool>? directoryExists = null)
     {
@@ -46,7 +48,7 @@ public sealed record RunnerSettings
 
         if (!HasRunnerKey)
         {
-            errors.Add("Add your personal runner key. Create one under Settings in the Offloadr web app.");
+            errors.Add(MissingKeyProblem);
         }
         else if (RunnerKey!.Trim().Any(char.IsWhiteSpace))
         {
