@@ -397,6 +397,50 @@ internal sealed class ModelDownloadService : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Frees the paths that local models are about to be linked at from the agent's own downloads of
+    /// them (see <see cref="DemandAwareModelHydrationCoordinator.ReleaseForLocalModelAsync"/>), and returns
+    /// the requests to project now: all of them but the local ones whose download is in use, which keeps
+    /// serving the editor until a later request finds it free.
+    /// </summary>
+    public async Task<IReadOnlyList<ModelDownloadRequest>> ReleaseForLocalModelsAsync(
+        IEnumerable<ModelDownloadRequest> downloads,
+        CancellationToken cancellationToken)
+    {
+        var requested = downloads.Where(static download => download is not null).ToArray();
+        if (_hydrationCoordinator is null)
+        {
+            return requested;
+        }
+
+        var inUse = new HashSet<string>(StringComparer.Ordinal);
+        var paths = requested
+            .Where(LocalModelProjector.IsLocalProjectionRequest)
+            .Select(static download => NormalizeDestination(download.DestinationPath))
+            .Where(static path => path is not null)
+            .Select(static path => path!)
+            .Distinct(StringComparer.Ordinal);
+        foreach (var path in paths)
+        {
+            if (await _hydrationCoordinator.ReleaseForLocalModelAsync(path, cancellationToken).ConfigureAwait(false) ==
+                LocalModelRelease.InUse)
+            {
+                RunnerLog.Info(
+                    nameof(ModelDownloadService),
+                    $"Keeping the downloaded copy at '{path}' while it is in use; the local model is linked there once it is free.");
+                inUse.Add(path);
+            }
+        }
+
+        return inUse.Count == 0
+            ? requested
+            : requested
+                .Where(download => !LocalModelProjector.IsLocalProjectionRequest(download) ||
+                                   NormalizeDestination(download.DestinationPath) is not { } path ||
+                                   !inUse.Contains(path))
+                .ToArray();
+    }
+
     private void ReportRefused(string sessionId, IReadOnlyCollection<ModelDownloadRequest> downloads)
     {
         var normalizedSessionId = string.IsNullOrWhiteSpace(sessionId) ? null : sessionId.Trim();

@@ -814,7 +814,7 @@ internal static partial class ServiceClientManager
         IReadOnlyList<string> supportedEditorTemplates,
         Func<LocalModelSnapshot>? localModelSnapshotProvider,
         Action<LocalModelSnapshot>? localModelSnapshotObserver,
-        Action<IEnumerable<ModelDownloadRequest>, bool>? localModelProjectionReconciler,
+        Func<IEnumerable<ModelDownloadRequest>, bool, CancellationToken, Task>? localModelProjectionReconciler,
         TimeSpan localModelsScanInterval,
         RuntimeIdentityRegistry runtimeIdentities,
         CancellationToken shutdown)
@@ -1225,7 +1225,7 @@ internal static partial class ServiceClientManager
         ArtifactUploadService artifactUploadService,
         WorkspaceMirrorService workspaceMirrorService,
         GpuPowerCommandExecutor gpuPowerLimitService,
-        Action<IEnumerable<ModelDownloadRequest>, bool>? localModelProjectionReconciler,
+        Func<IEnumerable<ModelDownloadRequest>, bool, CancellationToken, Task>? localModelProjectionReconciler,
         RunnerCommandWorkState commandWorkState,
         LogicalSessionState logicalSessionState,
         RuntimeIdentityRegistry runtimeIdentities,
@@ -2671,7 +2671,7 @@ internal static partial class ServiceClientManager
         ArtifactUploadService artifactUploadService,
         WorkspaceMirrorService workspaceMirrorService,
         ModelDownloadService downloadService,
-        Action<IEnumerable<ModelDownloadRequest>, bool>? localModelProjectionReconciler,
+        Func<IEnumerable<ModelDownloadRequest>, bool, CancellationToken, Task>? localModelProjectionReconciler,
         CancellationToken cancellationToken)
     {
         downloadService.SetActiveSession(command.SessionId);
@@ -2683,7 +2683,11 @@ internal static partial class ServiceClientManager
                     command.InitialModels,
                     command.EditorRuntimeKind,
                     sessionPaths);
-                localModelProjectionReconciler?.Invoke(initialModels, true);
+                if (localModelProjectionReconciler is not null)
+                {
+                    await localModelProjectionReconciler(initialModels, true, token).ConfigureAwait(false);
+                }
+
                 var remoteInitialModels = FilterRemoteDownloadRequests(initialModels);
 
                 await artifactUploadService.StartSessionAsync(command.SessionId, sessionPaths, token).ConfigureAwait(false);
@@ -3132,7 +3136,7 @@ internal static partial class ServiceClientManager
         Func<SubmitPromptCommand, Func<string, ReadOnlyMemory<byte>, CancellationToken, Task>?, Action, CancellationToken, Task<SessionProcessManager.PromptSubmissionResult>> submitPrompt,
         Action<string, string, string, string> mapPrompt,
         CancellationToken cancellationToken,
-        Action<IEnumerable<ModelDownloadRequest>, bool>? localModelProjectionReconciler = null,
+        Func<IEnumerable<ModelDownloadRequest>, bool, CancellationToken, Task>? localModelProjectionReconciler = null,
         Func<string, SessionProcessManager.SessionPaths?>? sessionPathsProvider = null,
         CancellationToken evidenceDeliveryCancellationToken = default,
         Action<string, string, SubmitPromptCommand>? unregisterUninvokedSubmission = null,
@@ -3274,7 +3278,11 @@ internal static partial class ServiceClientManager
                     prompt.Downloads,
                     prompt.EditorRuntimeKind,
                     sessionPathsProvider?.Invoke(prompt.SessionId));
-                localModelProjectionReconciler?.Invoke(downloads, false);
+                if (localModelProjectionReconciler is not null)
+                {
+                    await localModelProjectionReconciler(downloads, false, cancellationToken).ConfigureAwait(false);
+                }
+
                 var remoteDownloads = FilterRemoteDownloadRequests(downloads);
                 if (!string.IsNullOrWhiteSpace(prompt.EditorSid))
                 {

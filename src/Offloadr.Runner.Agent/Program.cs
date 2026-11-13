@@ -279,15 +279,17 @@ static async Task<int> RunAgentAsync()
             options.SupportedEditorTemplates,
             scanner is null ? null : () => scanner.Scan(),
             projector is null ? null : snapshot => projector.UpdateSnapshot(snapshot),
-            projector is null ? null : (downloads, replaceExisting) =>
+            projector is null ? null : async (downloads, replaceExisting, token) =>
             {
+                // A local model wins over the agent's own download of it at the same path.
+                var projected = await downloadService.ReleaseForLocalModelsAsync(downloads, token);
                 if (replaceExisting)
                 {
-                    projector.SetRequestedModels(downloads);
+                    projector.SetRequestedModels(projected);
                 }
                 else
                 {
-                    projector.AddRequestedModels(downloads);
+                    projector.AddRequestedModels(projected);
                 }
             },
             options.LocalModelsScanInterval,

@@ -30,6 +30,19 @@ public readonly record struct ModelHydrationOpenResult(
 
 public readonly record struct ModelHydrationEnsureResult(long TransferEpoch);
 
+/// <summary>What became of a downloaded model whose path a local model is to be linked at.</summary>
+public enum LocalModelRelease
+{
+    /// <summary>No download of the agent's is there; whatever is there was left alone.</summary>
+    NotManaged,
+
+    /// <summary>The download was stopped, forgotten and deleted; the path is free.</summary>
+    Released,
+
+    /// <summary>The editor has the downloaded copy open or a prompt waits for it, so it stays for now.</summary>
+    InUse,
+}
+
 public sealed class ModelHydrationIOException : IOException
 {
     public ModelHydrationIOException(
@@ -2289,52 +2302,8 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
                 }
 
                 record = currentRecord;
-
-                var handle = new ModelTransferHandle(record.Handle);
-                try
-                {
-                    await _backend.ForcePauseAsync(handle, cancellationToken).ConfigureAwait(false);
-                }
-                catch
-                {
-                    // The transfer may already be stopped or absent.
-                }
-
-                try
-                {
-                    await _backend.RemoveAsync(handle, cancellationToken).ConfigureAwait(false);
-                    changed = true;
-                }
-                catch (ModelTransferStatusUnavailableException)
-                {
-                    // Already absent.
-                }
-
-                if (record.PlaceholderOwned && !record.Complete)
-                {
-                    var destinationExists = LinuxFileIdentityReader.TryRead(
-                        record.DestinationPath,
-                        out var identity);
-                    var ownsDestination = destinationExists &&
-                        identity.DeviceId == record.DeviceId &&
-                        identity.Inode == record.Inode;
-                    if (ownsDestination)
-                    {
-                        File.Delete(record.DestinationPath);
-                    }
-
-                    var controlPath = $"{record.DestinationPath}.aria2";
-                    if ((ownsDestination || !destinationExists) && File.Exists(controlPath))
-                    {
-                        File.Delete(controlPath);
-                    }
-                }
-
-                if (!record.Complete)
-                {
-                    await _index.RemoveAsync(record.IdentityDigest, cancellationToken).ConfigureAwait(false);
-                    changed = true;
-                }
+                // Completed downloads stay: they are the persistent model cache.
+                changed |= await RemoveIndexedTransferAsync(record, deleteComplete: false, cancellationToken).ConfigureAwait(false);
 
                 lock (_sync)
                 {
@@ -2373,6 +2342,169 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
         if (changed)
         {
             await _backend.SaveSessionAsync(cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Stops one indexed transfer and removes it from aria2. An unfinished one is also forgotten, with
+    /// the file this coordinator created for it; <paramref name="deleteComplete"/> does the same for a
+    /// finished one. A file that is no longer the indexed one is never deleted. True when aria2's session
+    /// or the index changed.
+    /// </summary>
+    private async Task<bool> RemoveIndexedTransferAsync(
+        ModelTransferIndexRecord record,
+        bool deleteComplete,
+        CancellationToken cancellationToken)
+    {
+        var changed = false;
+        var handle = new ModelTransferHandle(record.Handle);
+        try
+        {
+            await _backend.ForcePauseAsync(handle, cancellationToken).ConfigureAwait(false);
+        }
+        catch
+        {
+            // The transfer may already be stopped or absent.
+        }
+
+        try
+        {
+            await _backend.RemoveAsync(handle, cancellationToken).ConfigureAwait(false);
+            changed = true;
+        }
+        catch (ModelTransferStatusUnavailableException)
+        {
+            // Already absent.
+        }
+
+        var forget = deleteComplete || !record.Complete;
+        if (record.PlaceholderOwned && forget)
+        {
+            DeleteOwnedDestination(record.DestinationPath, record.DeviceId, record.Inode);
+        }
+
+        if (forget)
+        {
+            await _index.RemoveAsync(record.IdentityDigest, cancellationToken).ConfigureAwait(false);
+            changed = true;
+        }
+
+        return changed;
+    }
+
+    /// <summary>Deletes the file at <paramref name="path"/> if it is still the given one, and its aria2 control file.</summary>
+    private static void DeleteOwnedDestination(string path, ulong deviceId, ulong inode)
+    {
+        var destinationExists = LinuxFileIdentityReader.TryRead(path, out var identity);
+        var ownsDestination = destinationExists && identity.DeviceId == deviceId && identity.Inode == inode;
+        if (ownsDestination)
+        {
+            File.Delete(path);
+        }
+
+        var controlPath = $"{path}.aria2";
+        if ((ownsDestination || !destinationExists) && File.Exists(controlPath))
+        {
+            File.Delete(controlPath);
+        }
+    }
+
+    /// <summary>
+    /// Gives <paramref name="path"/> up to a local model that is to be linked there instead: stops its
+    /// transfer, forgets it and deletes the file this coordinator downloaded for it, finished or not, so
+    /// the model is not kept twice. A model the editor has open or a prompt waits for is left as it is;
+    /// a file this coordinator did not create is never touched.
+    /// </summary>
+    public async Task<LocalModelRelease> ReleaseForLocalModelAsync(string path, CancellationToken cancellationToken)
+    {
+        var normalized = NormalizePath(path);
+        if (!IsRangeManaged(normalized))
+        {
+            return LocalModelRelease.NotManaged;
+        }
+
+        await _registrationCleanupGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            TransferState? state;
+            lock (_sync)
+            {
+                _states.TryGetValue(normalized, out state);
+                if (state is not null)
+                {
+                    if (state.DescriptorLeaseCount > 0 || state.OpenReservationCount > 0 || state.PromptWaiters.Count > 0)
+                    {
+                        return LocalModelRelease.InUse;
+                    }
+
+                    // Opens are refused from here until the state is gone.
+                    state.PendingOrphanCleanup = true;
+                }
+            }
+
+            var records = _index.Snapshot()
+                .Where(record => string.Equals(NormalizePath(record.DestinationPath), normalized, StringComparison.Ordinal))
+                .ToArray();
+            if (state is null && records.Length == 0)
+            {
+                return LocalModelRelease.NotManaged;
+            }
+
+            var changed = false;
+            foreach (var record in records)
+            {
+                changed |= await RemoveIndexedTransferAsync(record, deleteComplete: true, cancellationToken).ConfigureAwait(false);
+            }
+
+            if (state is not null && records.Length == 0)
+            {
+                // Registered, but its transfer was never recorded: only the placeholder may exist.
+                if (state.Handle is { } handle)
+                {
+                    try
+                    {
+                        await _backend.RemoveAsync(handle, cancellationToken).ConfigureAwait(false);
+                        changed = true;
+                    }
+                    catch (ModelTransferStatusUnavailableException)
+                    {
+                        // Already absent.
+                    }
+                }
+
+                if (state.PlaceholderOwned)
+                {
+                    DeleteOwnedDestination(normalized, state.DeviceId, state.Inode);
+                }
+            }
+
+            lock (_sync)
+            {
+                if (state is not null &&
+                    _states.TryGetValue(normalized, out var current) &&
+                    ReferenceEquals(current, state))
+                {
+                    _states.Remove(normalized);
+                }
+            }
+
+            if (changed)
+            {
+                await _backend.SaveSessionAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            if (!IsPathConfirmedAbsent(normalized))
+            {
+                return LocalModelRelease.NotManaged;
+            }
+
+            RunnerLog.Info<DemandAwareModelHydrationCoordinator>(
+                $"Removed the downloaded copy at '{normalized}': the same model is linked from the local models folder.");
+            return LocalModelRelease.Released;
+        }
+        finally
+        {
+            _registrationCleanupGate.Release();
         }
     }
 
