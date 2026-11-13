@@ -112,7 +112,7 @@ internal sealed class FakeContainerEngine : IContainerEngine
 
         if (PullFails)
         {
-            throw new ContainerEngineException($"Could not pull {image}.", "registry unreachable");
+            throw new ContainerEngineException($"Could not pull {image}.", PullFailureOutput, EngineOperation.Pull);
         }
 
         lock (_gate)
@@ -120,6 +120,9 @@ internal sealed class FakeContainerEngine : IContainerEngine
             _images.Add(image);
         }
     }
+
+    /// <summary>What a failing pull prints last.</summary>
+    public string PullFailureOutput { get; set; } = "registry unreachable";
 
     /// <summary>Thrown by InspectImageAsync, as when Docker is not installed.</summary>
     public Exception? InspectImageFailure { get; set; }

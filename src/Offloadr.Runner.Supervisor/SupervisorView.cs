@@ -37,6 +37,12 @@ public sealed record SupervisorView(
     int Restarts,
     DateTimeOffset UpdatedUtc)
 {
+    /// <summary>
+    /// Why the runner needs attention (<see cref="SupervisorState.Faulted"/>) or why an automatic
+    /// restart is waiting; null in every other state.
+    /// </summary>
+    public SupervisorFault? Fault { get; init; }
+
     public static SupervisorView Initial(DateTimeOffset now)
         => new(SupervisorState.Stopped, "The runner is stopped.", null, null, null, null, null, null, null, 0, now);
 

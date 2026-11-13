@@ -318,7 +318,7 @@ public sealed class RunnerSupervisor : BackgroundService
         {
             // Another copy manages the runner (or the lock cannot even be taken); this one must
             // neither adopt, restart nor remove it.
-            Fault(lockProblem!);
+            Fault(lockProblem!, _instanceLock.HeldElsewhere ? FaultKind.AnotherCopy : FaultKind.Unknown);
             return;
         }
 
@@ -334,7 +334,7 @@ public sealed class RunnerSupervisor : BackgroundService
                 // Docker may still be starting (at sign-in, say). The loop must run anyway, so
                 // Start, Stop and Refresh keep working; a start probes Docker again.
                 _logger.LogError(ex, "Runner supervisor startup check failed.");
-                Fault(ex is ContainerEngineException ? ex.Message : $"Unexpected error: {ex.Message}");
+                Fault(ex is ContainerEngineException ? ex.Message : $"Unexpected error: {ex.Message}", KindOf(ex));
                 if (_settings.Current.AutoStart)
                 {
                     RequestAutoStart();
@@ -351,7 +351,7 @@ public sealed class RunnerSupervisor : BackgroundService
                 catch (Exception ex) when (ex is not OperationCanceledException || !stoppingToken.IsCancellationRequested)
                 {
                     _logger.LogError(ex, "Runner supervision step failed.");
-                    Fault(ex is ContainerEngineException ? ex.Message : $"Unexpected error: {ex.Message}");
+                    Fault(ex is ContainerEngineException ? ex.Message : $"Unexpected error: {ex.Message}", KindOf(ex));
                 }
             }
         }
@@ -376,7 +376,7 @@ public sealed class RunnerSupervisor : BackgroundService
             case RememberedRunner.Unreachable:
                 // Nothing is started on another engine while the runner may still run on this one;
                 // an automatic start keeps checking it, and Start overrides the hint.
-                Fault($"{UnreachableEngineMessage()} Start it, or press Start to run the runner on the engine in Settings.");
+                Fault($"{UnreachableEngineMessage()} Start it, or press Start to run the runner on the engine in Settings.", FaultKind.EngineUnreachable);
                 if (_settings.Current.AutoStart)
                 {
                     RequestAutoStart();
@@ -816,7 +816,7 @@ public sealed class RunnerSupervisor : BackgroundService
             var problems = settings.Validate();
             if (problems.Count > 0)
             {
-                Fault(problems[0]);
+                Fault(problems[0], FaultKind.Settings);
                 return;
             }
 
@@ -827,7 +827,7 @@ public sealed class RunnerSupervisor : BackgroundService
                     case RememberedRunner.Adopted:
                         return;
                     case RememberedRunner.Unreachable when automatic:
-                        FailStart($"{UnreachableEngineMessage()} Press Start to run the runner on the engine in Settings instead.", automatic);
+                        FailStart($"{UnreachableEngineMessage()} Press Start to run the runner on the engine in Settings instead.", automatic, FaultKind.EngineUnreachable);
                         return;
                     case RememberedRunner.Unreachable:
                         // The person pressed Start: run on the engine Settings name.
@@ -874,7 +874,7 @@ public sealed class RunnerSupervisor : BackgroundService
             Update(view => view with { Engine = engine });
             if (!engine.Available)
             {
-                FailStart(engine.Error ?? "Docker is not available.", automatic);
+                FailStart(engine.Error ?? "Docker is not available.", automatic, engine.ErrorKind);
                 return;
             }
 
@@ -958,7 +958,7 @@ public sealed class RunnerSupervisor : BackgroundService
             Update(view => view with { Plan = plan ?? view.Plan, ActiveTemplate = template });
             if (template is null)
             {
-                Fault("No runner image is available for your editor.");
+                Fault("No runner image is available for your editor.", FaultKind.NoImageForEditor);
                 return;
             }
 
@@ -994,7 +994,7 @@ public sealed class RunnerSupervisor : BackgroundService
             {
                 if (image is null)
                 {
-                    FailStart(pullFailure.Message, automatic);
+                    FailStart(pullFailure, automatic);
                     return;
                 }
 
@@ -1035,7 +1035,7 @@ public sealed class RunnerSupervisor : BackgroundService
                 var changedProblems = current.Validate();
                 if (changedProblems.Count > 0)
                 {
-                    Fault(changedProblems[0]);
+                    Fault(changedProblems[0], FaultKind.Settings);
                     return;
                 }
 
@@ -1047,7 +1047,7 @@ public sealed class RunnerSupervisor : BackgroundService
 
             if (ModelsFolderProblem(settings, _engineSelection.Pin) is { } modelsProblem)
             {
-                Fault(modelsProblem);
+                Fault(modelsProblem, FaultKind.Settings);
                 return;
             }
 
@@ -1142,7 +1142,7 @@ public sealed class RunnerSupervisor : BackgroundService
         }
         catch (Exception ex) when (ex is ContainerEngineException or ProcessStartException)
         {
-            FailStart(ex.Message, automatic);
+            FailStart(ex, automatic);
         }
         catch (LaunchPlanRejectedException ex)
         {
@@ -1150,11 +1150,11 @@ public sealed class RunnerSupervisor : BackgroundService
             if (automatic && _lastLaunchSettings is { } lastLaunch && !IsRejected(lastLaunch))
             {
                 // The next attempt restarts with the key the runner last ran with.
-                FailStart(ex.Message, automatic);
+                FailStart(ex, automatic);
             }
             else
             {
-                Fault(ex.Message);
+                Fault(ex.Message, FaultKind.KeyRejected);
             }
         }
         finally
@@ -1213,6 +1213,7 @@ public sealed class RunnerSupervisor : BackgroundService
             {
                 State = SupervisorState.WaitingToRestart,
                 Message = $"The runner stopped{exit}. Restarting in {delay.TotalSeconds:0} seconds.",
+                Fault = null,
                 RunnerStatus = null,
                 Restarts = view.Restarts + 1,
             });
@@ -1651,7 +1652,7 @@ public sealed class RunnerSupervisor : BackgroundService
         }
         catch (ContainerEngineException ex)
         {
-            Fault(ex.Message);
+            Fault(ex.Message, ex.Kind);
             return;
         }
 
@@ -1999,7 +2000,8 @@ public sealed class RunnerSupervisor : BackgroundService
     private void FaultNameTaken(ContainerInfo? container = null)
         => Fault(container is not null && IsManaged(container) && !IsOwned(container)
             ? $"The runner container '{_options.ContainerName}' belongs to another copy of this app (another user account, or another computer using the same container engine). Stop it there, then start again."
-            : $"A container named '{_options.ContainerName}' already exists and was not started by this app. Remove or rename it, then start again.");
+            : $"A container named '{_options.ContainerName}' already exists and was not started by this app. Remove or rename it, then start again.",
+            FaultKind.NameTaken);
 
     /// <summary>The last line `docker run --detach` printed (the ID), or null when there is none.</summary>
     private static string? NormalizeContainerId(string? output)
@@ -2128,35 +2130,58 @@ public sealed class RunnerSupervisor : BackgroundService
         => Update(view => view with { State = state, Message = message });
 
     /// <summary>Faults a start the person asked for; schedules another attempt for an automatic one.</summary>
-    private void FailStart(string message, bool automatic)
+    private void FailStart(string message, bool automatic, FaultKind kind = FaultKind.Unknown)
     {
         if (!automatic)
         {
-            Fault(message);
+            Fault(message, kind);
             return;
         }
 
         var delay = RegistrationPolicy.ComputeBackoff(_restartAttempt++, _options.RestartMinBackoff, _options.RestartMaxBackoff);
         _restartDueAt = Now() + delay;
-        _logger.LogWarning("Runner restart failed: {Message}", message);
+        _logger.LogWarning("Runner restart failed ({Kind}): {Message}", kind, message);
         AppendLog($"supervisor: {message} Trying again in {delay.TotalSeconds:0} s.");
-        Set(SupervisorState.WaitingToRestart, $"{message} Trying again in {delay.TotalSeconds:0} seconds.");
+        Update(view => view with
+        {
+            State = SupervisorState.WaitingToRestart,
+            Message = $"{message} Trying again in {delay.TotalSeconds:0} seconds.",
+            Fault = SupervisorFault.For(kind, message, view.Engine?.Kind ?? ContainerEngineKind.Docker),
+        });
     }
 
-    private void Fault(string message)
+    /// <summary>A start that failed on the engine; the exception says what kind of failure it was.</summary>
+    private void FailStart(Exception failure, bool automatic) => FailStart(failure.Message, automatic, KindOf(failure));
+
+    private static FaultKind KindOf(Exception failure) => failure switch
+    {
+        ContainerEngineException engine => engine.Kind,
+        LaunchPlanRejectedException => FaultKind.KeyRejected,
+        _ => FaultKind.Unknown,
+    };
+
+    private void Fault(string message, FaultKind kind = FaultKind.Unknown)
     {
         // Needs attention: nothing runs or restarts it until the person starts it again.
         Volatile.Write(ref _runnerWanted, false);
-        _logger.LogWarning("Runner supervisor fault: {Message}", message);
+        _logger.LogWarning("Runner supervisor fault ({Kind}): {Message}", kind, message);
         AppendLog("supervisor: " + message);
-        Set(SupervisorState.Faulted, message);
+        Update(view => view with { State = SupervisorState.Faulted, Message = message, Fault = SupervisorFault.For(kind, message, view.Engine?.Kind ?? ContainerEngineKind.Docker) });
     }
 
     private void Update(Func<SupervisorView, SupervisorView> change)
     {
         lock (_gate)
         {
-            Volatile.Write(ref _view, change(_view) with { UpdatedUtc = _time.GetUtcNow() });
+            var next = change(_view) with { UpdatedUtc = _time.GetUtcNow() };
+
+            // A fault explains only the state it belongs to; once the runner moves on it is gone.
+            if (next.Fault is not null && next.State is not (SupervisorState.Faulted or SupervisorState.WaitingToRestart))
+            {
+                next = next with { Fault = null };
+            }
+
+            Volatile.Write(ref _view, next);
         }
 
         RaiseChanged();

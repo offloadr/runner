@@ -12,7 +12,7 @@
                 <MudIcon Icon="@StateIcon" Color="@StateColor" Size="Size.Large" />
                 <div>
                     <MudText Typo="Typo.h5" HtmlTag="h1">@View.StateTitle</MudText>
-                    <MudText Typo="Typo.body2" Class="mud-text-secondary">@View.Message</MudText>
+                    <MudText Typo="Typo.body2" Class="mud-text-secondary">@(View is { State: SupervisorState.Faulted, Fault: { } fault } ? fault.Title : View.Message)</MudText>
                 </div>
             </MudStack>
             @if (View.IsActive || View.State == SupervisorState.Stopping)
@@ -26,6 +26,23 @@
                            OnClick="Supervisor.RequestStart">Start runner</MudButton>
             }
         </MudStack>
+        @if (View.Fault is { } problem)
+        {
+            <MudAlert Severity="@(View.State == SupervisorState.Faulted ? Severity.Error : Severity.Warning)" Class="mt-4">
+                @if (View.State != SupervisorState.Faulted)
+                {
+                    <MudText Typo="Typo.subtitle2">@problem.Title</MudText>
+                }
+                <MudText Typo="Typo.body2">@problem.Message</MudText>
+                @if (problem.Detail is { } detail)
+                {
+                    <details class="mt-2">
+                        <summary>Details</summary>
+                        <pre class="runner-log runner-fault-detail mt-1">@detail</pre>
+                    </details>
+                }
+            </MudAlert>
+        }
         @if (View.State is SupervisorState.Pulling or SupervisorState.Checking or SupervisorState.ResolvingPlan or SupervisorState.Starting or SupervisorState.Stopping)
         {
             <MudProgressLinear Indeterminate="true" Color="Color.Primary" Class="mt-4" />
