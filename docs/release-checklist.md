@@ -58,6 +58,18 @@ This section checks the app itself, whichever image it runs. That image is the o
 9. Open the app again from the same window, start the runner, and end the app from Task Manager. Started again from that window, the app reconnects to the running container instead of starting a second one. Then choose Quit from the tray menu, so no test runner keeps running with the shared key.
 10. Starting at sign-in is offered only without `OFFLOADR_RUNNER_DATA_DIRECTORY`, so a test build cannot take over your own sign-in entry. Check it in a separate Windows account kept for testing, whose app settings and sign-in entries are its own, not in yours: there, start the app normally with the test environment's address and key, turn on starting at sign-in, sign out and back in: the app opens in the notification area. Turn it off under Startup apps in Task Manager: the switch in Settings shows it off. Turn the switch on and save: Task Manager shows the app enabled again. Turn it off and save: Startup apps no longer lists the app. Quit the app.
 
+## Signing the desktop app
+
+The `Release desktop app` workflow signs the installer and the app's own files with [Azure Artifact Signing](https://learn.microsoft.com/azure/artifact-signing/) when it is configured, and publishes an unsigned release, saying so in its notes, when it is not. Its `Check the signatures` step fails a signed release with any unsigned file, and an unsigned one with any signed file, and lists every file and its signer in the run summary. Signing needs no stored secret: the job signs in to Azure with GitHub's OpenID Connect token.
+
+To set it up once:
+
+1. In Azure, create an Artifact Signing account and a public-trust certificate profile, which needs the organisation's identity validation. The certificate's subject is the publisher Windows shows.
+2. In Microsoft Entra ID, register an application, give it the *Artifact Signing Certificate Profile Signer* role on the certificate profile, and add a federated credential for GitHub Actions with audience `api://AzureADTokenExchange`, entity type *Environment* and environment `release`. The subject must be exactly what this repository's tokens carry; repositories created after 15 July 2026 use GitHub's immutable format with owner and repository IDs. If unsure, read the `sub` claim of one run with [actions-oidc-debugger](https://github.com/github/actions-oidc-debugger).
+3. In the repository's `release` environment (created by the first release run, or under Settings > Environments), add the variables `AZURE_CLIENT_ID`, `AZURE_TENANT_ID` and `AZURE_SUBSCRIPTION_ID` from the application, and `ARTIFACT_SIGNING_ENDPOINT` (such as `https://weu.codesigning.azure.net/`), `ARTIFACT_SIGNING_ACCOUNT` and `ARTIFACT_SIGNING_PROFILE`. Optionally add `ARTIFACT_SIGNING_SUBJECT`, part of the certificate subject such as the organisation name, which the check then also requires. Required reviewers on the environment make each release wait for an approval before it signs.
+
+To sign or check locally, sign in with `az login`, write the same three values to a `metadata.json` (`Endpoint`, `CodeSigningAccountName`, `CertificateProfileName`) and run `build/publish-windows.ps1 -Pack -AzureTrustedSignFile metadata.json`, then `build/verify-windows-signatures.ps1 -ReleasesDir artifacts/releases/windows-win-x64 -Expect Signed`.
+
 ## 3. Automated checks worth running here
 
 Two opt-in tests need a real Docker engine or a real control plane, which CI does not have.

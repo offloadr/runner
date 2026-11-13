@@ -3,11 +3,16 @@
 # -Pack turns it into an installer and update packages in artifacts/releases/windows-<runtime>
 # (Velopack; the vpk tool comes from dotnet-tools.json). -PreviousReleasesFrom fetches the latest
 # published release from that GitHub repository first, so the packages include a delta from it.
+# -NoPublish packs a folder published earlier (a release signs and packs the folder CI built).
+# -AzureTrustedSignFile signs the app and installer with Azure Artifact Signing: the path of its
+# metadata.json, with an Azure sign-in already in place (az login, or azure/login in a workflow).
 param(
     [string]$Version = $(if ($env:OFFLOADR_RUNNER_VERSION) { $env:OFFLOADR_RUNNER_VERSION } else { '0.1.0' }),
     [ValidateSet('win-x64', 'win-arm64')][string]$Runtime = 'win-x64',
     [switch]$Pack,
-    [string]$PreviousReleasesFrom
+    [switch]$NoPublish,
+    [string]$PreviousReleasesFrom,
+    [string]$AzureTrustedSignFile
 )
 $ErrorActionPreference = 'Stop'
 if (-not $IsWindows) { throw 'Windows publishing requires Windows and the maui-windows workload.' }
@@ -17,24 +22,29 @@ $publishDir = Join-Path $repository "artifacts/packages/windows-$Runtime"
 $releasesDir = Join-Path $repository "artifacts/releases/windows-$Runtime"
 $packId = 'app.offloadr.runner'
 
-# Start from an empty folder: anything left from an earlier run (such as a browser profile from
-# starting the published app) would otherwise ship in the installer.
-if (Test-Path $publishDir) { Remove-Item $publishDir -Recurse -Force }
+if ($NoPublish) {
+    if (-not (Test-Path (Join-Path $publishDir 'OffloadrRunner.exe'))) { throw "There is no published app in $publishDir to pack." }
+}
+else {
+    # Start from an empty folder: anything left from an earlier run (such as a browser profile from
+    # starting the published app) would otherwise ship in the installer.
+    if (Test-Path $publishDir) { Remove-Item $publishDir -Recurse -Force }
 
-dotnet publish (Join-Path $repository 'src/Offloadr.Runner.Desktop/Offloadr.Runner.Desktop.csproj') `
-    -c Release `
-    -f net10.0-windows10.0.19041.0 `
-    "-p:RuntimeIdentifierOverride=$Runtime" `
-    "-p:VersionPrefix=$Version" `
-    -p:SelfContained=true `
-    -p:WindowsAppSDKSelfContained=true `
-    -p:WindowsPackageType=None `
-    -o $publishDir
-if ($LASTEXITCODE) { throw 'Windows publish failed.' }
+    dotnet publish (Join-Path $repository 'src/Offloadr.Runner.Desktop/Offloadr.Runner.Desktop.csproj') `
+        -c Release `
+        -f net10.0-windows10.0.19041.0 `
+        "-p:RuntimeIdentifierOverride=$Runtime" `
+        "-p:VersionPrefix=$Version" `
+        -p:SelfContained=true `
+        -p:WindowsAppSDKSelfContained=true `
+        -p:WindowsPackageType=None `
+        -o $publishDir
+    if ($LASTEXITCODE) { throw 'Windows publish failed.' }
 
-# The app's licence and the notices of what it bundles travel with it.
-Copy-Item (Join-Path $repository 'LICENSE') (Join-Path $publishDir 'LICENSE.txt')
-Copy-Item (Join-Path $repository 'THIRD-PARTY-NOTICES.md') (Join-Path $publishDir 'THIRD-PARTY-NOTICES.md')
+    # The app's licence and the notices of what it bundles travel with it.
+    Copy-Item (Join-Path $repository 'LICENSE') (Join-Path $publishDir 'LICENSE.txt')
+    Copy-Item (Join-Path $repository 'THIRD-PARTY-NOTICES.md') (Join-Path $publishDir 'THIRD-PARTY-NOTICES.md')
+}
 
 if (-not $Pack) { return }
 
@@ -53,7 +63,10 @@ try {
         if ($LASTEXITCODE) { Write-Warning 'No earlier release was downloaded, so no delta package is made.' }
     }
 
-    dotnet vpk pack `
+    $signing = @()
+    if ($AzureTrustedSignFile) { $signing = @('--azureTrustedSignFile', [IO.Path]::GetFullPath($AzureTrustedSignFile)) }
+
+    dotnet vpk pack @signing `
         --packId $packId `
         --packVersion $Version `
         --packDir $publishDir `
