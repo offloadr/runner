@@ -19,8 +19,8 @@
     <!-- User interface and desktop host -->
     <PackageVersion Include="Microsoft.AspNetCore.Components.Web" Version="10.0.13" />
     <PackageVersion Include="Microsoft.AspNetCore.DataProtection" Version="10.0.13" />
-    <PackageVersion Include="Microsoft.AspNetCore.Components.WebView.Maui" Version="10.0.20" />
-    <PackageVersion Include="Microsoft.Maui.Controls" Version="10.0.20" />
+    <PackageVersion Include="Microsoft.AspNetCore.Components.WebView.Maui" Version="10.0.130" />
+    <PackageVersion Include="Microsoft.Maui.Controls" Version="11.0.10" />
     <PackageVersion Include="MudBlazor" Version="9.9.0" />
     <PackageVersion Include="System.Drawing.Common" Version="10.0.13" />
     <!-- Testing -->
