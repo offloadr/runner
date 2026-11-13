@@ -28,6 +28,9 @@ public sealed record SupervisorPaths
     /// <summary>The engine the running container was started on, kept across a crash.</summary>
     public string EngineState => Path.Combine(Data, "engine.json");
 
+    /// <summary>Present while the app restarts to update with the runner wanted (see <see cref="Hosting.UpdateHandoff"/>).</summary>
+    public string ResumeAfterUpdate => Path.Combine(Data, "resume-after-update");
+
     /// <summary>%LOCALAPPDATA%\OffloadrRunner on Windows, ~/.local/share/OffloadrRunner on Linux.</summary>
     public static SupervisorPaths UserDefault()
         => new(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "OffloadrRunner"));

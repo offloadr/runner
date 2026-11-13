@@ -2299,6 +2299,44 @@ public class RunnerSupervisorTests
     }
 
     [Test]
+    public async Task ResumeAfterUpdate_WhenTheRunnerExitedDuringTheRestart_StartsItAgain()
+    {
+        // The previous version restarted to update just as its runner exited: nothing to reconnect to.
+        _engine.AddContainer(Name, "image", running: false, new Dictionary<string, string>
+        {
+            [RunnerSupervisor.ManagedLabel] = "true",
+            [RunnerSupervisor.OwnerLabel] = SupervisorOwner.Default.Id,
+        });
+
+        var supervisor = await StartSupervisorAsync();
+        supervisor.ResumeAfterUpdate();
+
+        await WaitForStateAsync(SupervisorState.Running);
+        Assert.That(_engine.Runs, Has.Count.EqualTo(1));
+    }
+
+    [Test]
+    public async Task ResumeAfterUpdate_WhenStartupReconnected_StartsNoSecondRunner()
+    {
+        var template = BuiltInLaunchPlanCatalog.Plan().Find(_settings.Current.SelectedEditorTemplate ?? "comfyui-latest")
+            ?? BuiltInLaunchPlanCatalog.Plan().Templates[0];
+        var earlier = new RunnerSupervisor(_settings, _engine, _plans, new FakeHostGpuProbe(), new SupervisorOptions(), TimeProvider.System, NullLogger<RunnerSupervisor>.Instance);
+        var spec = earlier.BuildSpec(_settings.Current, template);
+        _engine.AddContainer(Name, spec.Image, running: true, spec.Labels);
+
+        var supervisor = await StartSupervisorAsync();
+        supervisor.ResumeAfterUpdate();
+        await WaitForStateAsync(SupervisorState.Running);
+        await Task.Delay(200);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(_engine.Runs, Is.Empty);
+            Assert.That(supervisor.View.Message, Does.Contain("Reconnected"));
+        });
+    }
+
+    [Test]
     public async Task Logs_HideTheRunnerKey()
     {
         _engine.LogLine = $"echo {Key}";

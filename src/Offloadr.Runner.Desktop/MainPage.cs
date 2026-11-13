@@ -19,16 +19,18 @@ public sealed class MainPage : ContentPage
     private readonly RunnerSupervisor _supervisor;
     private readonly AppUpdateService _updates;
     private readonly ILogger<MainPage> _logger;
+    private readonly SupervisorPaths _paths;
     private readonly BlazorWebView _webView;
     private readonly TaskCompletionSource<bool> _started = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private bool _loaded;
     private bool _closing;
 
-    public MainPage(DesktopRuntime runtime, RunnerSupervisor supervisor, AppUpdateService updates, ILogger<MainPage> logger)
+    public MainPage(DesktopRuntime runtime, RunnerSupervisor supervisor, AppUpdateService updates, SupervisorPaths paths, ILogger<MainPage> logger)
     {
         _runtime = runtime;
         _supervisor = supervisor;
         _updates = updates;
+        _paths = paths;
         _logger = logger;
         _webView = new BlazorWebView { HostPage = "wwwroot/index.html" };
         _webView.RootComponents.Add(new RootComponent { Selector = "#app", ComponentType = typeof(Offloadr.Runner.UI.Components.Routes) });
@@ -62,6 +64,12 @@ public sealed class MainPage : ContentPage
         try
         {
             await _runtime.StartAsync();
+            if (UpdateHandoff.TakeResume(_paths))
+            {
+                // Just updated with the runner wanted: start it unless startup reconnected to it.
+                _supervisor.ResumeAfterUpdate();
+            }
+
             Content = _webView;
             _started.TrySetResult(true);
         }
@@ -108,7 +116,12 @@ public sealed class MainPage : ContentPage
             _updates.ApplyAfterExit(restart: true, []);
             Content = new Label { Text = "Restarting to install the update…", Margin = 32 };
             _supervisor.KeepRunnerOnShutdown();
+
+            // The runner may exit, or start waiting to restart, until the supervisor has stopped;
+            // the new version then has nothing to reconnect to, so it is told the runner is wanted.
+            var wanted = _supervisor.View;
             await _runtime.StopAsync();
+            UpdateHandoff.Save(_paths, wanted.IsActive ? wanted : _supervisor.View);
             CanClose = true;
             Application.Current?.CloseWindow(Window);
         }

@@ -1750,6 +1750,13 @@ public sealed class RunnerSupervisor : BackgroundService
     /// </summary>
     public void KeepRunnerOnShutdown() => Volatile.Write(ref _keepRunnerOnShutdown, true);
 
+    /// <summary>
+    /// Starts the runner after an update when the previous version wanted it, unless startup
+    /// reconnected to one: startup runs before this request, which does nothing while a runner is
+    /// active. Like starting with the app, Docker trouble is retried with the restart backoff.
+    /// </summary>
+    public void ResumeAfterUpdate() => RequestAutoStart();
+
     private bool _keepRunnerOnShutdown;
 
     private async Task ShutdownAsync()
