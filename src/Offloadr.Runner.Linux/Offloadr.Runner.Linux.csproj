@@ -21,6 +21,8 @@
     <PackageReference Include="Google.Protobuf" />
     <PackageReference Include="Grpc.Core.Api" />
     <PackageReference Include="Grpc.Net.Client" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" />
+    <PackageReference Include="Microsoft.Extensions.Logging" />
     <InternalsVisibleTo Include="RunnerAgent" />
     <InternalsVisibleTo Include="Offloadr.Runner.Tests" />
   </ItemGroup>
