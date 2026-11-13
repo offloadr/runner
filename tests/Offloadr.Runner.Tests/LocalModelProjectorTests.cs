@@ -114,6 +114,54 @@ public class LocalModelProjectorTests
     }
 
     [Test]
+    public void SetRequestedModels_LinksEveryModelItCanWhenOneIsRefused()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var sourceRoot = Path.Combine(root, "local");
+            var destinationRoot = Path.Combine(root, "models");
+            Directory.CreateDirectory(Path.Combine(sourceRoot, "checkpoints"));
+            Directory.CreateDirectory(Path.Combine(sourceRoot, "loras"));
+            var refusedSource = Path.Combine(sourceRoot, "checkpoints", "refused.safetensors");
+            var linkedSource = Path.Combine(sourceRoot, "loras", "linked.safetensors");
+            File.WriteAllText(refusedSource, "checkpoint");
+            File.WriteAllText(linkedSource, "lora");
+
+            // The first target is behind a linked directory; the second one's download was already given up.
+            var outside = Path.Combine(root, "outside");
+            Directory.CreateDirectory(outside);
+            Directory.CreateDirectory(destinationRoot);
+            Directory.CreateSymbolicLink(Path.Combine(destinationRoot, "checkpoints"), outside);
+            var refused = Path.Combine(destinationRoot, "checkpoints", "refused.safetensors");
+            var linked = Path.Combine(destinationRoot, "loras", "linked.safetensors");
+
+            var projector = new LocalModelProjector(sourceRoot, destinationRoot);
+            projector.UpdateSnapshot(CreateSnapshot(
+                CreateModel(refusedSource, ModelCategory.Checkpoint),
+                CreateModel(linkedSource, ModelCategory.Lora)));
+
+            Assert.That(
+                () => projector.SetRequestedModels(
+                [
+                    CreateLocalProjectionRequest(refusedSource, ModelCategory.Checkpoint, refused),
+                    CreateLocalProjectionRequest(linkedSource, ModelCategory.Lora, linked),
+                ]),
+                Throws.InvalidOperationException,
+                "The refused one is still reported.");
+            Assert.Multiple(() =>
+            {
+                Assert.That(new FileInfo(linked).LinkTarget, Is.EqualTo(linkedSource), "The other model is linked all the same.");
+                Assert.That(Directory.EnumerateFileSystemEntries(outside), Is.Empty);
+            });
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
     public void SetRequestedModels_DoesNotRemoveLinksThroughSymlinkedDirectory()
     {
         var root = CreateTempDirectory();

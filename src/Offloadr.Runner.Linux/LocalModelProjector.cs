@@ -353,7 +353,16 @@ internal sealed class LocalModelProjector
                 continue;
             }
 
-            EnsureProjectedLink(sourcePath!, targetPath);
+            try
+            {
+                EnsureProjectedLink(sourcePath!, targetPath);
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or IOException or UnauthorizedAccessException)
+            {
+                // The other models are still linked: a download may already have been given up for one of
+                // them. The first failure is reported once they are done.
+                failure ??= ex as InvalidOperationException ?? new InvalidOperationException(ex.Message, ex);
+            }
         }
 
         foreach (var stale in _managedTargets.ToArray())
