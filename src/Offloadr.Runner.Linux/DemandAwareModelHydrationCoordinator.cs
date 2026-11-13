@@ -2419,20 +2419,26 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
     /// </summary>
     /// <remarks>
     /// The scheduler loop does the work between candidate steps, as it does orphan cleanup, so it never
-    /// overlaps a transfer the loop is driving. Never throws for cancellation: a request cancelled before
-    /// the loop starts it is dropped and reported <see cref="LocalModelRelease.InUse"/>; one already
-    /// started finishes, so the caller always learns whether the path was freed.
+    /// overlaps a transfer the loop is driving; a path never downloaded is answered at once. Never throws
+    /// for cancellation: a request cancelled, or not started within <see cref="LocalReleaseStartTimeout"/>,
+    /// is dropped and reported <see cref="LocalModelRelease.InUse"/>; one already started finishes, so the
+    /// caller always learns whether the path was freed.
     /// </remarks>
     public async Task<LocalModelRelease> ReleaseForLocalModelAsync(string path, CancellationToken cancellationToken)
     {
         var normalized = NormalizePath(path);
-        if (!IsRangeManaged(normalized))
+        if (!IsRangeManaged(normalized) || !HasDownloadAt(normalized))
         {
+            // Nothing was ever downloaded there: no need to involve the scheduler, or aria2.
             return LocalModelRelease.NotManaged;
         }
 
         var request = new LocalReleaseRequest(normalized);
-        using (cancellationToken.Register(() =>
+        // A loop held up by aria2 or by a long transfer step must not hold the command up: a request it
+        // has not started in time is dropped, and the download stays.
+        using var wait = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        wait.CancelAfter(LocalReleaseStartTimeout);
+        using (wait.Token.Register(() =>
                {
                    if (request.TryAbandon())
                    {
@@ -2449,6 +2455,24 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
 
             return await request.Result.Task.ConfigureAwait(false);
         }
+    }
+
+    /// <summary>How long a local-model release waits for the scheduler loop to start it.</summary>
+    internal static TimeSpan LocalReleaseStartTimeout { get; set; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>Whether this coordinator has a registration or an index record for <paramref name="normalized"/>.</summary>
+    private bool HasDownloadAt(string normalized)
+    {
+        lock (_sync)
+        {
+            if (_states.ContainsKey(normalized))
+            {
+                return true;
+            }
+        }
+
+        return _index.Snapshot().Any(record =>
+            string.Equals(NormalizePath(record.DestinationPath), normalized, StringComparison.Ordinal));
     }
 
     /// <summary>Drops a released state; the scheduler must not resume it as its active transfer.</summary>
