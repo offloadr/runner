@@ -81,6 +81,7 @@ public class FileRunnerSettingsStoreTests
             RunnerKey = " plain-runner-key ",
             SelectedEditorTemplate = "comfyui-master",
             AutoStart = true,
+            DownloadModels = true,
         });
 
         var reloaded = new FileRunnerSettingsStore(paths, new ReversingSecretProtector(), NullLogger<FileRunnerSettingsStore>.Instance).Current;
@@ -92,6 +93,7 @@ public class FileRunnerSettingsStoreTests
             Assert.That(reloaded.OffloadrApiOrigin, Is.EqualTo("https://example.test"));
             Assert.That(reloaded.SelectedEditorTemplate, Is.EqualTo("comfyui-master"));
             Assert.That(reloaded.AutoStart, Is.True);
+            Assert.That(reloaded.DownloadModels, Is.True);
         });
     }
 
@@ -447,13 +449,15 @@ public class RunnerSettingsEditorTests
         var store = new FakeSettingsStore(new RunnerSettings());
         var editor = new RunnerSettingsEditor(store);
 
-        var result = await editor.SaveAsync(new SettingsForm(null, "comfyui-latest", null, "  ", null, AutoStart: true));
+        var result = await editor.SaveAsync(new SettingsForm(null, "comfyui-latest", null, "  ", null, AutoStart: true, DownloadModels: true));
 
         Assert.Multiple(() =>
         {
             Assert.That(result.Saved, Is.True);
             Assert.That(store.Current.OffloadrApiOrigin, Is.EqualTo(RunnerSettings.DefaultOffloadrApiOrigin));
             Assert.That(store.Current.AutoStart, Is.True);
+            Assert.That(store.Current.DownloadModels, Is.True);
+            Assert.That(editor.Load().DownloadModels, Is.True);
             Assert.That(result.Problems, Is.Not.Empty);
         });
     }

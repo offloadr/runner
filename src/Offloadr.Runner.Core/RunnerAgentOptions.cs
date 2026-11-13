@@ -103,6 +103,7 @@ public sealed class RunnerAgentOptions
     public required SessionProcessOptions Session { get; init; }
     public required Aria2Settings Aria2 { get; init; }
     public required ConsoleLogOptions ConsoleLogs { get; init; }
+    public ModelDownloadOptions ModelDownloads { get; init; } = new();
 
     public static RunnerAgentOptions FromEnvironment(
         Func<string, string?>? env = null,
@@ -149,7 +150,8 @@ public sealed class RunnerAgentOptions
             RuntimeTelemetryInterval = TimeSpan.FromSeconds(ParseInt(env, "RUNNER_GPU_STATS_INTERVAL_SEC", 5, 0, 300)),
             Session = session,
             Aria2 = Aria2Settings.FromEnvironment(env),
-            ConsoleLogs = ConsoleLogOptions.FromEnvironment(env, session.Sealing)
+            ConsoleLogs = ConsoleLogOptions.FromEnvironment(env, session.Sealing),
+            ModelDownloads = ModelDownloadOptions.FromEnvironment(env),
         };
     }
 

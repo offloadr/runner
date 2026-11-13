@@ -17,6 +17,12 @@ public sealed record RunnerSettings
     /// <summary>Host folder with model files, mounted read-only into the runner.</summary>
     public string? LocalModelsDirectory { get; init; }
 
+    /// <summary>
+    /// Let the runner download models a session needs and the models folder lacks. Off by default: models
+    /// are often several gigabytes each, and the disk and bandwidth are the person's own.
+    /// </summary>
+    public bool DownloadModels { get; init; }
+
     /// <summary>Path to the docker or podman executable. Empty means discover it.</summary>
     public string? ContainerEngineExecutable { get; init; }
 

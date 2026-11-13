@@ -47,7 +47,7 @@ docker run --rm -it `
   ghcr.io/offloadr/runner-comfyui:latest
 ```
 
-For non-prod environments, add `-e OFFLOADR_API_GRPC=<environment-origin>`.
+For non-prod environments, add `-e OFFLOADR_API_GRPC=<environment-origin>`. These runners have no models: mount a models folder (see the examples under [Workspace Mirroring](#workspace-mirroring)) or turn on [model downloads](#model-downloads).
 
 ## Selecting one physical GPU
 
@@ -87,6 +87,8 @@ own CUDA environment. Continue to use appropriate host/container isolation.
   - `REG_MIN_BACKOFF_SEC`
   - `REG_MAX_BACKOFF_SEC`
   - `REG_RPC_TIMEOUT_SEC`
+- Model downloads (see [Model Downloads](#model-downloads))
+  - `RUNNER_MODEL_DOWNLOADS` (`on` or `off`; default `off`, so a runner uses only its local models folder. Any other value fails startup)
 - Optional local model discovery (ephemeral local-only inventory)
   - `RUNNER_LOCAL_MODELS_DIR` (mounted directory to scan, typically `/local`; auto-detected when `/local` exists)
   - `RUNNER_LOCAL_MODELS_SCAN_INTERVAL_SEC` (scan interval, default `15`)
@@ -110,6 +112,16 @@ own CUDA environment. Continue to use appropriate host/container isolation.
   - `ARIA2_FILE_ALLOCATION` (file allocation mode, default `falloc`)
   - `RUNNER_MODEL_DOWNLOAD_RETRY_INITIAL_SEC` (initial delay after a transient terminal aria2 error, default `2`)
   - `RUNNER_MODEL_DOWNLOAD_RETRY_MAX_SEC` (maximum delay between transient retries, default `60`)
+
+## Model Downloads
+
+A runner downloads models only with `RUNNER_MODEL_DOWNLOADS=on`. Models are often several gigabytes each, and a personal runner spends its owner's disk and bandwidth, so by default it uses only the models in its local models folder (see the examples below). The desktop app has the same switch in Settings. Offloadr launches hosted runners with downloads on.
+
+With downloads off:
+
+- A session lists only the models it can load. Each model it would have downloaded is reported to Offloadr as a failed download with the reason, and no placeholder is created for it.
+- A prompt that needs a model the runner does not have is refused before the editor sees it. Its result names the missing models, with the diagnostic code `model_downloads_disabled`.
+- Models from the local models folder are linked into sessions as usual.
 
 Aria2 baseline notes:
 
@@ -147,6 +159,8 @@ docker run --rm -it \
   ghcr.io/offloadr/runner-comfyui:latest
 ```
 
+Add `-e RUNNER_MODEL_DOWNLOADS=on` to let the runner also download models the folder lacks.
+
 Forge Neo example:
 
 ```bash
@@ -165,7 +179,7 @@ Local model notes:
 - Matching studio-backed models are marked in Installed while the corresponding personal runner is active.
 - The runner reports only opaque selection hashes derived from `filename + size + category`; raw local filenames and directory paths do not leave the runner.
 - Runtime model folders only receive symlinks for registered studio models whose selection hash matches the active runner's local inventory.
-- When a prompt references a catalog model whose filename exists locally but whose size or category differs, the runner logs the mismatched metadata and downloads the catalog version instead of silently substituting different weights.
+- When a prompt references a catalog model whose filename exists locally but whose size or category differs, the runner logs the mismatched metadata and downloads the catalog version instead of silently substituting different weights; with model downloads off, the prompt is refused instead.
 - Runner-only local files do not appear in Installed until you add the same model to your studio catalog.
 - If you add/remove files under the mounted directory, the runner auto-rescans and updates inventory on the next scan interval. Unchanged inventories refresh by digest only to keep the Offloadr API lease alive. The Model Manager also supports manual refresh.
 

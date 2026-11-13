@@ -210,6 +210,31 @@ public sealed class PromptExecutionPermissionTests
         Assert.That(ServiceClientManager.TargetsPromptRuntime(interrupt, PromptWorkIdentity.Capture(command, false)), Is.False);
     }
 
+    [Test]
+    public async Task APromptNeedingADownloadWhileDownloadsAreOffIsRefusedWithTheReason()
+    {
+        var command = Command();
+        command.Downloads.Add(new ModelDownloadRequest
+        {
+            ModelId = "model-1",
+            Filename = "flux-dev.safetensors",
+            DestinationPath = "/comfyui/models/diffusion_models/flux-dev.safetensors",
+            SourceUrl = "https://models.example.test/flux-dev.safetensors",
+        });
+        AcknowledgePromptResultRequest? acknowledged = null;
+        await Execute(command, (_, _) => Task.FromResult(Permission(command, true)),
+            (_, _) => throw new AssertionException("A refused prompt invoked the runtime"),
+            acknowledge: (ack, _) => { acknowledged = ack.Clone(); return Task.CompletedTask; },
+            prepareDownloads: (downloads, _, _) => throw new ModelDownloadsDisabledException(downloads.Select(download => download.Filename).ToArray()));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(acknowledged!.Result.Outcome, Is.EqualTo(PromptInvocationOutcome.NotExecuted));
+            Assert.That(acknowledged.Result.DiagnosticCode, Is.EqualTo("model_downloads_disabled"));
+            Assert.That(acknowledged.Result.Message, Does.Contain("flux-dev.safetensors").And.Contain("turned off"));
+        });
+    }
+
     private static SubmitPromptCommand Command() => new()
     {
         CommandId = Guid.NewGuid().ToString("n"),
@@ -256,14 +281,15 @@ public sealed class PromptExecutionPermissionTests
         Func<AcknowledgePromptResultRequest, CancellationToken, Task>? acknowledge = null,
         CancellationToken cancellationToken = default,
         Func<string, Func<Task>>? captureRefresh = null,
-        bool nativeRequestAttempted = true)
+        bool nativeRequestAttempted = true,
+        Func<IEnumerable<ModelDownloadRequest>, CancellationToken, bool, Task<Task>>? prepareDownloads = null)
         => ServiceClientManager.HandleSubmitEditorActionAsync(
             acknowledge ?? ((_, _) => Task.CompletedTask), (_, _) => Task.CompletedTask,
             command, "11111111111141118111111111111111", grant, (_, _) => Task.CompletedTask,
             observe ?? ((_, _) => throw new AssertionException("Unexpected recovery")),
             (_, _, _, _) => Task.CompletedTask, (_, _, _) => { }, _ => { },
             (_, _, _, _) => Task.CompletedTask, (_, _, _, _, _) => Task.CompletedTask,
-            captureRefresh ?? (_ => () => Task.CompletedTask), (_, _) => { }, (_, _, _) => Task.FromResult(Task.CompletedTask),
+            captureRefresh ?? (_ => () => Task.CompletedTask), (_, _) => { }, prepareDownloads ?? ((_, _, _) => Task.FromResult(Task.CompletedTask)),
             (captured, _, onNativeRequestAttempt, token) =>
             {
                 if (nativeRequestAttempted) onNativeRequestAttempt();

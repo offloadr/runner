@@ -54,6 +54,7 @@ public sealed class FileRunnerSettingsStore : IRunnerSettingsStore
             OffloadrApiOrigin = normalized.OffloadrApiOrigin,
             ProtectedRunnerKey = normalized.HasRunnerKey ? _protector.Protect(normalized.RunnerKey!) : null,
             LocalModelsDirectory = normalized.LocalModelsDirectory,
+            DownloadModels = normalized.DownloadModels,
             ContainerEngineExecutable = normalized.ContainerEngineExecutable,
             SelectedEditorTemplate = normalized.SelectedEditorTemplate,
             AutoStart = normalized.AutoStart,
@@ -117,6 +118,7 @@ public sealed class FileRunnerSettingsStore : IRunnerSettingsStore
             OffloadrApiOrigin = document.OffloadrApiOrigin ?? RunnerSettings.DefaultOffloadrApiOrigin,
             RunnerKey = runnerKey,
             LocalModelsDirectory = document.LocalModelsDirectory,
+            DownloadModels = document.DownloadModels,
             ContainerEngineExecutable = document.ContainerEngineExecutable,
             SelectedEditorTemplate = document.SelectedEditorTemplate,
             AutoStart = document.AutoStart,
@@ -143,6 +145,8 @@ public sealed class FileRunnerSettingsStore : IRunnerSettingsStore
         public string? ProtectedRunnerKey { get; set; }
 
         public string? LocalModelsDirectory { get; set; }
+
+        public bool DownloadModels { get; set; }
 
         public string? ContainerEngineExecutable { get; set; }
 

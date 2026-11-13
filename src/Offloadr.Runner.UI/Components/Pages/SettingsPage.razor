@@ -32,11 +32,18 @@
 
         <MudStack Row="true" AlignItems="AlignItems.Start" Spacing="2">
             <MudTextField T="string" @bind-Value="_modelsDirectory" Label="Models folder (optional)" Variant="Variant.Outlined" Clearable="true"
-                          HelperText="Model files here are shared read-only with the runner, so matching models are not downloaded again." />
+                          HelperText="Your model files, shared read-only with the runner. Offloadr uses the ones that match what a workflow needs." />
             @if (Host.CanPickFolder)
             {
                 <MudButton Variant="Variant.Outlined" Class="mt-2" OnClick="PickModelsFolderAsync">Browse</MudButton>
             }
+        </MudStack>
+
+        <MudStack Spacing="0">
+            <MudSwitch T="bool" @bind-Value="_downloadModels" Color="Color.Primary" Label="Download models this computer does not have" />
+            <MudText Typo="Typo.caption" Class="mud-text-secondary ml-14">
+                Models are often several gigabytes each. When this is off, workflows can use only the models in your models folder.
+            </MudText>
         </MudStack>
 
         <MudSwitch T="bool" @bind-Value="_autoStart" Color="Color.Primary" Label="Start the runner when this app opens" />
@@ -83,6 +90,7 @@
     private string? _origin;
     private string? _engineExecutable;
     private bool _autoStart;
+    private bool _downloadModels;
     private bool _startAtSignIn;
     private bool _showKey;
     private bool _saving;
@@ -105,6 +113,7 @@
         _origin = form.OffloadrApiOrigin;
         _engineExecutable = form.ContainerEngineExecutable;
         _autoStart = form.AutoStart;
+        _downloadModels = form.DownloadModels;
         _startAtSignIn = Host.CanStartAtSignIn && Host.StartsAtSignIn;
     }
 
@@ -113,7 +122,7 @@
         _saving = true;
         try
         {
-            var result = await SettingsEditor.SaveAsync(new SettingsForm(_runnerKey, _editorTemplate, _modelsDirectory, _origin, _engineExecutable, _autoStart));
+            var result = await SettingsEditor.SaveAsync(new SettingsForm(_runnerKey, _editorTemplate, _modelsDirectory, _origin, _engineExecutable, _autoStart, _downloadModels));
             _problems = result.Problems;
             if (!result.Saved)
             {
