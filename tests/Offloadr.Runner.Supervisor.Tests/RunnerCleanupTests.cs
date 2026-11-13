@@ -109,7 +109,10 @@ public class RunnerCleanupTests
 
     private void Remember(string containerId)
     {
-        var selection = new ContainerEngineSelection(configured => new LocatedEngine(configured ?? "docker", ContainerEngineKind.Docker), _paths.EngineState);
+        // An executable that exists everywhere, so cleanup finds the remembered engine on any machine;
+        // the fake process runner answers its commands.
+        var docker = Environment.ProcessPath!;
+        var selection = new ContainerEngineSelection(_ => new LocatedEngine(docker, ContainerEngineKind.Docker), _paths.EngineState);
         selection.Select(null);
         Assert.That(selection.Remember(containerId, out var error), Is.True, error);
     }
