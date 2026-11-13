@@ -39,8 +39,7 @@ public partial class SessionProcessManagerOwnershipTests
         {
             await manager.StartSessionAsync(ActivityStartCommand(), CancellationToken.None);
             var childFile = Path.Combine(identity.HomeDirectory, "survivor.pid");
-            await WaitForFileAsync(childFile);
-            child = Process.GetProcessById(int.Parse(File.ReadAllText(childFile)));
+            child = Process.GetProcessById(await ReadPidAsync(childFile));
             Assert.That(SnapshotDescendantCanWrite(child), Is.True, "The real child must be alive before the parent exits.");
             if (unexpectedExit)
             {
@@ -98,8 +97,7 @@ public partial class SessionProcessManagerOwnershipTests
         {
             await manager.StartSessionAsync(ActivityStartCommand(), CancellationToken.None);
             var childFile = Path.Combine(identity.HomeDirectory, "survivor.pid");
-            await WaitForFileAsync(childFile);
-            child = Process.GetProcessById(int.Parse(File.ReadAllText(childFile)));
+            child = Process.GetProcessById(await ReadPidAsync(childFile));
             Assert.ThrowsAsync<InvalidOperationException>(() => manager.StopSessionAsync(ActivitySessionId, SnapshotAsync, CancellationToken.None));
             TestContext.Out.WriteLine($"failedQuiescenceSnapshotCount={snapshots}; descendantAlive={SnapshotDescendantCanWrite(child)}");
             Assert.Multiple(() =>
@@ -124,6 +122,29 @@ public partial class SessionProcessManagerOwnershipTests
             await manager.DisposeAsync();
             child?.Dispose();
             TryDelete(root);
+        }
+    }
+
+    /// <summary>
+    /// The PID the entry point wrote. Its shell redirect creates the file before the PID is in it, so
+    /// the file existing is not enough: wait for the whole line.
+    /// </summary>
+    private static async Task<int> ReadPidAsync(string path)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(15);
+        while (true)
+        {
+            if (File.Exists(path) && File.ReadAllText(path) is { } text && text.EndsWith('\n') && int.TryParse(text, out var pid))
+            {
+                return pid;
+            }
+
+            if (DateTime.UtcNow > deadline)
+            {
+                Assert.Fail($"Timed out waiting for a PID in '{path}'.");
+            }
+
+            await Task.Delay(50);
         }
     }
 
