@@ -440,7 +440,9 @@ internal sealed class ModelDownloadService : IAsyncDisposable
             {
                 var release = cancellationToken.IsCancellationRequested
                     ? LocalModelRelease.InUse
-                    : await hydrationCoordinator.ReleaseForLocalModelAsync(entry.Path!, cancellationToken).ConfigureAwait(false);
+                    : await hydrationCoordinator
+                        .ReleaseForLocalModelAsync(entry.Path!, cancellationToken, () => canLink(entry.Download))
+                        .ConfigureAwait(false);
                 if (release == LocalModelRelease.Released)
                 {
                     LinkFreed(linkFreed, entry.Download);
@@ -451,7 +453,8 @@ internal sealed class ModelDownloadService : IAsyncDisposable
             .ConfigureAwait(false);
         foreach (var (download, path, release) in releases)
         {
-            if (release != LocalModelRelease.InUse)
+            // Only a copy that is there can stand in for the local model; otherwise it is linked now.
+            if (release != LocalModelRelease.InUse || !File.Exists(path))
             {
                 continue;
             }

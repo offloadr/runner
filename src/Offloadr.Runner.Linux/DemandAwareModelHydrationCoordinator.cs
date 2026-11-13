@@ -2356,7 +2356,8 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
     private async Task<bool> RemoveIndexedTransferAsync(
         ModelTransferIndexRecord record,
         bool deleteComplete,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Func<bool>? mayDelete = null)
     {
         var changed = false;
         var handle = new ModelTransferHandle(record.Handle);
@@ -2380,6 +2381,11 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
         }
 
         var forget = deleteComplete || !record.Complete;
+        if (forget && mayDelete?.Invoke() == false)
+        {
+            throw new LocalReplacementGoneException(record.DestinationPath);
+        }
+
         if (record.PlaceholderOwned && forget)
         {
             DeleteOwnedDestination(record.DestinationPath, record.DeviceId, record.Inode);
@@ -2424,7 +2430,14 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
     /// is dropped and reported <see cref="LocalModelRelease.InUse"/>; one already started finishes, so the
     /// caller always learns whether the path was freed.
     /// </remarks>
-    public async Task<LocalModelRelease> ReleaseForLocalModelAsync(string path, CancellationToken cancellationToken)
+    /// <param name="canStillLink">
+    /// Asked again just before the file is deleted: the local model may have left its folder while the
+    /// release waited. When it says no, the download stays.
+    /// </param>
+    public async Task<LocalModelRelease> ReleaseForLocalModelAsync(
+        string path,
+        CancellationToken cancellationToken,
+        Func<bool>? canStillLink = null)
     {
         var normalized = NormalizePath(path);
         if (!IsRangeManaged(normalized) || !HasDownloadAt(normalized))
@@ -2433,7 +2446,7 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
             return LocalModelRelease.NotManaged;
         }
 
-        var request = new LocalReleaseRequest(normalized);
+        var request = new LocalReleaseRequest(normalized, canStillLink);
         // A loop held up by aria2 or by a long transfer step must not hold the command up: a request it
         // has not started in time is dropped, and the download stays.
         using var wait = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -2529,7 +2542,7 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
 
             try
             {
-                request.Result.TrySetResult(await ReleaseQueuedAsync(request.Path, cancellationToken).ConfigureAwait(false));
+                request.Result.TrySetResult(await ReleaseQueuedAsync(request.Path, request.CanStillLink, cancellationToken).ConfigureAwait(false));
             }
             catch (Exception ex)
             {
@@ -2557,8 +2570,16 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
         }
     }
 
-    private async Task<LocalModelRelease> ReleaseQueuedAsync(string normalized, CancellationToken cancellationToken)
+    private async Task<LocalModelRelease> ReleaseQueuedAsync(
+        string normalized,
+        Func<bool>? canStillLink,
+        CancellationToken cancellationToken)
     {
+        if (canStillLink?.Invoke() == false)
+        {
+            return LocalModelRelease.InUse;
+        }
+
         await _registrationCleanupGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
@@ -2585,7 +2606,7 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
 
             try
             {
-                return await ReleaseLockedAsync(normalized, state, cancellationToken).ConfigureAwait(false);
+                return await ReleaseLockedAsync(normalized, state, canStillLink, cancellationToken).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -2641,6 +2662,7 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
     private async Task<LocalModelRelease> ReleaseLockedAsync(
         string normalized,
         TransferState? state,
+        Func<bool>? canStillLink,
         CancellationToken cancellationToken)
     {
         var records = _index.Snapshot()
@@ -2654,7 +2676,7 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
         var changed = false;
         foreach (var record in records)
         {
-            changed |= await RemoveIndexedTransferAsync(record, deleteComplete: true, cancellationToken).ConfigureAwait(false);
+            changed |= await RemoveIndexedTransferAsync(record, deleteComplete: true, cancellationToken, canStillLink).ConfigureAwait(false);
         }
 
         if (state is not null && records.Length == 0)
@@ -2671,6 +2693,11 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
                 {
                     // Already absent.
                 }
+            }
+
+            if (canStillLink?.Invoke() == false)
+            {
+                throw new LocalReplacementGoneException(normalized);
             }
 
             if (state.PlaceholderOwned)
@@ -3513,8 +3540,14 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
     }
 
     /// <summary>A local-model release waiting for the scheduler loop. Started or abandoned, never both.</summary>
-    private sealed class LocalReleaseRequest(string path)
+    /// <summary>The local model left its folder while its release waited; the download is kept.</summary>
+    private sealed class LocalReplacementGoneException(string path)
+        : IOException($"The local model to be linked at '{path}' can no longer be linked.");
+
+    private sealed class LocalReleaseRequest(string path, Func<bool>? canStillLink)
     {
+        public Func<bool>? CanStillLink { get; } = canStillLink;
+
         private const int Queued = 0;
         private const int Started = 1;
         private const int Abandoned = 2;
