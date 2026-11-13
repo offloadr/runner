@@ -426,14 +426,21 @@ internal sealed class ModelDownloadService : IAsyncDisposable
             .Select(static download => NormalizeDestination(download.DestinationPath))
             .Where(static path => path is not null)
             .Select(static path => path!)
-            .Distinct(StringComparer.Ordinal);
-        foreach (var path in paths)
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        // All at once, so a held-up scheduler costs the command one start timeout, not one per model.
+        // Once the command is cancelled no further download is given up, but those already freed are
+        // still returned, so their local models get linked.
+        var hydrationCoordinator = _hydrationCoordinator;
+        var releases = await Task.WhenAll(paths.Select(async path => (
+                Path: path,
+                Release: cancellationToken.IsCancellationRequested
+                    ? LocalModelRelease.InUse
+                    : await hydrationCoordinator.ReleaseForLocalModelAsync(path, cancellationToken).ConfigureAwait(false))))
+            .ConfigureAwait(false);
+        foreach (var (path, release) in releases)
         {
-            // Once the command is cancelled no further download is given up, but those already freed
-            // are still returned, so their local models get linked.
-            if (cancellationToken.IsCancellationRequested ||
-                await _hydrationCoordinator.ReleaseForLocalModelAsync(path, cancellationToken).ConfigureAwait(false) ==
-                LocalModelRelease.InUse)
+            if (release == LocalModelRelease.InUse)
             {
                 RunnerLog.Info(
                     nameof(ModelDownloadService),
