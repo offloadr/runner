@@ -1,0 +1,26 @@
+version: 2
+updates:
+  # Workflow actions are pinned by commit; Dependabot moves the pin and its version comment together.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # Central package management: every version lives in Directory.Packages.props.
+  # A package joins the first group that matches it.
+  - package-ecosystem: nuget
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      tests:
+        patterns: ["NUnit*", "Microsoft.NET.Test.Sdk", "Moq", "coverlet.*"]
+      grpc:
+        patterns: ["Grpc.*", "Google.Protobuf"]
+      maui:
+        patterns: ["Microsoft.Maui.*", "Microsoft.AspNetCore.Components.WebView.Maui"]
+      dotnet:
+        patterns: ["Microsoft.*", "System.*"]

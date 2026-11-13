@@ -29,7 +29,7 @@ jobs:
     name: Registry recovery scripts
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: bash -n build/record-image-channels.sh build/restore-image-channels.sh
       - run: python3 build/test-record-image-channels.py
       - run: python3 build/test-restore-image-channels.py
@@ -51,7 +51,7 @@ jobs:
           aria2c --version
           node --version
 
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Build
         run: dotnet build runner.slnx -warnaserror
@@ -95,9 +95,9 @@ jobs:
     name: Build (Windows)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-dotnet@v6
+      - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
         with:
           global-json-file: global.json
 
@@ -112,19 +112,22 @@ jobs:
     name: Desktop app (Windows)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-dotnet@v6
+      - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
         with:
           global-json-file: global.json
 
       - run: dotnet workload install maui-windows --skip-manifest-update
 
+      - name: Build desktop solution
+        run: dotnet build runner.desktop.slnx -warnaserror
+
       - name: Publish self-contained folder
         shell: pwsh
         run: ./build/publish-windows.ps1 -Unpackaged
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: offloadr-runner-windows-x64
           path: artifacts/packages/windows-win-x64/
@@ -134,9 +137,9 @@ jobs:
     name: Lint contracts
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
 
@@ -165,12 +168,12 @@ jobs:
             --opt o=bind \
             buildx_buildkit_ci0_state
 
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
           name: ci
 
       - name: Build ${{ matrix.target }}
-        uses: docker/bake-action@v7
+        uses: docker/bake-action@59cb1203cd42bcefd40a1b6d73b589e48c86040e # v7.5.0
         with:
           targets: ${{ matrix.target }}
           push: false

@@ -11,6 +11,9 @@
     <SingleProject>true</SingleProject>
     <EnableDefaultCssItems>false</EnableDefaultCssItems>
     <ApplicationTitle>Offloadr Runner</ApplicationTitle>
+    <!-- File description and product name: what Task Manager and the file's properties show. -->
+    <AssemblyTitle>Offloadr Runner</AssemblyTitle>
+    <Product>Offloadr Runner</Product>
     <ApplicationId>app.offloadr.runner</ApplicationId>
     <ApplicationDisplayVersion>$(VersionPrefix)</ApplicationDisplayVersion>
     <ApplicationVersion>1</ApplicationVersion>
