@@ -115,7 +115,15 @@ internal sealed class LocalModelProjector
             return false;
         }
 
+        // The checks AddProjectionRequests makes, so a request it would refuse is refused here too.
         var selectionHash = LocalModelSelectionHash.NormalizeSelectionHash(download.LocalSelectionHash);
+        if (!LocalModelSelectionHash.IsValidSelectionHash(selectionHash) ||
+            string.IsNullOrWhiteSpace(download.DestinationPath) ||
+            !IsUnderRoot(NormalizePath(download.DestinationPath), _destinationRoot))
+        {
+            return false;
+        }
+
         lock (_gate)
         {
             if (!_modelsBySelectionHash.TryGetValue(selectionHash, out var model))

@@ -2450,15 +2450,25 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
             }
             catch (Exception ex)
             {
-                // Freeing a duplicate copy is only an optimisation: whatever failed, the path serves as
-                // before, and the command that asked carries on.
+                // Freeing a duplicate copy is only an optimisation: whatever failed, the command that asked
+                // carries on. Once the file is gone the state describes nothing, so it is forgotten, or opens
+                // of the local model linked there would be checked against the deleted download; otherwise
+                // the copy keeps serving.
+                var fileGone = IsPathConfirmedAbsent(normalized);
                 lock (_sync)
                 {
                     if (state is not null &&
                         _states.TryGetValue(normalized, out var current) &&
                         ReferenceEquals(current, state))
                     {
-                        state.PendingOrphanCleanup = wasPendingCleanup;
+                        if (fileGone)
+                        {
+                            _states.Remove(normalized);
+                        }
+                        else
+                        {
+                            state.PendingOrphanCleanup = wasPendingCleanup;
+                        }
                     }
                 }
 
@@ -2467,9 +2477,10 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
                     throw;
                 }
 
-                RunnerLog.Warning<DemandAwareModelHydrationCoordinator>(
-                    $"Could not remove the downloaded copy at '{normalized}' ({ex.GetType().Name}); it is kept until a later request frees it.");
-                return IsPathConfirmedAbsent(normalized) ? LocalModelRelease.Released : LocalModelRelease.InUse;
+                RunnerLog.Warning<DemandAwareModelHydrationCoordinator>(fileGone
+                    ? $"Removed the downloaded copy at '{normalized}', but not all of its records ({ex.GetType().Name})."
+                    : $"Could not remove the downloaded copy at '{normalized}' ({ex.GetType().Name}); it is kept until a later request frees it.");
+                return fileGone ? LocalModelRelease.Released : LocalModelRelease.InUse;
             }
         }
         finally
@@ -2520,6 +2531,11 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
             }
         }
 
+        if (changed)
+        {
+            await _backend.SaveSessionAsync(cancellationToken).ConfigureAwait(false);
+        }
+
         lock (_sync)
         {
             if (state is not null &&
@@ -2528,11 +2544,6 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
             {
                 _states.Remove(normalized);
             }
-        }
-
-        if (changed)
-        {
-            await _backend.SaveSessionAsync(cancellationToken).ConfigureAwait(false);
         }
 
         if (!IsPathConfirmedAbsent(normalized))

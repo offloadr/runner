@@ -59,6 +59,8 @@ public class LocalModelProjectorTests
             projector.UpdateSnapshot(CreateSnapshot(CreateModel(sourceFile, ModelCategory.Checkpoint)));
             var scanned = projector.CanProject(request);
             var remote = projector.CanProject(new ModelDownloadRequest { Filename = "demo.safetensors", DestinationPath = projected });
+            var outsideRoot = projector.CanProject(
+                CreateLocalProjectionRequest(sourceFile, ModelCategory.Checkpoint, Path.Combine(root, "elsewhere", "demo.safetensors")));
             File.Delete(sourceFile);
             var deleted = projector.CanProject(request);
 
@@ -67,6 +69,7 @@ public class LocalModelProjectorTests
                 Assert.That(beforeScan, Is.False, "Not in the inventory yet.");
                 Assert.That(scanned, Is.True);
                 Assert.That(remote, Is.False);
+                Assert.That(outsideRoot, Is.False, "A target the projector would refuse.");
                 Assert.That(deleted, Is.False, "Gone from the folder since the last scan.");
             });
         }

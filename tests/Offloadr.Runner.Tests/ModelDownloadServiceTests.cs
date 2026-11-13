@@ -1062,6 +1062,40 @@ public class ModelDownloadServiceTests
         }
     }
 
+    [Test]
+    public async Task ReleaseForLocalModels_ThatFailsAfterDeletingTheFile_LeavesThePathUnmanaged()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var destinationPath = Path.Combine(root, "diffusion_models", "half.safetensors");
+            var aria = new CompletingAria2Client(destinationPath, expectedBytes: 8);
+            await using var service = CreateRangeManagedService(aria, root);
+            await service.InitializeAsync(CancellationToken.None);
+            service.SetActiveSession("session-1");
+            service.SeedDownloads("session-1", [RemoteModel(destinationPath)]);
+            await ReadWholeModelAsync(service, destinationPath);
+            var local = LocalModel(destinationPath);
+
+            aria.FailSaveSession = true;
+            var projected = await service.ReleaseForLocalModelsAsync([local], AnyLocalModel, CancellationToken.None);
+            aria.FailSaveSession = false;
+
+            // The local model is linked where the download was, and its opens are not checked against it.
+            File.WriteAllText(destinationPath, "the local model");
+            var opened = await service.OpenRangeManagedAsync(destinationPath, "session-1", CancellationToken.None);
+            Assert.Multiple(() =>
+            {
+                Assert.That(projected, Is.EqualTo(new[] { local }), "The file is gone, so the local model is linked.");
+                Assert.That(opened.Disposition, Is.EqualTo(ModelHydrationOpenDisposition.Unmanaged));
+            });
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
     private static bool AnyLocalModel(ModelDownloadRequest _) => true;
 
     private static async Task ReadWholeModelAsync(ModelDownloadService service, string destinationPath)
@@ -1209,6 +1243,11 @@ public class ModelDownloadServiceTests
         public int RemoveCallCount { get; private set; }
 
         public bool FailRemoval { get; set; }
+
+        public bool FailSaveSession { get; set; }
+
+        public override Task SaveSessionAsync(CancellationToken cancellationToken)
+            => FailSaveSession ? throw new IOException("simulated aria2 failure") : Task.CompletedTask;
 
         /// <summary>Set to make removal wait until it is cancelled; completed when it starts waiting.</summary>
         public TaskCompletionSource? BlockRemoval { get; set; }
