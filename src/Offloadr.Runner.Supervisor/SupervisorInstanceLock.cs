@@ -9,6 +9,9 @@ public sealed class SupervisorInstanceLock(string path) : IDisposable
 {
     private FileStream? _handle;
 
+    /// <summary>True when the last attempt failed because another copy holds the lock.</summary>
+    public bool HeldElsewhere { get; private set; }
+
     /// <summary>True when this instance now holds the lock (or already did).</summary>
     public bool TryAcquire() => TryAcquire(out _);
 
@@ -19,6 +22,7 @@ public sealed class SupervisorInstanceLock(string path) : IDisposable
     public bool TryAcquire(out string? reason)
     {
         reason = null;
+        HeldElsewhere = false;
         if (_handle is not null)
         {
             return true;
@@ -37,6 +41,7 @@ public sealed class SupervisorInstanceLock(string path) : IDisposable
         }
         catch (IOException)
         {
+            HeldElsewhere = true;
             reason = "Another copy of the app is already running the runner. Use that one, or close it first.";
             return false;
         }

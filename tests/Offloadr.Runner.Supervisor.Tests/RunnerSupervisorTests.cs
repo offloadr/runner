@@ -94,6 +94,8 @@ public class RunnerSupervisorTests
         Assert.Multiple(() =>
         {
             Assert.That(supervisor.View.Message, Does.Contain("runner key"));
+            Assert.That(supervisor.View.Fault?.Kind, Is.EqualTo(FaultKind.Settings));
+            Assert.That(supervisor.View.Fault?.Action, Is.EqualTo(FaultAction.OpenSettings));
             Assert.That(_engine.Runs, Is.Empty);
         });
     }
@@ -101,13 +103,20 @@ public class RunnerSupervisorTests
     [Test]
     public async Task Start_WhenDockerIsNotRunning_Faults()
     {
-        _engine.Info = ContainerEngineInfo.Unavailable("Docker is installed but its engine is not running.");
+        _engine.Info = ContainerEngineInfo.Unavailable("Docker is installed but its engine is not running.", errorKind: FaultKind.EngineNotRunning);
         var supervisor = await StartSupervisorAsync();
 
         supervisor.RequestStart();
         await WaitForStateAsync(SupervisorState.Faulted);
 
-        Assert.That(supervisor.View.Message, Does.Contain("not running"));
+        Assert.Multiple(() =>
+        {
+            Assert.That(supervisor.View.Message, Does.Contain("not running"));
+            Assert.That(supervisor.View.Fault?.Kind, Is.EqualTo(FaultKind.EngineNotRunning));
+            Assert.That(supervisor.View.Fault?.Title, Is.EqualTo("Docker is not running"));
+            Assert.That(supervisor.View.Fault?.Detail, Is.EqualTo(supervisor.View.Message));
+            Assert.That(supervisor.View.Fault?.Action, Is.EqualTo(FaultAction.StartDocker));
+        });
     }
 
     [Test]
@@ -122,6 +131,97 @@ public class RunnerSupervisorTests
         Assert.Multiple(() =>
         {
             Assert.That(supervisor.View.Message, Does.Contain("Could not pull"));
+            Assert.That(supervisor.View.Fault?.Kind, Is.EqualTo(FaultKind.Unknown));
+            Assert.That(supervisor.View.Fault?.Message, Is.EqualTo(supervisor.View.Message));
+            Assert.That(_engine.Runs, Is.Empty);
+        });
+    }
+
+    [TestCase("failed to register layer: write /usr/lib/libcudnn.so.9: no space left on device", FaultKind.DiskFull)]
+    [TestCase("Error response from daemon: Get \"https://ghcr.io/v2/\": net/http: TLS handshake timeout", FaultKind.RegistryUnreachable)]
+    [TestCase("Error response from daemon: manifest unknown", FaultKind.ImageUnavailable)]
+    public async Task Start_WhenThePullFails_SaysWhy(string output, FaultKind kind)
+    {
+        _engine.PullFails = true;
+        _engine.PullFailureOutput = output;
+        var supervisor = await StartSupervisorAsync();
+
+        supervisor.RequestStart();
+        await WaitForStateAsync(SupervisorState.Faulted);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(supervisor.View.Fault?.Kind, Is.EqualTo(kind));
+            Assert.That(supervisor.View.Fault?.Detail, Does.Contain(output));
+            Assert.That(supervisor.View.Message, Does.Contain(output), "The message still says what happened.");
+        });
+    }
+
+    [Test]
+    public async Task Start_WhenDockerCannotAttachTheGpu_FaultsWithGpuAdvice()
+    {
+        _engine.NextRunFailure = new ContainerEngineException(
+            "Could not start the runner container from ghcr.io/offloadr/runner-comfyui:latest.",
+            "docker: Error response from daemon: could not select device driver \"\" with capabilities: [[gpu]].",
+            EngineOperation.Run);
+        var supervisor = await StartSupervisorAsync();
+
+        supervisor.RequestStart();
+        await WaitForStateAsync(SupervisorState.Faulted);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(supervisor.View.Fault?.Kind, Is.EqualTo(FaultKind.GpuUnavailable));
+            Assert.That(supervisor.View.Fault?.Action, Is.EqualTo(FaultAction.SetUpGpu));
+            Assert.That(_engine.Exists(Name), Is.False, "The failed launch is still cleaned up.");
+        });
+    }
+
+    [Test]
+    public async Task AFault_IsGoneOnceTheRunnerRuns()
+    {
+        _engine.PullFails = true;
+        var supervisor = await StartSupervisorAsync();
+        supervisor.RequestStart();
+        await WaitForStateAsync(SupervisorState.Faulted);
+        Assert.That(supervisor.View.Fault, Is.Not.Null);
+
+        _engine.PullFails = false;
+        supervisor.RequestStart();
+        await WaitForStateAsync(SupervisorState.Running);
+
+        Assert.That(supervisor.View.Fault, Is.Null);
+    }
+
+    [Test]
+    public async Task AutoStart_WhileDockerIsNotRunning_ShowsWhyItWaits()
+    {
+        _settings = new FakeSettingsStore(new RunnerSettings { RunnerKey = Key, AutoStart = true });
+        _engine.Info = ContainerEngineInfo.Unavailable("Docker is installed but its engine is not running.", errorKind: FaultKind.EngineNotRunning);
+        var supervisor = await StartSupervisorAsync(restartBackoff: TimeSpan.FromMinutes(5));
+
+        await WaitForStateAsync(SupervisorState.WaitingToRestart);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(supervisor.View.Fault?.Kind, Is.EqualTo(FaultKind.EngineNotRunning));
+            Assert.That(supervisor.View.Message, Does.Contain("Trying again"));
+        });
+    }
+
+    [Test]
+    public async Task Start_WithAKeyOffloadrRejects_FaultsAsARejectedKey()
+    {
+        _plans.Rejects = _ => true;
+        var supervisor = await StartSupervisorAsync();
+
+        supervisor.RequestStart();
+        await WaitForStateAsync(SupervisorState.Faulted);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(supervisor.View.Fault?.Kind, Is.EqualTo(FaultKind.KeyRejected));
+            Assert.That(supervisor.View.Fault?.Message, Does.Contain("did not accept"));
             Assert.That(_engine.Runs, Is.Empty);
         });
     }
@@ -151,6 +251,7 @@ public class RunnerSupervisorTests
         Assert.Multiple(() =>
         {
             Assert.That(supervisor.View.Message, Does.Contain("was not started by this app"));
+            Assert.That(supervisor.View.Fault?.Kind, Is.EqualTo(FaultKind.NameTaken));
             Assert.That(_engine.Exists(Name), Is.True);
             Assert.That(_engine.Runs, Is.Empty);
         });
@@ -501,6 +602,7 @@ public class RunnerSupervisorTests
         Assert.Multiple(() =>
         {
             Assert.That(second.View.Message, Does.Contain("Another copy"));
+            Assert.That(second.View.Fault?.Kind, Is.EqualTo(FaultKind.AnotherCopy));
             Assert.That(_engine.Runs, Has.Count.EqualTo(1));
             Assert.That(_engine.Exists(Name), Is.True);
             Assert.That(first.View.State, Is.EqualTo(SupervisorState.Running));

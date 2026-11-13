@@ -84,8 +84,15 @@ public sealed record ContainerEngineInfo(
     bool NvidiaRuntimeListed,
     string? Error)
 {
-    public static ContainerEngineInfo Unavailable(string error, string? executable = null, ContainerEngineKind kind = ContainerEngineKind.Docker)
-        => new(false, kind, executable, null, null, null, false, error);
+    /// <summary>Why no engine is available, when <see cref="Error"/> is set.</summary>
+    public FaultKind ErrorKind { get; init; }
+
+    public static ContainerEngineInfo Unavailable(
+        string error,
+        string? executable = null,
+        ContainerEngineKind kind = ContainerEngineKind.Docker,
+        FaultKind errorKind = FaultKind.Unknown)
+        => new(false, kind, executable, null, null, null, false, error) { ErrorKind = errorKind };
 }
 
 public sealed record VolumeMount(string HostPath, string ContainerPath, bool ReadOnly);
@@ -111,10 +118,19 @@ public sealed record ImageInfo(string Id, string? RepoDigest);
 
 public sealed record GpuAccessCheck(bool Succeeded, string Output);
 
-public sealed class ContainerEngineException(string message, string? detail = null) : Exception(
-    string.IsNullOrWhiteSpace(detail) ? message : $"{message} {detail.Trim()}")
+/// <summary>
+/// The engine failed. <see cref="Kind"/> is what the engine's output (<paramref name="detail"/>) says
+/// about the cause, unless the thrower already knows it.
+/// </summary>
+public sealed class ContainerEngineException(
+    string message,
+    string? detail = null,
+    EngineOperation operation = EngineOperation.Command,
+    FaultKind? kind = null) : Exception(string.IsNullOrWhiteSpace(detail) ? message : $"{message} {detail.Trim()}")
 {
     public string? Detail { get; } = detail;
+
+    public FaultKind Kind { get; } = kind ?? EngineFailureClassifier.Classify(operation, detail);
 }
 
 public interface IContainerEngine

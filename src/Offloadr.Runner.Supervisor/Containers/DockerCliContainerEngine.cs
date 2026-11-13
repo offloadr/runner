@@ -28,9 +28,11 @@ public sealed class DockerCliContainerEngine(IProcessRunner processes, Func<stri
         var engine = Locate();
         if (engine is null)
         {
-            return ContainerEngineInfo.Unavailable(string.IsNullOrWhiteSpace(configuredExecutable())
-                ? "Docker was not found. Install Docker Desktop (Windows, macOS) or Docker Engine with the NVIDIA Container Toolkit (Linux)."
-                : $"The container engine '{configuredExecutable()}' was not found.");
+            return ContainerEngineInfo.Unavailable(
+                string.IsNullOrWhiteSpace(configuredExecutable())
+                    ? "Docker was not found. Install Docker Desktop (Windows, macOS) or Docker Engine with the NVIDIA Container Toolkit (Linux)."
+                    : $"The container engine '{configuredExecutable()}' was not found.",
+                errorKind: FaultKind.EngineMissing);
         }
 
         ProcessResult version;
@@ -41,7 +43,7 @@ public sealed class DockerCliContainerEngine(IProcessRunner processes, Func<stri
         catch (ContainerEngineException ex)
         {
             // Not answering, or not even starting: either way the engine is unavailable right now.
-            return ContainerEngineInfo.Unavailable(ex.Message, engine.Executable, engine.Kind);
+            return ContainerEngineInfo.Unavailable(ex.Message, engine.Executable, engine.Kind, ex.Kind);
         }
 
         if (engine.Kind == ContainerEngineKind.Docker && DockerCliJson.IsPodman(version.StandardOutput))
@@ -54,10 +56,17 @@ public sealed class DockerCliContainerEngine(IProcessRunner processes, Func<stri
         var serverVersion = DockerCliJson.ServerVersion(version.StandardOutput, engine.Kind);
         if (!version.Succeeded || serverVersion is null)
         {
+            // Mostly a stopped engine, but the client also says so when this account may not use it.
+            var kind = EngineFailureClassifier.Classify(EngineOperation.Command, version.StandardError) is FaultKind.EnginePermission
+                ? FaultKind.EnginePermission
+                : FaultKind.EngineNotRunning;
             return ContainerEngineInfo.Unavailable(
-                $"{Name(engine)} is installed but its engine is not running. Start {(engine.Kind == ContainerEngineKind.Docker ? "Docker Desktop" : "podman")} and try again.",
+                kind == FaultKind.EnginePermission
+                    ? $"{Name(engine)} is installed, but this account may not use its engine. {version.StandardError.Trim()}".Trim()
+                    : $"{Name(engine)} is installed but its engine is not running. Start {(engine.Kind == ContainerEngineKind.Docker ? "Docker Desktop" : "podman")} and try again.",
                 engine.Executable,
-                engine.Kind);
+                engine.Kind,
+                kind);
         }
 
         ProcessResult info;
@@ -67,7 +76,7 @@ public sealed class DockerCliContainerEngine(IProcessRunner processes, Func<stri
         }
         catch (ContainerEngineException ex)
         {
-            return ContainerEngineInfo.Unavailable(ex.Message, engine.Executable, engine.Kind);
+            return ContainerEngineInfo.Unavailable(ex.Message, engine.Executable, engine.Kind, ex.Kind);
         }
 
         if (!info.Succeeded)
@@ -76,14 +85,20 @@ public sealed class DockerCliContainerEngine(IProcessRunner processes, Func<stri
             return ContainerEngineInfo.Unavailable(
                 $"{Name(engine)} did not report its engine details. {info.StandardError.Trim()}".Trim(),
                 engine.Executable,
-                engine.Kind);
+                engine.Kind,
+                EngineFailureClassifier.Classify(EngineOperation.Command, info.StandardError) is var infoKind and not FaultKind.Unknown
+                    ? infoKind
+                    : FaultKind.EngineNotRunning);
         }
 
         var (serverOs, operatingSystem, nvidia) = DockerCliJson.Info(info.StandardOutput);
         if (serverOs is not null && !serverOs.Equals("linux", StringComparison.OrdinalIgnoreCase))
         {
             return new ContainerEngineInfo(false, engine.Kind, engine.Executable, serverVersion, serverOs, operatingSystem, nvidia,
-                "The engine runs Windows containers. Switch Docker Desktop to Linux containers.");
+                "The engine runs Windows containers. Switch Docker Desktop to Linux containers.")
+            {
+                ErrorKind = FaultKind.WindowsContainers,
+            };
         }
 
         return new ContainerEngineInfo(true, engine.Kind, engine.Executable, serverVersion, serverOs, operatingSystem, nvidia, null);
@@ -117,7 +132,7 @@ public sealed class DockerCliContainerEngine(IProcessRunner processes, Func<stri
                 detail = string.Join(" ", lastLines);
             }
 
-            throw new ContainerEngineException($"Could not pull {image}.", detail);
+            throw new ContainerEngineException($"Could not pull {image}.", detail, EngineOperation.Pull);
         }
     }
 
@@ -141,7 +156,7 @@ public sealed class DockerCliContainerEngine(IProcessRunner processes, Func<stri
             cancellationToken).ConfigureAwait(false);
         if (!result.Succeeded)
         {
-            throw new ContainerEngineException($"Could not start the runner container from {spec.Image}.", result.StandardError);
+            throw new ContainerEngineException($"Could not start the runner container from {spec.Image}.", result.StandardError, EngineOperation.Run);
         }
 
         return result.StandardOutput.Trim();
@@ -223,11 +238,11 @@ public sealed class DockerCliContainerEngine(IProcessRunner processes, Func<stri
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
-            throw new ContainerEngineException($"{Name(engine)} did not stop container {container} within {deadline.TotalSeconds:0} seconds.");
+            throw new ContainerEngineException($"{Name(engine)} did not stop container {container} within {deadline.TotalSeconds:0} seconds.", kind: FaultKind.EngineNotResponding);
         }
         catch (ProcessStartException ex)
         {
-            throw new ContainerEngineException(ex.Message);
+            throw new ContainerEngineException(ex.Message, kind: FaultKind.EngineMissing);
         }
 
         if (!result.Succeeded && !IsNotFound(result))
@@ -415,11 +430,11 @@ public sealed class DockerCliContainerEngine(IProcessRunner processes, Func<stri
         {
             // Failing is the safe answer: unpinned commands could reach whichever daemon the default
             // points at by the time they run.
-            throw new ContainerEngineException(ex.Message);
+            throw new ContainerEngineException(ex.Message, kind: FaultKind.EngineMissing);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
-            throw new ContainerEngineException($"{Name(engine)} did not tell which engine its commands reach within {QuickCommandTimeout.TotalSeconds:0} seconds.");
+            throw new ContainerEngineException($"{Name(engine)} did not tell which engine its commands reach within {QuickCommandTimeout.TotalSeconds:0} seconds.", kind: FaultKind.EngineNotResponding);
         }
     }
 
@@ -497,11 +512,11 @@ public sealed class DockerCliContainerEngine(IProcessRunner processes, Func<stri
         }
         catch (ProcessStartException ex)
         {
-            throw new ContainerEngineException(ex.Message);
+            throw new ContainerEngineException(ex.Message, kind: FaultKind.EngineMissing);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
-            throw new ContainerEngineException($"Podman did not list its connections within {QuickCommandTimeout.TotalSeconds:0} seconds.");
+            throw new ContainerEngineException($"Podman did not list its connections within {QuickCommandTimeout.TotalSeconds:0} seconds.", kind: FaultKind.EngineNotResponding);
         }
 
         return connections.Succeeded
@@ -528,7 +543,7 @@ public sealed class DockerCliContainerEngine(IProcessRunner processes, Func<stri
         => Environment.GetEnvironmentVariable(name) is { Length: > 0 } value && !string.IsNullOrWhiteSpace(value) ? value : null;
 
     private LocatedEngine Require()
-        => Locate() ?? throw new ContainerEngineException("Docker was not found.");
+        => Locate() ?? throw new ContainerEngineException("Docker was not found.", kind: FaultKind.EngineMissing);
 
     /// <summary>
     /// The engine to run, as the probe identified it when that differs from its file name. A pinned
@@ -561,13 +576,13 @@ public sealed class DockerCliContainerEngine(IProcessRunner processes, Func<stri
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
-            throw new ContainerEngineException($"{Name(engine)} did not answer within {QuickCommandTimeout.TotalSeconds:0} seconds.");
+            throw new ContainerEngineException($"{Name(engine)} did not answer within {QuickCommandTimeout.TotalSeconds:0} seconds.", kind: FaultKind.EngineNotResponding);
         }
         catch (ProcessStartException ex)
         {
             // An executable that no longer starts (permissions, a broken replacement) is an engine
             // outage like any other: the runner stays supervised and the command is retried.
-            throw new ContainerEngineException(ex.Message);
+            throw new ContainerEngineException(ex.Message, kind: FaultKind.EngineMissing);
         }
     }
 
@@ -580,7 +595,7 @@ public sealed class DockerCliContainerEngine(IProcessRunner processes, Func<stri
         }
         catch (ProcessStartException ex)
         {
-            throw new ContainerEngineException(ex.Message);
+            throw new ContainerEngineException(ex.Message, kind: FaultKind.EngineMissing);
         }
     }
 
