@@ -3377,6 +3377,16 @@ internal static partial class ServiceClientManager
             RunnerLog.Warning(nameof(ServiceClientManager), nativeInvocationStarted
                 ? $"Prompt {prompt.CommandId} ended with {ex.GetType().Name}; retaining invocation uncertainty."
                 : $"Prompt {prompt.CommandId} ended with {ex.GetType().Name} before native request I/O.");
+            if (ex is ModelDownloadsDisabledException && !nativeInvocationStarted)
+            {
+                ack.Result ??= new()
+                {
+                    Outcome = PromptInvocationOutcome.NotExecuted,
+                    DiagnosticCode = ModelDownloadsDisabledException.DiagnosticCode,
+                    Message = ex.Message,
+                };
+            }
+
             ack.Result ??= new()
             {
                 Outcome = nativeInvocationStarted ? PromptInvocationOutcome.Unknown : PromptInvocationOutcome.NotExecuted,

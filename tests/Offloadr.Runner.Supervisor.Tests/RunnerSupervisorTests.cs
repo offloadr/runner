@@ -82,6 +82,35 @@ public class RunnerSupervisorTests
         });
     }
 
+    [TestCase(false, "off")]
+    [TestCase(true, "on")]
+    public async Task Start_TellsTheRunnerWhetherItMayDownloadModels(bool downloadModels, string expected)
+    {
+        _settings = new FakeSettingsStore(new RunnerSettings { RunnerKey = Key, DownloadModels = downloadModels });
+        var supervisor = await StartSupervisorAsync();
+
+        supervisor.RequestStart();
+        await WaitForStateAsync(SupervisorState.Running);
+
+        Assert.That(_engine.Runs.Single().Environment["RUNNER_MODEL_DOWNLOADS"], Is.EqualTo(expected));
+    }
+
+    [Test]
+    public async Task TurningModelDownloadsOn_RecreatesTheRunner()
+    {
+        _settings = new FakeSettingsStore(new RunnerSettings { RunnerKey = Key });
+        _engine.StatusJson = Status(activeSessionId: "");
+        var supervisor = await StartSupervisorAsync();
+        supervisor.RequestStart();
+        await WaitForStateAsync(SupervisorState.Running);
+        await WaitUntilAsync(() => supervisor.View.RunnerStatus is not null);
+
+        await _settings.SaveAsync(_settings.Current with { DownloadModels = true });
+        await WaitUntilAsync(() => _engine.Runs.Count == 2);
+
+        Assert.That(_engine.Runs[1].Environment["RUNNER_MODEL_DOWNLOADS"], Is.EqualTo("on"));
+    }
+
     [Test]
     public async Task Start_WithoutARunnerKey_Faults()
     {

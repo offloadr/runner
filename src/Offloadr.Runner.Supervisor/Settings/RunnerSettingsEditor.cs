@@ -9,7 +9,8 @@ public sealed record SettingsForm(
     string? LocalModelsDirectory,
     string? OffloadrApiOrigin,
     string? ContainerEngineExecutable,
-    bool AutoStart);
+    bool AutoStart,
+    bool DownloadModels = false);
 
 /// <param name="Saved">False when the settings could not be written; <paramref name="Error"/> says why.</param>
 /// <param name="Problems">What is still wrong with saved settings; the runner does not start until it is fixed.</param>
@@ -31,7 +32,8 @@ public sealed class RunnerSettingsEditor(IRunnerSettingsStore store)
             settings.LocalModelsDirectory,
             settings.OffloadrApiOrigin,
             settings.ContainerEngineExecutable,
-            settings.AutoStart);
+            settings.AutoStart,
+            settings.DownloadModels);
     }
 
     /// <summary>Saves the form. Settings with problems are saved too, so nothing typed is lost; the problems are returned.</summary>
@@ -45,6 +47,7 @@ public sealed class RunnerSettingsEditor(IRunnerSettingsStore store)
             OffloadrApiOrigin = string.IsNullOrWhiteSpace(form.OffloadrApiOrigin) ? RunnerSettings.DefaultOffloadrApiOrigin : form.OffloadrApiOrigin,
             ContainerEngineExecutable = form.ContainerEngineExecutable,
             AutoStart = form.AutoStart,
+            DownloadModels = form.DownloadModels,
         };
 
         try

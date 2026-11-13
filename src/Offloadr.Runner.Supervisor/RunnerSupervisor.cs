@@ -1935,6 +1935,7 @@ public sealed class RunnerSupervisor : BackgroundService
         {
             ["RUNNER_SECRET"] = settings.RunnerKey!.Trim(),
             ["OFFLOADR_API_GRPC"] = settings.OffloadrApiOrigin,
+            ["RUNNER_MODEL_DOWNLOADS"] = settings.DownloadModels ? "on" : "off",
         };
         var volumes = new List<VolumeMount>();
         if (!string.IsNullOrWhiteSpace(settings.LocalModelsDirectory))

@@ -16,14 +16,21 @@ internal sealed class ModelDownloadService : IAsyncDisposable
     private readonly ModelDestinationPolicy? _destinationPolicy;
     private readonly IModelTransferBackend _transferBackend;
     private readonly SessionModelDownloadStaging? _staging;
+    private readonly bool _downloadsEnabled;
 
+    /// <param name="downloadsEnabled">
+    /// False when <c>RUNNER_MODEL_DOWNLOADS</c> is off: no remote model is registered, so nothing can start
+    /// a transfer; each one is reported as failed, and a prompt that needs one is refused.
+    /// </param>
     public ModelDownloadService(
         IModelTransferBackend transferBackend,
         Aria2Settings settings,
         ModelHydrationRuntimeCapabilities? capabilities = null,
         ModelDestinationPolicy? destinationPolicy = null,
-        SessionModelDownloadStaging? staging = null)
+        SessionModelDownloadStaging? staging = null,
+        bool downloadsEnabled = true)
     {
+        _downloadsEnabled = downloadsEnabled;
         _destinationPolicy = destinationPolicy;
         _transferBackend = transferBackend ?? throw new ArgumentNullException(nameof(transferBackend));
         _staging = staging;
@@ -128,6 +135,12 @@ internal sealed class ModelDownloadService : IAsyncDisposable
     public void RegisterDownloads(string sessionId, IEnumerable<ModelDownloadRequest> downloads)
     {
         var snapshot = FilterRemoteDownloadRequests(downloads);
+        if (!_downloadsEnabled)
+        {
+            ReportRefused(sessionId, snapshot);
+            return;
+        }
+
         ConfineDestinations(snapshot);
         var (managed, full) = PartitionDownloads(snapshot);
         _hydrationCoordinator?.RegisterDownloads(
@@ -141,6 +154,12 @@ internal sealed class ModelDownloadService : IAsyncDisposable
     public void SeedDownloads(string sessionId, IEnumerable<ModelDownloadRequest> downloads)
     {
         var snapshot = FilterRemoteDownloadRequests(downloads);
+        if (!_downloadsEnabled)
+        {
+            ReportRefused(sessionId, snapshot);
+            return;
+        }
+
         ConfineDestinations(snapshot);
         var (managed, full) = PartitionDownloads(snapshot);
         _hydrationCoordinator?.RegisterDownloads(
@@ -378,6 +397,55 @@ internal sealed class ModelDownloadService : IAsyncDisposable
         }
     }
 
+    private void ReportRefused(string sessionId, IReadOnlyCollection<ModelDownloadRequest> downloads)
+    {
+        var normalizedSessionId = string.IsNullOrWhiteSpace(sessionId) ? null : sessionId.Trim();
+        if (downloads.Count == 0 || normalizedSessionId is null)
+        {
+            return;
+        }
+
+        RunnerLog.Info(
+            nameof(ModelDownloadService),
+            $"Not downloading {downloads.Count} model(s) for session '{normalizedSessionId}': RUNNER_MODEL_DOWNLOADS is off.");
+        if (ProgressReporter is not { } reporter)
+        {
+            return;
+        }
+
+        var runtime = RuntimeResolver?.Invoke(normalizedSessionId);
+        var reports = downloads.Select(download => new ModelDownloadProgress(
+                normalizedSessionId,
+                download.ModelId ?? string.Empty,
+                download.Filename ?? Path.GetFileName(download.DestinationPath) ?? string.Empty,
+                download.DestinationPath ?? string.Empty,
+                BytesDownloaded: 0,
+                TotalBytes: download.SizeBytes,
+                Percent: 0,
+                BytesPerSecond: 0,
+                AverageBytesPerSecond: 0,
+                ModelDownloadState.Failed,
+                ModelDownloadsDisabledException.ReportMessage,
+                runtime))
+            .ToArray();
+        _ = ReportRefusedAsync(reporter, reports);
+    }
+
+    private static async Task ReportRefusedAsync(Func<ModelDownloadProgress, Task> reporter, IEnumerable<ModelDownloadProgress> reports)
+    {
+        foreach (var report in reports)
+        {
+            try
+            {
+                await reporter(report).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                RunnerLog.Warning(nameof(ModelDownloadService), $"Could not report a refused download ({ex.GetType().Name}).");
+            }
+        }
+    }
+
     private static ModelDownloadRequest[] FilterRemoteDownloadRequests(IEnumerable<ModelDownloadRequest>? downloads)
         => downloads?
             .Where(static download => download is not null && !LocalModelProjector.IsLocalProjectionRequest(download))
@@ -399,6 +467,12 @@ internal sealed class ModelDownloadService : IAsyncDisposable
         bool highPriority)
     {
         var snapshot = FilterRemoteDownloadRequests(downloads);
+        if (!_downloadsEnabled && snapshot.Length > 0)
+        {
+            // Registration already reported each one; nothing was registered, so the editor would only fail later.
+            throw new ModelDownloadsDisabledException(snapshot.Select(static download => download.Filename).ToArray());
+        }
+
         ConfineDestinations(snapshot);
         var (managed, full) = PartitionDownloads(snapshot);
         Task conventional;

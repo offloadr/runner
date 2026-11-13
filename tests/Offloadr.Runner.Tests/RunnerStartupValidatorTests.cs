@@ -73,6 +73,32 @@ public partial class RunnerStartupValidatorTests
     }
 
     [Test]
+    public void ValidateOrThrow_RejectsAnUnknownModelDownloadsValue()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            Assert.Ignore("Runner startup validation is Linux-specific.");
+        }
+
+        var tempRoot = Path.Combine(Path.GetTempPath(), $"runner-validator-{Guid.NewGuid():N}");
+        try
+        {
+            var options = BuildOptions(
+                tempRoot,
+                "/bin/sh",
+                modelDownloads: ModelDownloadOptions.FromEnvironment(name => name == "RUNNER_MODEL_DOWNLOADS" ? "yes" : null));
+
+            var ex = Assert.Throws<InvalidOperationException>(
+                () => new RunnerStartupValidator(new NoopIsolationStrategy()).ValidateOrThrow(options));
+            Assert.That(ex!.Message, Does.Contain("RUNNER_MODEL_DOWNLOADS must be on or off, not 'yes'"));
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+        }
+    }
+
+    [Test]
     public void ValidateOrThrow_RequiredSealedStorageNeedsAMemoryBackedRoot()
     {
         if (!OperatingSystem.IsLinux())
@@ -495,7 +521,8 @@ public partial class RunnerStartupValidatorTests
         string? uvBinaryPath = null,
         bool requireAria2User = false,
         SealedStorageOptions? sealing = null,
-        ConsoleLogOptions? consoleLogs = null)
+        ConsoleLogOptions? consoleLogs = null,
+        ModelDownloadOptions? modelDownloads = null)
     {
         var sessionRoot = Path.Combine(tempRoot, "sessions");
         var workingDirectory = Path.Combine(tempRoot, "comfy");
@@ -551,7 +578,8 @@ public partial class RunnerStartupValidatorTests
                 "ARIA2_REQUIRE_USER" => requireAria2User ? "1" : null,
                 _ => null
             }),
-            ConsoleLogs = consoleLogs ?? new ConsoleLogOptions()
+            ConsoleLogs = consoleLogs ?? new ConsoleLogOptions(),
+            ModelDownloads = modelDownloads ?? new ModelDownloadOptions(),
         };
     }
 

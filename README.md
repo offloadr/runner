@@ -24,6 +24,8 @@ On Linux, or if you prefer the command line:
 docker run --rm -it --pull always --gpus all -e RUNNER_SECRET=<your-runner-key> ghcr.io/offloadr/runner-comfyui:latest
 ```
 
+A runner uses only the models in a folder you give it unless you add `-e RUNNER_MODEL_DOWNLOADS=on`, which lets it download the ones a workflow needs. Models are often several gigabytes each.
+
 | Image | Editor |
 | --- | --- |
 | `ghcr.io/offloadr/runner-comfyui:latest` | ComfyUI, current release |

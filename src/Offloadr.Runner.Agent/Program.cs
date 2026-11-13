@@ -66,6 +66,9 @@ static async Task<int> RunAgentAsync()
         $"Runner starting id={options.RunnerId} version={version} offloadr-api={GrpcChannelManager.RedactForLog(options.OffloadrApiUrl)} " +
         $"instance={instanceId} mode=grpc grpc-trace={(options.TraceGrpcHttp ? "on" : "off")}");
     RunnerLog.Info("Offloadr runner is free software under AGPL-3.0-only; source: https://github.com/offloadr/runner");
+    RunnerLog.Info(options.ModelDownloads.Enabled
+        ? "Model downloads are on: models this runner lacks are downloaded when a session needs them."
+        : "Model downloads are off (RUNNER_MODEL_DOWNLOADS): sessions use only the models in the local models folder.");
     var sealedStorageStatus = sealedStorageProbe.Probe(options.Session.Sealing);
     RunnerLog.Info(
         $"Sealed storage mode={sealedStorageStatus.Mode} root='{sealedStorageStatus.Root}' available={sealedStorageStatus.Available} " +
@@ -172,7 +175,8 @@ static async Task<int> RunAgentAsync()
         options.Aria2,
         hydrationCapabilities,
         new ModelDestinationPolicy(modelRoots),
-        new SessionModelDownloadStaging(options.Session.SessionRoot, options.Aria2.StagingDirectory));
+        new SessionModelDownloadStaging(options.Session.SessionRoot, options.Aria2.StagingDirectory),
+        downloadsEnabled: options.ModelDownloads.Enabled);
     await using var sessionEventRelay = new ComfySessionEventRelay(
         sessionManager.SignalRuntimeActivity,
         options.RunnerId,
