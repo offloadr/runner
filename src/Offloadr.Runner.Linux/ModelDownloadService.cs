@@ -425,11 +425,15 @@ internal sealed class ModelDownloadService : IAsyncDisposable
         }
 
         var inUse = new HashSet<string>(StringComparer.Ordinal);
+        // A path depends only on a model's category and file name, so the download there may be another
+        // model of another size. That one is never given up: it stays in the way, and the projector
+        // refuses the local request, rather than deleting a model that was not asked to be replaced.
         var releasable = requested
             .Where(LocalModelProjector.IsLocalProjectionRequest)
             .Where(canLink)
             .Select(download => (Download: download, Path: NormalizeDestination(download.DestinationPath)))
             .Where(static entry => entry.Path is not null)
+            .Where(entry => IsSameSize(entry.Download, ExpectedSizeOfDownloadAt(entry.Path!)))
             .DistinctBy(static entry => entry.Path, StringComparer.Ordinal)
             .ToArray();
         // All at once, so a held-up scheduler costs the command one start timeout, not one per model.

@@ -91,6 +91,8 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
 
     private TransferState? _activeState;
     private readonly ConcurrentQueue<LocalReleaseRequest> _localReleases = new();
+    // Set and cleared by the scheduler loop only.
+    private bool _localReleasesChangedSession;
     private long _nextIntentSequence;
 
     public DemandAwareModelHydrationCoordinator(
@@ -2582,6 +2584,20 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
                     $"Could not release the downloaded copy at '{request.Path}' ({ex.GetType().Name}); it is kept.");
             }
         }
+
+        if (_localReleasesChangedSession)
+        {
+            _localReleasesChangedSession = false;
+            try
+            {
+                await _backend.SaveSessionAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+            {
+                RunnerLog.Warning<DemandAwareModelHydrationCoordinator>(
+                    $"Could not save aria2's session after releasing downloads ({ex.GetType().Name}).");
+            }
+        }
     }
 
     /// <summary>Answers releases still queued when the coordinator stops: their downloads stay.</summary>
@@ -2674,6 +2690,8 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
                 // of the local model linked there would be checked against the deleted download.
                 var fileGone = IsPathConfirmedAbsent(normalized);
                 var restore = false;
+                // aria2 may have dropped the transfer before the failure.
+                _localReleasesChangedSession = true;
                 lock (_sync)
                 {
                     if (state is not null &&
@@ -2765,11 +2783,6 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
             }
         }
 
-        if (changed)
-        {
-            await _backend.SaveSessionAsync(cancellationToken).ConfigureAwait(false);
-        }
-
         lock (_sync)
         {
             if (state is not null &&
@@ -2779,6 +2792,10 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
                 ForgetStateLocked(state);
             }
         }
+
+        // aria2's session is saved once the caller has its answer, so the local model is linked without
+        // waiting for it (ProcessLocalReleasesAsync).
+        _localReleasesChangedSession |= changed;
 
         if (!IsPathConfirmedAbsent(normalized))
         {

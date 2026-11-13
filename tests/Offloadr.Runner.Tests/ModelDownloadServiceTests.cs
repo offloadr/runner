@@ -1423,6 +1423,71 @@ public class ModelDownloadServiceTests
         }
     }
 
+    [Test]
+    public async Task ReleaseForLocalModels_NeverFreesTheDownloadOfAnotherModelAtThePath()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var destinationPath = Path.Combine(root, "checkpoints", "foo.safetensors");
+            var aria = new CompletingAria2Client(destinationPath, expectedBytes: 8);
+            await using var service = CreateRangeManagedService(aria, root);
+            await service.InitializeAsync(CancellationToken.None);
+            service.SetActiveSession("session-1");
+            service.SeedDownloads("session-1", [RemoteModel(destinationPath)]);
+            await ReadWholeModelAsync(service, destinationPath);
+
+            // A local model of the same name, but another size: another model.
+            var other = LocalModel(destinationPath);
+            other.SizeBytes = 16;
+            var projected = await service.ReleaseForLocalModelsAsync([other], AnyLocalModel, CancellationToken.None);
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(projected, Is.EqualTo(new[] { other }), "Handed to the projector, which refuses the occupied path.");
+                Assert.That(File.Exists(destinationPath), Is.True, "The other model's download is not deleted.");
+                Assert.That(aria.RemoveCallCount, Is.Zero);
+            });
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
+    public async Task ReleaseForLocalModels_AnswersBeforeAria2HasSavedItsSession()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var destinationPath = Path.Combine(root, "diffusion_models", "slow-save.safetensors");
+            var aria = new CompletingAria2Client(destinationPath, expectedBytes: 8);
+            await using var service = CreateRangeManagedService(aria, root);
+            await service.InitializeAsync(CancellationToken.None);
+            service.SetActiveSession("session-1");
+            service.SeedDownloads("session-1", [RemoteModel(destinationPath)]);
+            await ReadWholeModelAsync(service, destinationPath);
+
+            var save = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            aria.SaveGate = save.Task;
+            var local = LocalModel(destinationPath);
+            var projected = await service.ReleaseForLocalModelsAsync([local], AnyLocalModel, CancellationToken.None)
+                .WaitAsync(TimeSpan.FromSeconds(5));
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(projected, Is.EqualTo(new[] { local }), "The local model is linked without waiting for the save.");
+                Assert.That(File.Exists(destinationPath), Is.False);
+            });
+            save.TrySetResult();
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
     private static bool AnyLocalModel(ModelDownloadRequest _) => true;
 
     private static async Task ReadWholeModelAsync(ModelDownloadService service, string destinationPath)
@@ -1622,8 +1687,21 @@ public class ModelDownloadServiceTests
 
         public bool FailSaveSession { get; set; }
 
-        public override Task SaveSessionAsync(CancellationToken cancellationToken)
-            => FailSaveSession ? throw new IOException("simulated aria2 failure") : Task.CompletedTask;
+        /// <summary>When set, saving the session waits for it.</summary>
+        public Task? SaveGate { get; set; }
+
+        public override async Task SaveSessionAsync(CancellationToken cancellationToken)
+        {
+            if (FailSaveSession)
+            {
+                throw new IOException("simulated aria2 failure");
+            }
+
+            if (SaveGate is { } gate)
+            {
+                await gate.WaitAsync(cancellationToken);
+            }
+        }
 
         /// <summary>Set to make removal wait for <see cref="RemovalGate"/>; completed when it starts waiting.</summary>
         public TaskCompletionSource? BlockRemoval { get; set; }
