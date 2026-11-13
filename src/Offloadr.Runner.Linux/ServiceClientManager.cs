@@ -814,7 +814,7 @@ internal static partial class ServiceClientManager
         IReadOnlyList<string> supportedEditorTemplates,
         Func<LocalModelSnapshot>? localModelSnapshotProvider,
         Action<LocalModelSnapshot>? localModelSnapshotObserver,
-        Func<IEnumerable<ModelDownloadRequest>, bool, CancellationToken, Task>? localModelProjectionReconciler,
+        Func<SessionProcessManager.SessionPaths?, IEnumerable<ModelDownloadRequest>, bool, CancellationToken, Task>? localModelProjectionReconciler,
         TimeSpan localModelsScanInterval,
         RuntimeIdentityRegistry runtimeIdentities,
         CancellationToken shutdown)
@@ -1225,7 +1225,7 @@ internal static partial class ServiceClientManager
         ArtifactUploadService artifactUploadService,
         WorkspaceMirrorService workspaceMirrorService,
         GpuPowerCommandExecutor gpuPowerLimitService,
-        Func<IEnumerable<ModelDownloadRequest>, bool, CancellationToken, Task>? localModelProjectionReconciler,
+        Func<SessionProcessManager.SessionPaths?, IEnumerable<ModelDownloadRequest>, bool, CancellationToken, Task>? localModelProjectionReconciler,
         RunnerCommandWorkState commandWorkState,
         LogicalSessionState logicalSessionState,
         RuntimeIdentityRegistry runtimeIdentities,
@@ -2671,7 +2671,7 @@ internal static partial class ServiceClientManager
         ArtifactUploadService artifactUploadService,
         WorkspaceMirrorService workspaceMirrorService,
         ModelDownloadService downloadService,
-        Func<IEnumerable<ModelDownloadRequest>, bool, CancellationToken, Task>? localModelProjectionReconciler,
+        Func<SessionProcessManager.SessionPaths?, IEnumerable<ModelDownloadRequest>, bool, CancellationToken, Task>? localModelProjectionReconciler,
         CancellationToken cancellationToken)
     {
         downloadService.SetActiveSession(command.SessionId);
@@ -2685,7 +2685,7 @@ internal static partial class ServiceClientManager
                     sessionPaths);
                 if (localModelProjectionReconciler is not null)
                 {
-                    await localModelProjectionReconciler(initialModels, true, token).ConfigureAwait(false);
+                    await localModelProjectionReconciler(sessionPaths, initialModels, true, token).ConfigureAwait(false);
                 }
 
                 var remoteInitialModels = FilterRemoteDownloadRequests(initialModels);
@@ -3136,7 +3136,7 @@ internal static partial class ServiceClientManager
         Func<SubmitPromptCommand, Func<string, ReadOnlyMemory<byte>, CancellationToken, Task>?, Action, CancellationToken, Task<SessionProcessManager.PromptSubmissionResult>> submitPrompt,
         Action<string, string, string, string> mapPrompt,
         CancellationToken cancellationToken,
-        Func<IEnumerable<ModelDownloadRequest>, bool, CancellationToken, Task>? localModelProjectionReconciler = null,
+        Func<SessionProcessManager.SessionPaths?, IEnumerable<ModelDownloadRequest>, bool, CancellationToken, Task>? localModelProjectionReconciler = null,
         Func<string, SessionProcessManager.SessionPaths?>? sessionPathsProvider = null,
         CancellationToken evidenceDeliveryCancellationToken = default,
         Action<string, string, SubmitPromptCommand>? unregisterUninvokedSubmission = null,
@@ -3274,13 +3274,14 @@ internal static partial class ServiceClientManager
             if (ShouldPrepareGenerationDependencies(prompt))
             {
                 setActiveDownloadSession(prompt.SessionId);
+                var promptSessionPaths = sessionPathsProvider?.Invoke(prompt.SessionId);
                 var downloads = MaterializeModelDownloadPathsForSession(
                     prompt.Downloads,
                     prompt.EditorRuntimeKind,
-                    sessionPathsProvider?.Invoke(prompt.SessionId));
+                    promptSessionPaths);
                 if (localModelProjectionReconciler is not null)
                 {
-                    await localModelProjectionReconciler(downloads, false, cancellationToken).ConfigureAwait(false);
+                    await localModelProjectionReconciler(promptSessionPaths, downloads, false, cancellationToken).ConfigureAwait(false);
                 }
 
                 var remoteDownloads = FilterRemoteDownloadRequests(downloads);
@@ -3688,19 +3689,32 @@ internal static partial class ServiceClientManager
             throw new InvalidOperationException("Forge model downloads require active session paths.");
         }
 
+        // Models live in the runner's cache, which outlasts the session; the session's own models
+        // directory links to them (SessionModelLinks). Without a cache they go into the session.
+        var cacheDirectory = sessionPaths.Value.ModelCacheDirectory is { Length: > 0 } cache ? cache : null;
         var rewritten = new ModelDownloadRequest[snapshot.Length];
         for (var i = 0; i < snapshot.Length; i++)
         {
             var download = snapshot[i];
             var clone = download.Clone();
-            clone.DestinationPath = BuildSessionModelPath(modelsDirectory, download.RelativeModelPath, download.Filename);
+            clone.DestinationPath = BuildModelPath(
+                cacheDirectory ?? modelsDirectory,
+                download.RelativeModelPath,
+                download.Filename,
+                sessionOwned: cacheDirectory is null);
             rewritten[i] = clone;
         }
 
         return rewritten;
     }
 
-    private static string BuildSessionModelPath(string sessionModelsDirectory, string? relativeModelPath, string? filename)
+    /// <summary>
+    /// Where <paramref name="relativeModelPath"/> goes beneath <paramref name="modelsDirectory"/>, refusing any
+    /// path that leaves it. In a <paramref name="sessionOwned"/> directory, symlinked components are refused too.
+    /// The cache is the agent's own: the download service confines what is downloaded there, and a local
+    /// model's entry in it is a link.
+    /// </summary>
+    internal static string BuildModelPath(string modelsDirectory, string? relativeModelPath, string? filename, bool sessionOwned)
     {
         if (string.IsNullOrWhiteSpace(relativeModelPath))
         {
@@ -3716,16 +3730,20 @@ internal static partial class ServiceClientManager
             throw new InvalidOperationException($"Forge model download '{filename}' has an invalid relative model path.");
         }
 
-        var modelsRoot = NormalizeFullPath(sessionModelsDirectory);
+        var modelsRoot = NormalizeFullPath(modelsDirectory);
         var destinationPath = NormalizeFullPath(Path.Combine(modelsRoot, normalizedRelativePath));
         if (!IsPathWithinRoot(destinationPath, modelsRoot))
         {
             throw new InvalidOperationException($"Forge model download '{filename}' escapes the session model root.");
         }
 
-        // The session user owns its models directory; refuse symlinked components so
-        // root-run downloads and placeholders cannot be redirected out of it.
-        ModelDestinationPolicy.ConfineToSessionRoot(modelsRoot, destinationPath);
+        if (sessionOwned)
+        {
+            // The session user owns its models directory; refuse symlinked components so
+            // root-run downloads and placeholders cannot be redirected out of it.
+            ModelDestinationPolicy.ConfineToSessionRoot(modelsRoot, destinationPath);
+        }
+
         return destinationPath;
     }
 

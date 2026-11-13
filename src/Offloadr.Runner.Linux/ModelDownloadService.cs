@@ -419,11 +419,6 @@ internal sealed class ModelDownloadService : IAsyncDisposable
     {
         ArgumentNullException.ThrowIfNull(canLink);
         var requested = downloads.Where(static download => download is not null).ToArray();
-        if (_hydrationCoordinator is null)
-        {
-            return requested;
-        }
-
         var inUse = new HashSet<string>(StringComparer.Ordinal);
         // A path depends only on a model's category and file name, so the download there may be another
         // model of another size. That one is never given up: it stays in the way, and the projector
@@ -444,9 +439,11 @@ internal sealed class ModelDownloadService : IAsyncDisposable
             {
                 var release = cancellationToken.IsCancellationRequested
                     ? LocalModelRelease.InUse
-                    : await hydrationCoordinator
-                        .ReleaseForLocalModelAsync(entry.Path!, cancellationToken, () => canLink(entry.Download))
-                        .ConfigureAwait(false);
+                    : hydrationCoordinator?.IsRangeManaged(entry.Path!) == true
+                        ? await hydrationCoordinator
+                            .ReleaseForLocalModelAsync(entry.Path!, cancellationToken, () => canLink(entry.Download))
+                            .ConfigureAwait(false)
+                        : ReleaseFullDownloadForLocalModel(entry.Path!);
                 if (release == LocalModelRelease.Released)
                 {
                     LinkFreed(linkFreed, entry.Download);
@@ -519,6 +516,57 @@ internal sealed class ModelDownloadService : IAsyncDisposable
             // Reported again when the whole request is projected.
             RunnerLog.Warning(nameof(ModelDownloadService), $"Could not link a local model at once ({ex.GetType().Name}).");
         }
+    }
+
+    /// <summary>
+    /// Gives up a fully downloaded file to a local model, as the hydration coordinator does for its own:
+    /// only in a model root no session can write (not a session home, whose downloads are staged), and
+    /// only a regular file, which there only the agent's downloads are. One still downloading stays.
+    /// </summary>
+    private LocalModelRelease ReleaseFullDownloadForLocalModel(string path)
+    {
+        if (_destinationPolicy is null || _staging?.GetStagingPath(path) is not null)
+        {
+            return LocalModelRelease.NotManaged;
+        }
+
+        try
+        {
+            // Also refuses a path whose leaf is a link: the local model may be linked there already.
+            _destinationPolicy.Confine(path);
+        }
+        catch (InvalidOperationException)
+        {
+            return LocalModelRelease.NotManaged;
+        }
+
+        lock (_conventionalPlaceholderGate)
+        {
+            if (_conventionalOperations.TryGetValue(path, out var operations) &&
+                operations.Any(static operation => !operation.IsCompleted))
+            {
+                return LocalModelRelease.InUse;
+            }
+
+            var file = new FileInfo(path);
+            if (!file.Exists || file.LinkTarget is not null)
+            {
+                return LocalModelRelease.NotManaged;
+            }
+
+            File.Delete(path);
+            File.Delete($"{path}.aria2");
+            _ownedConventionalPlaceholders.Remove(path);
+            foreach (var sessionPaths in _conventionalPathsBySession.Values)
+            {
+                sessionPaths.Remove(path);
+            }
+        }
+
+        RunnerLog.Info(
+            nameof(ModelDownloadService),
+            $"Removed the downloaded copy at '{path}': the same model is linked from the local models folder.");
+        return LocalModelRelease.Released;
     }
 
     private void ReportRefused(string sessionId, IReadOnlyCollection<ModelDownloadRequest> downloads)

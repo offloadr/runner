@@ -1930,7 +1930,7 @@ public partial class ServiceClientManagerTests
             (_, _, _, _) => Task.FromResult(new SessionProcessManager.PromptSubmissionResult(true, 200, System.Text.Encoding.UTF8.GetBytes("{}"), "Prompt submitted")),
             (_, _, _, _) => { },
                         CancellationToken.None,
-            (downloads, replace, _) =>
+            (_, downloads, replace, _) =>
             {
                 projectedDownloads = downloads.ToArray();
                 replaceExisting = replace;
@@ -1964,6 +1964,58 @@ public partial class ServiceClientManagerTests
         Assert.That(result[0].DestinationPath, Is.EqualTo("/sessions/session-1/models/Stable-diffusion/model.safetensors"));
         Assert.That(result[0].RelativeModelPath, Is.EqualTo("Stable-diffusion/model.safetensors"));
         Assert.That(download.DestinationPath, Is.Empty);
+    }
+
+    [Test]
+    public void MaterializeModelDownloadPathsForSession_WhenForgeNeoHasACache_PutsModelsInIt()
+    {
+        var remote = new Offloadr.Runner.V1.ModelDownloadRequest
+        {
+            Filename = "model.safetensors",
+            RelativeModelPath = "Stable-diffusion/model.safetensors",
+        };
+        var local = new Offloadr.Runner.V1.ModelDownloadRequest
+        {
+            Filename = "mine.safetensors",
+            RelativeModelPath = "Lora/mine.safetensors",
+            LocalSelectionHash = new string('a', 64),
+        };
+
+        var result = ServiceClientManager.MaterializeModelDownloadPathsForSession(
+            [remote, local],
+            "forge-neo",
+            new SessionProcessManager.SessionPaths
+            {
+                ModelsDirectory = "/sessions/session-1/models",
+                ModelCacheDirectory = "/var/lib/offloadr/models",
+            });
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(result[0].DestinationPath, Is.EqualTo(Path.GetFullPath("/var/lib/offloadr/models/Stable-diffusion/model.safetensors")));
+            Assert.That(result[1].DestinationPath, Is.EqualTo(Path.GetFullPath("/var/lib/offloadr/models/Lora/mine.safetensors")));
+        });
+    }
+
+    [Test]
+    public void MaterializeModelDownloadPathsForSession_WhenForgeNeoRelativePathEscapesTheCache_Throws()
+    {
+        var download = new Offloadr.Runner.V1.ModelDownloadRequest
+        {
+            Filename = "model.safetensors",
+            RelativeModelPath = "../model.safetensors"
+        };
+
+        Assert.That(
+            () => ServiceClientManager.MaterializeModelDownloadPathsForSession(
+                [download],
+                "forge-neo",
+                new SessionProcessManager.SessionPaths
+                {
+                    ModelsDirectory = "/sessions/session-1/models",
+                    ModelCacheDirectory = "/var/lib/offloadr/models",
+                }),
+            Throws.InvalidOperationException);
     }
 
     [Test]

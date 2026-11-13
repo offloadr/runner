@@ -825,6 +825,41 @@ public class ModelDownloadServiceTests
     }
 
     [Test]
+    public async Task ReleaseForLocalModels_KeepsAFullDownloadThatIsStillRunning()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var destinationPath = Path.Combine(root, "Stable-diffusion", "running.safetensors");
+            var backend = new BlockingPartialTransferBackend(destinationPath);
+            await using var service = new ModelDownloadService(
+                backend,
+                DefaultAria2Settings,
+                destinationPolicy: new ModelDestinationPolicy([root]));
+            service.SetActiveSession("session-1");
+            service.SeedDownloads("session-1", [RemoteModel(destinationPath)]);
+            var download = service.EnsureDownloadedAsync(destinationPath, CancellationToken.None, highPriority: false);
+            await backend.StatusRequested.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            var projected = await service.ReleaseForLocalModelsAsync([LocalModel(destinationPath)], AnyLocalModel, CancellationToken.None);
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(projected, Is.Empty, "No link over a download in progress.");
+                Assert.That(File.Exists(destinationPath), Is.True);
+            });
+
+            service.CancelSession("session-1");
+            backend.AllowRemoval.TrySetResult();
+            Assert.That(async () => await download, Throws.InstanceOf<OperationCanceledException>());
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
     public async Task TryEnsureRegisteredDownloadAsync_WhenPathUnregistered_ReturnsFalseWithoutTrustingExistingFile()
     {
         var root = CreateTempDirectory();

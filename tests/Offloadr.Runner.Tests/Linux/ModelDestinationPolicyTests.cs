@@ -214,6 +214,61 @@ public class ModelDestinationPolicyTests
     }
 
     [Test]
+    public async Task ReleaseForLocalModels_DeletesAFullDownloadInAModelRoot()
+    {
+        await using var service = new ModelDownloadService(
+            new NoopTransferBackend(),
+            DefaultAria2Settings,
+            capabilities: null,
+            new ModelDestinationPolicy([_modelsRoot]));
+        var destination = Path.Combine(_modelsRoot, "Stable-diffusion", "model.safetensors");
+        Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+        File.WriteAllText(destination, "downloaded earlier");
+        var local = LocalModel(destination);
+
+        var projected = await service.ReleaseForLocalModelsAsync([local], static _ => true, CancellationToken.None);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(projected, Is.EqualTo(new[] { local }));
+            Assert.That(File.Exists(destination), Is.False, "The local model is linked there instead; it is not kept twice.");
+        });
+    }
+
+    [Test]
+    public async Task ReleaseForLocalModels_LeavesALinkAndPathsOutsideTheModelRoots()
+    {
+        await using var service = new ModelDownloadService(
+            new NoopTransferBackend(),
+            DefaultAria2Settings,
+            capabilities: null,
+            new ModelDestinationPolicy([_modelsRoot]));
+        var linked = Path.Combine(_modelsRoot, "Lora", "linked.safetensors");
+        Directory.CreateDirectory(Path.GetDirectoryName(linked)!);
+        File.WriteAllText(Path.Combine(_outside, "source.safetensors"), "local");
+        File.CreateSymbolicLink(linked, Path.Combine(_outside, "source.safetensors"));
+        var outsidePath = Path.Combine(_outside, "theirs.safetensors");
+        File.WriteAllText(outsidePath, "not in a model root");
+
+        var projected = await service.ReleaseForLocalModelsAsync([LocalModel(linked), LocalModel(outsidePath)], static _ => true, CancellationToken.None);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(projected, Has.Count.EqualTo(2));
+            Assert.That(new FileInfo(linked).LinkTarget, Is.Not.Null);
+            Assert.That(File.ReadAllText(outsidePath), Is.EqualTo("not in a model root"));
+        });
+    }
+
+    private static ModelDownloadRequest LocalModel(string destination) => new()
+    {
+        ModelId = "model-1",
+        Filename = Path.GetFileName(destination),
+        DestinationPath = destination,
+        LocalSelectionHash = new string('a', 64),
+    };
+
+    [Test]
     public void CreatePlaceholder_CreatesAnEmptyFileAndItsDirectoriesOnce()
     {
         var policy = new ModelDestinationPolicy([_modelsRoot]);

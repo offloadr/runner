@@ -188,6 +188,22 @@ public class RunnerAgentOptionsTests
     }
 
     [Test]
+    public void FromEnvironment_KeepsForgeModelsInTheRunnersCacheUnlessToldOtherwise()
+    {
+        var defaults = RunnerAgentOptions.FromEnvironment(GetEnv(new Dictionary<string, string?>()));
+        var configured = RunnerAgentOptions.FromEnvironment(GetEnv(new Dictionary<string, string?>
+        {
+            ["RUNNER_MODEL_CACHE_DIR"] = " /data/models ",
+        }));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(defaults.Session.ModelCacheDirectory, Is.EqualTo("/var/lib/offloadr/models"));
+            Assert.That(configured.Session.ModelCacheDirectory, Is.EqualTo("/data/models"));
+        });
+    }
+
+    [Test]
     public void FromEnvironment_AutoDetectsDefaultLocalModelsMount_WhenUnset()
     {
         var env = new Dictionary<string, string?>
