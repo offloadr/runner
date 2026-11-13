@@ -80,6 +80,40 @@ public class LocalModelProjectorTests
     }
 
     [Test]
+    public void CanProject_RefusesATargetBehindALinkedDirectory()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var sourceRoot = Path.Combine(root, "local");
+            var destinationRoot = Path.Combine(root, "models");
+            Directory.CreateDirectory(Path.Combine(sourceRoot, "checkpoints"));
+            var sourceFile = Path.Combine(sourceRoot, "checkpoints", "demo.safetensors");
+            File.WriteAllText(sourceFile, "checkpoint");
+
+            // A download's directory moved out of the model root and linked back in.
+            var outside = Path.Combine(root, "outside", "checkpoints");
+            Directory.CreateDirectory(outside);
+            File.WriteAllText(Path.Combine(outside, "demo.safetensors"), "downloaded");
+            Directory.CreateDirectory(destinationRoot);
+            Directory.CreateSymbolicLink(Path.Combine(destinationRoot, "checkpoints"), outside);
+            var projected = Path.Combine(destinationRoot, "checkpoints", "demo.safetensors");
+
+            var projector = new LocalModelProjector(sourceRoot, destinationRoot);
+            projector.UpdateSnapshot(CreateSnapshot(CreateModel(sourceFile, ModelCategory.Checkpoint)));
+
+            Assert.That(
+                projector.CanProject(CreateLocalProjectionRequest(sourceFile, ModelCategory.Checkpoint, projected)),
+                Is.False,
+                "Linking would be refused there, so the download must not be given up for it.");
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
     public void SetRequestedModels_DoesNotRemoveLinksThroughSymlinkedDirectory()
     {
         var root = CreateTempDirectory();

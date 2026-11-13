@@ -115,11 +115,13 @@ internal sealed class LocalModelProjector
             return false;
         }
 
-        // The checks AddProjectionRequests makes, so a request it would refuse is refused here too.
+        // The checks AddProjectionRequests and EnsureProjectedLink make, so a request they would refuse
+        // is refused here too.
         var selectionHash = LocalModelSelectionHash.NormalizeSelectionHash(download.LocalSelectionHash);
         if (!LocalModelSelectionHash.IsValidSelectionHash(selectionHash) ||
             string.IsNullOrWhiteSpace(download.DestinationPath) ||
-            !IsUnderRoot(NormalizePath(download.DestinationPath), _destinationRoot))
+            !IsUnderRoot(NormalizePath(download.DestinationPath), _destinationRoot) ||
+            !IsReachableThroughRealDirectories(NormalizePath(download.DestinationPath)))
         {
             return false;
         }
@@ -140,6 +142,30 @@ internal sealed class LocalModelProjector
             {
                 return false;
             }
+        }
+    }
+
+    /// <summary>
+    /// Whether every directory between the destination root and <paramref name="targetPath"/> is a real
+    /// one, as <see cref="EnsureProjectedLink"/> requires: a link there makes it refuse the target.
+    /// </summary>
+    private bool IsReachableThroughRealDirectories(string targetPath)
+    {
+        if (!OperatingSystem.IsLinux() || !Directory.Exists(_destinationRoot))
+        {
+            return true;
+        }
+
+        try
+        {
+            using var secureRoot = new LinuxSecureDirectoryRoot(_destinationRoot);
+            var relativePath = GetRelativeTargetPath(targetPath);
+            return secureRoot.GetStatus(relativePath).Kind is SecureEntryKind.RegularFile or SecureEntryKind.Missing ||
+                   secureRoot.ReadSymbolicLink(relativePath, out _) == SecureLinkKind.SymbolicLink;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException)
+        {
+            return false;
         }
     }
 
