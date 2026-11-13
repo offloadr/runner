@@ -17,6 +17,10 @@ $publishDir = Join-Path $repository "artifacts/packages/windows-$Runtime"
 $releasesDir = Join-Path $repository "artifacts/releases/windows-$Runtime"
 $packId = 'app.offloadr.runner'
 
+# Start from an empty folder: anything left from an earlier run (such as a browser profile from
+# starting the published app) would otherwise ship in the installer.
+if (Test-Path $publishDir) { Remove-Item $publishDir -Recurse -Force }
+
 dotnet publish (Join-Path $repository 'src/Offloadr.Runner.Desktop/Offloadr.Runner.Desktop.csproj') `
     -c Release `
     -f net10.0-windows10.0.19041.0 `
@@ -61,6 +65,7 @@ try {
         --runtime $Runtime `
         --shortcuts StartMenuRoot `
         --noPortable `
+        --exclude '.*\.pdb|.*\.WebView2([\\/].*)?' `
         -o $releasesDir
     if ($LASTEXITCODE) { throw 'Packing the installer failed.' }
 }
@@ -72,4 +77,4 @@ finally {
 Get-ChildItem $releasesDir -Filter '*.nupkg' |
     Where-Object { $_.Name -notlike "$packId-$Version-*" } |
     Remove-Item
-Get-ChildItem $releasesDir | Format-Table Name, Length
+Get-ChildItem $releasesDir | ForEach-Object { '{0,12}  {1}' -f $_.Length, $_.Name }
