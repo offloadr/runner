@@ -2359,6 +2359,36 @@ public class RunnerSupervisorTests
         _supervisor = null;
         supervisor.Dispose();
 
+        Assert.Multiple(() =>
+        {
+            Assert.That(supervisor.RunnerWanted, Is.False);
+            Assert.That(_engine.Exists(Name), Is.False, "The Stop wins: the new version must find no runner to reconnect to.");
+        });
+    }
+
+    [Test]
+    public async Task RunnerWanted_ForAStartStillQueuedAsTheAppGoesDownToUpdate_IsKept()
+    {
+        var supervisor = await StartSupervisorAsync();
+        supervisor.KeepRunnerOnShutdown();
+
+        supervisor.RequestStart();
+        await supervisor.StopAsync(CancellationToken.None);
+        _supervisor = null;
+        supervisor.Dispose();
+
+        Assert.That(supervisor.RunnerWanted, Is.True, "The new version starts it, though this one never got to.");
+    }
+
+    [Test]
+    public async Task RunnerWanted_WhenStartingFailsForGood_IsCleared()
+    {
+        _settings = new FakeSettingsStore(new RunnerSettings());
+        var supervisor = await StartSupervisorAsync();
+
+        supervisor.RequestStart();
+        await WaitForStateAsync(SupervisorState.Faulted);
+
         Assert.That(supervisor.RunnerWanted, Is.False);
     }
 

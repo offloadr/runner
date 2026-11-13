@@ -119,7 +119,7 @@ public sealed class MainPage : ContentPage
 
             // The runner may exit, or start waiting to restart, until the supervisor has stopped;
             // the new version then has nothing to reconnect to, so it is told the runner is wanted.
-            // A Stop pressed meanwhile clears that.
+            // A Stop pressed meanwhile clears that, and the shutdown then stops the runner after all.
             await _runtime.StopAsync();
             UpdateHandoff.Save(_paths, _supervisor.RunnerWanted);
             CanClose = true;

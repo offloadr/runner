@@ -233,12 +233,12 @@ public sealed class RunnerSupervisor : BackgroundService
     }
 
     /// <summary>
-    /// True while the person wants the runner: since a Start, a start with the app or reconnecting to
-    /// a running runner, and until a Stop is asked for, which clears it at once, before the stop
-    /// even runs. False when starting failed for good (needs attention). Unlike the state, this tells
-    /// a runner that exited (it is restarted) from one the person stopped.
+    /// True while the person wants the runner: since a Start (even one still queued), a start with
+    /// the app or reconnecting to a running runner, and until a Stop is asked for, which clears it at
+    /// once, before the stop even runs, or the runner needs attention. Unlike the state, this tells a
+    /// runner that exited (it is restarted) from one the person stopped.
     /// </summary>
-    public bool RunnerWanted => Volatile.Read(ref _runnerWanted) && View.State is not (SupervisorState.Stopped or SupervisorState.Faulted);
+    public bool RunnerWanted => Volatile.Read(ref _runnerWanted);
 
     private bool _runnerWanted;
 
@@ -776,6 +776,10 @@ public sealed class RunnerSupervisor : BackgroundService
             {
                 // Stop was pressed after this start was decided but before it could be cancelled.
                 operation.Cancel();
+            }
+            else
+            {
+                Volatile.Write(ref _runnerWanted, true);
             }
         }
 
@@ -1791,7 +1795,9 @@ public sealed class RunnerSupervisor : BackgroundService
     {
         CancelImageDownload();
         await StopLogFollowerAsync().ConfigureAwait(false);
-        if (!_options.StopContainerOnShutdown || !_ownsContainer || Volatile.Read(ref _keepRunnerOnShutdown))
+        // Kept for an update only while still wanted: a Stop asked for as the app goes down (from the
+        // tray, say) may never have run, and the new version would otherwise reconnect to the runner.
+        if (!_options.StopContainerOnShutdown || !_ownsContainer || (Volatile.Read(ref _keepRunnerOnShutdown) && RunnerWanted))
         {
             return;
         }
@@ -2139,6 +2145,8 @@ public sealed class RunnerSupervisor : BackgroundService
 
     private void Fault(string message)
     {
+        // Needs attention: nothing runs or restarts it until the person starts it again.
+        Volatile.Write(ref _runnerWanted, false);
         _logger.LogWarning("Runner supervisor fault: {Message}", message);
         AppendLog("supervisor: " + message);
         Set(SupervisorState.Faulted, message);
