@@ -1324,6 +1324,66 @@ public class ModelDownloadServiceTests
         }
     }
 
+    [Test]
+    public async Task ReleaseForLocalModels_HoldsBackOnlyTheSelectionTheOpenCopyMatches()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var destinationPath = Path.Combine(root, "diffusion_models", "shared.safetensors");
+            var aria = new CompletingAria2Client(destinationPath, expectedBytes: 8);
+            await using var service = CreateRangeManagedService(aria, root);
+            await service.InitializeAsync(CancellationToken.None);
+            service.SetActiveSession("session-1");
+            service.SeedDownloads("session-1", [RemoteModel(destinationPath)]);
+            var opened = await service.OpenRangeManagedAsync(destinationPath, "session-1", CancellationToken.None);
+
+            var matching = LocalModel(destinationPath);
+            var conflicting = LocalModel(destinationPath);
+            conflicting.SizeBytes = 16;
+            var projected = await service.ReleaseForLocalModelsAsync([matching, conflicting], AnyLocalModel, CancellationToken.None);
+
+            Assert.That(projected, Is.EqualTo(new[] { conflicting }), "The other selection still reaches the projector.");
+            await service.ReleaseAsync(opened.LeaseId);
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
+    public async Task ReleaseForLocalModels_DoesNotTakeAFilePutInTheCopysPlaceForIt()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var destinationPath = Path.Combine(root, "diffusion_models", "replaced.safetensors");
+            var aria = new CompletingAria2Client(destinationPath, expectedBytes: 8);
+            await using var service = CreateRangeManagedService(aria, root);
+            await service.InitializeAsync(CancellationToken.None);
+            service.SetActiveSession("session-1");
+            service.SeedDownloads("session-1", [RemoteModel(destinationPath)]);
+            await ReadWholeModelAsync(service, destinationPath);
+            var opened = await service.OpenRangeManagedAsync(destinationPath, "session-1", CancellationToken.None);
+
+            // The open copy's name now leads to another file, made before the copy is unlinked so it
+            // cannot reuse its inode.
+            var replacement = destinationPath + ".other";
+            File.WriteAllBytes(replacement, new byte[8]);
+            File.Move(replacement, destinationPath, overwrite: true);
+            var local = LocalModel(destinationPath);
+            var projected = await service.ReleaseForLocalModelsAsync([local], AnyLocalModel, CancellationToken.None);
+
+            Assert.That(projected, Is.EqualTo(new[] { local }), "Handed to the projector, which refuses the file it did not make.");
+            await service.ReleaseAsync(opened.LeaseId);
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
     private static bool AnyLocalModel(ModelDownloadRequest _) => true;
 
     private static async Task ReadWholeModelAsync(ModelDownloadService service, string destinationPath)

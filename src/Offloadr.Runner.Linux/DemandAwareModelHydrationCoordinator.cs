@@ -2474,6 +2474,32 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
     internal static TimeSpan LocalReleaseStartTimeout { get; set; } = TimeSpan.FromSeconds(5);
 
     /// <summary>Whether this coordinator has a registration or an index record for <paramref name="normalized"/>.</summary>
+    /// <summary>
+    /// Whether the file at <paramref name="path"/> is still the one this coordinator downloaded there: same
+    /// device and inode as its registration or index record. A file put there since is not.
+    /// </summary>
+    public bool HasIntactCopyAt(string path)
+    {
+        var normalized = NormalizePath(path);
+        if (!LinuxFileIdentityReader.TryRead(normalized, out var current))
+        {
+            return false;
+        }
+
+        lock (_sync)
+        {
+            if (_states.TryGetValue(normalized, out var state) && state.Inode != 0)
+            {
+                return state.DeviceId == current.DeviceId && state.Inode == current.Inode;
+            }
+        }
+
+        return _index.Snapshot().Any(record =>
+            string.Equals(NormalizePath(record.DestinationPath), normalized, StringComparison.Ordinal) &&
+            record.DeviceId == current.DeviceId &&
+            record.Inode == current.Inode);
+    }
+
     /// <summary>The length the download at <paramref name="path"/> was registered with, or null when there is none.</summary>
     public long? ExpectedLengthAt(string path)
     {

@@ -451,17 +451,20 @@ internal sealed class ModelDownloadService : IAsyncDisposable
                 return (entry.Download, Path: entry.Path!, Release: release);
             }))
             .ConfigureAwait(false);
+        var keptSizes = new Dictionary<string, long?>(StringComparer.Ordinal);
         foreach (var (download, path, release) in releases)
         {
-            // Only a copy that is there can stand in for the local model; otherwise it is linked now.
-            if (release != LocalModelRelease.InUse || !File.Exists(path))
+            // Only the copy the agent downloaded, still at its path, can stand in for the local model;
+            // otherwise the request goes on to the projector.
+            if (release != LocalModelRelease.InUse || !HasIntactCopyAt(path))
             {
                 continue;
             }
 
             // The copy keeps serving only as the same model: one of another size stays in the way, and
             // the projector refuses the request as it did before, rather than the editor using other weights.
-            if (download.SizeBytes > 0 && ExpectedSizeOfDownloadAt(path) is { } downloadedSize && downloadedSize != download.SizeBytes)
+            var downloadedSize = ExpectedSizeOfDownloadAt(path);
+            if (!IsSameSize(download, downloadedSize))
             {
                 RunnerLog.Warning(
                     nameof(ModelDownloadService),
@@ -473,16 +476,29 @@ internal sealed class ModelDownloadService : IAsyncDisposable
                 nameof(ModelDownloadService),
                 $"Keeping the downloaded copy at '{path}' while it is in use; the local model is linked there once it is free.");
             inUse.Add(path);
+            keptSizes[path] = downloadedSize;
         }
 
+        // Every request for a kept path is checked, not only the one that was released: another selection
+        // of another size at the same path still reaches the projector.
         return inUse.Count == 0
             ? requested
             : requested
                 .Where(download => !LocalModelProjector.IsLocalProjectionRequest(download) ||
                                    NormalizeDestination(download.DestinationPath) is not { } path ||
-                                   !inUse.Contains(path))
+                                   !inUse.Contains(path) ||
+                                   !IsSameSize(download, keptSizes[path]))
                 .ToArray();
     }
+
+    private static bool IsSameSize(ModelDownloadRequest download, long? downloadedSize)
+        => download.SizeBytes <= 0 || downloadedSize is not { } size || size == download.SizeBytes;
+
+    /// <summary>Whether the file at <paramref name="path"/> is still the one the agent downloaded there.</summary>
+    private bool HasIntactCopyAt(string path)
+        => _hydrationCoordinator?.IsRangeManaged(path) == true
+            ? _hydrationCoordinator.HasIntactCopyAt(path)
+            : File.Exists(path);
 
     /// <summary>The size the download at <paramref name="path"/> was asked for with, not how far it has got.</summary>
     private long? ExpectedSizeOfDownloadAt(string path)
