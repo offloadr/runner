@@ -29,9 +29,9 @@ public sealed class DesktopRuntime(IEnumerable<IHostedService> services, ILogger
     }
 
     /// <summary>
-    /// Keeps "start at sign-in" pointing at this copy of the app, for example after an update moved
-    /// it. Only the copy that now holds the single-instance lock does it, and never one pointed at
-    /// another data folder, which Windows would then start against the person's real one.
+    /// Keeps "start at sign-in" pointing at this copy of the app, for example after it was installed
+    /// over an unzipped copy. Only the copy that now holds the single-instance lock does it, and never
+    /// one pointed at another data folder, which Windows would then start against the person's real one.
     /// </summary>
     private void RefreshStartupRegistration()
     {
@@ -42,7 +42,7 @@ public sealed class DesktopRuntime(IEnumerable<IHostedService> services, ILogger
 
         try
         {
-            new Offloadr.Runner.Supervisor.Hosting.WindowsStartupRegistration(Environment.ProcessPath!).RefreshIfMoved();
+            new Offloadr.Runner.Supervisor.Hosting.WindowsStartupRegistration(MauiProgram.LaunchPath).RefreshIfMoved();
         }
         catch (Exception ex) when (ex is UnauthorizedAccessException or System.Security.SecurityException or IOException)
         {

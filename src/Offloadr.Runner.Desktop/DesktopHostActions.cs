@@ -4,7 +4,7 @@ namespace Offloadr.Runner.Desktop;
 
 public sealed class DesktopHostActions : IHostActions
 {
-    private readonly WindowsStartupRegistration _startup = new(Environment.ProcessPath!);
+    private readonly WindowsStartupRegistration _startup = new(MauiProgram.LaunchPath);
 
     public bool CanPickFolder => true;
 

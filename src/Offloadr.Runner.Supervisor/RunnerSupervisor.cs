@@ -1992,10 +1992,13 @@ public sealed class RunnerSupervisor : BackgroundService
     /// A runner this copy of the app started (now or before a crash). One another copy started, with
     /// another data folder or on another computer sharing the engine, is never adopted or stopped.
     /// </summary>
-    private bool IsOwned(ContainerInfo container)
+    private bool IsOwned(ContainerInfo container) => IsOwnedBy(container, _owner.Id);
+
+    /// <summary>True when <paramref name="container"/> is a runner the copy of the app with <paramref name="ownerId"/> started.</summary>
+    internal static bool IsOwnedBy(ContainerInfo container, string ownerId)
         => IsManaged(container) &&
            container.Labels.TryGetValue(OwnerLabel, out var owner) &&
-           string.Equals(owner, _owner.Id, StringComparison.Ordinal);
+           string.Equals(owner, ownerId, StringComparison.Ordinal);
 
     /// <param name="resume">
     /// Follows again after the stream dropped, from new lines only, so earlier lines are not repeated.

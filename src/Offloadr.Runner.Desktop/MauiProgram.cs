@@ -15,6 +15,9 @@ public static class MauiProgram
     /// </summary>
     public static bool UsesOtherDataDirectory => !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(DataDirectoryVariable));
 
+    /// <summary>What "start at sign-in" starts: the installer's launcher when installed, which outlives updates.</summary>
+    public static string LaunchPath => Offloadr.Runner.Supervisor.Hosting.WindowsStartupRegistration.LaunchPath(Environment.ProcessPath!);
+
     public static SupervisorPaths Paths()
     {
         var data = Environment.GetEnvironmentVariable(DataDirectoryVariable);
@@ -24,6 +27,10 @@ public static class MauiProgram
     public static MauiApp CreateMauiApp()
     {
         var paths = Paths();
+
+        // WebView2 keeps its profile next to the executable unless told otherwise, and every update
+        // replaces the installed app's folder: keep it with the app's data instead.
+        Environment.SetEnvironmentVariable("WEBVIEW2_USER_DATA_FOLDER", paths.WebView);
         var builder = MauiApp.CreateBuilder().UseMauiApp<App>();
         builder.Services.AddMauiBlazorWebView();
         builder.Services.Replace(ServiceDescriptor.Singleton<IHostEnvironment>(new DesktopHostEnvironment()));

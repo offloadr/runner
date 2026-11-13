@@ -67,6 +67,25 @@ public sealed class WindowsStartupRegistration
         approved?.DeleteValue(_valueName, throwOnMissingValue: false);
     }
 
+    /// <summary>Removes the entry when it starts this executable, leaving one for another copy of the app alone.</summary>
+    /// <returns>True when the entry was removed.</returns>
+    public bool RemoveIfRegistered()
+    {
+        using (var key = Registry.CurrentUser.OpenSubKey(_runKey, writable: true))
+        {
+            if (key?.GetValue(_valueName) is not string current || !string.Equals(current, _command, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            key.DeleteValue(_valueName, throwOnMissingValue: false);
+        }
+
+        using var approved = Registry.CurrentUser.OpenSubKey(_approvedKey, writable: true);
+        approved?.DeleteValue(_valueName, throwOnMissingValue: false);
+        return true;
+    }
+
     /// <summary>
     /// Windows' Startup apps switch writes a binary value whose first byte is odd (3) when the entry
     /// is turned off and even (2) when it is on; no value means on.
@@ -75,6 +94,26 @@ public sealed class WindowsStartupRegistration
     {
         using var approved = Registry.CurrentUser.OpenSubKey(_approvedKey);
         return approved?.GetValue(_valueName) is byte[] { Length: > 0 } state && (state[0] & 1) == 1;
+    }
+
+    /// <summary>
+    /// The path Windows should start: for an installed copy, the installer's launcher next to the
+    /// <c>current</c> folder, which keeps its path while every update replaces that folder; otherwise
+    /// the executable itself (a copy run from a build folder, say).
+    /// </summary>
+    public static string LaunchPath(string processPath, Func<string, bool>? fileExists = null)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(processPath);
+        fileExists ??= File.Exists;
+        var folder = Path.GetDirectoryName(processPath);
+        var root = folder is null ? null : Path.GetDirectoryName(folder);
+        if (root is null || !string.Equals(Path.GetFileName(folder), "current", StringComparison.OrdinalIgnoreCase))
+        {
+            return processPath;
+        }
+
+        var launcher = Path.Combine(root, Path.GetFileName(processPath));
+        return fileExists(Path.Combine(root, "Update.exe")) && fileExists(launcher) ? launcher : processPath;
     }
 
     /// <summary>Points an existing registration at this executable, for example after an update moved the app.</summary>

@@ -16,6 +16,9 @@ public sealed record SupervisorPaths
 
     public string Keys => Path.Combine(Data, "keys");
 
+    /// <summary>The desktop window's browser profile (WebView2).</summary>
+    public string WebView => Path.Combine(Data, "webview");
+
     /// <summary>Held while a supervisor manages the runner container.</summary>
     public string SupervisorLock => Path.Combine(Data, "supervisor.lock");
 

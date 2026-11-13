@@ -100,6 +100,10 @@ public sealed class SupervisorOwner(string id)
         }
     }
 
+    /// <summary>The ID kept in <paramref name="path"/>, or null when there is none; never creates one.</summary>
+    public static SupervisorOwner? TryLoad(string path)
+        => Read(path, out var stored) == Stored.Valid ? new SupervisorOwner(stored!) : null;
+
     private enum Stored
     {
         Missing,

@@ -123,14 +123,20 @@ jobs:
       - name: Build desktop solution
         run: dotnet build runner.desktop.slnx -warnaserror
 
-      - name: Publish self-contained folder
+      # A release also packs a delta from the latest published release.
+      - name: Publish and pack the installer
         shell: pwsh
-        run: ./build/publish-windows.ps1 -Unpackaged
+        run: |
+          if ($env:OFFLOADR_RUNNER_VERSION) {
+            ./build/publish-windows.ps1 -Pack -PreviousReleasesFrom "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY"
+          } else {
+            ./build/publish-windows.ps1 -Pack
+          }
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: offloadr-runner-windows-x64
-          path: artifacts/packages/windows-win-x64/
+          path: artifacts/releases/windows-win-x64/
           if-no-files-found: error
 
   contracts:
