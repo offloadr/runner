@@ -23,13 +23,10 @@ public class UpdateHandoffTests
         }
     }
 
-    [TestCase(SupervisorState.Running)]
-    [TestCase(SupervisorState.RestartPending)]
-    [TestCase(SupervisorState.WaitingToRestart)]
-    [TestCase(SupervisorState.Starting)]
-    public void AWantedRunner_IsResumedOnceByTheNextVersion(SupervisorState state)
+    [Test]
+    public void AWantedRunner_IsResumedOnceByTheNextVersion()
     {
-        UpdateHandoff.Save(_paths, View(state));
+        UpdateHandoff.Save(_paths, runnerWanted: true);
 
         Assert.Multiple(() =>
         {
@@ -38,15 +35,12 @@ public class UpdateHandoffTests
         });
     }
 
-    [TestCase(SupervisorState.Stopped)]
-    [TestCase(SupervisorState.Faulted)]
-    public void ARunnerThatWasNotWanted_IsNotStarted(SupervisorState state)
+    [Test]
+    public void ARunnerThatWasNotWanted_IsNotStarted()
     {
-        UpdateHandoff.Save(_paths, View(SupervisorState.Running));
-        UpdateHandoff.Save(_paths, View(state));
+        UpdateHandoff.Save(_paths, runnerWanted: true);
+        UpdateHandoff.Save(_paths, runnerWanted: false);
 
         Assert.That(UpdateHandoff.TakeResume(_paths), Is.False);
     }
-
-    private static SupervisorView View(SupervisorState state) => SupervisorView.Initial(DateTimeOffset.UtcNow) with { State = state };
 }

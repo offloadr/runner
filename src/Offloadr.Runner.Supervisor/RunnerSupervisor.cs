@@ -226,7 +226,21 @@ public sealed class RunnerSupervisor : BackgroundService
     /// <summary>Raised after <see cref="View"/> or <see cref="LogLines"/> changed, on a background thread.</summary>
     public event Action? Changed;
 
-    public void RequestStart() => Enqueue(Command.Start);
+    public void RequestStart()
+    {
+        Volatile.Write(ref _runnerWanted, true);
+        Enqueue(Command.Start);
+    }
+
+    /// <summary>
+    /// True while the person wants the runner: since a Start, a start with the app or reconnecting to
+    /// a running runner, and until a Stop is asked for, which clears it at once, before the stop
+    /// even runs. False when starting failed for good (needs attention). Unlike the state, this tells
+    /// a runner that exited (it is restarted) from one the person stopped.
+    /// </summary>
+    public bool RunnerWanted => Volatile.Read(ref _runnerWanted) && View.State is not (SupervisorState.Stopped or SupervisorState.Faulted);
+
+    private bool _runnerWanted;
 
     /// <summary>
     /// Queues the start AutoStart asks for, stamped with the Stop generation from when the app opened:
@@ -236,6 +250,11 @@ public sealed class RunnerSupervisor : BackgroundService
     {
         lock (_gate)
         {
+            if (_stopGeneration == _startupGeneration)
+            {
+                Volatile.Write(ref _runnerWanted, true);
+            }
+
             _commands.Writer.TryWrite(new Request(Command.AutoStart, _startupGeneration));
         }
     }
@@ -250,6 +269,7 @@ public sealed class RunnerSupervisor : BackgroundService
             // Queued under the same lock as the count, so no request queued after it can carry the
             // older count, and none queued before it can pass a check against the newer one.
             var generation = ++_stopGeneration;
+            Volatile.Write(ref _runnerWanted, false);
             _operation?.Cancel();
             _imageDownload?.Cancellation.Cancel();
             _imageDownload = null;
@@ -559,6 +579,14 @@ public sealed class RunnerSupervisor : BackgroundService
                        !_engineSelection.Matches(settings.ContainerEngineExecutable) ||
                        (wanted is not null && !string.Equals(Fingerprint(BuildSpec(settings, wanted)), fingerprint, StringComparison.Ordinal));
         var reconnected = $"Reconnected to the runner that was already running{(template is null ? "." : $" ({template.Label}).")}";
+        lock (_gate)
+        {
+            // Wanted, unless a Stop was asked for since the app opened.
+            if (_stopGeneration == _startupGeneration)
+            {
+                Volatile.Write(ref _runnerWanted, true);
+            }
+        }
 
         if (startedWithCurrentSettings)
         {

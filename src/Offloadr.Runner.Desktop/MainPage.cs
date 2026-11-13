@@ -119,9 +119,9 @@ public sealed class MainPage : ContentPage
 
             // The runner may exit, or start waiting to restart, until the supervisor has stopped;
             // the new version then has nothing to reconnect to, so it is told the runner is wanted.
-            var wanted = _supervisor.View;
+            // A Stop pressed meanwhile clears that.
             await _runtime.StopAsync();
-            UpdateHandoff.Save(_paths, wanted.IsActive ? wanted : _supervisor.View);
+            UpdateHandoff.Save(_paths, _supervisor.RunnerWanted);
             CanClose = true;
             Application.Current?.CloseWindow(Window);
         }

@@ -2316,6 +2316,53 @@ public class RunnerSupervisorTests
     }
 
     [Test]
+    public async Task RunnerWanted_FollowsStartAndStop_NotTheState()
+    {
+        var supervisor = await StartSupervisorAsync();
+        Assert.That(supervisor.RunnerWanted, Is.False, "Nothing was started.");
+
+        supervisor.RequestStart();
+        await WaitForStateAsync(SupervisorState.Running);
+        Assert.That(supervisor.RunnerWanted, Is.True);
+
+        // Cleared when the Stop is asked for, before it runs: a restart to update that begins
+        // now must not bring the runner back.
+        supervisor.RequestStop();
+        Assert.That(supervisor.RunnerWanted, Is.False);
+        await WaitForStateAsync(SupervisorState.Stopped);
+        Assert.That(supervisor.RunnerWanted, Is.False);
+    }
+
+    [Test]
+    public async Task RunnerWanted_StaysWhileAnExitedRunnerWaitsToRestart()
+    {
+        var supervisor = await StartSupervisorAsync(restartBackoff: TimeSpan.FromMinutes(5));
+        supervisor.RequestStart();
+        await WaitForStateAsync(SupervisorState.Running);
+
+        _engine.Exit(Name, 137);
+        await WaitForStateAsync(SupervisorState.WaitingToRestart);
+
+        Assert.That(supervisor.RunnerWanted, Is.True);
+    }
+
+    [Test]
+    public async Task RunnerWanted_WhenAStopIsAskedForAsTheAppGoesDownToUpdate_IsCleared()
+    {
+        var supervisor = await StartSupervisorAsync();
+        supervisor.RequestStart();
+        await WaitForStateAsync(SupervisorState.Running);
+
+        supervisor.KeepRunnerOnShutdown();
+        supervisor.RequestStop();
+        await supervisor.StopAsync(CancellationToken.None);
+        _supervisor = null;
+        supervisor.Dispose();
+
+        Assert.That(supervisor.RunnerWanted, Is.False);
+    }
+
+    [Test]
     public async Task ResumeAfterUpdate_WhenStartupReconnected_StartsNoSecondRunner()
     {
         var template = BuiltInLaunchPlanCatalog.Plan().Find(_settings.Current.SelectedEditorTemplate ?? "comfyui-latest")

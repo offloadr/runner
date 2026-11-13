@@ -9,12 +9,15 @@ namespace Offloadr.Runner.Supervisor.Hosting;
 /// </summary>
 public static class UpdateHandoff
 {
-    /// <summary>Records, as the app exits to update, whether the runner was wanted.</summary>
-    public static void Save(SupervisorPaths paths, SupervisorView view)
+    /// <summary>
+    /// Records, as the app exits to update, whether the runner was wanted
+    /// (<see cref="RunnerSupervisor.RunnerWanted"/>, read once the supervisor has stopped).
+    /// </summary>
+    public static void Save(SupervisorPaths paths, bool runnerWanted)
     {
         try
         {
-            if (view.IsActive)
+            if (runnerWanted)
             {
                 Directory.CreateDirectory(paths.Data);
                 File.WriteAllText(paths.ResumeAfterUpdate, string.Empty);
