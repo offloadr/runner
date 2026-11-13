@@ -282,7 +282,11 @@ static async Task<int> RunAgentAsync()
             projector is null ? null : async (downloads, replaceExisting, token) =>
             {
                 // A local model wins over the agent's own download of it at the same path.
-                var projected = await downloadService.ReleaseForLocalModelsAsync(downloads, projector.CanProject, token);
+                var projected = await downloadService.ReleaseForLocalModelsAsync(
+                    downloads,
+                    projector.CanProject,
+                    token,
+                    linkFreed: freed => projector.AddRequestedModels([freed]));
                 if (replaceExisting)
                 {
                     projector.SetRequestedModels(projected);

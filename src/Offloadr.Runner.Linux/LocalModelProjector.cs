@@ -136,13 +136,33 @@ internal sealed class LocalModelProjector
             try
             {
                 var sourcePath = BuildSourcePath(model);
-                return !string.IsNullOrWhiteSpace(sourcePath) && File.Exists(sourcePath);
+                return !string.IsNullOrWhiteSpace(sourcePath) &&
+                       File.Exists(sourcePath) &&
+                       !IsSameFile(sourcePath, NormalizePath(download.DestinationPath));
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
                 return false;
             }
         }
+    }
+
+    /// <summary>
+    /// True when <paramref name="sourcePath"/> and <paramref name="targetPath"/> are one file, as when the
+    /// local folder and the model folder are the same directory: freeing the target would delete the source.
+    /// </summary>
+    private static bool IsSameFile(string sourcePath, string targetPath)
+    {
+        if (PathsEqual(sourcePath, targetPath))
+        {
+            return true;
+        }
+
+        return OperatingSystem.IsLinux() &&
+               LinuxFileIdentityReader.TryRead(Path.GetFullPath(LinuxPathCanonicalizer.ResolveExistingPath(sourcePath)), out var source) &&
+               LinuxFileIdentityReader.TryRead(targetPath, out var target) &&
+               source.DeviceId == target.DeviceId &&
+               source.Inode == target.Inode;
     }
 
     /// <summary>

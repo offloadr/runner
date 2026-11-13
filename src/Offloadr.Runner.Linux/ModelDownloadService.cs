@@ -407,10 +407,15 @@ internal sealed class ModelDownloadService : IAsyncDisposable
     /// Whether the local model a request names can be linked now. A download is never given up for one
     /// that cannot: the local file may be gone from the folder since Offloadr chose it.
     /// </param>
+    /// <param name="linkFreed">
+    /// Links the local model of a request whose path was just freed, so the path is not left empty while
+    /// the rest of the batch is released. The returned requests are projected again afterwards.
+    /// </param>
     public async Task<IReadOnlyList<ModelDownloadRequest>> ReleaseForLocalModelsAsync(
         IEnumerable<ModelDownloadRequest> downloads,
         Func<ModelDownloadRequest, bool> canLink,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action<ModelDownloadRequest>? linkFreed = null)
     {
         ArgumentNullException.ThrowIfNull(canLink);
         var requested = downloads.Where(static download => download is not null).ToArray();
@@ -420,33 +425,51 @@ internal sealed class ModelDownloadService : IAsyncDisposable
         }
 
         var inUse = new HashSet<string>(StringComparer.Ordinal);
-        var paths = requested
+        var releasable = requested
             .Where(LocalModelProjector.IsLocalProjectionRequest)
             .Where(canLink)
-            .Select(static download => NormalizeDestination(download.DestinationPath))
-            .Where(static path => path is not null)
-            .Select(static path => path!)
-            .Distinct(StringComparer.Ordinal)
+            .Select(download => (Download: download, Path: NormalizeDestination(download.DestinationPath)))
+            .Where(static entry => entry.Path is not null)
+            .DistinctBy(static entry => entry.Path, StringComparer.Ordinal)
             .ToArray();
         // All at once, so a held-up scheduler costs the command one start timeout, not one per model.
         // Once the command is cancelled no further download is given up, but those already freed are
         // still returned, so their local models get linked.
         var hydrationCoordinator = _hydrationCoordinator;
-        var releases = await Task.WhenAll(paths.Select(async path => (
-                Path: path,
-                Release: cancellationToken.IsCancellationRequested
-                    ? LocalModelRelease.InUse
-                    : await hydrationCoordinator.ReleaseForLocalModelAsync(path, cancellationToken).ConfigureAwait(false))))
-            .ConfigureAwait(false);
-        foreach (var (path, release) in releases)
-        {
-            if (release == LocalModelRelease.InUse)
+        var releases = await Task.WhenAll(releasable.Select(async entry =>
             {
-                RunnerLog.Info(
-                    nameof(ModelDownloadService),
-                    $"Keeping the downloaded copy at '{path}' while it is in use; the local model is linked there once it is free.");
-                inUse.Add(path);
+                var release = cancellationToken.IsCancellationRequested
+                    ? LocalModelRelease.InUse
+                    : await hydrationCoordinator.ReleaseForLocalModelAsync(entry.Path!, cancellationToken).ConfigureAwait(false);
+                if (release == LocalModelRelease.Released)
+                {
+                    LinkFreed(linkFreed, entry.Download);
+                }
+
+                return (entry.Download, Path: entry.Path!, Release: release);
+            }))
+            .ConfigureAwait(false);
+        foreach (var (download, path, release) in releases)
+        {
+            if (release != LocalModelRelease.InUse)
+            {
+                continue;
             }
+
+            // The copy keeps serving only as the same model: one of another size stays in the way, and
+            // the projector refuses the request as it did before, rather than the editor using other weights.
+            if (download.SizeBytes > 0 && new FileInfo(path) is { Exists: true } copy && copy.Length != download.SizeBytes)
+            {
+                RunnerLog.Warning(
+                    nameof(ModelDownloadService),
+                    $"The downloaded copy at '{path}' is in use and is not the local model requested there.");
+                continue;
+            }
+
+            RunnerLog.Info(
+                nameof(ModelDownloadService),
+                $"Keeping the downloaded copy at '{path}' while it is in use; the local model is linked there once it is free.");
+            inUse.Add(path);
         }
 
         return inUse.Count == 0
@@ -456,6 +479,19 @@ internal sealed class ModelDownloadService : IAsyncDisposable
                                    NormalizeDestination(download.DestinationPath) is not { } path ||
                                    !inUse.Contains(path))
                 .ToArray();
+    }
+
+    private static void LinkFreed(Action<ModelDownloadRequest>? linkFreed, ModelDownloadRequest download)
+    {
+        try
+        {
+            linkFreed?.Invoke(download);
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or IOException or UnauthorizedAccessException)
+        {
+            // Reported again when the whole request is projected.
+            RunnerLog.Warning(nameof(ModelDownloadService), $"Could not link a local model at once ({ex.GetType().Name}).");
+        }
     }
 
     private void ReportRefused(string sessionId, IReadOnlyCollection<ModelDownloadRequest> downloads)

@@ -114,6 +114,39 @@ public class LocalModelProjectorTests
     }
 
     [Test]
+    public void CanProject_RefusesWhenTheLocalFolderIsTheModelFolder()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var destinationRoot = Path.Combine(root, "models");
+            Directory.CreateDirectory(Path.Combine(destinationRoot, "checkpoints"));
+            var file = Path.Combine(destinationRoot, "checkpoints", "demo.safetensors");
+            File.WriteAllText(file, "the only copy");
+            // Both roots reach the same directory.
+            var sourceRoot = Path.Combine(root, "local");
+            Directory.CreateSymbolicLink(sourceRoot, destinationRoot);
+            var sourceFile = Path.Combine(sourceRoot, "checkpoints", "demo.safetensors");
+
+            var projector = new LocalModelProjector(sourceRoot, destinationRoot);
+            projector.UpdateSnapshot(CreateSnapshot(CreateModel(sourceFile, ModelCategory.Checkpoint)));
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(
+                    projector.CanProject(CreateLocalProjectionRequest(sourceFile, ModelCategory.Checkpoint, file)),
+                    Is.False,
+                    "Freeing the target would delete the source.");
+                Assert.That(File.ReadAllText(file), Is.EqualTo("the only copy"));
+            });
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
     public void SetRequestedModels_LinksEveryModelItCanWhenOneIsRefused()
     {
         var root = CreateTempDirectory();

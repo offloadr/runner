@@ -1179,6 +1179,83 @@ public class ModelDownloadServiceTests
         }
     }
 
+    [Test]
+    public async Task ReleaseForLocalModels_LinksEachFreedPathWithoutWaitingForTheRest()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var first = Path.Combine(root, "diffusion_models", "first.safetensors");
+            var second = Path.Combine(root, "loras", "second.safetensors");
+            var aria = new PerPathAria2Client(expectedBytes: 8);
+            await using var service = CreateRangeManagedService(aria, root);
+            await service.InitializeAsync(CancellationToken.None);
+            service.SetActiveSession("session-1");
+            var secondRemote = RemoteModel(second);
+            secondRemote.ModelId = "model-2";
+            service.SeedDownloads("session-1", [RemoteModel(first), secondRemote]);
+            await ReadWholeModelAsync(service, first);
+            await ReadWholeModelAsync(service, second);
+            var firstLocal = LocalModel(first);
+            var secondLocal = LocalModel(second);
+
+            aria.BlockRemovalOf = second;
+            var linked = new TaskCompletionSource<ModelDownloadRequest>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var release = service.ReleaseForLocalModelsAsync(
+                [firstLocal, secondLocal],
+                AnyLocalModel,
+                CancellationToken.None,
+                linkFreed: freed => linked.TrySetResult(freed));
+
+            await aria.RemovalBlocked.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            var linkedFirst = await linked.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Multiple(() =>
+            {
+                Assert.That(linkedFirst, Is.SameAs(firstLocal), "Linked while the second is still being released.");
+                Assert.That(release.IsCompleted, Is.False);
+            });
+
+            aria.RemovalGate.TrySetResult();
+            Assert.That(await release.WaitAsync(TimeSpan.FromSeconds(5)), Is.EqualTo(new[] { firstLocal, secondLocal }));
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
+    public async Task ReleaseForLocalModels_DoesNotLetAnOpenCopyOfAnotherSizeStandInForTheLocalModel()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var destinationPath = Path.Combine(root, "diffusion_models", "same-name.safetensors");
+            var aria = new CompletingAria2Client(destinationPath, expectedBytes: 8);
+            await using var service = CreateRangeManagedService(aria, root);
+            await service.InitializeAsync(CancellationToken.None);
+            service.SetActiveSession("session-1");
+            service.SeedDownloads("session-1", [RemoteModel(destinationPath)]);
+            var opened = await service.OpenRangeManagedAsync(destinationPath, "session-1", CancellationToken.None);
+
+            // Another model of the same name, but another size.
+            var other = LocalModel(destinationPath);
+            other.SizeBytes = 16;
+            var projected = await service.ReleaseForLocalModelsAsync([other], AnyLocalModel, CancellationToken.None);
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(projected, Is.EqualTo(new[] { other }), "Handed to the projector, which refuses the occupied path.");
+                Assert.That(File.Exists(destinationPath), Is.True);
+            });
+            await service.ReleaseAsync(opened.LeaseId);
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
     private static bool AnyLocalModel(ModelDownloadRequest _) => true;
 
     private static async Task ReadWholeModelAsync(ModelDownloadService service, string destinationPath)
@@ -1346,11 +1423,23 @@ public class ModelDownloadServiceTests
                     files: [new ModelTransferFileSnapshot(path, expectedBytes, expectedBytes, ["https://models.example.test/model"])]))
                 : throw new ModelTransferStatusUnavailableException($"Transfer '{handle}' is unavailable.");
 
-        public override Task RemoveAsync(ModelTransferHandle handle, CancellationToken cancellationToken)
+        /// <summary>Removal of the transfer for this path waits for <see cref="RemovalGate"/>.</summary>
+        public string? BlockRemovalOf { get; set; }
+
+        public TaskCompletionSource RemovalBlocked { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource RemovalGate { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public override async Task RemoveAsync(ModelTransferHandle handle, CancellationToken cancellationToken)
         {
+            if (_paths.TryGetValue(handle, out var path) && string.Equals(path, BlockRemovalOf, StringComparison.Ordinal))
+            {
+                RemovalBlocked.TrySetResult();
+                await RemovalGate.Task.WaitAsync(cancellationToken);
+            }
+
             _paths.Remove(handle);
             AfterRemoval?.Invoke();
-            return Task.CompletedTask;
         }
     }
 
