@@ -72,6 +72,26 @@ public class RunnerCleanupTests
     }
 
     [Test]
+    public async Task ARunnerAnotherRunningCopyManages_IsLeftAlone()
+    {
+        File.WriteAllText(_paths.Owner, OwnerId);
+        Remember("abc");
+        var processes = new FakeProcessRunner()
+            .On("container", 0, Inspect(OwnerId));
+        using var running = new SupervisorInstanceLock(_paths.SupervisorLock);
+        Assert.That(running.TryAcquire(), Is.True);
+
+        var removed = await RunnerCleanup.RemoveLeftoverRunnerAsync(_paths, processes, new SupervisorOptions(), CancellationToken.None);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(removed, Is.False);
+            Assert.That(processes.Calls, Is.Empty);
+            Assert.That(File.Exists(_paths.EngineState), Is.True, "The running copy still needs its engine hint.");
+        });
+    }
+
+    [Test]
     public async Task WithoutAnOwnerFile_NothingIsRemoved()
     {
         Remember("abc");
