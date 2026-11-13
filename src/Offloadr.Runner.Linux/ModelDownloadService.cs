@@ -554,8 +554,20 @@ internal sealed class ModelDownloadService : IAsyncDisposable
                 return LocalModelRelease.NotManaged;
             }
 
-            File.Delete(path);
-            File.Delete($"{path}.aria2");
+            try
+            {
+                File.Delete(path);
+                File.Delete($"{path}.aria2");
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // Only an optimisation: the copy keeps serving, and a later request tries again.
+                RunnerLog.Warning(
+                    nameof(ModelDownloadService),
+                    $"Could not remove the downloaded copy at '{path}' ({ex.GetType().Name}); it is kept until a later request frees it.");
+                return File.Exists(path) ? LocalModelRelease.InUse : LocalModelRelease.Released;
+            }
+
             _ownedConventionalPlaceholders.Remove(path);
             foreach (var sessionPaths in _conventionalPathsBySession.Values)
             {
