@@ -12,6 +12,8 @@ internal sealed class ModelDownloadService : IAsyncDisposable
     private readonly object _conventionalPlaceholderGate = new();
     private readonly Dictionary<string, HashSet<string>> _conventionalPathsBySession = new(StringComparer.Ordinal);
     private readonly Dictionary<string, LinuxFileIdentity> _ownedConventionalPlaceholders = new(StringComparer.Ordinal);
+    // The size each full download was registered with, so an in-use copy can be told apart from another model.
+    private readonly Dictionary<string, long> _conventionalExpectedSizes = new(StringComparer.Ordinal);
     private readonly Dictionary<string, HashSet<Task>> _conventionalOperations = new(StringComparer.Ordinal);
     private readonly ModelDestinationPolicy? _destinationPolicy;
     private readonly IModelTransferBackend _transferBackend;
@@ -207,6 +209,13 @@ internal sealed class ModelDownloadService : IAsyncDisposable
                 .Where(static path => path is not null)
                 .Select(static path => path!)
                 .ToHashSet(StringComparer.Ordinal);
+            foreach (var download in downloads)
+            {
+                if (NormalizeDestination(download.DestinationPath) is { } path && download.SizeBytes > 0)
+                {
+                    _conventionalExpectedSizes[path] = download.SizeBytes;
+                }
+            }
 
             foreach (var path in paths)
             {
@@ -503,7 +512,17 @@ internal sealed class ModelDownloadService : IAsyncDisposable
 
     /// <summary>The size the download at <paramref name="path"/> was asked for with, not how far it has got.</summary>
     private long? ExpectedSizeOfDownloadAt(string path)
-        => _hydrationCoordinator?.ExpectedLengthAt(path);
+    {
+        if (_hydrationCoordinator?.IsRangeManaged(path) == true)
+        {
+            return _hydrationCoordinator.ExpectedLengthAt(path);
+        }
+
+        lock (_conventionalPlaceholderGate)
+        {
+            return _conventionalExpectedSizes.TryGetValue(path, out var size) ? size : null;
+        }
+    }
 
     private static void LinkFreed(Action<ModelDownloadRequest>? linkFreed, ModelDownloadRequest download)
     {
