@@ -112,23 +112,33 @@ public sealed class MainPage : ContentPage
         _closing = true;
         try
         {
-            // First, so a failure leaves the app as it was. The installer waits for this process to exit.
-            _updates.ApplyAfterExit(restart: true, []);
             Content = new Label { Text = "Restarting to install the update…", Margin = 32 };
             _supervisor.KeepRunnerOnShutdown();
 
             // The runner may exit, or start waiting to restart, until the supervisor has stopped;
             // the new version then has nothing to reconnect to, so it is told the runner is wanted.
-            // A Stop pressed meanwhile clears that, and the shutdown then stops the runner after all.
+            // A Stop pressed meanwhile clears that, and the shutdown then stops the runner after all,
+            // which can take longer than the minute the installer waits for the exit: so the
+            // installer is handed the update only now.
             await _runtime.StopAsync();
             UpdateHandoff.Save(_paths, _supervisor.RunnerWanted);
             CanClose = true;
+            try
+            {
+                _updates.ApplyAfterExit(restart: true, []);
+            }
+            catch (Exception ex)
+            {
+                // Everything has stopped already, so the app closes anyway. The update stays
+                // downloaded, and the banner offers it again at the next start.
+                _logger.LogError(ex, "Could not hand the update to the installer.");
+                await DisplayAlertAsync(
+                    "Could not install the update",
+                    "Offloadr Runner closes now. Open it again from the Start menu; it offers the update again.",
+                    "OK");
+            }
+
             Application.Current?.CloseWindow(Window);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Could not hand the update to the installer.");
-            await DisplayAlertAsync("Could not install the update", "Offloadr Runner tries again when you quit it.", "OK");
         }
         finally
         {
