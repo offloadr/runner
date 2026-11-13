@@ -111,14 +111,15 @@ public sealed class AppUpdateService : BackgroundService
 
     /// <summary>
     /// True when a restart may install the downloaded release now. Not while the runner is being
-    /// prepared, started or stopped: the app would exit in the middle of that. A running runner,
-    /// with or without a session, is fine: the restart leaves it running and the new version
-    /// reconnects to it.
+    /// prepared, started or stopped: the app would exit in the middle of that. Nor while it waits
+    /// to restart after exiting: no container runs then for the new version to reconnect to, and
+    /// the pending restart would be lost. A running runner, with or without a session, is fine: the
+    /// restart leaves it running and the new version reconnects to it.
     /// </summary>
     public bool CanRestartNow(SupervisorView view)
         => Status.State == AppUpdateState.Ready &&
            view.State is not (SupervisorState.Checking or SupervisorState.ResolvingPlan or SupervisorState.Pulling
-               or SupervisorState.Starting or SupervisorState.Stopping);
+               or SupervisorState.Starting or SupervisorState.Stopping or SupervisorState.WaitingToRestart);
 
     /// <summary>
     /// Hands the downloaded release to the installer, which applies it once the app exits and, when

@@ -102,6 +102,7 @@ public class AppUpdateServiceTests
     [TestCase(SupervisorState.Pulling, false)]
     [TestCase(SupervisorState.Starting, false)]
     [TestCase(SupervisorState.Stopping, false)]
+    [TestCase(SupervisorState.WaitingToRestart, false)]
     public async Task ARestart_WaitsWhileTheRunnerIsBeingStartedOrStopped(SupervisorState state, bool allowed)
     {
         using var updates = Create(new FakeAppUpdateSource { Latest = new Version(1, 3, 0) });
