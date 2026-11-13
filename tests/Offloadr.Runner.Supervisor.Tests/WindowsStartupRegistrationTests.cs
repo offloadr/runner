@@ -119,6 +119,42 @@ public class WindowsStartupRegistrationTests
         Assert.That(Approved(), Is.Null);
     }
 
+    [Test]
+    public void LaunchPath_OfAnInstalledCopy_IsTheLauncherThatOutlivesUpdates()
+    {
+        var files = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            @"C:\Users\a\AppData\Local\app.offloadr.runner\Update.exe",
+            @"C:\Users\a\AppData\Local\app.offloadr.runner\OffloadrRunner.exe",
+        };
+
+        var path = WindowsStartupRegistration.LaunchPath(@"C:\Users\a\AppData\Local\app.offloadr.runner\current\OffloadrRunner.exe", files.Contains);
+
+        Assert.That(path, Is.EqualTo(@"C:\Users\a\AppData\Local\app.offloadr.runner\OffloadrRunner.exe"));
+    }
+
+    [TestCase(@"C:\Apps\Offloadr Runner\OffloadrRunner.exe")]
+    [TestCase(@"C:\Users\a\AppData\Local\app.offloadr.runner\current\OffloadrRunner.exe")]
+    public void LaunchPath_WithoutAnInstaller_IsTheExecutableItself(string processPath)
+    {
+        // No Update.exe or launcher next to "current": a folder that merely has that name.
+        Assert.That(WindowsStartupRegistration.LaunchPath(processPath, _ => false), Is.EqualTo(processPath));
+    }
+
+    [Test]
+    public void RefreshIfMoved_FromAnUnzippedCopy_PointsTheEntryAtTheInstalledLauncher()
+    {
+        new WindowsStartupRegistration(@"C:\Downloads\OffloadrRunner\OffloadrRunner.exe", _runKey).SetEnabled(true);
+
+        var changed = new WindowsStartupRegistration(@"C:\Local\app.offloadr.runner\OffloadrRunner.exe", _runKey).RefreshIfMoved();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(Value(), Is.EqualTo("\"C:\\Local\\app.offloadr.runner\\OffloadrRunner.exe\" --minimized"));
+        });
+    }
+
     private void SetApproved(byte[] state)
     {
         using var key = Registry.CurrentUser.CreateSubKey(_runKey + "Approved", writable: true);

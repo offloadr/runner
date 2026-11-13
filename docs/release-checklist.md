@@ -14,7 +14,7 @@ The `Publish runner images` workflow moves the channel tags people download as s
 
 - A Windows machine with an NVIDIA GPU, a current driver, and Docker Desktop on the WSL 2 backend. A Linux host with the NVIDIA Container Toolkit works for the container checks.
 - The four images of the release commit. Preferably the published ones, by the digests in the summary of the `Publish runner images` run for that commit (`ghcr.io/offloadr/<repository>@sha256:<digest>`): exactly what personal and hosted runners get. To check before publishing, build them locally instead with `SOURCE_REVISION=$(git rev-parse HEAD) docker buildx bake --pull --load`; `--pull` builds on the current editor images, but it is still a rebuild, so check the published digests too once they exist.
-- The desktop app built from the same commit: the CI artifact, or `build/publish-windows.ps1 -Unpackaged`.
+- The desktop app built from the same commit: the folder from `build/publish-windows.ps1` (`artifacts/packages/windows-win-x64`), and for the installer steps the CI artifact or `build/publish-windows.ps1 -Pack` (`artifacts/releases/windows-win-x64`).
 
 ## 1. Container runner
 

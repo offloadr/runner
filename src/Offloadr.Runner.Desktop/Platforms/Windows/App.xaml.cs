@@ -23,7 +23,7 @@ public partial class App : MauiWinUIApplication
         }
     }
 
-    private static void WriteStartupError(Exception? error)
+    internal static void WriteStartupError(Exception? error)
     {
         try
         {

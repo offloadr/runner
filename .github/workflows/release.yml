@@ -53,12 +53,15 @@ jobs:
           name: offloadr-runner-windows-x64
           path: dist/offloadr-runner-windows-x64
 
+      # The installer gets a name that stays the same across releases, so a download link can use
+      # releases/latest/download/OffloadrRunner-Setup.exe. The packages and release index keep the
+      # names the app's updater looks for.
       - name: Collect packages
-        env:
-          VERSION: ${{ inputs.version }}
         run: |
           mkdir release
-          (cd dist/offloadr-runner-windows-x64 && zip -qr "../../release/OffloadrRunner-$VERSION-windows-x64.zip" .)
+          cp dist/offloadr-runner-windows-x64/* release/
+          mv release/app.offloadr.runner-win-x64-Setup.exe release/OffloadrRunner-Setup.exe
+          (cd release && sha256sum -- * > SHA256SUMS.txt)
           ls -l release
 
       - name: Tag and publish release
@@ -68,4 +71,4 @@ jobs:
         run: |
           gh release create "v$VERSION" release/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
             --title "Offloadr Runner $VERSION" --generate-notes \
-            --notes "**Windows:** extract \`OffloadrRunner-$VERSION-windows-x64.zip\` and run \`OffloadrRunner.exe\`. You also need Docker Desktop with the WSL 2 backend and an NVIDIA driver. The build is unsigned, so Windows may ask you to confirm the first launch."
+            --notes "**Windows:** run \`OffloadrRunner-Setup.exe\`. It installs for your account only, with no administrator rights. You also need Docker Desktop with the WSL 2 backend and an NVIDIA driver. The build is unsigned, so Windows may ask you to confirm the first launch."

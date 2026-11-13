@@ -1,36 +1,80 @@
 # Publishes the Windows desktop app. Needs Windows and the maui-windows workload.
-# -Unpackaged produces a self-contained folder in artifacts/packages/windows-<runtime>;
-# otherwise an unsigned MSIX is produced, which must be signed before it can be installed.
+# Always produces a self-contained folder in artifacts/packages/windows-<runtime>.
+# -Pack turns it into an installer and update packages in artifacts/releases/windows-<runtime>
+# (Velopack; the vpk tool comes from dotnet-tools.json). -PreviousReleasesFrom fetches the latest
+# published release from that GitHub repository first, so the packages include a delta from it.
 param(
     [string]$Version = $(if ($env:OFFLOADR_RUNNER_VERSION) { $env:OFFLOADR_RUNNER_VERSION } else { '0.1.0' }),
     [ValidateSet('win-x64', 'win-arm64')][string]$Runtime = 'win-x64',
-    [string]$SigningProperties,
-    [switch]$Unpackaged
+    [switch]$Pack,
+    [string]$PreviousReleasesFrom
 )
 $ErrorActionPreference = 'Stop'
 if (-not $IsWindows) { throw 'Windows publishing requires Windows and the maui-windows workload.' }
 
 $repository = Split-Path $PSScriptRoot -Parent
-$arguments = @(
-    'publish', (Join-Path $repository 'src/Offloadr.Runner.Desktop/Offloadr.Runner.Desktop.csproj'),
-    '-c', 'Release',
-    '-f', 'net10.0-windows10.0.19041.0',
-    "-p:RuntimeIdentifierOverride=$Runtime",
-    "-p:VersionPrefix=$Version",
-    '-p:SelfContained=true',
-    '-p:WindowsAppSDKSelfContained=true'
-)
-if ($Unpackaged) {
-    $arguments += @('-p:WindowsPackageType=None', '-o', (Join-Path $repository "artifacts/packages/windows-$Runtime"))
-}
-else {
-    $arguments += @('-p:WindowsPackageType=MSIX', '-p:GenerateAppxPackageOnBuild=true', '-p:AppxBundle=Never')
-    if (-not $SigningProperties) { $arguments += '-p:AppxPackageSigningEnabled=false' }
-}
-if ($SigningProperties) { $arguments += "-p:CustomAfterMicrosoftCommonTargets=$([IO.Path]::GetFullPath($SigningProperties))" }
+$publishDir = Join-Path $repository "artifacts/packages/windows-$Runtime"
+$releasesDir = Join-Path $repository "artifacts/releases/windows-$Runtime"
+$packId = 'app.offloadr.runner'
 
-dotnet @arguments
+# Start from an empty folder: anything left from an earlier run (such as a browser profile from
+# starting the published app) would otherwise ship in the installer.
+if (Test-Path $publishDir) { Remove-Item $publishDir -Recurse -Force }
+
+dotnet publish (Join-Path $repository 'src/Offloadr.Runner.Desktop/Offloadr.Runner.Desktop.csproj') `
+    -c Release `
+    -f net10.0-windows10.0.19041.0 `
+    "-p:RuntimeIdentifierOverride=$Runtime" `
+    "-p:VersionPrefix=$Version" `
+    -p:SelfContained=true `
+    -p:WindowsAppSDKSelfContained=true `
+    -p:WindowsPackageType=None `
+    -o $publishDir
 if ($LASTEXITCODE) { throw 'Windows publish failed.' }
-if (-not $Unpackaged -and -not $SigningProperties) {
-    Write-Output 'The MSIX package is unsigned; sign it before installing.'
+
+# The app's licence and the notices of what it bundles travel with it.
+Copy-Item (Join-Path $repository 'LICENSE') (Join-Path $publishDir 'LICENSE.txt')
+Copy-Item (Join-Path $repository 'THIRD-PARTY-NOTICES.md') (Join-Path $publishDir 'THIRD-PARTY-NOTICES.md')
+
+if (-not $Pack) { return }
+
+Push-Location $repository
+try {
+    dotnet tool restore
+    if ($LASTEXITCODE) { throw 'Could not restore the vpk tool.' }
+
+    if (Test-Path $releasesDir) { Remove-Item $releasesDir -Recurse -Force }
+    New-Item -ItemType Directory $releasesDir | Out-Null
+    # One update channel per architecture: an installed app only ever updates from its own.
+    $channel = $Runtime
+    if ($PreviousReleasesFrom) {
+        # There is nothing to download before the first release; packing then makes no delta.
+        dotnet vpk download github --repoUrl $PreviousReleasesFrom --channel $channel -o $releasesDir
+        if ($LASTEXITCODE) { Write-Warning 'No earlier release was downloaded, so no delta package is made.' }
+    }
+
+    dotnet vpk pack `
+        --packId $packId `
+        --packVersion $Version `
+        --packDir $publishDir `
+        --mainExe OffloadrRunner.exe `
+        --packTitle 'Offloadr Runner' `
+        --packAuthors 'Offloadr' `
+        --icon (Join-Path $publishDir 'appicon.ico') `
+        --channel $channel `
+        --runtime $Runtime `
+        --shortcuts StartMenuRoot `
+        --noPortable `
+        --exclude '.*\.pdb|.*\.WebView2([\\/].*)?' `
+        -o $releasesDir
+    if ($LASTEXITCODE) { throw 'Packing the installer failed.' }
 }
+finally {
+    Pop-Location
+}
+
+# The downloaded earlier release only served to make the delta; it is already published.
+Get-ChildItem $releasesDir -Filter '*.nupkg' |
+    Where-Object { $_.Name -notlike "$packId-$Version-*" } |
+    Remove-Item
+Get-ChildItem $releasesDir | ForEach-Object { '{0,12}  {1}' -f $_.Length, $_.Name }
