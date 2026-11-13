@@ -90,6 +90,7 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
     private readonly TimeSpan _shutdownCleanupTimeout;
 
     private TransferState? _activeState;
+    private readonly ConcurrentQueue<LocalReleaseRequest> _localReleases = new();
     private long _nextIntentSequence;
 
     public DemandAwareModelHydrationCoordinator(
@@ -1288,6 +1289,7 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
                 await QuarantineConflictsAsync(cancellationToken).ConfigureAwait(false);
                 await CleanupLegacyTransfersAsync(cancellationToken).ConfigureAwait(false);
                 await CleanupOrphansAsync(cancellationToken).ConfigureAwait(false);
+                await ProcessLocalReleasesAsync(cancellationToken).ConfigureAwait(false);
                 var candidate = SelectCandidate();
                 if (candidate is null)
                 {
@@ -2415,6 +2417,12 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
     /// the model is not kept twice. A model the editor has open or a prompt waits for is left as it is;
     /// a file this coordinator did not create is never touched.
     /// </summary>
+    /// <remarks>
+    /// The scheduler loop does the work between candidate steps, as it does orphan cleanup, so it never
+    /// overlaps a transfer the loop is driving. Never throws for cancellation: a request cancelled before
+    /// the loop starts it is dropped and reported <see cref="LocalModelRelease.InUse"/>; one already
+    /// started finishes, so the caller always learns whether the path was freed.
+    /// </remarks>
     public async Task<LocalModelRelease> ReleaseForLocalModelAsync(string path, CancellationToken cancellationToken)
     {
         var normalized = NormalizePath(path);
@@ -2423,6 +2431,93 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
             return LocalModelRelease.NotManaged;
         }
 
+        var request = new LocalReleaseRequest(normalized);
+        using (cancellationToken.Register(() =>
+               {
+                   if (request.TryAbandon())
+                   {
+                       request.Result.TrySetResult(LocalModelRelease.InUse);
+                   }
+               }))
+        {
+            _localReleases.Enqueue(request);
+            SignalScheduler();
+            if (_shutdown.IsCancellationRequested && request.TryAbandon())
+            {
+                request.Result.TrySetResult(LocalModelRelease.InUse);
+            }
+
+            return await request.Result.Task.ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>Drops a released state; the scheduler must not resume it as its active transfer.</summary>
+    private void ForgetStateLocked(TransferState state)
+    {
+        _states.Remove(state.Identity.DestinationPath);
+        if (ReferenceEquals(_activeState, state))
+        {
+            _activeState = null;
+        }
+    }
+
+    /// <summary>Writes a state's index record back after a failed release; a failure here is only logged.</summary>
+    private async Task TryPersistStateAsync(TransferState state)
+    {
+        try
+        {
+            await PersistStateAsync(state, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            RunnerLog.Warning<DemandAwareModelHydrationCoordinator>(
+                $"Could not restore the index record of '{state.Identity.DestinationPath}' ({ex.GetType().Name}).");
+        }
+    }
+
+    /// <summary>Runs the queued local-model releases; called by the scheduler loop only.</summary>
+    private async Task ProcessLocalReleasesAsync(CancellationToken cancellationToken)
+    {
+        var count = _localReleases.Count;
+        for (var index = 0; index < count && _localReleases.TryDequeue(out var request); index++)
+        {
+            if (!request.TryStart())
+            {
+                continue;
+            }
+
+            try
+            {
+                request.Result.TrySetResult(await ReleaseQueuedAsync(request.Path, cancellationToken).ConfigureAwait(false));
+            }
+            catch (Exception ex)
+            {
+                request.Result.TrySetResult(LocalModelRelease.InUse);
+                if (ex is OperationCanceledException && cancellationToken.IsCancellationRequested)
+                {
+                    throw;
+                }
+
+                RunnerLog.Warning<DemandAwareModelHydrationCoordinator>(
+                    $"Could not release the downloaded copy at '{request.Path}' ({ex.GetType().Name}); it is kept.");
+            }
+        }
+    }
+
+    /// <summary>Answers releases still queued when the coordinator stops: their downloads stay.</summary>
+    private void AbandonLocalReleases()
+    {
+        while (_localReleases.TryDequeue(out var request))
+        {
+            if (request.TryAbandon())
+            {
+                request.Result.TrySetResult(LocalModelRelease.InUse);
+            }
+        }
+    }
+
+    private async Task<LocalModelRelease> ReleaseQueuedAsync(string normalized, CancellationToken cancellationToken)
+    {
         await _registrationCleanupGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
@@ -2433,7 +2528,10 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
                 _states.TryGetValue(normalized, out state);
                 if (state is not null)
                 {
-                    if (state.DescriptorLeaseCount > 0 || state.OpenReservationCount > 0 || state.PromptWaiters.Count > 0)
+                    if (state.DescriptorLeaseCount > 0 ||
+                        state.OpenReservationCount > 0 ||
+                        state.PromptWaiters.Count > 0 ||
+                        state.RangeWaiters.Count > 0)
                     {
                         return LocalModelRelease.InUse;
                     }
@@ -2452,9 +2550,9 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
             {
                 // Freeing a duplicate copy is only an optimisation: whatever failed, the command that asked
                 // carries on. Once the file is gone the state describes nothing, so it is forgotten, or opens
-                // of the local model linked there would be checked against the deleted download; otherwise
-                // the copy keeps serving.
+                // of the local model linked there would be checked against the deleted download.
                 var fileGone = IsPathConfirmedAbsent(normalized);
+                var restore = false;
                 lock (_sync)
                 {
                     if (state is not null &&
@@ -2463,13 +2561,22 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
                     {
                         if (fileGone)
                         {
-                            _states.Remove(normalized);
+                            ForgetStateLocked(state);
                         }
                         else
                         {
+                            // The copy keeps serving, but aria2 may already have dropped its transfer and the
+                            // index its record: an unfinished one starts its transfer again when next needed.
                             state.PendingOrphanCleanup = wasPendingCleanup;
+                            state.RestartRequired |= !state.Complete;
+                            restore = true;
                         }
                     }
+                }
+
+                if (restore)
+                {
+                    await TryPersistStateAsync(state!).ConfigureAwait(false);
                 }
 
                 if (ex is OperationCanceledException && cancellationToken.IsCancellationRequested)
@@ -2542,7 +2649,7 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
                 _states.TryGetValue(normalized, out var current) &&
                 ReferenceEquals(current, state))
             {
-                _states.Remove(normalized);
+                ForgetStateLocked(state);
             }
         }
 
@@ -3340,6 +3447,8 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
             // Expected during shutdown.
         }
 
+        AbandonLocalReleases();
+
         try
         {
             using var cleanupCancellation = new CancellationTokenSource(_shutdownCleanupTimeout);
@@ -3360,6 +3469,23 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
             _wake.Dispose();
             _shutdown.Dispose();
         }
+    }
+
+    /// <summary>A local-model release waiting for the scheduler loop. Started or abandoned, never both.</summary>
+    private sealed class LocalReleaseRequest(string path)
+    {
+        private const int Queued = 0;
+        private const int Started = 1;
+        private const int Abandoned = 2;
+        private int _stage = Queued;
+
+        public string Path { get; } = path;
+
+        public TaskCompletionSource<LocalModelRelease> Result { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public bool TryStart() => Interlocked.CompareExchange(ref _stage, Started, Queued) == Queued;
+
+        public bool TryAbandon() => Interlocked.CompareExchange(ref _stage, Abandoned, Queued) == Queued;
     }
 
     private sealed class TransferState(

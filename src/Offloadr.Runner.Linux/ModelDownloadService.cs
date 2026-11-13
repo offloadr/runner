@@ -429,7 +429,10 @@ internal sealed class ModelDownloadService : IAsyncDisposable
             .Distinct(StringComparer.Ordinal);
         foreach (var path in paths)
         {
-            if (await _hydrationCoordinator.ReleaseForLocalModelAsync(path, cancellationToken).ConfigureAwait(false) ==
+            // Once the command is cancelled no further download is given up, but those already freed
+            // are still returned, so their local models get linked.
+            if (cancellationToken.IsCancellationRequested ||
+                await _hydrationCoordinator.ReleaseForLocalModelAsync(path, cancellationToken).ConfigureAwait(false) ==
                 LocalModelRelease.InUse)
             {
                 RunnerLog.Info(

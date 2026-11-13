@@ -1026,7 +1026,7 @@ public class ModelDownloadServiceTests
     }
 
     [Test]
-    public async Task ReleaseForLocalModels_CancelledMidway_LeavesTheModelUsable()
+    public async Task ReleaseForLocalModels_CancelledOnceStarted_FinishesAndSaysSo()
     {
         var root = CreateTempDirectory();
         try
@@ -1038,22 +1038,21 @@ public class ModelDownloadServiceTests
             service.SetActiveSession("session-1");
             service.SeedDownloads("session-1", [RemoteModel(destinationPath)]);
             await ReadWholeModelAsync(service, destinationPath);
+            var local = LocalModel(destinationPath);
 
             aria.BlockRemoval = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             using var stop = new CancellationTokenSource();
-            var release = service.ReleaseForLocalModelsAsync([LocalModel(destinationPath)], AnyLocalModel, stop.Token);
+            var release = service.ReleaseForLocalModelsAsync([local], AnyLocalModel, stop.Token);
             await aria.BlockRemoval.Task.WaitAsync(TimeSpan.FromSeconds(5));
             stop.Cancel();
+            aria.RemovalGate.TrySetResult();
 
-            Assert.That(async () => await release, Throws.InstanceOf<OperationCanceledException>());
-            aria.BlockRemoval = null;
+            // The caller learns the path is free, so the local model is linked rather than nothing being there.
+            var projected = await release.WaitAsync(TimeSpan.FromSeconds(5));
             Assert.Multiple(() =>
             {
-                Assert.That(File.Exists(destinationPath), Is.True);
-                Assert.That(
-                    async () => await ReadWholeModelAsync(service, destinationPath),
-                    Throws.Nothing,
-                    "The model is not left refused as pending cleanup.");
+                Assert.That(projected, Is.EqualTo(new[] { local }));
+                Assert.That(File.Exists(destinationPath), Is.False);
             });
         }
         finally
@@ -1110,13 +1109,13 @@ public class ModelDownloadServiceTests
             service.SeedDownloads("session-1", [RemoteModel(destinationPath)]);
             await ReadWholeModelAsync(service, destinationPath);
 
-            // Stop arrives once aria2 has dropped the transfer, before its index entry goes.
+            // Stop arrives once aria2 has dropped the transfer, before its index entry goes. The release
+            // finishes anyway, so nothing is left half done.
             using var stop = new CancellationTokenSource();
             aria.AfterRemoval = stop.Cancel;
-            Assert.That(
-                async () => await service.ReleaseForLocalModelsAsync([LocalModel(destinationPath)], AnyLocalModel, stop.Token),
-                Throws.InstanceOf<OperationCanceledException>());
+            var projected = await service.ReleaseForLocalModelsAsync([LocalModel(destinationPath)], AnyLocalModel, stop.Token);
             aria.AfterRemoval = null;
+            Assert.That(projected, Has.Count.EqualTo(1), "The caller links the local model.");
 
             var opened = await service.OpenRangeManagedAsync(destinationPath, "session-1", CancellationToken.None);
             Assert.Multiple(() =>
@@ -1133,6 +1132,46 @@ public class ModelDownloadServiceTests
                 Assert.That(aria.AddUriCallCount, Is.EqualTo(2));
                 Assert.That(new FileInfo(destinationPath).Length, Is.EqualTo(8));
             });
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
+    public async Task ReleaseForLocalModels_CancelledBetweenModels_LinksTheFreedOneAndKeepsTheRest()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var first = Path.Combine(root, "diffusion_models", "first.safetensors");
+            var second = Path.Combine(root, "loras", "second.safetensors");
+            var aria = new PerPathAria2Client(expectedBytes: 8);
+            await using var service = CreateRangeManagedService(aria, root);
+            await service.InitializeAsync(CancellationToken.None);
+            service.SetActiveSession("session-1");
+            var secondRemote = RemoteModel(second);
+            secondRemote.ModelId = "model-2";
+            service.SeedDownloads("session-1", [RemoteModel(first), secondRemote]);
+            await ReadWholeModelAsync(service, first);
+            await ReadWholeModelAsync(service, second);
+            var firstLocal = LocalModel(first);
+            var secondLocal = LocalModel(second);
+
+            // Stop arrives while the first download is being given up.
+            using var stop = new CancellationTokenSource();
+            aria.AfterRemoval = stop.Cancel;
+            var projected = await service.ReleaseForLocalModelsAsync([firstLocal, secondLocal], AnyLocalModel, stop.Token);
+            aria.AfterRemoval = null;
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(projected, Is.EqualTo(new[] { firstLocal }), "The freed path still gets its local link.");
+                Assert.That(File.Exists(first), Is.False);
+                Assert.That(File.Exists(second), Is.True, "No further download is given up once cancelled.");
+            });
+            Assert.That(async () => await ReadWholeModelAsync(service, second), Throws.Nothing);
         }
         finally
         {
@@ -1278,6 +1317,43 @@ public class ModelDownloadServiceTests
         }
     }
 
+    /// <summary>Completes each transfer at once, at the path it was created for.</summary>
+    private sealed class PerPathAria2Client(int expectedBytes) : TestModelTransferBackend
+    {
+        private readonly Dictionary<ModelTransferHandle, string> _paths = [];
+
+        public Action? AfterRemoval { get; set; }
+
+        public override Task<IReadOnlyList<ModelTransferHandle>> CreateAsync(
+            ModelTransferCreateRequest request,
+            CancellationToken cancellationToken)
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(request.DestinationPath)!);
+            File.WriteAllBytes(request.DestinationPath, Enumerable.Repeat((byte)1, expectedBytes).ToArray());
+            var handle = new ModelTransferHandle(request.PreferredIdentifier ?? $"gid-{_paths.Count + 1}");
+            _paths[handle] = request.DestinationPath;
+            IReadOnlyList<ModelTransferHandle> handles = [handle];
+            return Task.FromResult(handles);
+        }
+
+        public override Task<ModelTransferSnapshot> GetStatusAsync(ModelTransferHandle handle, CancellationToken cancellationToken)
+            => _paths.TryGetValue(handle, out var path)
+                ? Task.FromResult(Snapshot(
+                    handle,
+                    "complete",
+                    expectedBytes,
+                    expectedBytes,
+                    files: [new ModelTransferFileSnapshot(path, expectedBytes, expectedBytes, ["https://models.example.test/model"])]))
+                : throw new ModelTransferStatusUnavailableException($"Transfer '{handle}' is unavailable.");
+
+        public override Task RemoveAsync(ModelTransferHandle handle, CancellationToken cancellationToken)
+        {
+            _paths.Remove(handle);
+            AfterRemoval?.Invoke();
+            return Task.CompletedTask;
+        }
+    }
+
     private sealed class CompletingAria2Client(string destinationPath, int expectedBytes) : TestModelTransferBackend
     {
         private readonly HashSet<ModelTransferHandle> _createdHandles = [];
@@ -1293,8 +1369,10 @@ public class ModelDownloadServiceTests
         public override Task SaveSessionAsync(CancellationToken cancellationToken)
             => FailSaveSession ? throw new IOException("simulated aria2 failure") : Task.CompletedTask;
 
-        /// <summary>Set to make removal wait until it is cancelled; completed when it starts waiting.</summary>
+        /// <summary>Set to make removal wait for <see cref="RemovalGate"/>; completed when it starts waiting.</summary>
         public TaskCompletionSource? BlockRemoval { get; set; }
+
+        public TaskCompletionSource RemovalGate { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public override async Task RemoveAsync(ModelTransferHandle handle, CancellationToken cancellationToken)
         {
@@ -1307,7 +1385,7 @@ public class ModelDownloadServiceTests
             if (BlockRemoval is { } blocked)
             {
                 blocked.TrySetResult();
-                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+                await RemovalGate.Task.WaitAsync(cancellationToken);
             }
 
             _createdHandles.Remove(handle);
