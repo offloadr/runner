@@ -46,11 +46,31 @@ public class RunnerCleanupTests
 
         var removed = await RunnerCleanup.RemoveLeftoverRunnerAsync(_paths, processes, new SupervisorOptions(), CancellationToken.None);
 
+        var commands = processes.Calls.Select(call => string.Join(' ', call.Arguments)).ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(removed, Is.True);
+            Assert.That(commands, Does.Contain("stop --time 10 abc"), "The agent gets to shut down cleanly first.");
+            Assert.That(commands.IndexOf("stop --time 10 abc"), Is.LessThan(commands.IndexOf("rm --force abc")));
+            Assert.That(File.Exists(_paths.EngineState), Is.False);
+        });
+    }
+
+    [Test]
+    public async Task ARunnerThatWillNotStop_IsStillRemoved()
+    {
+        File.WriteAllText(_paths.Owner, OwnerId);
+        Remember("abc");
+        var processes = new FakeProcessRunner()
+            .On("container", 0, Inspect(OwnerId))
+            .On("stop", 1, stderr: "Error response from daemon: cannot stop container: abc");
+
+        var removed = await RunnerCleanup.RemoveLeftoverRunnerAsync(_paths, processes, new SupervisorOptions(), CancellationToken.None);
+
         Assert.Multiple(() =>
         {
             Assert.That(removed, Is.True);
             Assert.That(processes.Calls.Select(call => string.Join(' ', call.Arguments)), Does.Contain("rm --force abc"));
-            Assert.That(File.Exists(_paths.EngineState), Is.False);
         });
     }
 

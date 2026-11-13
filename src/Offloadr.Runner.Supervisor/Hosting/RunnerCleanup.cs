@@ -44,8 +44,29 @@ public static class RunnerCleanup
             return false;
         }
 
-        await engine.RemoveAsync(string.IsNullOrWhiteSpace(container.Id) ? options.ContainerName : container.Id, cancellationToken).ConfigureAwait(false);
+        var target = string.IsNullOrWhiteSpace(container.Id) ? options.ContainerName : container.Id;
+        if (container.Running)
+        {
+            // Stopped first, as on a host shutdown, so the agent sends what it still holds (session
+            // events, workspace writes) instead of being killed. The grace period is short, to leave
+            // the removal room in the installer's budget.
+            using var stopBudget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            stopBudget.CancelAfter(StopGracePeriod + TimeSpan.FromSeconds(3));
+            try
+            {
+                await engine.StopAsync(target, StopGracePeriod, stopBudget.Token).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is ContainerEngineException || ex is OperationCanceledException && !cancellationToken.IsCancellationRequested)
+            {
+                // Removing it below still ends it.
+            }
+        }
+
+        await engine.RemoveAsync(target, cancellationToken).ConfigureAwait(false);
         selection.Forget();
         return true;
     }
+
+    /// <summary>How long the runner may take to shut down cleanly before it is killed.</summary>
+    public static readonly TimeSpan StopGracePeriod = TimeSpan.FromSeconds(10);
 }
