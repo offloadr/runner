@@ -1096,6 +1096,50 @@ public class ModelDownloadServiceTests
         }
     }
 
+    [Test]
+    public async Task ReleaseForLocalModels_CancelledAfterTheTransferIsRemoved_RecoversInTheSameSession()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var destinationPath = Path.Combine(root, "diffusion_models", "partly.safetensors");
+            var aria = new CompletingAria2Client(destinationPath, expectedBytes: 8);
+            await using var service = CreateRangeManagedService(aria, root);
+            await service.InitializeAsync(CancellationToken.None);
+            service.SetActiveSession("session-1");
+            service.SeedDownloads("session-1", [RemoteModel(destinationPath)]);
+            await ReadWholeModelAsync(service, destinationPath);
+
+            // Stop arrives once aria2 has dropped the transfer, before its index entry goes.
+            using var stop = new CancellationTokenSource();
+            aria.AfterRemoval = stop.Cancel;
+            Assert.That(
+                async () => await service.ReleaseForLocalModelsAsync([LocalModel(destinationPath)], AnyLocalModel, stop.Token),
+                Throws.InstanceOf<OperationCanceledException>());
+            aria.AfterRemoval = null;
+
+            var opened = await service.OpenRangeManagedAsync(destinationPath, "session-1", CancellationToken.None);
+            Assert.Multiple(() =>
+            {
+                Assert.That(File.Exists(destinationPath), Is.False);
+                Assert.That(opened.Disposition, Is.EqualTo(ModelHydrationOpenDisposition.Unmanaged), "No state of the removed transfer is left.");
+            });
+
+            // Asked for as a download again, it is downloaded again rather than tied to the removed transfer.
+            service.SeedDownloads("session-1", [RemoteModel(destinationPath)]);
+            await ReadWholeModelAsync(service, destinationPath);
+            Assert.Multiple(() =>
+            {
+                Assert.That(aria.AddUriCallCount, Is.EqualTo(2));
+                Assert.That(new FileInfo(destinationPath).Length, Is.EqualTo(8));
+            });
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
     private static bool AnyLocalModel(ModelDownloadRequest _) => true;
 
     private static async Task ReadWholeModelAsync(ModelDownloadService service, string destinationPath)
@@ -1267,7 +1311,11 @@ public class ModelDownloadServiceTests
             }
 
             _createdHandles.Remove(handle);
+            AfterRemoval?.Invoke();
         }
+
+        /// <summary>Runs once a transfer is removed, before the caller goes on.</summary>
+        public Action? AfterRemoval { get; set; }
 
         public override Task<IReadOnlyList<ModelTransferHandle>> CreateAsync(
             ModelTransferCreateRequest request,
