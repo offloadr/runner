@@ -45,6 +45,30 @@ public sealed class MainPage : ContentPage
             }
         };
         Content = new Label { Text = "Opening Offloadr Runner…", Margin = 32 };
+
+        // The page's own colors behind everything, so neither the window nor the web view, which
+        // paints white until its first frame, flashes light in dark mode.
+        this.SetAppThemeColor(BackgroundColorProperty, LightPage, DarkPage);
+        _webView.BlazorWebViewInitialized += (_, args) => PaintWebViewBackground(args.WebView, Application.Current?.RequestedTheme);
+        if (Application.Current is { } app)
+        {
+            app.RequestedThemeChanged += (_, args) =>
+            {
+                if (_webView.Handler?.PlatformView is Microsoft.UI.Xaml.Controls.WebView2 native)
+                {
+                    PaintWebViewBackground(native, args.RequestedTheme);
+                }
+            };
+        }
+    }
+
+    internal static readonly Color LightPage = Color.FromArgb(Offloadr.Runner.UI.RunnerTheme.LightPage);
+
+    internal static readonly Color DarkPage = Color.FromArgb(Offloadr.Runner.UI.RunnerTheme.DarkPage);
+
+    private static void PaintWebViewBackground(Microsoft.UI.Xaml.Controls.WebView2 webView, AppTheme? theme)
+    {
+        webView.DefaultBackgroundColor = PlatformWindow.Native(theme == AppTheme.Dark ? DarkPage : LightPage);
     }
 
     public bool CanClose { get; private set; }
