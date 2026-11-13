@@ -10,11 +10,24 @@ updates:
         patterns: ["*"]
 
   # Central package management: every version lives in Directory.Packages.props.
-  # A package joins the first group that matches it.
   - package-ecosystem: nuget
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # The runner and app target .NET 10 (LTS). Moving to another .NET release (its packages, and
+      # MAUI, which needs that release's SDK and workload) is a change of its own, not an update.
+      - dependency-name: "Microsoft.Extensions.*"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "Microsoft.AspNetCore.*"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "Microsoft.Maui.*"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "System.*"
+        update-types: ["version-update:semver-major"]
+      # NUnit 5 changes assertion APIs across every test suite; adopt it deliberately.
+      - dependency-name: "NUnit"
+        update-types: ["version-update:semver-major"]
     groups:
       tests:
         patterns: ["NUnit*", "Microsoft.NET.Test.Sdk", "Moq", "coverlet.*"]
@@ -24,3 +37,4 @@ updates:
         patterns: ["Microsoft.Maui.*", "Microsoft.AspNetCore.Components.WebView.Maui"]
       dotnet:
         patterns: ["Microsoft.*", "System.*"]
+        exclude-patterns: ["Microsoft.Maui.*", "Microsoft.AspNetCore.Components.WebView.Maui", "Microsoft.NET.Test.Sdk"]
