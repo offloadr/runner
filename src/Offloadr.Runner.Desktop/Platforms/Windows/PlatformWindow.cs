@@ -26,6 +26,11 @@ internal static class PlatformWindow
         TrayIcon? tray = null;
         TrayStateIcons? icons = null;
         native.Activated += (_, _) => activated = true;
+        PaintTitleBar(native, Application.Current?.RequestedTheme);
+        if (Application.Current is { } app)
+        {
+            app.RequestedThemeChanged += (_, args) => native.DispatcherQueue.TryEnqueue(() => PaintTitleBar(native, args.RequestedTheme));
+        }
 
         void Open()
         {
@@ -178,6 +183,37 @@ internal static class PlatformWindow
     }
 
     private static string Tooltip(SupervisorView view) => $"Offloadr Runner: {view.StateTitle}";
+
+    /// <summary>The title bar in the page's colors, so the window reads as one surface.</summary>
+    private static void PaintTitleBar(Microsoft.UI.Xaml.Window native, AppTheme? theme)
+    {
+        if (!Microsoft.UI.Windowing.AppWindowTitleBar.IsCustomizationSupported())
+        {
+            return;
+        }
+
+        var dark = theme == AppTheme.Dark;
+        var background = Native(dark ? MainPage.DarkPage : MainPage.LightPage);
+        var text = Native(Color.FromArgb(dark ? "#edf4ff" : "#102033"));
+        var inactiveText = Native(Color.FromArgb(dark ? "#7f8bb8" : "#7480a8"));
+        var hover = Native(Color.FromArgb(dark ? "#0d1d34" : "#e2e8fb"));
+        var bar = native.AppWindow.TitleBar;
+        bar.BackgroundColor = background;
+        bar.InactiveBackgroundColor = background;
+        bar.ForegroundColor = text;
+        bar.InactiveForegroundColor = inactiveText;
+        bar.ButtonBackgroundColor = background;
+        bar.ButtonInactiveBackgroundColor = background;
+        bar.ButtonForegroundColor = text;
+        bar.ButtonInactiveForegroundColor = inactiveText;
+        bar.ButtonHoverBackgroundColor = hover;
+        bar.ButtonHoverForegroundColor = text;
+        bar.ButtonPressedBackgroundColor = hover;
+        bar.ButtonPressedForegroundColor = text;
+    }
+
+    internal static Windows.UI.Color Native(Color color)
+        => Windows.UI.Color.FromArgb(255, (byte)(color.Red * 255), (byte)(color.Green * 255), (byte)(color.Blue * 255));
 }
 
 internal static class PlatformFiles

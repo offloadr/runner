@@ -1,40 +1,46 @@
 @inherits LayoutComponentBase
+@inject IHostActions Host
 
 <MudThemeProvider @ref="_themeProvider" @bind-IsDarkMode="_isDarkMode" Theme="_theme" ObserveSystemDarkModeChange="true" />
-<MudPopoverProvider />
-<MudDialogProvider />
-<MudSnackbarProvider />
 
-<MudLayout>
-    <MudAppBar Elevation="0" Dense="true">
-        <MudIcon Icon="@Icons.Material.Filled.Memory" />
-        <MudText Typo="Typo.h6" Class="ml-2">Offloadr Runner</MudText>
-        <MudSpacer />
-        <NavButton Href="/" Text="Status" />
-        <NavButton Href="settings" Text="Settings" />
-        <NavButton Href="logs" Text="Logs" />
-    </MudAppBar>
-    <MudMainContent>
-        <MudContainer MaxWidth="MaxWidth.Large" Class="py-6">
-            <UpdateBanner />
-            @Body
-        </MudContainer>
-    </MudMainContent>
-</MudLayout>
+<div class="@ShellClass">
+    <MudPopoverProvider />
+    <MudDialogProvider />
+    <MudSnackbarProvider />
+
+    <MudLayout>
+        <MudAppBar Elevation="0" Dense="true">
+            <img src="_content/Offloadr.Runner.UI/icon.svg" alt="" class="runner-logo" />
+            <MudText Typo="Typo.h6" HtmlTag="span" Class="ml-2 runner-wordmark">Offloadr Runner</MudText>
+            <MudSpacer />
+            <NavButton Href="/" Text="Status" />
+            <NavButton Href="settings" Text="Settings" />
+            <NavButton Href="logs" Text="Logs" />
+        </MudAppBar>
+        <MudMainContent>
+            <MudContainer MaxWidth="MaxWidth.Large" Class="py-6">
+                <UpdateBanner />
+                @Body
+            </MudContainer>
+        </MudMainContent>
+    </MudLayout>
+</div>
 
 @code {
-    private readonly MudTheme _theme = new()
-    {
-        PaletteLight = new PaletteLight { Primary = "#4f46e5", AppbarBackground = "#4f46e5" },
-        PaletteDark = new PaletteDark { Primary = "#818cf8", AppbarBackground = "#1e1b4b" },
-    };
+    private readonly MudTheme _theme = RunnerTheme.Create();
 
     private MudThemeProvider? _themeProvider;
     private bool _isDarkMode;
 
+    private string ShellClass => _isDarkMode ? "runner-shell runner-dark" : "runner-shell";
+
+    // The host knows the system theme before the page has rendered; asking the browser only
+    // afterwards would paint one light frame first.
+    protected override void OnInitialized() => _isDarkMode = Host.PrefersDark ?? false;
+
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
-        if (firstRender && _themeProvider is not null)
+        if (firstRender && Host.PrefersDark is null && _themeProvider is not null)
         {
             _isDarkMode = await _themeProvider.GetSystemDarkModeAsync();
             StateHasChanged();

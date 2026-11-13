@@ -25,6 +25,9 @@ public interface IHostActions
     /// <summary>Turns starting at sign-in on or off; throws when the host cannot change it.</summary>
     void SetStartAtSignIn(bool enabled) => throw new NotSupportedException("This host cannot start at sign-in.");
 
+    /// <summary>Whether the system uses a dark theme, when the host knows before the page renders; null otherwise.</summary>
+    bool? PrefersDark => null;
+
     /// <summary>Closes the app to install a downloaded update and starts it again, leaving the runner running.</summary>
     Task RestartToUpdateAsync() => Task.CompletedTask;
 }

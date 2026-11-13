@@ -31,6 +31,13 @@ public sealed class DesktopHostActions(MainPage page) : IHostActions
         }
     }
 
+    public bool? PrefersDark => Application.Current?.RequestedTheme switch
+    {
+        AppTheme.Dark => true,
+        AppTheme.Light => false,
+        _ => null,
+    };
+
     public Task<string?> PickFolderAsync() => MainThread.InvokeOnMainThreadAsync(PlatformFiles.PickFolderAsync);
 
     public Task RestartToUpdateAsync() => MainThread.InvokeOnMainThreadAsync(page.RestartToUpdateAsync);

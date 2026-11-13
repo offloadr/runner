@@ -1,0 +1,143 @@
+/* The semantic tokens of offloadr.studio, for what MudTheme cannot express. Light values sit on
+   .runner-shell and dark ones on .runner-shell.runner-dark, so components never pick colors per
+   scheme. Blue is for actions; purple is atmosphere only. */
+
+.runner-shell {
+    --blue-ribbon-650: #0b338b;
+    --blue-ribbon-600: #0e3b9e;
+    --blue-ribbon-500: #1753d7;
+    --blue-ribbon-400: #3f77ed;
+    --blue-ribbon-375: #5084ef;
+    --purple-heart-500: #7a00e2;
+    --purple-heart-400: #9c3fff;
+    --purple-heart-375: #a853ff;
+
+    --color-text-strong: #070b1d;
+    --color-text: #102033;
+    --color-text-body: #27345f;
+    --color-text-muted: #5e708a;
+    --color-text-soft: #7480a8;
+    --color-action: var(--blue-ribbon-500);
+    --color-action-hover: var(--blue-ribbon-600);
+    --color-action-active: var(--blue-ribbon-650);
+    --color-accent: var(--purple-heart-500);
+    --color-success: #16a34a;
+    --color-warning: #d97706;
+    --color-danger: #ef4444;
+
+    --surface-page: #f4f7fb;
+    --surface-panel: rgba(255, 255, 255, 0.76);
+    --surface-panel-strong: #ffffff;
+    --surface-card: rgba(255, 255, 255, 0.78);
+    --surface-card-solid: #ffffff;
+    --surface-control: rgba(255, 255, 255, 0.72);
+    --surface-selected: #eff5ff;
+    --border-subtle: rgba(23, 83, 215, 0.1);
+    --border-default: rgba(109, 128, 156, 0.18);
+    --border-emphasis: rgba(85, 0, 171, 0.18);
+
+    --radius-control: 12px;
+    --radius-card: 22px;
+    --radius-panel: 28px;
+    --radius-pill: 999px;
+
+    --shadow-panel: 0 24px 70px rgba(13, 20, 48, 0.08);
+    --shadow-card: 0 12px 32px rgba(13, 20, 48, 0.07);
+    --shadow-control: 0 8px 20px rgba(13, 20, 48, 0.05);
+    --shadow-action: 0 14px 32px rgba(23, 83, 215, 0.24);
+    --focus-ring: rgba(63, 119, 237, 0.35);
+
+    --shell-glow:
+        radial-gradient(circle at 12% -10%, rgba(100, 187, 255, 0.22), transparent 38%),
+        radial-gradient(circle at 88% -6%, rgba(168, 83, 255, 0.12), transparent 32%);
+}
+
+.runner-shell.runner-dark {
+    --color-text-strong: #ffffff;
+    --color-text: #edf4ff;
+    --color-text-body: #d8def2;
+    --color-text-muted: #9fb3cc;
+    --color-text-soft: #7f8bb8;
+    --color-action: var(--blue-ribbon-400);
+    --color-action-hover: var(--blue-ribbon-375);
+    --color-action-active: var(--blue-ribbon-500);
+    --color-accent: var(--purple-heart-400);
+
+    --surface-page: #07111f;
+    --surface-panel: rgba(11, 24, 42, 0.8);
+    --surface-panel-strong: #0d1d34;
+    --surface-card: rgba(14, 21, 48, 0.74);
+    --surface-card-solid: #101832;
+    --surface-control: rgba(11, 24, 42, 0.72);
+    --surface-selected: rgba(80, 132, 239, 0.16);
+    --border-subtle: rgba(80, 132, 239, 0.16);
+    --border-default: rgba(143, 174, 219, 0.18);
+    --border-emphasis: rgba(168, 83, 255, 0.24);
+
+    --shadow-panel: 0 24px 80px rgba(0, 0, 0, 0.34);
+    --shadow-card: 0 14px 34px rgba(1, 8, 20, 0.2);
+    --shadow-control: 0 14px 34px rgba(1, 8, 20, 0.2), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+    --shadow-action: 0 18px 42px rgba(23, 83, 215, 0.18);
+    --focus-ring: rgba(80, 132, 239, 0.45);
+
+    --shell-glow:
+        radial-gradient(circle at 12% -10%, rgba(111, 179, 255, 0.14), transparent 36%),
+        radial-gradient(circle at 88% -6%, rgba(122, 0, 226, 0.14), transparent 30%);
+}
+
+.runner-shell {
+    min-height: 100vh;
+    color: var(--color-text);
+    background: var(--shell-glow), var(--surface-page);
+    background-attachment: fixed;
+}
+
+/* The bar is glass over the page, not a colored band. */
+.runner-shell .mud-appbar {
+    background: var(--surface-panel);
+    border-bottom: 1px solid var(--border-subtle);
+    backdrop-filter: blur(18px) saturate(1.2);
+}
+
+.runner-logo {
+    width: 28px;
+    height: 28px;
+    display: block;
+}
+
+.runner-wordmark {
+    font-weight: 650;
+    letter-spacing: -0.01em;
+    color: var(--color-text-strong);
+}
+
+/* Cards: the site's 22 px glass card with a hairline and soft shadow. */
+.runner-shell .mud-paper.mud-paper-outlined {
+    background: var(--surface-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-card);
+    box-shadow: var(--shadow-card);
+    backdrop-filter: blur(16px);
+}
+
+.runner-shell .mud-alert {
+    border-radius: var(--radius-control);
+}
+
+/* Buttons are pills; the one filled primary action gets the blue glow. */
+.runner-shell .mud-button-root.mud-button {
+    border-radius: var(--radius-pill);
+}
+
+.runner-shell .mud-button-filled.mud-button-filled-primary:not(.mud-button-disabled) {
+    box-shadow: var(--shadow-action), inset 0 1px 0 rgba(255, 255, 255, 0.22);
+}
+
+.runner-shell .mud-button-outlined:not(.mud-button-disabled) {
+    background: var(--surface-control);
+}
+
+.runner-shell :focus-visible {
+    outline: 2px solid var(--focus-ring);
+    outline-offset: 2px;
+}

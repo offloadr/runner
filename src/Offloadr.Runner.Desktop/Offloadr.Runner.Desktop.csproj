@@ -41,7 +41,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <MauiIcon Include="..\Offloadr.Runner.UI\wwwroot\icon.svg" Link="Resources\AppIcon\appicon.svg" Color="#4f46e5" />
+    <MauiIcon Include="..\Offloadr.Runner.UI\wwwroot\icon.svg" Link="Resources\AppIcon\appicon.svg" Color="#1753d7" />
   </ItemGroup>
 
 </Project>
