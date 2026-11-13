@@ -2427,6 +2427,7 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
         try
         {
             TransferState? state;
+            var wasPendingCleanup = false;
             lock (_sync)
             {
                 _states.TryGetValue(normalized, out state);
@@ -2438,74 +2439,110 @@ public sealed class DemandAwareModelHydrationCoordinator : IAsyncDisposable
                     }
 
                     // Opens are refused from here until the state is gone.
+                    wasPendingCleanup = state.PendingOrphanCleanup;
                     state.PendingOrphanCleanup = true;
                 }
             }
 
-            var records = _index.Snapshot()
-                .Where(record => string.Equals(NormalizePath(record.DestinationPath), normalized, StringComparison.Ordinal))
-                .ToArray();
-            if (state is null && records.Length == 0)
+            try
             {
-                return LocalModelRelease.NotManaged;
+                return await ReleaseLockedAsync(normalized, state, cancellationToken).ConfigureAwait(false);
             }
-
-            var changed = false;
-            foreach (var record in records)
+            catch (Exception ex)
             {
-                changed |= await RemoveIndexedTransferAsync(record, deleteComplete: true, cancellationToken).ConfigureAwait(false);
-            }
-
-            if (state is not null && records.Length == 0)
-            {
-                // Registered, but its transfer was never recorded: only the placeholder may exist.
-                if (state.Handle is { } handle)
+                // Freeing a duplicate copy is only an optimisation: whatever failed, the path serves as
+                // before, and the command that asked carries on.
+                lock (_sync)
                 {
-                    try
+                    if (state is not null &&
+                        _states.TryGetValue(normalized, out var current) &&
+                        ReferenceEquals(current, state))
                     {
-                        await _backend.RemoveAsync(handle, cancellationToken).ConfigureAwait(false);
-                        changed = true;
-                    }
-                    catch (ModelTransferStatusUnavailableException)
-                    {
-                        // Already absent.
+                        state.PendingOrphanCleanup = wasPendingCleanup;
                     }
                 }
 
-                if (state.PlaceholderOwned)
+                if (ex is OperationCanceledException && cancellationToken.IsCancellationRequested)
                 {
-                    DeleteOwnedDestination(normalized, state.DeviceId, state.Inode);
+                    throw;
                 }
-            }
 
-            lock (_sync)
-            {
-                if (state is not null &&
-                    _states.TryGetValue(normalized, out var current) &&
-                    ReferenceEquals(current, state))
-                {
-                    _states.Remove(normalized);
-                }
+                RunnerLog.Warning<DemandAwareModelHydrationCoordinator>(
+                    $"Could not remove the downloaded copy at '{normalized}' ({ex.GetType().Name}); it is kept until a later request frees it.");
+                return IsPathConfirmedAbsent(normalized) ? LocalModelRelease.Released : LocalModelRelease.InUse;
             }
-
-            if (changed)
-            {
-                await _backend.SaveSessionAsync(cancellationToken).ConfigureAwait(false);
-            }
-
-            if (!IsPathConfirmedAbsent(normalized))
-            {
-                return LocalModelRelease.NotManaged;
-            }
-
-            RunnerLog.Info<DemandAwareModelHydrationCoordinator>(
-                $"Removed the downloaded copy at '{normalized}': the same model is linked from the local models folder.");
-            return LocalModelRelease.Released;
         }
         finally
         {
             _registrationCleanupGate.Release();
         }
+    }
+
+    /// <summary>The work of <see cref="ReleaseForLocalModelAsync"/>, under the registration cleanup gate.</summary>
+    private async Task<LocalModelRelease> ReleaseLockedAsync(
+        string normalized,
+        TransferState? state,
+        CancellationToken cancellationToken)
+    {
+        var records = _index.Snapshot()
+            .Where(record => string.Equals(NormalizePath(record.DestinationPath), normalized, StringComparison.Ordinal))
+            .ToArray();
+        if (state is null && records.Length == 0)
+        {
+            return LocalModelRelease.NotManaged;
+        }
+
+        var changed = false;
+        foreach (var record in records)
+        {
+            changed |= await RemoveIndexedTransferAsync(record, deleteComplete: true, cancellationToken).ConfigureAwait(false);
+        }
+
+        if (state is not null && records.Length == 0)
+        {
+            // Registered, but its transfer was never recorded: only the placeholder may exist.
+            if (state.Handle is { } handle)
+            {
+                try
+                {
+                    await _backend.RemoveAsync(handle, cancellationToken).ConfigureAwait(false);
+                    changed = true;
+                }
+                catch (ModelTransferStatusUnavailableException)
+                {
+                    // Already absent.
+                }
+            }
+
+            if (state.PlaceholderOwned)
+            {
+                DeleteOwnedDestination(normalized, state.DeviceId, state.Inode);
+            }
+        }
+
+        lock (_sync)
+        {
+            if (state is not null &&
+                _states.TryGetValue(normalized, out var current) &&
+                ReferenceEquals(current, state))
+            {
+                _states.Remove(normalized);
+            }
+        }
+
+        if (changed)
+        {
+            await _backend.SaveSessionAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        if (!IsPathConfirmedAbsent(normalized))
+        {
+            return LocalModelRelease.NotManaged;
+        }
+
+        RunnerLog.Info<DemandAwareModelHydrationCoordinator>(
+            $"Removed the downloaded copy at '{normalized}': the same model is linked from the local models folder.");
+        return LocalModelRelease.Released;
     }
 
     private ConflictQuarantineEligibility GetConflictQuarantineEligibility(

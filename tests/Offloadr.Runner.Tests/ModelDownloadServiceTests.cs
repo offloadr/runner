@@ -922,6 +922,48 @@ public class ModelDownloadServiceTests
     }
 
     [Test]
+    public async Task ReleaseForLocalModels_ThatFails_KeepsTheDownloadServingAndTriesAgainLater()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var destinationPath = Path.Combine(root, "diffusion_models", "stuck.safetensors");
+            var aria = new CompletingAria2Client(destinationPath, expectedBytes: 8);
+            await using var service = CreateRangeManagedService(aria, root);
+            await service.InitializeAsync(CancellationToken.None);
+            service.SetActiveSession("session-1");
+            service.SeedDownloads("session-1", [RemoteModel(destinationPath)]);
+            await ReadWholeModelAsync(service, destinationPath);
+            var local = LocalModel(destinationPath);
+
+            aria.FailRemoval = true;
+            var projected = await service.ReleaseForLocalModelsAsync([local], CancellationToken.None);
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(projected, Is.Empty, "The command carries on, without a link over the download.");
+                Assert.That(File.Exists(destinationPath), Is.True);
+            });
+            Assert.That(
+                async () => await ReadWholeModelAsync(service, destinationPath),
+                Throws.Nothing,
+                "The download keeps serving; it is not left refused as pending cleanup.");
+
+            aria.FailRemoval = false;
+            var retried = await service.ReleaseForLocalModelsAsync([local], CancellationToken.None);
+            Assert.Multiple(() =>
+            {
+                Assert.That(retried, Is.EqualTo(new[] { local }));
+                Assert.That(File.Exists(destinationPath), Is.False);
+            });
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
     public async Task ReleaseForLocalModels_LeavesAFileItDidNotDownload()
     {
         var root = CreateTempDirectory();
@@ -1095,9 +1137,16 @@ public class ModelDownloadServiceTests
 
         public int RemoveCallCount { get; private set; }
 
+        public bool FailRemoval { get; set; }
+
         public override Task RemoveAsync(ModelTransferHandle handle, CancellationToken cancellationToken)
         {
             RemoveCallCount++;
+            if (FailRemoval)
+            {
+                throw new IOException("simulated aria2 failure");
+            }
+
             _createdHandles.Remove(handle);
             return Task.CompletedTask;
         }
