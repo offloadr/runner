@@ -864,7 +864,7 @@ public class ModelDownloadServiceTests
             Assert.That(aria.AddUriCallCount, Is.EqualTo(1), "The download finished first.");
 
             var local = LocalModel(destinationPath);
-            var projected = await service.ReleaseForLocalModelsAsync([local], CancellationToken.None);
+            var projected = await service.ReleaseForLocalModelsAsync([local], AnyLocalModel, CancellationToken.None);
 
             Assert.Multiple(() =>
             {
@@ -899,7 +899,7 @@ public class ModelDownloadServiceTests
             var opened = await service.OpenRangeManagedAsync(destinationPath, "session-1", CancellationToken.None);
 
             var local = LocalModel(destinationPath);
-            var whileOpen = await service.ReleaseForLocalModelsAsync([local], CancellationToken.None);
+            var whileOpen = await service.ReleaseForLocalModelsAsync([local], AnyLocalModel, CancellationToken.None);
             Assert.Multiple(() =>
             {
                 Assert.That(whileOpen, Is.Empty, "No link is made over a model the editor is reading.");
@@ -908,7 +908,7 @@ public class ModelDownloadServiceTests
             });
 
             await service.ReleaseAsync(opened.LeaseId);
-            var afterClose = await service.ReleaseForLocalModelsAsync([local], CancellationToken.None);
+            var afterClose = await service.ReleaseForLocalModelsAsync([local], AnyLocalModel, CancellationToken.None);
             Assert.Multiple(() =>
             {
                 Assert.That(afterClose, Is.EqualTo(new[] { local }));
@@ -937,7 +937,7 @@ public class ModelDownloadServiceTests
             var local = LocalModel(destinationPath);
 
             aria.FailRemoval = true;
-            var projected = await service.ReleaseForLocalModelsAsync([local], CancellationToken.None);
+            var projected = await service.ReleaseForLocalModelsAsync([local], AnyLocalModel, CancellationToken.None);
 
             Assert.Multiple(() =>
             {
@@ -950,7 +950,7 @@ public class ModelDownloadServiceTests
                 "The download keeps serving; it is not left refused as pending cleanup.");
 
             aria.FailRemoval = false;
-            var retried = await service.ReleaseForLocalModelsAsync([local], CancellationToken.None);
+            var retried = await service.ReleaseForLocalModelsAsync([local], AnyLocalModel, CancellationToken.None);
             Assert.Multiple(() =>
             {
                 Assert.That(retried, Is.EqualTo(new[] { local }));
@@ -978,7 +978,7 @@ public class ModelDownloadServiceTests
 
             var local = LocalModel(destinationPath);
             var remote = RemoteModel(Path.Combine(root, "loras", "other.safetensors"));
-            var projected = await service.ReleaseForLocalModelsAsync([local, remote], CancellationToken.None);
+            var projected = await service.ReleaseForLocalModelsAsync([local, remote], AnyLocalModel, CancellationToken.None);
 
             Assert.Multiple(() =>
             {
@@ -992,6 +992,77 @@ public class ModelDownloadServiceTests
             TryDelete(root);
         }
     }
+
+    [Test]
+    public async Task ReleaseForLocalModels_KeepsTheDownloadWhenTheLocalModelCannotBeLinked()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var destinationPath = Path.Combine(root, "diffusion_models", "gone.safetensors");
+            var aria = new CompletingAria2Client(destinationPath, expectedBytes: 8);
+            await using var service = CreateRangeManagedService(aria, root);
+            await service.InitializeAsync(CancellationToken.None);
+            service.SetActiveSession("session-1");
+            service.SeedDownloads("session-1", [RemoteModel(destinationPath)]);
+            await ReadWholeModelAsync(service, destinationPath);
+            var local = LocalModel(destinationPath);
+
+            // The local file left the folder after Offloadr chose it.
+            var projected = await service.ReleaseForLocalModelsAsync([local], static _ => false, CancellationToken.None);
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(projected, Is.EqualTo(new[] { local }), "The projector reports the missing local model.");
+                Assert.That(File.Exists(destinationPath), Is.True, "The download is not given up for a model that cannot replace it.");
+                Assert.That(aria.RemoveCallCount, Is.Zero);
+            });
+            Assert.That(async () => await ReadWholeModelAsync(service, destinationPath), Throws.Nothing);
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
+    public async Task ReleaseForLocalModels_CancelledMidway_LeavesTheModelUsable()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var destinationPath = Path.Combine(root, "diffusion_models", "cancelled.safetensors");
+            var aria = new CompletingAria2Client(destinationPath, expectedBytes: 8);
+            await using var service = CreateRangeManagedService(aria, root);
+            await service.InitializeAsync(CancellationToken.None);
+            service.SetActiveSession("session-1");
+            service.SeedDownloads("session-1", [RemoteModel(destinationPath)]);
+            await ReadWholeModelAsync(service, destinationPath);
+
+            aria.BlockRemoval = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            using var stop = new CancellationTokenSource();
+            var release = service.ReleaseForLocalModelsAsync([LocalModel(destinationPath)], AnyLocalModel, stop.Token);
+            await aria.BlockRemoval.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            stop.Cancel();
+
+            Assert.That(async () => await release, Throws.InstanceOf<OperationCanceledException>());
+            aria.BlockRemoval = null;
+            Assert.Multiple(() =>
+            {
+                Assert.That(File.Exists(destinationPath), Is.True);
+                Assert.That(
+                    async () => await ReadWholeModelAsync(service, destinationPath),
+                    Throws.Nothing,
+                    "The model is not left refused as pending cleanup.");
+            });
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    private static bool AnyLocalModel(ModelDownloadRequest _) => true;
 
     private static async Task ReadWholeModelAsync(ModelDownloadService service, string destinationPath)
     {
@@ -1139,7 +1210,10 @@ public class ModelDownloadServiceTests
 
         public bool FailRemoval { get; set; }
 
-        public override Task RemoveAsync(ModelTransferHandle handle, CancellationToken cancellationToken)
+        /// <summary>Set to make removal wait until it is cancelled; completed when it starts waiting.</summary>
+        public TaskCompletionSource? BlockRemoval { get; set; }
+
+        public override async Task RemoveAsync(ModelTransferHandle handle, CancellationToken cancellationToken)
         {
             RemoveCallCount++;
             if (FailRemoval)
@@ -1147,8 +1221,13 @@ public class ModelDownloadServiceTests
                 throw new IOException("simulated aria2 failure");
             }
 
+            if (BlockRemoval is { } blocked)
+            {
+                blocked.TrySetResult();
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            }
+
             _createdHandles.Remove(handle);
-            return Task.CompletedTask;
         }
 
         public override Task<IReadOnlyList<ModelTransferHandle>> CreateAsync(

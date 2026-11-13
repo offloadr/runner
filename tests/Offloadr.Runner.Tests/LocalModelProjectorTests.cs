@@ -41,6 +41,42 @@ public class LocalModelProjectorTests
     }
 
     [Test]
+    public void CanProject_OnlyAReadableModelInTheInventory()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var sourceRoot = Path.Combine(root, "local");
+            var destinationRoot = Path.Combine(root, "models");
+            Directory.CreateDirectory(Path.Combine(sourceRoot, "checkpoints"));
+            var sourceFile = Path.Combine(sourceRoot, "checkpoints", "demo.safetensors");
+            File.WriteAllText(sourceFile, "checkpoint");
+            var projected = Path.Combine(destinationRoot, "checkpoints", "demo.safetensors");
+            var request = CreateLocalProjectionRequest(sourceFile, ModelCategory.Checkpoint, projected);
+            var projector = new LocalModelProjector(sourceRoot, destinationRoot);
+
+            var beforeScan = projector.CanProject(request);
+            projector.UpdateSnapshot(CreateSnapshot(CreateModel(sourceFile, ModelCategory.Checkpoint)));
+            var scanned = projector.CanProject(request);
+            var remote = projector.CanProject(new ModelDownloadRequest { Filename = "demo.safetensors", DestinationPath = projected });
+            File.Delete(sourceFile);
+            var deleted = projector.CanProject(request);
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(beforeScan, Is.False, "Not in the inventory yet.");
+                Assert.That(scanned, Is.True);
+                Assert.That(remote, Is.False);
+                Assert.That(deleted, Is.False, "Gone from the folder since the last scan.");
+            });
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
     public void SetRequestedModels_DoesNotRemoveLinksThroughSymlinkedDirectory()
     {
         var root = CreateTempDirectory();

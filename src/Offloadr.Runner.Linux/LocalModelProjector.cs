@@ -104,6 +104,37 @@ internal sealed class LocalModelProjector
     public static bool IsLocalProjectionRequest(ModelDownloadRequest? download)
         => !string.IsNullOrWhiteSpace(download?.LocalSelectionHash);
 
+    /// <summary>
+    /// Whether the local file <paramref name="download"/> names is in the current inventory and readable,
+    /// so a link to it can be made now.
+    /// </summary>
+    public bool CanProject(ModelDownloadRequest download)
+    {
+        if (!IsLocalProjectionRequest(download))
+        {
+            return false;
+        }
+
+        var selectionHash = LocalModelSelectionHash.NormalizeSelectionHash(download.LocalSelectionHash);
+        lock (_gate)
+        {
+            if (!_modelsBySelectionHash.TryGetValue(selectionHash, out var model))
+            {
+                return false;
+            }
+
+            try
+            {
+                var sourcePath = BuildSourcePath(model);
+                return !string.IsNullOrWhiteSpace(sourcePath) && File.Exists(sourcePath);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                return false;
+            }
+        }
+    }
+
     private void AddProjectionRequests(
         IEnumerable<ModelDownloadRequest>? downloads,
         bool reportRemoteFallbacks)

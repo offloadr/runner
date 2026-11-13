@@ -403,10 +403,16 @@ internal sealed class ModelDownloadService : IAsyncDisposable
     /// the requests to project now: all of them but the local ones whose download is in use, which keeps
     /// serving the editor until a later request finds it free.
     /// </summary>
+    /// <param name="canLink">
+    /// Whether the local model a request names can be linked now. A download is never given up for one
+    /// that cannot: the local file may be gone from the folder since Offloadr chose it.
+    /// </param>
     public async Task<IReadOnlyList<ModelDownloadRequest>> ReleaseForLocalModelsAsync(
         IEnumerable<ModelDownloadRequest> downloads,
+        Func<ModelDownloadRequest, bool> canLink,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(canLink);
         var requested = downloads.Where(static download => download is not null).ToArray();
         if (_hydrationCoordinator is null)
         {
@@ -416,6 +422,7 @@ internal sealed class ModelDownloadService : IAsyncDisposable
         var inUse = new HashSet<string>(StringComparer.Ordinal);
         var paths = requested
             .Where(LocalModelProjector.IsLocalProjectionRequest)
+            .Where(canLink)
             .Select(static download => NormalizeDestination(download.DestinationPath))
             .Where(static path => path is not null)
             .Select(static path => path!)
