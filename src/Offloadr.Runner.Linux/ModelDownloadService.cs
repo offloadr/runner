@@ -125,9 +125,29 @@ internal sealed class ModelDownloadService : IAsyncDisposable
         _library?.DiscardAll();
     }
 
-    /// <summary>Sends downloads to the owner's models folder when they are saved there.</summary>
-    private ModelDownloadRequest[] Redirect(ModelDownloadRequest[] downloads, string? sessionId)
-        => _library is null || !_downloadsEnabled ? downloads : _library.Redirect(downloads, sessionId);
+    /// <summary>
+    /// Sends downloads to the owner's models folder when they are saved there, then runs
+    /// <paramref name="register"/> on them. If it fails, nothing of the batch is registered, and the links
+    /// and claims the redirect made are undone, so none keeps a path from a local model.
+    /// </summary>
+    private T RedirectAndRegister<T>(ModelDownloadRequest[] downloads, string? sessionId, Func<ModelDownloadRequest[], T> register)
+    {
+        if (_library is null || !_downloadsEnabled)
+        {
+            return register(downloads);
+        }
+
+        var redirected = _library.Redirect(downloads, sessionId, out var batch);
+        try
+        {
+            return register(redirected);
+        }
+        catch
+        {
+            _library.Undo(batch);
+            throw;
+        }
+    }
 
     public void SetActiveSession(string? sessionId)
     {
@@ -151,41 +171,32 @@ internal sealed class ModelDownloadService : IAsyncDisposable
     }
 
     public void RegisterDownloads(string sessionId, IEnumerable<ModelDownloadRequest> downloads)
-    {
-        var snapshot = Redirect(FilterRemoteDownloadRequests(downloads), sessionId);
-        if (!_downloadsEnabled)
-        {
-            ReportRefused(sessionId, snapshot);
-            return;
-        }
-
-        ConfineDestinations(snapshot);
-        var (managed, full) = PartitionDownloads(snapshot);
-        _hydrationCoordinator?.RegisterDownloads(
-            sessionId,
-            managed,
-            replaceExisting: false);
-        _fullDownloadCoordinator.RegisterDownloads(sessionId, full);
-        SeedConventionalPlaceholders(sessionId, full, replaceExisting: false);
-    }
+        => RegisterDownloads(sessionId, downloads, replaceExisting: false);
 
     public void SeedDownloads(string sessionId, IEnumerable<ModelDownloadRequest> downloads)
+        => RegisterDownloads(sessionId, downloads, replaceExisting: true);
+
+    private void RegisterDownloads(string sessionId, IEnumerable<ModelDownloadRequest> downloads, bool replaceExisting)
     {
-        var snapshot = Redirect(FilterRemoteDownloadRequests(downloads), sessionId);
+        var filtered = FilterRemoteDownloadRequests(downloads);
         if (!_downloadsEnabled)
         {
-            ReportRefused(sessionId, snapshot);
+            ReportRefused(sessionId, filtered);
             return;
         }
 
-        ConfineDestinations(snapshot);
-        var (managed, full) = PartitionDownloads(snapshot);
-        _hydrationCoordinator?.RegisterDownloads(
-            sessionId,
-            managed,
-            replaceExisting: true);
-        _fullDownloadCoordinator.RegisterDownloads(sessionId, full, replaceExisting: true);
-        SeedConventionalPlaceholders(sessionId, full, replaceExisting: true);
+        RedirectAndRegister(filtered, sessionId, snapshot =>
+        {
+            ConfineDestinations(snapshot);
+            var (managed, full) = PartitionDownloads(snapshot);
+            _hydrationCoordinator?.RegisterDownloads(
+                sessionId,
+                managed,
+                replaceExisting);
+            _fullDownloadCoordinator.RegisterDownloads(sessionId, full, replaceExisting);
+            SeedConventionalPlaceholders(sessionId, full, replaceExisting);
+            return true;
+        });
     }
 
     private string? CreateConventionalPlaceholder(string path)
@@ -758,15 +769,18 @@ internal sealed class ModelDownloadService : IAsyncDisposable
         CancellationToken demandCancellation,
         bool highPriority)
     {
-        var snapshot = Redirect(FilterRemoteDownloadRequests(downloads), _fullDownloadCoordinator.GetActiveSessionId());
-        if (!_downloadsEnabled && snapshot.Length > 0)
+        var filtered = FilterRemoteDownloadRequests(downloads);
+        if (!_downloadsEnabled && filtered.Length > 0)
         {
             // Registration already reported each one; nothing was registered, so the editor would only fail later.
-            throw new ModelDownloadsDisabledException(snapshot.Select(static download => download.Filename).ToArray());
+            throw new ModelDownloadsDisabledException(filtered.Select(static download => download.Filename).ToArray());
         }
 
-        ConfineDestinations(snapshot);
-        var (managed, full) = PartitionDownloads(snapshot);
+        var (managed, full) = RedirectAndRegister(filtered, _fullDownloadCoordinator.GetActiveSessionId(), snapshot =>
+        {
+            ConfineDestinations(snapshot);
+            return PartitionDownloads(snapshot);
+        });
         Task conventional;
         lock (_conventionalPlaceholderGate)
         {

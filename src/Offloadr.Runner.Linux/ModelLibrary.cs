@@ -29,8 +29,8 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
     private readonly Dictionary<string, string?> _linkSessions = new(StringComparer.Ordinal);
     // Editor paths where the projector links a local model for the session now, under _gate.
     private readonly HashSet<string> _projectedLinks = new(StringComparer.Ordinal);
-    // The links the redirect batch in progress made, under _gate.
-    private List<string>? _linksMadeInBatch;
+    // What the redirect in progress changes, under _gate.
+    private RedirectBatch? _batch;
 
     /// <param name="directory">The models folder, writable.</param>
     /// <param name="readOnlyDirectory">The same folder as sessions see it, read-only.</param>
@@ -162,35 +162,54 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
     /// model of another size there, as two models at one path always are.
     /// </param>
     public ModelDownloadRequest[] Redirect(IEnumerable<ModelDownloadRequest> downloads, string? sessionId)
+        => Redirect(downloads, sessionId, out _);
+
+    /// <param name="batch">
+    /// What this redirect changed, for <see cref="Undo"/> when the batch is refused later on, before anything
+    /// of it is registered.
+    /// </param>
+    public ModelDownloadRequest[] Redirect(IEnumerable<ModelDownloadRequest> downloads, string? sessionId, out RedirectBatch batch)
     {
         // Prompts are prepared concurrently: two naming the same new model must not both find its link
         // missing, and the second fall back to downloading over the first one's link.
         var session = NormalizeSession(sessionId);
+        batch = new RedirectBatch(session);
         lock (_gate)
         {
             // A refused request fails the whole batch, and nothing of it is registered: the links and claims
             // made for the requests before it are undone, so none keeps a path from a local model.
-            var claims = new Dictionary<string, string?>(_linkSessions, StringComparer.Ordinal);
-            _linksMadeInBatch = [];
+            _batch = batch;
             try
             {
                 return downloads.Select(download => Redirect(download, session)).ToArray();
             }
             catch
             {
-                UndoBatch(claims);
+                UndoLocked(batch);
                 throw;
             }
             finally
             {
-                _linksMadeInBatch = null;
+                _batch = null;
             }
         }
     }
 
-    private void UndoBatch(Dictionary<string, string?> claimsBefore)
+    /// <summary>
+    /// Undoes the links and claims <paramref name="batch"/> made, where they are still as it left them: the
+    /// batch was refused after it was redirected, and none of its downloads is registered.
+    /// </summary>
+    public void Undo(RedirectBatch batch)
     {
-        foreach (var relative in _linksMadeInBatch!)
+        lock (_gate)
+        {
+            UndoLocked(batch);
+        }
+    }
+
+    private void UndoLocked(RedirectBatch batch)
+    {
+        foreach (var relative in batch.LinksMade)
         {
             if (HoldsOwnLink(relative, Path.Combine(_readOnlyDirectory, relative)))
             {
@@ -198,18 +217,46 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
             }
         }
 
-        // A link removed meanwhile keeps no claim.
-        foreach (var path in _linkSessions.Keys.ToArray())
+        // A link removed meanwhile keeps no claim, and one claimed again since keeps that claim.
+        foreach (var (path, before) in batch.ClaimsBefore)
         {
-            if (claimsBefore.TryGetValue(path, out var sessionId))
+            if (!_linkSessions.TryGetValue(path, out var current) ||
+                !string.Equals(current, batch.SessionId, StringComparison.Ordinal))
             {
-                _linkSessions[path] = sessionId;
+                continue;
+            }
+
+            if (before.Existed)
+            {
+                _linkSessions[path] = before.SessionId;
             }
             else
             {
                 _linkSessions.Remove(path);
             }
         }
+    }
+
+    private void Claim(string relativePath, string? sessionId)
+    {
+        if (_batch is { } batch)
+        {
+            batch.ClaimsBefore.TryAdd(
+                relativePath,
+                _linkSessions.TryGetValue(relativePath, out var before) ? (true, before) : (false, null));
+        }
+
+        _linkSessions[relativePath] = sessionId;
+    }
+
+    /// <summary>What one redirect changed: the links it made, and the claims it set, with what they were.</summary>
+    internal sealed class RedirectBatch(string? sessionId)
+    {
+        public string? SessionId { get; } = sessionId;
+
+        public List<string> LinksMade { get; } = [];
+
+        public Dictionary<string, (bool Existed, string? SessionId)> ClaimsBefore { get; } = new(StringComparer.Ordinal);
     }
 
     public void SetProjected(string editorPath, bool projected)
@@ -426,7 +473,7 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
                         return false;
                     }
 
-                    _linkSessions[relativePath] = sessionId;
+                    Claim(relativePath, sessionId);
                     return true;
                 case SecureLinkKind.Other:
                     // A model downloaded inside the container earlier, or a path that is not plain directories.
@@ -435,8 +482,8 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
 
             root.CreateSymbolicLink(relativePath, target);
             _ownLinks.Add(relativePath);
-            _linksMadeInBatch?.Add(relativePath);
-            _linkSessions[relativePath] = sessionId;
+            _batch?.LinksMade.Add(relativePath);
+            Claim(relativePath, sessionId);
             return true;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)

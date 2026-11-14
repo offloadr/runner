@@ -437,6 +437,82 @@ public class ModelLibraryTests
             Is.EqualTo(Path.Combine(_editorModels, "checkpoints", "base.safetensors")));
     }
 
+    [TestCase(false)]
+    [TestCase(true)]
+    public async Task ABatchRefusedAfterItIsRedirected_UndoesItsLinks(bool seeded)
+    {
+        var backend = new WritingBackend();
+        var settings = Aria2Settings.FromEnvironment(name => name == "ARIA2_STATE_DIR" ? Path.Combine(_root, "aria2-state") : null, static () => "generated-secret");
+        var library = CreateLibrary();
+        await using var service = new ModelDownloadService(
+            backend,
+            settings,
+            destinationPolicy: new ModelDestinationPolicy([_editorModels, _library]),
+            library: library);
+        await service.InitializeAsync(CancellationToken.None);
+        service.SetActiveSession(Session);
+        var outside = Remote("loras/escape.safetensors", 4);
+        outside.DestinationPath = Path.Combine(_root, "elsewhere", "escape.safetensors");
+        ModelDownloadRequest[] batch = [Remote("loras/style.safetensors", 4), outside];
+
+        // Its second destination is outside the model roots, which is found only after the redirect.
+        Assert.That(
+            () =>
+            {
+                if (seeded)
+                {
+                    service.SeedDownloads(Session, batch);
+                }
+                else
+                {
+                    service.RegisterDownloads(Session, batch);
+                }
+            },
+            Throws.InvalidOperationException);
+
+        var style = Path.Combine(_editorModels, "loras", "style.safetensors");
+        Assert.Multiple(() =>
+        {
+            Assert.That(File.Exists(style) || new FileInfo(style).LinkTarget is not null, Is.False, "The first request's link is undone.");
+            Assert.That(library.KeepsEditorLink(style), Is.False);
+        });
+
+        // The same session may have the owner's model linked there instead.
+        var mine = WriteLibraryFile("loras/mine/style.safetensors", 6);
+        var projector = new LocalModelProjector(_library, _editorModels, downloadLinks: library);
+        projector.UpdateSnapshot(new LocalModelScanner("runner-1", _library).Scan());
+        projector.SetRequestedModels([LocalAt("loras/style.safetensors", 6, ModelCategory.Lora)]);
+        Assert.That(new FileInfo(style).LinkTarget, Is.EqualTo(mine));
+    }
+
+    [Test]
+    public async Task APromptRefusedAfterItIsRedirected_UndoesItsLinks()
+    {
+        var backend = new WritingBackend();
+        var settings = Aria2Settings.FromEnvironment(name => name == "ARIA2_STATE_DIR" ? Path.Combine(_root, "aria2-state") : null, static () => "generated-secret");
+        var library = CreateLibrary();
+        await using var service = new ModelDownloadService(
+            backend,
+            settings,
+            destinationPolicy: new ModelDestinationPolicy([_editorModels, _library]),
+            library: library);
+        await service.InitializeAsync(CancellationToken.None);
+        service.SetActiveSession(Session);
+        var outside = Remote("loras/escape.safetensors", 4);
+        outside.DestinationPath = Path.Combine(_root, "elsewhere", "escape.safetensors");
+
+        Assert.That(
+            async () => await service.PreparePromptDownloadsAsync(
+                [Remote("loras/style.safetensors", 4), outside],
+                CancellationToken.None,
+                highPriority: true),
+            Throws.InvalidOperationException);
+
+        var style = Path.Combine(_editorModels, "loras", "style.safetensors");
+        Assert.That(File.Exists(style) || new FileInfo(style).LinkTarget is not null, Is.False);
+        Assert.That(library.KeepsEditorLink(style), Is.False);
+    }
+
     [Test]
     public void ARefusedRequest_UndoesTheLinksItsBatchMade()
     {
