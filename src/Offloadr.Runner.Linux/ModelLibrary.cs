@@ -286,6 +286,23 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
         }
     }
 
+    /// <summary>
+    /// Gives up the editor's link to a download that was never saved: removed if this library made it, and no
+    /// longer kept from the projector otherwise.
+    /// </summary>
+    private void ReleaseEditorLink(string relative)
+    {
+        lock (_gate)
+        {
+            if (HoldsOwnLink(relative, Path.Combine(_readOnlyDirectory, relative)))
+            {
+                DetachEditorLink(relative);
+            }
+
+            _linkSessions.Remove(relative.Replace(Path.DirectorySeparatorChar, '/'));
+        }
+    }
+
     private void DetachEditorLink(string relative)
     {
         var relativePath = relative.Replace(Path.DirectorySeparatorChar, '/');
@@ -380,6 +397,8 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
                 return;
             }
 
+            // The editor's link would now open the owner's file under this model's name.
+            ReleaseEditorLink(Path.GetRelativePath(Directory, destination));
             throw new IOException($"A file appeared at '{Path.GetRelativePath(Directory, destination)}' in the models folder while it was downloaded; it is kept.");
         }
 

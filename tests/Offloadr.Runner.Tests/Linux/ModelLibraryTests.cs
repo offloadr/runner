@@ -205,13 +205,25 @@ public class ModelLibraryTests
     public void Publish_NeverReplacesAFilePutThereMeanwhile()
     {
         var library = CreateLibrary();
+        var request = Remote("loras/style.safetensors", 8);
+        library.Redirect([request], Session);
+        // The owner copies in a file of the same name while it downloads.
         var destination = WriteLibraryFile("loras/style.safetensors", 4);
         var staging = library.GetStagingPath(destination)!;
         Directory.CreateDirectory(Path.GetDirectoryName(staging)!);
         File.WriteAllBytes(staging, new byte[8]);
 
         Assert.That(() => library.Publish(staging, destination), Throws.InstanceOf<IOException>());
-        Assert.That(new FileInfo(destination).Length, Is.EqualTo(4), "The owner's file is kept.");
+        var editorPath = new FileInfo(Path.Combine(_editorModels, "loras", "style.safetensors"));
+        Assert.Multiple(() =>
+        {
+            Assert.That(new FileInfo(destination).Length, Is.EqualTo(4), "The owner's file is kept.");
+            Assert.That(editorPath.Exists || editorPath.LinkTarget is not null, Is.False, "The editor's path no longer opens the owner's file.");
+            Assert.That(
+                library.Redirect([request], Session).Single().DestinationPath,
+                Is.EqualTo(request.DestinationPath),
+                "The session may still download the model inside the container.");
+        });
     }
 
     [Test]
