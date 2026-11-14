@@ -27,6 +27,10 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
     // Editor links a download was sent through (made here, or found in place), under _gate, each with the
     // session that last asked for its model: until that session ends it may be using the model.
     private readonly Dictionary<string, string?> _linkSessions = new(StringComparer.Ordinal);
+    // Editor paths where the projector links a local model for the session now, under _gate.
+    private readonly HashSet<string> _projectedLinks = new(StringComparer.Ordinal);
+    // The links the redirect batch in progress made, under _gate.
+    private List<string>? _linksMadeInBatch;
 
     /// <param name="directory">The models folder, writable.</param>
     /// <param name="readOnlyDirectory">The same folder as sessions see it, read-only.</param>
@@ -164,7 +168,69 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
         var session = NormalizeSession(sessionId);
         lock (_gate)
         {
-            return downloads.Select(download => Redirect(download, session)).ToArray();
+            // A refused request fails the whole batch, and nothing of it is registered: the links and claims
+            // made for the requests before it are undone, so none keeps a path from a local model.
+            var claims = new Dictionary<string, string?>(_linkSessions, StringComparer.Ordinal);
+            _linksMadeInBatch = [];
+            try
+            {
+                return downloads.Select(download => Redirect(download, session)).ToArray();
+            }
+            catch
+            {
+                UndoBatch(claims);
+                throw;
+            }
+            finally
+            {
+                _linksMadeInBatch = null;
+            }
+        }
+    }
+
+    private void UndoBatch(Dictionary<string, string?> claimsBefore)
+    {
+        foreach (var relative in _linksMadeInBatch!)
+        {
+            if (HoldsOwnLink(relative, Path.Combine(_readOnlyDirectory, relative)))
+            {
+                DetachEditorLink(relative);
+            }
+        }
+
+        // A link removed meanwhile keeps no claim.
+        foreach (var path in _linkSessions.Keys.ToArray())
+        {
+            if (claimsBefore.TryGetValue(path, out var sessionId))
+            {
+                _linkSessions[path] = sessionId;
+            }
+            else
+            {
+                _linkSessions.Remove(path);
+            }
+        }
+    }
+
+    public void SetProjected(string editorPath, bool projected)
+    {
+        var normalized = Normalize(editorPath);
+        if (!IsStrictlyBeneath(normalized, _editorModelsDirectory))
+        {
+            return;
+        }
+
+        var key = Path.GetRelativePath(_editorModelsDirectory, normalized).Replace(Path.DirectorySeparatorChar, '/');
+        lock (_gate)
+        {
+            if (projected)
+            {
+                _projectedLinks.Add(key);
+            }
+            else
+            {
+                _projectedLinks.Remove(key);
+            }
         }
     }
 
@@ -193,19 +259,25 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
 
         if (!HasRealDirectoriesUpTo(libraryPath) || !IsFreeOrSameSize(libraryPath, download.SizeBytes))
         {
-            // Another model is saved there. If this library linked the editor's path to it for another
-            // session, that link goes, so this one can be downloaded inside the container at that path; the
-            // session that asked for the model linked there may still be using it, and is refused this one.
-            if (HoldsOwnLink(relative, linkTarget))
+            // Another model is saved there. While the editor's path links to it for this session, as its
+            // download or as a local model the projector linked, it may be in use, and this one is refused.
+            // Otherwise a link this library made goes, so this one can be downloaded inside the container at
+            // that path.
+            var key = relative.Replace(Path.DirectorySeparatorChar, '/');
+            if (PointsAtLibrary(relative, linkTarget))
             {
-                if (_linkSessions.TryGetValue(relative.Replace(Path.DirectorySeparatorChar, '/'), out var linkSessionId) &&
-                    string.Equals(linkSessionId, sessionId, StringComparison.Ordinal))
+                if (_projectedLinks.Contains(key) ||
+                    (_linkSessions.TryGetValue(key, out var linkSessionId) &&
+                     string.Equals(linkSessionId, sessionId, StringComparison.Ordinal)))
                 {
                     throw new InvalidOperationException(
                         $"Model '{relative}' cannot be downloaded in this session: another model of the same name, saved in the models folder, is already in use at that path.");
                 }
 
-                DetachEditorLink(relative);
+                if (_ownLinks.Contains(key))
+                {
+                    DetachEditorLink(relative);
+                }
             }
 
             return download;
@@ -345,6 +417,7 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
 
             root.CreateSymbolicLink(relativePath, target);
             _ownLinks.Add(relativePath);
+            _linksMadeInBatch?.Add(relativePath);
             _linkSessions[relativePath] = sessionId;
             return true;
         }

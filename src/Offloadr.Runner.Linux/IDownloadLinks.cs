@@ -17,4 +17,10 @@ internal interface IDownloadLinks
     /// unclaimed in it stays unclaimed until the change is made.
     /// </summary>
     void WhileLinksAreHeld(Action change);
+
+    /// <summary>
+    /// Records whether the projector links a local model at <paramref name="editorPath"/> for the session now:
+    /// a download of another model is never sent there in its place.
+    /// </summary>
+    void SetProjected(string editorPath, bool projected);
 }

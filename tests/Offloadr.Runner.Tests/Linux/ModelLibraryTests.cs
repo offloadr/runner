@@ -399,6 +399,69 @@ public class ModelLibraryTests
                 _changing = false;
             }
         });
+
+        public void SetProjected(string editorPath, bool projected) => library.SetProjected(editorPath, projected);
+    }
+
+    /// <summary>A request for the owner's model of that size, linked at the editor's path of that name.</summary>
+    private ModelDownloadRequest LocalAt(string relative, long size, ModelCategory category) => new()
+    {
+        Filename = Path.GetFileName(relative),
+        Category = category,
+        SizeBytes = size,
+        DestinationPath = Path.Combine(_editorModels, relative),
+        LocalSelectionHash = LocalModelSelectionHash.Compute(Path.GetFileName(relative), size, category)
+    };
+
+    [Test]
+    public void ADownloadOfAnotherSize_IsRefusedWhereTheProjectorLinksTheSavedModelForANewSession()
+    {
+        var library = CreateLibrary();
+        library.Redirect([Remote("checkpoints/base.safetensors", 8)], Session);
+        var saved = WriteLibraryFile("checkpoints/base.safetensors", 8);
+        library.ReleaseSessionsOtherThan("session-2");
+        // The next session picks the saved file as a local model, through the same link.
+        var projector = new LocalModelProjector(_library, _editorModels, downloadLinks: library);
+        projector.UpdateSnapshot(new LocalModelScanner("runner-1", _library).Scan());
+        projector.SetRequestedModels([LocalAt("checkpoints/base.safetensors", 8, ModelCategory.Checkpoint)]);
+
+        Assert.That(
+            () => library.Redirect([Remote("checkpoints/base.safetensors", 16)], "session-2"),
+            Throws.InvalidOperationException.With.Message.Contains("already in use"));
+        Assert.That(new FileInfo(Path.Combine(_editorModels, "checkpoints", "base.safetensors")).LinkTarget, Is.EqualTo(saved));
+
+        // Once the local model is no longer asked for, the link gives way as before.
+        projector.SetRequestedModels([]);
+        Assert.That(
+            library.Redirect([Remote("checkpoints/base.safetensors", 16)], "session-2").Single().DestinationPath,
+            Is.EqualTo(Path.Combine(_editorModels, "checkpoints", "base.safetensors")));
+    }
+
+    [Test]
+    public void ARefusedRequest_UndoesTheLinksItsBatchMade()
+    {
+        var library = CreateLibrary();
+        library.Redirect([Remote("checkpoints/base.safetensors", 8)], Session);
+        WriteLibraryFile("checkpoints/base.safetensors", 8);
+
+        Assert.That(
+            () => library.Redirect([Remote("loras/style.safetensors", 4), Remote("checkpoints/base.safetensors", 16)], Session),
+            Throws.InvalidOperationException);
+
+        var style = Path.Combine(_editorModels, "loras", "style.safetensors");
+        Assert.Multiple(() =>
+        {
+            Assert.That(File.Exists(style) || new FileInfo(style).LinkTarget is not null, Is.False, "The first request's link is undone.");
+            Assert.That(library.KeepsEditorLink(style), Is.False);
+            Assert.That(library.KeepsEditorLink(Path.Combine(_editorModels, "checkpoints", "base.safetensors")), Is.True, "Earlier links stay claimed.");
+        });
+
+        // The same session may have the owner's model linked there instead.
+        var mine = WriteLibraryFile("loras/mine/style.safetensors", 6);
+        var projector = new LocalModelProjector(_library, _editorModels, downloadLinks: library);
+        projector.UpdateSnapshot(new LocalModelScanner("runner-1", _library).Scan());
+        projector.SetRequestedModels([LocalAt("loras/style.safetensors", 6, ModelCategory.Lora)]);
+        Assert.That(new FileInfo(style).LinkTarget, Is.EqualTo(mine));
     }
 
     [Test]

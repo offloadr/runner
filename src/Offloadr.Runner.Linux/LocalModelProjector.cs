@@ -468,6 +468,7 @@ internal sealed class LocalModelProjector
                 {
                     case SecureLinkKind.SymbolicLink when LinkPointsTo(targetPath, existingTarget!, sourcePath):
                         _managedTargets.Add(targetPath);
+                        _downloadLinks?.SetProjected(targetPath, true);
                         return;
                     // A link into the local root is a projection, or a download's link no session needs any
                     // more: either gives way to the model asked for now.
@@ -483,6 +484,7 @@ internal sealed class LocalModelProjector
 
                 secureRoot.CreateSymbolicLink(relativePath, sourcePath);
                 _managedTargets.Add(targetPath);
+                _downloadLinks?.SetProjected(targetPath, true);
             });
         }
         catch (Exception ex)
@@ -533,6 +535,7 @@ internal sealed class LocalModelProjector
         finally
         {
             _managedTargets.Remove(targetPath);
+            _downloadLinks?.SetProjected(targetPath, false);
         }
     }
 
