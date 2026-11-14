@@ -79,17 +79,22 @@ internal sealed class ModelLibrary : IModelDownloadStaging
     /// container as before, when something already holds either place: a file of the owner's of another
     /// size, or a link or file at the editor's path. A file of the requested size there counts as the model.
     /// </summary>
-    public ModelDownloadRequest[] Redirect(IEnumerable<ModelDownloadRequest> downloads)
+    /// <param name="newSession">
+    /// True for the models a session starts with. Only then may a link this library made to another model
+    /// at the same path give way: within a session an earlier prompt may still be using that model, so a
+    /// model of another size there is refused, as two models at one path always are.
+    /// </param>
+    public ModelDownloadRequest[] Redirect(IEnumerable<ModelDownloadRequest> downloads, bool newSession = false)
     {
         // Prompts are prepared concurrently: two naming the same new model must not both find its link
         // missing, and the second fall back to downloading over the first one's link.
         lock (_gate)
         {
-            return downloads.Select(Redirect).ToArray();
+            return downloads.Select(download => Redirect(download, newSession)).ToArray();
         }
     }
 
-    private ModelDownloadRequest Redirect(ModelDownloadRequest download)
+    private ModelDownloadRequest Redirect(ModelDownloadRequest download, bool newSession)
     {
         if (LocalModelProjector.IsLocalProjectionRequest(download) ||
             string.IsNullOrWhiteSpace(download.DestinationPath) ||
@@ -114,9 +119,20 @@ internal sealed class ModelLibrary : IModelDownloadStaging
 
         if (!HasRealDirectoriesUpTo(libraryPath) || !IsFreeOrSameSize(libraryPath, download.SizeBytes))
         {
-            // Another model is saved there. If this library linked the editor's path to it, the link goes,
-            // so this one can be downloaded inside the container at that path.
-            DetachEditorLink(relative, linkTarget);
+            // Another model is saved there. If this library linked the editor's path to it, that link goes
+            // for a new session, so this one can be downloaded inside the container at that path; within a
+            // session the model linked there may still be in use, and this one is refused.
+            if (HoldsOwnLink(relative, linkTarget))
+            {
+                if (!newSession)
+                {
+                    throw new InvalidOperationException(
+                        $"Model '{relative}' cannot be downloaded in this session: another model of the same name, saved in the models folder, is already in use at that path.");
+                }
+
+                DetachEditorLink(relative);
+            }
+
             return download;
         }
 
@@ -171,25 +187,35 @@ internal sealed class ModelLibrary : IModelDownloadStaging
         return !existing.Exists || existing.Length == size;
     }
 
-    private void DetachEditorLink(string relative, string target)
+    /// <summary>Whether the editor's path holds a link this library made (the projector links to the same place).</summary>
+    private bool HoldsOwnLink(string relative, string target)
     {
+        var relativePath = relative.Replace(Path.DirectorySeparatorChar, '/');
+        if (!_ownLinks.Contains(relativePath) || !System.IO.Directory.Exists(_editorModelsDirectory))
+        {
+            return false;
+        }
+
         try
         {
-            if (!System.IO.Directory.Exists(_editorModelsDirectory))
-            {
-                return;
-            }
-
             using var root = new LinuxSecureDirectoryRoot(_editorModelsDirectory);
-            var relativePath = relative.Replace(Path.DirectorySeparatorChar, '/');
-            // Only a link this library made: the projector links local models to the same place.
-            if (_ownLinks.Contains(relativePath) &&
-                root.ReadSymbolicLink(relativePath, out var existing) == SecureLinkKind.SymbolicLink &&
-                string.Equals(existing, target, StringComparison.Ordinal))
-            {
-                root.DeleteSymbolicLink(relativePath);
-                _ownLinks.Remove(relativePath);
-            }
+            return root.ReadSymbolicLink(relativePath, out var existing) == SecureLinkKind.SymbolicLink &&
+                   string.Equals(existing, target, StringComparison.Ordinal);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    private void DetachEditorLink(string relative)
+    {
+        var relativePath = relative.Replace(Path.DirectorySeparatorChar, '/');
+        try
+        {
+            using var root = new LinuxSecureDirectoryRoot(_editorModelsDirectory);
+            root.DeleteSymbolicLink(relativePath);
+            _ownLinks.Remove(relativePath);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {

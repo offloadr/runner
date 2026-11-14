@@ -274,14 +274,14 @@ public class ModelLibraryTests
     }
 
     [Test]
-    public void Redirect_OfAnotherSizeAtALinkedPath_RemovesTheLinkSoItDownloadsInTheContainer()
+    public void Redirect_OfAnotherSizeAtALinkedPath_InANewSession_RemovesTheLinkSoItDownloadsInTheContainer()
     {
         var library = CreateLibrary();
         library.Redirect([Remote("checkpoints/base.safetensors", 8)]);
         WriteLibraryFile("checkpoints/base.safetensors", 8);
         var other = Remote("checkpoints/base.safetensors", 16);
 
-        var redirected = library.Redirect([other]).Single();
+        var redirected = library.Redirect([other], newSession: true).Single();
 
         var editorPath = Path.Combine(_editorModels, "checkpoints", "base.safetensors");
         Assert.Multiple(() =>
@@ -290,6 +290,22 @@ public class ModelLibraryTests
             Assert.That(File.Exists(editorPath) || new FileInfo(editorPath).LinkTarget is not null, Is.False, "Its link to the saved model is gone.");
             Assert.That(new FileInfo(Path.Combine(_library, "checkpoints", "base.safetensors")).Length, Is.EqualTo(8), "The saved model stays.");
         });
+    }
+
+    [Test]
+    public void Redirect_OfAnotherSizeAtALinkedPath_WithinASession_IsRefusedAndKeepsTheLink()
+    {
+        var library = CreateLibrary();
+        library.Redirect([Remote("checkpoints/base.safetensors", 8)]);
+        WriteLibraryFile("checkpoints/base.safetensors", 8);
+
+        // An earlier prompt may still be using the saved model.
+        Assert.That(
+            () => library.Redirect([Remote("checkpoints/base.safetensors", 16)]),
+            Throws.InvalidOperationException.With.Message.Contains("already in use"));
+        Assert.That(
+            new FileInfo(Path.Combine(_editorModels, "checkpoints", "base.safetensors")).LinkTarget,
+            Is.EqualTo(Path.Combine(_library, "checkpoints", "base.safetensors")));
     }
 
     [Test]

@@ -126,8 +126,8 @@ internal sealed class ModelDownloadService : IAsyncDisposable
     }
 
     /// <summary>Sends downloads to the owner's models folder when they are saved there.</summary>
-    private ModelDownloadRequest[] Redirect(ModelDownloadRequest[] downloads)
-        => _library is null || !_downloadsEnabled ? downloads : _library.Redirect(downloads);
+    private ModelDownloadRequest[] Redirect(ModelDownloadRequest[] downloads, bool newSession = false)
+        => _library is null || !_downloadsEnabled ? downloads : _library.Redirect(downloads, newSession);
 
     public void SetActiveSession(string? sessionId)
     {
@@ -168,7 +168,7 @@ internal sealed class ModelDownloadService : IAsyncDisposable
 
     public void SeedDownloads(string sessionId, IEnumerable<ModelDownloadRequest> downloads)
     {
-        var snapshot = Redirect(FilterRemoteDownloadRequests(downloads));
+        var snapshot = Redirect(FilterRemoteDownloadRequests(downloads), newSession: true);
         if (!_downloadsEnabled)
         {
             ReportRefused(sessionId, snapshot);
