@@ -29,6 +29,11 @@ public interface IModelDownloadStaging
     /// <summary>Returns where the downloader writes <paramref name="destinationPath"/>, or null to write it in place.</summary>
     string? GetStagingPath(string destinationPath);
 
+    /// <summary>Makes the directory <paramref name="stagingPath"/> is written in, before the download starts.</summary>
+    void PrepareStagingDirectory(string stagingPath)
+    {
+    }
+
     /// <summary>Moves the completed <paramref name="stagingPath"/> to <paramref name="destinationPath"/>.</summary>
     void Publish(string stagingPath, string destinationPath);
 
@@ -339,6 +344,11 @@ public sealed class DownloadCoordinator
         if (string.IsNullOrWhiteSpace(directory))
         {
             throw new InvalidOperationException($"Download destination '{normalized}' does not contain a directory.");
+        }
+
+        if (stagingPath is not null)
+        {
+            _staging!.PrepareStagingDirectory(stagingPath);
         }
 
         _fileSystem.CreateDirectory(directory);

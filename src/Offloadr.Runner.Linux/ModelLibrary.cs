@@ -582,6 +582,23 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
         }
     }
 
+    /// <summary>
+    /// Makes the folders a download is staged in, each the owner's of the folder it is made in, as published
+    /// models are: the owner can remove what a runner that never comes back leaves half downloaded.
+    /// </summary>
+    public void PrepareStagingDirectory(string stagingPath)
+    {
+        var normalized = Normalize(stagingPath);
+        if (!IsStrictlyBeneath(normalized, _stagingDirectory))
+        {
+            throw new InvalidOperationException($"'{stagingPath}' is not in this runner's download folder.");
+        }
+
+        using var root = new LinuxSecureDirectoryRoot(Directory);
+        root.EnsureDirectoryInheritingOwner(
+            Path.GetRelativePath(Directory, Path.GetDirectoryName(normalized)!).Replace(Path.DirectorySeparatorChar, '/'));
+    }
+
     public string? GetStagingPath(string destinationPath)
     {
         var destination = Normalize(destinationPath);
@@ -696,6 +713,18 @@ internal sealed class CombinedStaging(IModelDownloadStaging? sessionStaging, Mod
 {
     public string? GetStagingPath(string destinationPath)
         => library.GetStagingPath(destinationPath) ?? sessionStaging?.GetStagingPath(destinationPath);
+
+    public void PrepareStagingDirectory(string stagingPath)
+    {
+        if (library.IsStagingPath(stagingPath))
+        {
+            library.PrepareStagingDirectory(stagingPath);
+        }
+        else
+        {
+            sessionStaging?.PrepareStagingDirectory(stagingPath);
+        }
+    }
 
     public void Publish(string stagingPath, string destinationPath)
     {

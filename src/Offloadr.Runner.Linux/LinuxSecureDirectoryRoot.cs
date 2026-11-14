@@ -636,6 +636,28 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
     /// create to the owner of the directory it creates it in. Links made in a directory a user owns then
     /// leave that user able to write beside them.
     /// </summary>
+    /// <summary>
+    /// Creates every missing directory of <paramref name="relativeDirectory"/> beneath the root without
+    /// following links, each handed to the owner of the directory it is made in.
+    /// </summary>
+    public void EnsureDirectoryInheritingOwner(string relativeDirectory)
+    {
+        var current = DuplicateDirectory(_rootHandle);
+        try
+        {
+            foreach (var part in SplitRelativePath(relativeDirectory))
+            {
+                var next = OpenOrCreateDirectoryInheritingOwner(current, part);
+                current.Dispose();
+                current = next;
+            }
+        }
+        finally
+        {
+            current.Dispose();
+        }
+    }
+
     public void CreateSymbolicLinkInheritingOwner(string relativePath, string target)
     {
         var parts = SplitRelativePath(relativePath);

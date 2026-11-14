@@ -185,6 +185,53 @@ public class ModelLibraryTests
         });
     }
 
+    [Test]
+    public void PrepareStagingDirectory_LeavesTheDownloadFoldersToTheFoldersOwner()
+    {
+        LinuxTestPrerequisites.RequireRoot();
+        Chown("12345:12345", _library);
+        var library = CreateLibrary();
+        var staging = library.GetStagingPath(Path.Combine(_library, "loras", "style.safetensors"))!;
+        var key = Path.GetDirectoryName(staging)!;
+        var runnerFolder = Path.GetDirectoryName(key)!;
+
+        library.PrepareStagingDirectory(staging);
+
+        // A runner that never comes back leaves its part files there: the owner can remove them.
+        Assert.Multiple(() =>
+        {
+            Assert.That(OwnerOf(Path.Combine(_library, ModelLibrary.StagingFolderName)), Is.EqualTo("12345:12345"));
+            Assert.That(OwnerOf(runnerFolder), Is.EqualTo("12345:12345"));
+            Assert.That(OwnerOf(key), Is.EqualTo("12345:12345"));
+        });
+    }
+
+    [Test]
+    public async Task ADownload_MakesItsDownloadFoldersTheFoldersOwners()
+    {
+        LinuxTestPrerequisites.RequireRoot();
+        Chown("12345:12345", _library);
+        var backend = new WritingBackend();
+        var settings = Aria2Settings.FromEnvironment(name => name == "ARIA2_STATE_DIR" ? Path.Combine(_root, "aria2-state") : null, static () => "generated-secret");
+        var library = CreateLibrary();
+        await using var service = new ModelDownloadService(
+            backend,
+            settings,
+            destinationPolicy: new ModelDestinationPolicy([_editorModels, _library]),
+            library: library);
+        await service.InitializeAsync(CancellationToken.None);
+        service.SetActiveSession(Session);
+
+        await await service.PreparePromptDownloadsAsync([Remote("loras/style.safetensors", 4)], CancellationToken.None, highPriority: true);
+
+        var downloadFolder = Path.Combine(_library, ModelLibrary.StagingFolderName);
+        Assert.Multiple(() =>
+        {
+            Assert.That(OwnerOf(downloadFolder), Is.EqualTo("12345:12345"));
+            Assert.That(OwnerOf(Directory.GetDirectories(downloadFolder).Single()), Is.EqualTo("12345:12345"));
+        });
+    }
+
     private static void Chown(string owner, string path)
     {
         using var chown = System.Diagnostics.Process.Start("/bin/chown", [owner, path])!;
