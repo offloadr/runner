@@ -36,7 +36,8 @@ public class ModelLibraryTests
     private const string Session = "session-1";
 
     // The read-only view is the same folder here; in the runner it is a second, read-only mount of it.
-    private ModelLibrary CreateLibrary(string runnerId = "11111111-1111-4111-8111-111111111111") => new(_library, _library, _editorModels, runnerId);
+    private ModelLibrary CreateLibrary(string runnerId = "11111111-1111-4111-8111-111111111111", string? instanceId = null)
+        => new(_library, _library, _editorModels, runnerId, instanceId);
 
     [Test]
     public void Redirect_SendsADownloadToTheFolderAndLinksTheEditorsPathThere()
@@ -447,6 +448,67 @@ public class ModelLibraryTests
             RemovedWhileFileWasThere = File.Exists(paths[int.Parse(handle.ToString()!["restored-".Length..], System.Globalization.CultureInfo.InvariantCulture)]);
             return Task.CompletedTask;
         }
+    }
+
+    [Test]
+    public async Task ARunsFirstDownload_StartsThoughARunClearingEndedOnesHoldsItsLeaseAMoment()
+    {
+        const string Runner = "11111111-1111-4111-8111-111111111111";
+        const string Instance = "0123456789abcdef0123456789abcdef";
+        var lease = $"{ModelLibrary.StagingFolderName}/{Runner}/{Instance}.lease";
+        Directory.CreateDirectory(Path.Combine(_library, ModelLibrary.StagingFolderName, Runner));
+        // Another run, clearing ended ones, found this run's lease before this run locked it.
+        using var root = new LinuxSecureDirectoryRoot(_library);
+        Assert.That(root.TryLockFile(lease, out var held), Is.EqualTo(SecureLockResult.Locked));
+        using var library = CreateLibrary(Runner, Instance);
+        var staging = library.GetStagingPath(Path.Combine(_library, "loras", "style.safetensors"))!;
+
+        var preparing = Task.Run(() => library.PrepareStagingDirectory(staging));
+        await Task.Delay(TimeSpan.FromMilliseconds(200));
+        var waited = !preparing.IsCompleted;
+        // The other run clears it as an ended run's, and lets go.
+        root.DeleteFile(lease);
+        held!.Dispose();
+        await preparing.WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(waited, Is.True, "It waits while the lease is held.");
+            Assert.That(Directory.Exists(Path.GetDirectoryName(staging)), Is.True, "Then its download starts.");
+            Assert.That(File.Exists(Path.Combine(_library, lease)), Is.True, "On a lease of its own.");
+        });
+    }
+
+    [Test]
+    public async Task ALinkFoundInPlace_GivesWayToAnotherModelOnceItsSessionEnds()
+    {
+        // A link an earlier run made to a saved model, still in the editor's folder.
+        var saved = WriteLibraryFile("checkpoints/base.safetensors", 8);
+        var editorPath = Path.Combine(_editorModels, "checkpoints", "base.safetensors");
+        Directory.CreateDirectory(Path.GetDirectoryName(editorPath)!);
+        File.CreateSymbolicLink(editorPath, saved);
+        var backend = new WritingBackend();
+        var settings = Aria2Settings.FromEnvironment(name => name == "ARIA2_STATE_DIR" ? Path.Combine(_root, "aria2-state") : null, static () => "generated-secret");
+        await using var service = new ModelDownloadService(
+            backend,
+            settings,
+            destinationPolicy: new ModelDestinationPolicy([_editorModels, _library]),
+            library: CreateLibrary());
+        await service.InitializeAsync(CancellationToken.None);
+        service.SetActiveSession(Session);
+        await await service.PreparePromptDownloadsAsync([Remote("checkpoints/base.safetensors", 8)], CancellationToken.None, highPriority: true, Session);
+
+        // The next session asks for another model of that name.
+        service.SetActiveSession("session-2");
+        await await service.PreparePromptDownloadsAsync([Remote("checkpoints/base.safetensors", 16)], CancellationToken.None, highPriority: true, "session-2");
+
+        var editorFile = new FileInfo(editorPath);
+        Assert.Multiple(() =>
+        {
+            Assert.That(editorFile.LinkTarget, Is.Null, "Downloaded inside the container, in place of the link.");
+            Assert.That(editorFile.Length, Is.EqualTo(16));
+            Assert.That(new FileInfo(saved).Length, Is.EqualTo(8), "Never written through the link.");
+        });
     }
 
     [Test]

@@ -74,6 +74,8 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks, IDis
     }
 
     private const string LeaseSuffix = ".lease";
+    private const int LeaseAttempts = 100;
+    private static readonly TimeSpan LeaseRetryDelay = TimeSpan.FromMilliseconds(50);
 
     /// <summary>Gives up this run's lease: its downloads in progress are then another run's to clear.</summary>
     public void Dispose()
@@ -100,16 +102,29 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks, IDis
 
             using var root = new LinuxSecureDirectoryRoot(Directory);
             root.EnsureDirectoryInheritingOwner(RelativeToFolder(_runnerDirectory));
-            switch (root.TryLockFile(RelativeToFolder(_stagingDirectory + LeaseSuffix), out var lease))
+            // The lease is this run's alone, but another run clearing ended ones may hold it a moment, having
+            // found it before this run locked it; it then removes it, and the lock is taken on a new one.
+            for (var attempt = 0; ; attempt++)
             {
-                case SecureLockResult.Locked:
+                var result = root.TryLockFile(RelativeToFolder(_stagingDirectory + LeaseSuffix), out var lease);
+                if (result == SecureLockResult.Locked)
+                {
                     _lease = lease;
                     break;
-                case SecureLockResult.Unsupported:
+                }
+
+                if (result == SecureLockResult.Unsupported)
+                {
                     RunnerLog.Warning(nameof(ModelLibrary), "The models folder takes no file locks: an overlapping run of this runner may clear this run's downloads in progress.");
                     break;
-                default:
-                    throw new IOException($"This run's download folder lease is held by another process.");
+                }
+
+                if (attempt >= LeaseAttempts)
+                {
+                    throw new IOException("This run's download folder lease is held by another process.");
+                }
+
+                Thread.Sleep(LeaseRetryDelay);
             }
 
             _leaseTaken = true;
@@ -682,6 +697,13 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks, IDis
                     if (!string.Equals(existing, target, StringComparison.Ordinal))
                     {
                         return false;
+                    }
+
+                    // One the projector does not hold now is this library's from here on, so it can give way
+                    // to another model later, as one it made would; one it holds stays the projector's.
+                    if (!_projectedLinks.Contains(relativePath))
+                    {
+                        _ownLinks.Add(relativePath);
                     }
 
                     Claim(relativePath, sessionId, size);
