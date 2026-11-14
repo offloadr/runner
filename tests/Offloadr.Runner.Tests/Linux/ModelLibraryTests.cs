@@ -508,6 +508,48 @@ public class ModelLibraryTests
     }
 
     [Test]
+    public void UndoingABatch_LeavesALinkTheProjectorAdoptedSince()
+    {
+        var library = CreateLibrary();
+        var saved = WriteLibraryFile("checkpoints/base.safetensors", 8);
+        library.Redirect([Remote("checkpoints/base.safetensors", 8)], Session, out var refused);
+        // Meanwhile the session picks the saved model as a local one, through the same link.
+        var projector = new LocalModelProjector(_library, _editorModels, downloadLinks: library);
+        projector.UpdateSnapshot(new LocalModelScanner("runner-1", _library).Scan());
+        projector.SetRequestedModels([LocalAt("checkpoints/base.safetensors", 8, ModelCategory.Checkpoint)]);
+
+        library.Undo(refused);
+
+        Assert.That(new FileInfo(Path.Combine(_editorModels, "checkpoints", "base.safetensors")).LinkTarget, Is.EqualTo(saved));
+    }
+
+    [Test]
+    public void UndoingTwoBatchesThroughOneLink_InEitherOrder_LeavesNoClaim([Values] bool makerFirst)
+    {
+        var library = CreateLibrary();
+        var request = Remote("loras/style.safetensors", 4);
+        library.Redirect([request], Session, out var maker);
+        library.Redirect([request], "session-2", out var adopter);
+
+        library.Undo(makerFirst ? maker : adopter);
+        library.Undo(makerFirst ? adopter : maker);
+
+        var style = Path.Combine(_editorModels, "loras", "style.safetensors");
+        Assert.Multiple(() =>
+        {
+            Assert.That(File.Exists(style) || new FileInfo(style).LinkTarget is not null, Is.False, "Neither batch keeps the link.");
+            Assert.That(library.KeepsEditorLink(style), Is.False);
+        });
+
+        // Another local model can be linked there.
+        var mine = WriteLibraryFile("loras/mine/style.safetensors", 6);
+        var projector = new LocalModelProjector(_library, _editorModels, downloadLinks: library);
+        projector.UpdateSnapshot(new LocalModelScanner("runner-1", _library).Scan());
+        projector.SetRequestedModels([LocalAt("loras/style.safetensors", 6, ModelCategory.Lora)]);
+        Assert.That(new FileInfo(style).LinkTarget, Is.EqualTo(mine));
+    }
+
+    [Test]
     public async Task APromptRefusedAfterItIsRedirected_UndoesItsLinks()
     {
         var backend = new WritingBackend();

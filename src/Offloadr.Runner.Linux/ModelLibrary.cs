@@ -213,25 +213,39 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
 
     private void UndoLocked(RedirectBatch batch)
     {
+        batch.Undone = true;
+
         // Another redirect, of this session or another, may have sent its download through a link since: then
-        // the link is that redirect's as well, and it stays with its claim.
+        // the link is that redirect's as well, and it stays with its claim. So does one the projector now links a
+        // local model at.
         foreach (var relative in batch.LinksMade)
         {
-            if (!ClaimedByAnother(relative, batch) && HoldsOwnLink(relative, Path.Combine(_readOnlyDirectory, relative)))
-            {
-                DetachEditorLink(relative);
-            }
+            DetachUnlessInUse(relative, batch);
         }
 
         // A link removed meanwhile keeps no claim.
-        foreach (var (path, before) in batch.ClaimsBefore)
+        foreach (var (path, claimBefore) in batch.ClaimsBefore)
         {
             if (ClaimedByAnother(path, batch) || !_linkSessions.ContainsKey(path))
             {
                 continue;
             }
 
-            if (before.Existed)
+            // A claim set by a redirect undone since is no claim: go back to the one before it. If such a
+            // redirect made the link, nothing that was kept sent a download through it, and it goes.
+            var before = claimBefore;
+            RedirectBatch? undoneMaker = null;
+            while (before.By is { Undone: true } undone && undone.ClaimsBefore.TryGetValue(path, out var earlier))
+            {
+                if (undone.LinksMade.Contains(path))
+                {
+                    undoneMaker = undone;
+                }
+
+                before = earlier;
+            }
+
+            if (before.Existed && before.By is not { Undone: true })
             {
                 _linkSessions[path] = before.SessionId;
                 SetClaimedBy(path, before.By);
@@ -240,7 +254,22 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
             {
                 _linkSessions.Remove(path);
                 _claimedBy.Remove(path);
+                if (undoneMaker is not null)
+                {
+                    DetachUnlessInUse(path, batch);
+                }
             }
+        }
+    }
+
+    /// <summary>Removes a link a refused redirect made, unless another claimed it or the projector links there.</summary>
+    private void DetachUnlessInUse(string relative, RedirectBatch batch)
+    {
+        if (!ClaimedByAnother(relative, batch) &&
+            !_projectedLinks.Contains(relative.Replace(Path.DirectorySeparatorChar, '/')) &&
+            HoldsOwnLink(relative, Path.Combine(_readOnlyDirectory, relative)))
+        {
+            DetachEditorLink(relative);
         }
     }
 
@@ -278,6 +307,9 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
     internal sealed class RedirectBatch(string? sessionId)
     {
         public string? SessionId { get; } = sessionId;
+
+        /// <summary>Whether the batch was refused and undone: the claims it set stand for nothing.</summary>
+        public bool Undone { get; set; }
 
         public List<string> LinksMade { get; } = [];
 
