@@ -743,6 +743,45 @@ public class ModelLibraryTests
         });
     }
 
+    [TestCase(false)]
+    [TestCase(true)]
+    public async Task APromptPreparedAfterItsSessionEnded_SendsNothingToTheFolder(bool cancelled)
+    {
+        var backend = new WritingBackend();
+        var settings = Aria2Settings.FromEnvironment(name => name == "ARIA2_STATE_DIR" ? Path.Combine(_root, "aria2-state") : null, static () => "generated-secret");
+        var library = CreateLibrary();
+        await using var service = new ModelDownloadService(
+            backend,
+            settings,
+            destinationPolicy: new ModelDestinationPolicy([_editorModels, _library]),
+            library: library);
+        await service.InitializeAsync(CancellationToken.None);
+        service.SetActiveSession(Session);
+        // The prompt's session is stopped, and maybe the next one active, before its downloads are prepared.
+        if (cancelled)
+        {
+            service.CancelSession(Session);
+        }
+        else
+        {
+            service.SetActiveSession("session-2");
+        }
+
+        await await service.PreparePromptDownloadsAsync(
+            [Remote("loras/style.safetensors", 4)],
+            CancellationToken.None,
+            highPriority: true,
+            sessionId: Session);
+
+        var style = Path.Combine(_editorModels, "loras", "style.safetensors");
+        Assert.Multiple(() =>
+        {
+            Assert.That(new FileInfo(style).LinkTarget, Is.Null, "No link is made for it.");
+            Assert.That(library.KeepsEditorLink(style), Is.False, "Nor claimed for the session now active.");
+            Assert.That(File.Exists(Path.Combine(_library, "loras", "style.safetensors")), Is.False, "Nothing is saved in the folder.");
+        });
+    }
+
     [Test]
     public void ASessionActiveAgain_ClaimsItsLinksAgain()
     {

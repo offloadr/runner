@@ -768,10 +768,15 @@ internal sealed class ModelDownloadService : IAsyncDisposable
     /// own request timeout. The demand lasts until its completion settles or
     /// <paramref name="demandCancellation"/> withdraws it.
     /// </summary>
+    /// <param name="sessionId">
+    /// The prompt's own session; the active one when not given. A prompt of a session that has ended while it
+    /// was prepared sends nothing to the models folder: the session now active may hold its paths.
+    /// </param>
     public async Task<Task> PreparePromptDownloadsAsync(
         IEnumerable<ModelDownloadRequest> downloads,
         CancellationToken demandCancellation,
-        bool highPriority)
+        bool highPriority,
+        string? sessionId = null)
     {
         var filtered = FilterRemoteDownloadRequests(downloads);
         if (!_downloadsEnabled && filtered.Length > 0)
@@ -780,7 +785,7 @@ internal sealed class ModelDownloadService : IAsyncDisposable
             throw new ModelDownloadsDisabledException(filtered.Select(static download => download.Filename).ToArray());
         }
 
-        var (managed, full) = RedirectAndRegister(filtered, _fullDownloadCoordinator.GetActiveSessionId(), snapshot =>
+        var (managed, full) = RedirectAndRegister(filtered, sessionId ?? _fullDownloadCoordinator.GetActiveSessionId(), snapshot =>
         {
             ConfineDestinations(snapshot);
             return PartitionDownloads(snapshot);
