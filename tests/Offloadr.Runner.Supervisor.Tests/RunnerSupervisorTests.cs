@@ -2120,6 +2120,36 @@ public class RunnerSupervisorTests
     }
 
     [Test]
+    public async Task AnImageUpdate_KeepsAReplacedImageAnotherTemplatePinsByDigest()
+    {
+        _engine.StatusJson = Status(activeSessionId: "");
+        // One template follows the tag; another pins the image the tag names now by its digest.
+        _plans.Plan = new LaunchPlan(
+            [
+                new LaunchTemplate("comfyui-latest", "comfyui", "ghcr.io/offloadr/runner-comfyui:latest", "ComfyUI - current release"),
+                new LaunchTemplate("comfyui-pinned", "comfyui", "ghcr.io/offloadr/runner-comfyui@sha256:pinned", "ComfyUI - pinned"),
+            ],
+            "comfyui-latest",
+            TimeSpan.FromMilliseconds(20),
+            LaunchPlanSource.ControlPlane);
+        _engine.ImageIds["ghcr.io/offloadr/runner-comfyui@sha256:pinned"] = "sha256:local";
+        _engine.AddImage("ghcr.io/offloadr/runner-comfyui@sha256:pinned");
+        var supervisor = await StartSupervisorAsync(imageUpdateInterval: TimeSpan.FromSeconds(1));
+        supervisor.RequestStart();
+        await WaitForStateAsync(SupervisorState.Running);
+        await WaitUntilAsync(() => supervisor.View.Plan?.Source == LaunchPlanSource.ControlPlane);
+
+        _engine.ImageIds["ghcr.io/offloadr/runner-comfyui:latest"] = "sha256:newer";
+
+        await WaitUntilAsync(() => _engine.Runs.Count == 2 && supervisor.View.State == SupervisorState.Running);
+        Assert.Multiple(() =>
+        {
+            Assert.That(_engine.RemovalRequests, Is.Empty);
+            Assert.That(_engine.RemovedImages, Is.Empty, "A switch to the pinned template needs no download.");
+        });
+    }
+
+    [Test]
     public async Task ASwitchFromADigestPinnedTemplate_KeepsThatImage()
     {
         _engine.StatusJson = Status(activeSessionId: "");

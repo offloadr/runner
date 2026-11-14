@@ -1255,6 +1255,21 @@ public sealed class RunnerSupervisor : BackgroundService
                     return;
                 }
 
+                // Nor while another template pins it by digest, which the engine lists as no tag: a switch to
+                // that template needs it.
+                var pinned = (View.Plan?.Templates ?? [])
+                    .Concat(BuiltInLaunchPlanCatalog.Plan().Templates)
+                    .Select(static template => template.Image)
+                    .Where(static reference => reference.Contains('@', StringComparison.Ordinal))
+                    .Distinct(StringComparer.Ordinal);
+                foreach (var reference in pinned)
+                {
+                    if ((await _engine.InspectImageAsync(reference, cancellationToken).ConfigureAwait(false))?.Id == imageId)
+                    {
+                        return;
+                    }
+                }
+
                 // Removed by its digest, not its ID: the engine then drops only that reference, and keeps
                 // the image if a name was put on it since it was looked at. By ID it would remove an image
                 // with a single tag along with the tag.
