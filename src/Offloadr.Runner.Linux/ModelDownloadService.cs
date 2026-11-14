@@ -802,6 +802,8 @@ internal sealed class ModelDownloadService : IAsyncDisposable
 
     public Task EnsureDownloadedAsync(string destinationPath, CancellationToken cancellationToken, bool highPriority)
     {
+        // Through the editor's link, the download is the one into the models folder behind it.
+        destinationPath = _library?.LibraryPathFor(destinationPath) ?? destinationPath;
         _destinationPolicy?.Confine(destinationPath);
         lock (_conventionalPlaceholderGate)
         {
@@ -813,6 +815,8 @@ internal sealed class ModelDownloadService : IAsyncDisposable
 
     public Task<bool> TryEnsureRegisteredDownloadAsync(string destinationPath, CancellationToken cancellationToken, bool highPriority)
     {
+        // An editor opening its link before the model is in the folder waits for that download.
+        destinationPath = _library?.LibraryPathFor(destinationPath) ?? destinationPath;
         lock (_conventionalPlaceholderGate)
         {
             var operation = TryEnsureConventionalDownloadAsync(destinationPath, cancellationToken, highPriority);

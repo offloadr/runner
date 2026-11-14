@@ -159,7 +159,7 @@ static async Task<int> RunAgentAsync()
         if (libraryDirectory is not null)
         {
             aria2FileAccess.PrepareModelLibrary(libraryDirectory);
-            modelLibrary = new ModelLibrary(libraryDirectory, options.LocalModelsDirectory!, modelProjectionRoot);
+            modelLibrary = new ModelLibrary(libraryDirectory, options.LocalModelsDirectory!, modelProjectionRoot, options.RunnerId);
             RunnerLog.Info($"Downloaded models are saved in the local models folder ('{options.LocalModelsDirectory}').");
         }
     }

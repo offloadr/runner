@@ -33,7 +33,7 @@ public class ModelLibraryTests
     }
 
     // The read-only view is the same folder here; in the runner it is a second, read-only mount of it.
-    private ModelLibrary CreateLibrary() => new(_library, _library, _editorModels);
+    private ModelLibrary CreateLibrary(string runnerId = "11111111-1111-4111-8111-111111111111") => new(_library, _library, _editorModels, runnerId);
 
     [Test]
     public void Redirect_SendsADownloadToTheFolderAndLinksTheEditorsPathThere()
@@ -160,6 +160,123 @@ public class ModelLibraryTests
     }
 
     [Test]
+    public void Publish_WhereRenamesCannotRefuseATakenName_StillNeverReplacesIt()
+    {
+        LinuxSecureDirectoryRoot.RenameWithoutReplacingUnsupportedForTests = true;
+        try
+        {
+            var library = CreateLibrary();
+            var free = Path.Combine(_library, "loras", "new.safetensors");
+            var freeStaging = Stage(library, free, 8);
+            var taken = WriteLibraryFile("loras/taken.safetensors", 4);
+            var takenStaging = Stage(library, taken, 8);
+
+            library.Publish(freeStaging, free);
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(new FileInfo(free).Length, Is.EqualTo(8), "Moved by a hard link, then its old name removed.");
+                Assert.That(File.Exists(freeStaging), Is.False);
+                Assert.That(() => library.Publish(takenStaging, taken), Throws.InstanceOf<IOException>());
+                Assert.That(new FileInfo(taken).Length, Is.EqualTo(4), "The owner's file is kept.");
+            });
+        }
+        finally
+        {
+            LinuxSecureDirectoryRoot.RenameWithoutReplacingUnsupportedForTests = false;
+        }
+    }
+
+    [Test]
+    public void DiscardAll_LeavesTheDownloadsOfAnotherRunnerSharingTheFolder()
+    {
+        var mine = CreateLibrary("11111111-1111-4111-8111-111111111111");
+        var theirs = CreateLibrary("22222222-2222-4222-8222-222222222222");
+        var theirStaging = Stage(theirs, Path.Combine(_library, "loras", "theirs.safetensors"), 3);
+        var myStaging = Stage(mine, Path.Combine(_library, "loras", "mine.safetensors"), 3);
+
+        mine.DiscardAll();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(File.Exists(myStaging), Is.False);
+            Assert.That(File.Exists(theirStaging), Is.True, "Another runner's download in progress is left alone.");
+        });
+    }
+
+    [Test]
+    public void Redirect_OfAnotherSizeAtALinkedPath_RemovesTheLinkSoItDownloadsInTheContainer()
+    {
+        var library = CreateLibrary();
+        library.Redirect([Remote("checkpoints/base.safetensors", 8)]);
+        WriteLibraryFile("checkpoints/base.safetensors", 8);
+        var other = Remote("checkpoints/base.safetensors", 16);
+
+        var redirected = library.Redirect([other]).Single();
+
+        var editorPath = Path.Combine(_editorModels, "checkpoints", "base.safetensors");
+        Assert.Multiple(() =>
+        {
+            Assert.That(redirected.DestinationPath, Is.EqualTo(editorPath));
+            Assert.That(File.Exists(editorPath) || new FileInfo(editorPath).LinkTarget is not null, Is.False, "Its link to the saved model is gone.");
+            Assert.That(new FileInfo(Path.Combine(_library, "checkpoints", "base.safetensors")).Length, Is.EqualTo(8), "The saved model stays.");
+        });
+    }
+
+    [Test]
+    public void LibraryPathFor_FindsTheDownloadBehindTheEditorsLinkOnly()
+    {
+        var library = CreateLibrary();
+        library.Redirect([Remote("checkpoints/base.safetensors", 8)]);
+        var other = Path.Combine(_editorModels, "loras", "own.safetensors");
+        Directory.CreateDirectory(Path.GetDirectoryName(other)!);
+        File.WriteAllBytes(other, new byte[2]);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(
+                library.LibraryPathFor(Path.Combine(_editorModels, "checkpoints", "base.safetensors")),
+                Is.EqualTo(Path.Combine(_library, "checkpoints", "base.safetensors")));
+            Assert.That(library.LibraryPathFor(other), Is.Null);
+        });
+    }
+
+    [Test]
+    public async Task AnEditorOpeningItsLinkBeforeTheModelIsThere_WaitsForTheDownload()
+    {
+        var backend = new WritingBackend();
+        var settings = Aria2Settings.FromEnvironment(name => name == "ARIA2_STATE_DIR" ? Path.Combine(_root, "aria2-state") : null, static () => "generated-secret");
+        await using var service = new ModelDownloadService(
+            backend,
+            settings,
+            destinationPolicy: new ModelDestinationPolicy([_editorModels, _library]),
+            library: CreateLibrary());
+        await service.InitializeAsync(CancellationToken.None);
+        service.SetActiveSession("session-1");
+        service.SeedDownloads("session-1", [Remote("checkpoints/base.safetensors", 8)]);
+
+        // What the shim asks for when the editor opens its own path, as at startup, without a prompt.
+        var handled = await service.TryEnsureRegisteredDownloadAsync(
+            Path.Combine(_editorModels, "checkpoints", "base.safetensors"),
+            CancellationToken.None,
+            highPriority: true);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(handled, Is.True);
+            Assert.That(new FileInfo(Path.Combine(_library, "checkpoints", "base.safetensors")).Length, Is.EqualTo(8));
+        });
+    }
+
+    private static string Stage(ModelLibrary library, string destination, int size)
+    {
+        var staging = library.GetStagingPath(destination)!;
+        Directory.CreateDirectory(Path.GetDirectoryName(staging)!);
+        File.WriteAllBytes(staging, new byte[size]);
+        return staging;
+    }
+
+    [Test]
     public void DiscardAll_EmptiesTheDownloadFolderOnly()
     {
         var library = CreateLibrary();
@@ -201,7 +318,10 @@ public class ModelLibraryTests
             Assert.That(new FileInfo(saved).Length, Is.EqualTo(8), "Saved in the owner's folder.");
             Assert.That(backend.Destinations, Has.All.Contains(ModelLibrary.StagingFolderName), "Written in the download folder first.");
             Assert.That(new FileInfo(Path.Combine(_editorModels, "checkpoints", "base.safetensors")).LinkTarget, Is.EqualTo(saved));
-            Assert.That(Directory.EnumerateFileSystemEntries(Path.Combine(_library, ModelLibrary.StagingFolderName)), Is.Empty);
+            Assert.That(
+                Directory.EnumerateFiles(Path.Combine(_library, ModelLibrary.StagingFolderName), "*", SearchOption.AllDirectories),
+                Is.Empty,
+                "Nothing half downloaded is left.");
         });
     }
 

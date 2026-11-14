@@ -19,20 +19,53 @@ internal sealed class ModelLibrary : IModelDownloadStaging
 
     private readonly string _readOnlyDirectory;
     private readonly string _editorModelsDirectory;
+    private readonly string _downloadFolder;
     private readonly string _stagingDirectory;
 
     /// <param name="directory">The models folder, writable.</param>
     /// <param name="readOnlyDirectory">The same folder as sessions see it, read-only.</param>
     /// <param name="editorModelsDirectory">Where the editor finds its models: requests for paths there are sent to the folder.</param>
-    public ModelLibrary(string directory, string readOnlyDirectory, string editorModelsDirectory)
+    /// <param name="runnerId">
+    /// This runner's id. Several runners may share one folder, so each keeps its downloads in progress in a
+    /// folder of its own and clears only that one.
+    /// </param>
+    public ModelLibrary(string directory, string readOnlyDirectory, string editorModelsDirectory, string runnerId)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(directory);
         ArgumentException.ThrowIfNullOrWhiteSpace(readOnlyDirectory);
         ArgumentException.ThrowIfNullOrWhiteSpace(editorModelsDirectory);
+        ArgumentException.ThrowIfNullOrWhiteSpace(runnerId);
         Directory = Normalize(directory);
         _readOnlyDirectory = Normalize(readOnlyDirectory);
         _editorModelsDirectory = Normalize(editorModelsDirectory);
-        _stagingDirectory = Path.Combine(Directory, StagingFolderName);
+        _downloadFolder = Path.Combine(Directory, StagingFolderName);
+        _stagingDirectory = Path.Combine(_downloadFolder, RunnerFolderName(runnerId));
+    }
+
+    private static string RunnerFolderName(string runnerId)
+    {
+        var trimmed = runnerId.Trim();
+        return trimmed.All(static character => char.IsAsciiLetterOrDigit(character) || character == '-')
+            ? trimmed
+            : Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(trimmed)))[..32];
+    }
+
+    /// <summary>
+    /// The download in the folder behind <paramref name="editorPath"/>, when that path is this library's
+    /// link: an editor opening the model before it is there waits for that download.
+    /// </summary>
+    public string? LibraryPathFor(string editorPath)
+    {
+        var normalized = Normalize(editorPath);
+        if (!IsStrictlyBeneath(normalized, _editorModelsDirectory))
+        {
+            return null;
+        }
+
+        var relative = Path.GetRelativePath(_editorModelsDirectory, normalized);
+        return string.Equals(new FileInfo(normalized).LinkTarget, Path.Combine(_readOnlyDirectory, relative), StringComparison.Ordinal)
+            ? Path.Combine(Directory, relative)
+            : null;
     }
 
     public string Directory { get; }
@@ -63,12 +96,21 @@ internal sealed class ModelLibrary : IModelDownloadStaging
 
         var relative = Path.GetRelativePath(_editorModelsDirectory, editorPath);
         var libraryPath = Path.Combine(Directory, relative);
-        if (IsStrictlyBeneath(libraryPath, _stagingDirectory) || !IsFreeOrSameSize(libraryPath, download.SizeBytes))
+        var linkTarget = Path.Combine(_readOnlyDirectory, relative);
+        if (IsStrictlyBeneath(libraryPath, _downloadFolder))
         {
             return download;
         }
 
-        if (!TryLinkEditorPath(relative, Path.Combine(_readOnlyDirectory, relative)))
+        if (!IsFreeOrSameSize(libraryPath, download.SizeBytes))
+        {
+            // Another model is saved there. If this library linked the editor's path to it, the link goes,
+            // so this one can be downloaded inside the container at that path.
+            DetachEditorLink(relative, linkTarget);
+            return download;
+        }
+
+        if (!TryLinkEditorPath(relative, linkTarget))
         {
             return download;
         }
@@ -87,6 +129,29 @@ internal sealed class ModelLibrary : IModelDownloadStaging
         }
 
         return !existing.Exists || existing.Length == size;
+    }
+
+    private void DetachEditorLink(string relative, string target)
+    {
+        try
+        {
+            if (!System.IO.Directory.Exists(_editorModelsDirectory))
+            {
+                return;
+            }
+
+            using var root = new LinuxSecureDirectoryRoot(_editorModelsDirectory);
+            var relativePath = relative.Replace(Path.DirectorySeparatorChar, '/');
+            if (root.ReadSymbolicLink(relativePath, out var existing) == SecureLinkKind.SymbolicLink &&
+                string.Equals(existing, target, StringComparison.Ordinal))
+            {
+                root.DeleteSymbolicLink(relativePath);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            RunnerLog.Warning(nameof(ModelLibrary), $"Could not remove the link at '{relative}' ({ex.GetType().Name}).");
+        }
     }
 
     private bool TryLinkEditorPath(string relative, string target)
@@ -119,7 +184,7 @@ internal sealed class ModelLibrary : IModelDownloadStaging
     public string? GetStagingPath(string destinationPath)
     {
         var destination = Normalize(destinationPath);
-        if (!IsStrictlyBeneath(destination, Directory) || IsStrictlyBeneath(destination, _stagingDirectory))
+        if (!IsStrictlyBeneath(destination, Directory) || IsStrictlyBeneath(destination, _downloadFolder))
         {
             return null;
         }
@@ -168,10 +233,12 @@ internal sealed class ModelLibrary : IModelDownloadStaging
     public bool IsStagingPath(string? path)
         => !string.IsNullOrWhiteSpace(path) && IsStrictlyBeneath(Normalize(path), _stagingDirectory);
 
-    /// <summary>Removes what an earlier run left half downloaded.</summary>
+    /// <summary>Removes what an earlier run of this runner left half downloaded; other runners' stay.</summary>
     public void DiscardAll()
     {
-        if (!System.IO.Directory.Exists(_stagingDirectory) || new DirectoryInfo(_stagingDirectory).LinkTarget is not null)
+        if (!System.IO.Directory.Exists(_stagingDirectory) ||
+            new DirectoryInfo(_downloadFolder).LinkTarget is not null ||
+            new DirectoryInfo(_stagingDirectory).LinkTarget is not null)
         {
             return;
         }

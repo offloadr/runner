@@ -462,8 +462,12 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
     /// Moves the regular file at <paramref name="relativeSource"/> to <paramref name="relativeDestination"/>
     /// beneath this root, creating missing directories, but never over anything already there. Returns false
     /// when the destination is taken. On a filesystem that cannot rename without replacing (a Windows folder
-    /// shared into a container), the destination is checked first and renamed to only while free.
+    /// shared into a container), the file is hard-linked to its new name, which is refused just as atomically
+    /// when the name is taken, and its old name removed.
     /// </summary>
+    /// <summary>Makes <see cref="MoveRegularFileWithoutReplacing"/> act as on a Windows folder, for tests.</summary>
+    internal static bool RenameWithoutReplacingUnsupportedForTests { get; set; }
+
     public bool MoveRegularFileWithoutReplacing(string relativeSource, string relativeDestination)
     {
         var (sourceParent, sourceName) = OpenParent(relativeSource, createDirectories: false);
@@ -486,12 +490,13 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
             var (destinationParent, destinationName) = OpenParent(relativeDestination, createDirectories: true);
             using (destinationParent)
             {
-                if (renameat2(GetDescriptor(sourceParent), sourceName, GetDescriptor(destinationParent), destinationName, RenameNoReplace) == 0)
+                if (!RenameWithoutReplacingUnsupportedForTests &&
+                    renameat2(GetDescriptor(sourceParent), sourceName, GetDescriptor(destinationParent), destinationName, RenameNoReplace) == 0)
                 {
                     return true;
                 }
 
-                var error = Marshal.GetLastPInvokeError();
+                var error = RenameWithoutReplacingUnsupportedForTests ? EInvalidArgument : Marshal.GetLastPInvokeError();
                 if (error == AlreadyExists)
                 {
                     return false;
@@ -502,23 +507,22 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
                     throw CreateException($"moving '{relativeSource}' to '{relativeDestination}'", error);
                 }
 
-                var existing = openat(GetDescriptor(destinationParent), destinationName, OPath | ONoFollow | OCloseOnExec);
-                if (existing >= 0)
+                // A hard link refuses a taken name as atomically as the rename would have; then the file's
+                // old name goes. Where hard links do not work either, the move fails rather than risk replacing.
+                if (linkat(GetDescriptor(sourceParent), sourceName, GetDescriptor(destinationParent), destinationName, 0) != 0)
                 {
-                    using (new SafeFileHandle((nint)existing, ownsHandle: true))
+                    var linkError = Marshal.GetLastPInvokeError();
+                    if (linkError == AlreadyExists)
                     {
                         return false;
                     }
+
+                    throw CreateException($"linking '{relativeSource}' to '{relativeDestination}'", linkError);
                 }
 
-                if (Marshal.GetLastPInvokeError() != ENoEntry)
+                if (unlinkat(GetDescriptor(sourceParent), sourceName, 0) != 0)
                 {
-                    throw CreateException($"inspecting '{relativeDestination}'");
-                }
-
-                if (renameat(GetDescriptor(sourceParent), sourceName, GetDescriptor(destinationParent), destinationName) != 0)
-                {
-                    throw CreateException($"moving '{relativeSource}' to '{relativeDestination}'");
+                    throw CreateException($"removing '{relativeSource}' once moved");
                 }
 
                 return true;
@@ -1376,6 +1380,9 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
 
     [DllImport("libc", SetLastError = true)]
     private static extern int fchownat(int directoryFileDescriptor, string path, uint owner, uint group, int flags);
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int linkat(int oldDirectoryFileDescriptor, string oldPath, int newDirectoryFileDescriptor, string newPath, int flags);
 }
 
 internal enum SecureLinkKind
