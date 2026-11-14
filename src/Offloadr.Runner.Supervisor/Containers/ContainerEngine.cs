@@ -149,10 +149,11 @@ public interface IContainerEngine
     Task<ImageInfo?> InspectImageAsync(string image, CancellationToken cancellationToken);
 
     /// <summary>
-    /// Removes the image with this ID, never by force: the engine keeps one a container still uses, and
-    /// one another name points at. False when it was kept, or is gone.
+    /// Removes <paramref name="reference"/> (a name, a digest reference or an ID), never by force: the engine
+    /// keeps an image a container still uses. Removing a name or digest reference removes the image only
+    /// when no other name points at it. False when the engine kept it, or it is gone.
     /// </summary>
-    Task<bool> RemoveImageAsync(string imageId, CancellationToken cancellationToken);
+    Task<bool> RemoveImageAsync(string reference, CancellationToken cancellationToken);
 
     /// <summary>Starts the container detached and returns its id.</summary>
     Task<string> RunDetachedAsync(ContainerSpec spec, CancellationToken cancellationToken);

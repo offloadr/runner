@@ -147,9 +147,10 @@ internal sealed class FakeContainerEngine : IContainerEngine
             if (image.StartsWith("sha256:", StringComparison.Ordinal))
             {
                 // By ID, as for an image no name may point at any more.
-                var tags = _images.Where(reference => ImageId(reference) == image).ToArray();
+                // A digest reference is no name: the engine lists only tags.
+                var tags = _images.Where(reference => !reference.Contains('@', StringComparison.Ordinal) && ImageId(reference) == image).ToArray();
                 return Task.FromResult(tags.Length > 0 || (_seenImageIds.Contains(image) && !RemovedImages.Contains(image))
-                    ? new ImageInfo(image, null, tags)
+                    ? new ImageInfo(image, DigestReference(image), tags)
                     : null);
             }
 
@@ -166,28 +167,52 @@ internal sealed class FakeContainerEngine : IContainerEngine
 
     private readonly HashSet<string> _seenImageIds = new(StringComparer.Ordinal);
 
+    /// <summary>The digest reference an image pulled from a registry keeps after its tag moves.</summary>
+    public static string DigestReference(string imageId) => $"ghcr.io/offloadr/runner-comfyui@{imageId}";
+
     /// <summary>The image IDs removed, in order.</summary>
     public List<string> RemovedImages { get; } = [];
+
+    /// <summary>What RemoveImageAsync was asked to remove, in order.</summary>
+    public List<string> RemovalRequests { get; } = [];
 
     /// <summary>Thrown by RemoveImageAsync, as when the engine does not answer.</summary>
     public Exception? RemoveImageFailure { get; set; }
 
-    public Task<bool> RemoveImageAsync(string imageId, CancellationToken cancellationToken)
+    /// <summary>Runs as a removal reaches the engine, for example to tag the image meanwhile.</summary>
+    public Action? BeforeRemoveImage { get; set; }
+
+    public Task<bool> RemoveImageAsync(string reference, CancellationToken cancellationToken)
     {
         if (RemoveImageFailure is { } failure)
         {
             return Task.FromException<bool>(failure);
         }
 
+        BeforeRemoveImage?.Invoke();
         lock (_gate)
         {
-            // The engine keeps an image a container uses, or a name points at, unless forced.
+            RemovalRequests.Add(reference);
+            var imageId = reference.StartsWith("sha256:", StringComparison.Ordinal) ? reference : reference[(reference.IndexOf('@', StringComparison.Ordinal) + 1)..];
+            var tags = _images.Where(name => !name.Contains('@', StringComparison.Ordinal) && ImageId(name) == imageId).ToArray();
             if (_containers.Values.Any(container => container.ImageId == imageId) ||
-                _images.Any(reference => ImageId(reference) == imageId) ||
                 !_seenImageIds.Contains(imageId) ||
                 RemovedImages.Contains(imageId))
             {
+                // Kept for a container that uses it, unless forced, or already gone.
                 return Task.FromResult(false);
+            }
+
+            if (reference.StartsWith("sha256:", StringComparison.Ordinal) ? tags.Length > 1 : tags.Length > 0)
+            {
+                // By ID the engine removes an image with a single tag, tag and all, and refuses one with
+                // several; by a digest reference it drops only that reference while a name remains.
+                return Task.FromResult(!reference.StartsWith("sha256:", StringComparison.Ordinal));
+            }
+
+            foreach (var name in _images.Where(name => ImageId(name) == imageId).ToArray())
+            {
+                _images.Remove(name);
             }
 
             RemovedImages.Add(imageId);

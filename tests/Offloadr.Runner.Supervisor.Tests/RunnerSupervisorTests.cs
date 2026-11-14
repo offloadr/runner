@@ -2088,7 +2088,58 @@ public class RunnerSupervisorTests
         Assert.Multiple(() =>
         {
             Assert.That(_engine.RemovedImages, Is.EqualTo(new[] { "sha256:local" }));
+            Assert.That(_engine.RemovalRequests, Is.EqualTo(new[] { FakeContainerEngine.DigestReference("sha256:local") }), "By its digest, not its ID.");
             Assert.That(supervisor.LogLines, Has.Some.Contains("removed the runner image this one replaced"));
+        });
+    }
+
+    [Test]
+    public async Task AnImageUpdate_KeepsAReplacedImageTaggedJustBeforeItsRemoval()
+    {
+        _engine.StatusJson = Status(activeSessionId: "");
+        var supervisor = await StartSupervisorAsync(imageUpdateInterval: TimeSpan.FromSeconds(1));
+        supervisor.RequestStart();
+        await WaitForStateAsync(SupervisorState.Running);
+        // Someone tags the replaced image after the app found it unnamed, before the engine removes it.
+        _engine.BeforeRemoveImage = () =>
+        {
+            _engine.ImageIds["ghcr.io/offloadr/runner-comfyui:kept"] = "sha256:local";
+            _engine.AddImage("ghcr.io/offloadr/runner-comfyui:kept");
+        };
+
+        _engine.ImageIds["ghcr.io/offloadr/runner-comfyui:latest"] = "sha256:newer";
+
+        await WaitUntilAsync(() => _engine.Runs.Count == 2 && supervisor.View.State == SupervisorState.Running && _engine.RemovalRequests.Count > 0);
+        var kept = await _engine.InspectImageAsync("ghcr.io/offloadr/runner-comfyui:kept", CancellationToken.None);
+        Assert.Multiple(() =>
+        {
+            Assert.That(_engine.RemovedImages, Is.Empty);
+            Assert.That(kept?.Id, Is.EqualTo("sha256:local"), "The new name and its image stay.");
+            Assert.That(supervisor.LogLines, Has.None.Contains("removed the runner image"));
+        });
+    }
+
+    [Test]
+    public async Task ASwitchFromADigestPinnedTemplate_KeepsThatImage()
+    {
+        _engine.StatusJson = Status(activeSessionId: "");
+        _engine.ImageIds["ghcr.io/offloadr/runner-comfyui@sha256:latest"] = "sha256:pinned-latest";
+        _engine.ImageIds["ghcr.io/offloadr/runner-comfyui@sha256:master"] = "sha256:pinned-master";
+        _plans.Plan = ControlPlanePlan(selected: "comfyui-latest");
+        var supervisor = await StartSupervisorAsync();
+        supervisor.RequestStart();
+        await WaitForStateAsync(SupervisorState.Running);
+        await WaitUntilAsync(() => supervisor.View.RunnerStatus is not null);
+
+        // Its template names that image by digest, which the engine lists as no tag; a switch back needs it.
+        _plans.Plan = ControlPlanePlan(selected: "comfyui-master");
+        supervisor.RequestRefresh();
+
+        await WaitUntilAsync(() => _engine.Runs.Count == 2 && supervisor.View.State == SupervisorState.Running);
+        Assert.Multiple(() =>
+        {
+            Assert.That(_engine.RemovalRequests, Is.Empty);
+            Assert.That(_engine.RemovedImages, Is.Empty);
         });
     }
 

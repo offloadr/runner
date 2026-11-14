@@ -807,6 +807,7 @@ public sealed class RunnerSupervisor : BackgroundService
         // The image the runner ran before, on the engine it ran on: once this start runs another, that one
         // is removed if nothing names or uses it any more.
         var previousImageId = _runningImageId;
+        var previousImageReference = _runningTemplate?.Image;
         var previousEngine = _engineSelection.Current;
         try
         {
@@ -1179,9 +1180,10 @@ public sealed class RunnerSupervisor : BackgroundService
                 RunnerStatus = null,
             });
 
-            if (previousImageId is not null && !string.Equals(previousImageId, _runningImageId, StringComparison.Ordinal))
+            if (previousImageId is not null && previousImageReference is not null &&
+                !string.Equals(previousImageId, _runningImageId, StringComparison.Ordinal))
             {
-                await RemoveSupersededImageAsync(previousImageId, previousEngine, cancellationToken).ConfigureAwait(false);
+                await RemoveSupersededImageAsync(previousImageId, previousImageReference, previousEngine, cancellationToken).ConfigureAwait(false);
             }
 
             if (View.GpuAccess is null)
@@ -1228,19 +1230,36 @@ public sealed class RunnerSupervisor : BackgroundService
     /// while a container uses it, and an image another template still names stays for a switch back.
     /// Each runner image takes many gigabytes; nothing else is pruned.
     /// </summary>
-    private async Task RemoveSupersededImageAsync(string imageId, ContainerEngineSelection.Selected engine, CancellationToken cancellationToken)
+    /// <param name="imageReference">
+    /// What the previous runner was started from. A digest (<c>repo@sha256:…</c>) names that very image
+    /// for good, though the engine lists no tag for it: such an image is kept, for its template.
+    /// </param>
+    private async Task RemoveSupersededImageAsync(
+        string imageId,
+        string imageReference,
+        ContainerEngineSelection.Selected engine,
+        CancellationToken cancellationToken)
     {
+        if (imageReference.Contains('@', StringComparison.Ordinal))
+        {
+            return;
+        }
+
         try
         {
             using (_engineSelection.Use(engine))
             {
                 var image = await _engine.InspectImageAsync(imageId, cancellationToken).ConfigureAwait(false);
-                if (image?.RepoTags is not { Count: 0 })
+                if (image?.RepoTags is not { Count: 0 } || image.RepoDigest is not { } digestReference)
                 {
                     return;
                 }
 
-                if (await _engine.RemoveImageAsync(imageId, cancellationToken).ConfigureAwait(false))
+                // Removed by its digest, not its ID: the engine then drops only that reference, and keeps
+                // the image if a name was put on it since it was looked at. By ID it would remove an image
+                // with a single tag along with the tag.
+                if (await _engine.RemoveImageAsync(digestReference, cancellationToken).ConfigureAwait(false) &&
+                    await _engine.InspectImageAsync(imageId, cancellationToken).ConfigureAwait(false) is null)
                 {
                     AppendLog($"supervisor: removed the runner image this one replaced ({ShortImageId(imageId)}).");
                 }

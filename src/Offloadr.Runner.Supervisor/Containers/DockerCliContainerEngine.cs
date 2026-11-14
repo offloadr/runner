@@ -149,10 +149,10 @@ public sealed class DockerCliContainerEngine(IProcessRunner processes, Func<stri
         return IsImageNotFound(result) ? null : throw new ContainerEngineException($"Could not look up {image}.", result.StandardError);
     }
 
-    public async Task<bool> RemoveImageAsync(string imageId, CancellationToken cancellationToken)
+    public async Task<bool> RemoveImageAsync(string reference, CancellationToken cancellationToken)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(imageId);
-        var result = await RunQuickAsync(Require(), ["image", "rm", imageId], cancellationToken).ConfigureAwait(false);
+        ArgumentException.ThrowIfNullOrWhiteSpace(reference);
+        var result = await RunQuickAsync(Require(), ["image", "rm", reference], cancellationToken).ConfigureAwait(false);
         if (result.Succeeded)
         {
             return true;
@@ -161,7 +161,7 @@ public sealed class DockerCliContainerEngine(IProcessRunner processes, Func<stri
         // Kept by the engine (a container uses it, or another name points at it), or already gone.
         return IsImageNotFound(result) || IsImageKept(result)
             ? false
-            : throw new ContainerEngineException($"Could not remove image {imageId}.", result.StandardError);
+            : throw new ContainerEngineException($"Could not remove image {reference}.", result.StandardError);
     }
 
     private static bool IsImageKept(ProcessResult result)
