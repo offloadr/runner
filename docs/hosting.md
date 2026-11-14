@@ -97,6 +97,7 @@ own CUDA environment. Continue to use appropriate host/container isolation.
   - `RUNNER_UV_BINARY` (runner-owned `uv` executable used to create session virtualenvs, default `/usr/local/bin/uv`)
   - `RUNNER_PERSISTENT_RANGE_HYDRATION` (image-owned runtime capability; `1` for persistent ComfyUI model roots and `0` for Forge Neo)
   - `RUNNER_MODEL_CACHE_DIR` (Forge Neo's model cache, shared by its sessions; default `/var/lib/offloadr/models`)
+  - `RUNNER_MODEL_LIBRARY_DIR` (the local models folder mounted again, writable, to save downloads in; see [Saving downloads in the models folder](#saving-downloads-in-the-models-folder))
   - `RUNNER_VFS_LOG` (`1` enables verbose native shim and VFS IPC tracing; default `0`)
 - Optional console logging (see [Console Logs](#console-logs))
   - `RUNNER_CONSOLE_LOGS` (`full` or `metadata`; default `full`, and always `metadata` with `RUNNER_SEALED_STORAGE=required`. Any other value fails startup)
@@ -123,6 +124,28 @@ With downloads off:
 - A session lists only the models it can load. Each model it would have downloaded is reported to Offloadr as a failed download with the reason, and no placeholder is created for it.
 - A prompt that needs a model the runner does not have is refused before the editor sees it. Its result names the missing models, with the diagnostic code `model_downloads_disabled`.
 - Models from the local models folder are linked into sessions as usual.
+
+### Saving downloads in the models folder
+
+A personal runner can save what it downloads in its local models folder, beside the owner's own models, instead of inside the container. There they last, take space where the owner chose, and any other app can use them. Mount the same folder a second time, writable, and name that path in `RUNNER_MODEL_LIBRARY_DIR`. The desktop app does this whenever downloads are on, and requires a models folder for them.
+
+```bash
+docker run --rm -it \
+  --pull always --gpus all \
+  -v /host/models:/local:ro \
+  -v /host/models:/var/lib/offloadr-library/models \
+  -e RUNNER_SECRET=replace-with-your-runner-key \
+  -e RUNNER_LOCAL_MODELS_DIR=/local \
+  -e RUNNER_MODEL_LIBRARY_DIR=/var/lib/offloadr-library/models \
+  -e RUNNER_MODEL_DOWNLOADS=on \
+  ghcr.io/offloadr/runner-comfyui:latest
+```
+
+- Each model is downloaded whole, at the path the editor uses (`checkpoints/…`, `loras/…`, or Forge Neo's `Stable-diffusion/…` and so on), into `.offloadr-downloads` in the folder first, and moved into place once complete, so other apps never see half a model. The editor's path is a link to it through the read-only `/local`, so sessions still cannot change the folder. A prompt waits for its downloads to finish; streaming the bytes a model reads first is not used here, since in a folder shared from Windows a model's empty file would take its full size at once.
+- A file already in the folder at that path counts as the model when it has the requested size. A file of another size is the owner's: it is never replaced, and that model is downloaded inside the container as before.
+- The agent closes the writable path's parent directory (`/var/lib/offloadr-library` here) to everyone but root and aria2, and refuses to start when the two mounts are not the same folder.
+- aria2 does not preallocate with a models folder (`ARIA2_FILE_ALLOCATION` defaults to `none`), since a folder shared from Windows cannot.
+- Hosted runners, and personal runners without the writable mount, download inside the container as described above.
 
 Aria2 baseline notes:
 
@@ -161,7 +184,7 @@ docker run --rm -it \
   ghcr.io/offloadr/runner-comfyui:latest
 ```
 
-Add `-e RUNNER_MODEL_DOWNLOADS=on` to let the runner also download models the folder lacks.
+Add `-e RUNNER_MODEL_DOWNLOADS=on` to let the runner also download models the folder lacks, and see [Saving downloads in the models folder](#saving-downloads-in-the-models-folder) to keep them there.
 
 Forge Neo example:
 

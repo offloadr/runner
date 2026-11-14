@@ -459,6 +459,74 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
     }
 
     /// <summary>
+    /// Moves the regular file at <paramref name="relativeSource"/> to <paramref name="relativeDestination"/>
+    /// beneath this root, creating missing directories, but never over anything already there. Returns false
+    /// when the destination is taken. On a filesystem that cannot rename without replacing (a Windows folder
+    /// shared into a container), the destination is checked first and renamed to only while free.
+    /// </summary>
+    public bool MoveRegularFileWithoutReplacing(string relativeSource, string relativeDestination)
+    {
+        var (sourceParent, sourceName) = OpenParent(relativeSource, createDirectories: false);
+        using (sourceParent)
+        {
+            var descriptor = openat(GetDescriptor(sourceParent), sourceName, OPath | ONoFollow | OCloseOnExec);
+            if (descriptor < 0)
+            {
+                throw CreateException($"opening '{relativeSource}'");
+            }
+
+            using (var entry = new SafeFileHandle((nint)descriptor, ownsHandle: true))
+            {
+                if (ReadStatus(entry, relativeSource).Kind != SecureEntryKind.RegularFile)
+                {
+                    throw NotRegularFile(relativeSource);
+                }
+            }
+
+            var (destinationParent, destinationName) = OpenParent(relativeDestination, createDirectories: true);
+            using (destinationParent)
+            {
+                if (renameat2(GetDescriptor(sourceParent), sourceName, GetDescriptor(destinationParent), destinationName, RenameNoReplace) == 0)
+                {
+                    return true;
+                }
+
+                var error = Marshal.GetLastPInvokeError();
+                if (error == AlreadyExists)
+                {
+                    return false;
+                }
+
+                if (error != EInvalidArgument)
+                {
+                    throw CreateException($"moving '{relativeSource}' to '{relativeDestination}'", error);
+                }
+
+                var existing = openat(GetDescriptor(destinationParent), destinationName, OPath | ONoFollow | OCloseOnExec);
+                if (existing >= 0)
+                {
+                    using (new SafeFileHandle((nint)existing, ownsHandle: true))
+                    {
+                        return false;
+                    }
+                }
+
+                if (Marshal.GetLastPInvokeError() != ENoEntry)
+                {
+                    throw CreateException($"inspecting '{relativeDestination}'");
+                }
+
+                if (renameat(GetDescriptor(sourceParent), sourceName, GetDescriptor(destinationParent), destinationName) != 0)
+                {
+                    throw CreateException($"moving '{relativeSource}' to '{relativeDestination}'");
+                }
+
+                return true;
+            }
+        }
+    }
+
+    /// <summary>
     /// Creates a symbolic link like <see cref="CreateSymbolicLink"/>, but gives each directory it has to
     /// create to the owner of the directory it creates it in. Links made in a directory a user owns then
     /// leave that user able to write beside them.

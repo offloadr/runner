@@ -138,13 +138,30 @@ static async Task<int> RunAgentAsync()
     }
 
     var sessionModelLinks = new SessionModelLinks(options.Session.SessionRoot);
-    string[] modelRoots = [options.Aria2.DownloadDirectory, modelProjectionRoot, .. hydrationCapabilities.PersistentModelRoots];
+    // Downloads are saved in the owner's models folder when it is shared writable too.
+    var libraryDirectory = options.ModelDownloads.Enabled && options.LocalModelsDirectory is not null
+        ? options.ModelLibraryDirectory
+        : null;
+    string[] modelRoots =
+    [
+        options.Aria2.DownloadDirectory,
+        modelProjectionRoot,
+        .. hydrationCapabilities.PersistentModelRoots,
+        .. libraryDirectory is null ? Array.Empty<string>() : [libraryDirectory],
+    ];
     LinuxAria2FileAccess aria2FileAccess;
+    ModelLibrary? modelLibrary = null;
     try
     {
         // aria2 runs unprivileged and writes in place only beneath model roots no session can
         // write; destinations inside session homes are staged and published by the agent.
         aria2FileAccess = LinuxAria2FileAccess.Create(options.Aria2, modelRoots, options.Session.SessionRoot);
+        if (libraryDirectory is not null)
+        {
+            aria2FileAccess.PrepareModelLibrary(libraryDirectory);
+            modelLibrary = new ModelLibrary(libraryDirectory, options.LocalModelsDirectory!, modelProjectionRoot);
+            RunnerLog.Info($"Downloaded models are saved in the local models folder ('{options.LocalModelsDirectory}').");
+        }
     }
     catch (Exception ex)
     {
@@ -190,7 +207,8 @@ static async Task<int> RunAgentAsync()
         hydrationCapabilities,
         new ModelDestinationPolicy(modelRoots),
         new SessionModelDownloadStaging(options.Session.SessionRoot, options.Aria2.StagingDirectory),
-        downloadsEnabled: options.ModelDownloads.Enabled);
+        downloadsEnabled: options.ModelDownloads.Enabled,
+        library: modelLibrary);
     await using var sessionEventRelay = new ComfySessionEventRelay(
         sessionManager.SignalRuntimeActivity,
         options.RunnerId,

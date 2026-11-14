@@ -72,6 +72,9 @@ public sealed class SupervisorOptions
 public sealed class RunnerSupervisor : BackgroundService
 {
     public const string ManagedLabel = "app.offloadr.runner.managed";
+
+    /// <summary>Where the models folder is mounted writable for downloads; its parent is closed to sessions.</summary>
+    public const string ModelLibraryContainerPath = "/var/lib/offloadr-library/models";
     public const string TemplateLabel = "app.offloadr.runner.template";
     public const string SpecLabel = "app.offloadr.runner.spec";
 
@@ -1942,6 +1945,13 @@ public sealed class RunnerSupervisor : BackgroundService
         {
             volumes.Add(new VolumeMount(settings.LocalModelsDirectory, "/local", ReadOnly: true));
             environment["RUNNER_LOCAL_MODELS_DIR"] = "/local";
+            if (settings.DownloadModels)
+            {
+                // Downloads are saved in the folder, beside the person's own models. Sessions still see
+                // it only read-only, at /local; the agent closes this second path to them.
+                volumes.Add(new VolumeMount(settings.LocalModelsDirectory, ModelLibraryContainerPath, ReadOnly: false));
+                environment["RUNNER_MODEL_LIBRARY_DIR"] = ModelLibraryContainerPath;
+            }
         }
 
         var labels = new Dictionary<string, string>(StringComparer.Ordinal)

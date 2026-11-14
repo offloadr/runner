@@ -73,6 +73,41 @@ public partial class RunnerStartupValidatorTests
     }
 
     [Test]
+    public void ValidateOrThrow_TheWritableModelsFolderMustBeTheLocalOne()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            Assert.Ignore("Runner startup validation is Linux-specific.");
+        }
+
+        var tempRoot = Path.Combine(Path.GetTempPath(), $"runner-validator-{Guid.NewGuid():N}");
+        try
+        {
+            var local = Directory.CreateDirectory(Path.Combine(tempRoot, "local")).FullName;
+            var other = Directory.CreateDirectory(Path.Combine(tempRoot, "other")).FullName;
+            var validator = new RunnerStartupValidator(new NoopIsolationStrategy());
+
+            var withoutLocal = Assert.Throws<InvalidOperationException>(
+                () => validator.ValidateOrThrow(BuildOptions(tempRoot, "/bin/sh", modelLibraryDirectory: other)));
+            var mismatched = Assert.Throws<InvalidOperationException>(
+                () => validator.ValidateOrThrow(BuildOptions(tempRoot, "/bin/sh", localModelsDirectory: local, modelLibraryDirectory: other)));
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(withoutLocal!.Message, Does.Contain("RUNNER_MODEL_LIBRARY_DIR needs RUNNER_LOCAL_MODELS_DIR"));
+                Assert.That(mismatched!.Message, Does.Contain("must be the folder mounted at RUNNER_LOCAL_MODELS_DIR"));
+                Assert.That(
+                    () => validator.ValidateOrThrow(BuildOptions(tempRoot, "/bin/sh", localModelsDirectory: local, modelLibraryDirectory: local)),
+                    Throws.Nothing);
+            });
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+        }
+    }
+
+    [Test]
     public void ValidateOrThrow_RejectsAnUnknownModelDownloadsValue()
     {
         if (!OperatingSystem.IsLinux())
@@ -522,7 +557,8 @@ public partial class RunnerStartupValidatorTests
         bool requireAria2User = false,
         SealedStorageOptions? sealing = null,
         ConsoleLogOptions? consoleLogs = null,
-        ModelDownloadOptions? modelDownloads = null)
+        ModelDownloadOptions? modelDownloads = null,
+        string? modelLibraryDirectory = null)
     {
         var sessionRoot = Path.Combine(tempRoot, "sessions");
         var workingDirectory = Path.Combine(tempRoot, "comfy");
@@ -580,6 +616,7 @@ public partial class RunnerStartupValidatorTests
             }),
             ConsoleLogs = consoleLogs ?? new ConsoleLogOptions(),
             ModelDownloads = modelDownloads ?? new ModelDownloadOptions(),
+            ModelLibraryDirectory = modelLibraryDirectory,
         };
     }
 

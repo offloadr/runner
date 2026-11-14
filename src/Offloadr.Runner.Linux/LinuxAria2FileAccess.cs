@@ -191,6 +191,34 @@ internal sealed class LinuxAria2FileAccess : IAria2FileAccess
         SetOwnerAndMode(staging, 0, account.GroupId, StagingDirectoryMode, _stagingDirectory);
     }
 
+    /// <summary>
+    /// Closes the directory holding the writable models folder to everyone but root and aria2's group, so
+    /// sessions cannot reach the folder through it: a folder shared from Windows is open to everyone inside.
+    /// </summary>
+    public void PrepareModelLibrary(string libraryDirectory)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(libraryDirectory);
+        var library = Normalize(libraryDirectory);
+        var parent = Path.GetDirectoryName(library);
+        if (string.IsNullOrEmpty(parent) || parent == "/" || !Directory.Exists(library))
+        {
+            throw new InvalidOperationException($"The models folder '{library}' must be a mounted directory inside a directory of its own.");
+        }
+
+        using var handle = OpenDirectory(parent);
+        if (Account is { } account)
+        {
+            SetOwnerAndMode(handle, 0, account.GroupId, LibraryParentMode, parent);
+        }
+        else
+        {
+            SetOwnerAndMode(handle, 0, 0, PrivateDirectoryMode, parent);
+        }
+    }
+
+    internal const uint LibraryParentMode = 0x1E8; // 0750
+    internal const uint PrivateDirectoryMode = 0x1C0; // 0700
+
     public void PrepareTransferTarget(string destinationPath)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(destinationPath);

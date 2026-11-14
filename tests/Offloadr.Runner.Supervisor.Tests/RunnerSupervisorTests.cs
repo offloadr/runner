@@ -86,7 +86,12 @@ public class RunnerSupervisorTests
     [TestCase(true, "on")]
     public async Task Start_TellsTheRunnerWhetherItMayDownloadModels(bool downloadModels, string expected)
     {
-        _settings = new FakeSettingsStore(new RunnerSettings { RunnerKey = Key, DownloadModels = downloadModels });
+        _settings = new FakeSettingsStore(new RunnerSettings
+        {
+            RunnerKey = Key,
+            LocalModelsDirectory = Path.GetTempPath(),
+            DownloadModels = downloadModels,
+        });
         var supervisor = await StartSupervisorAsync();
 
         supervisor.RequestStart();
@@ -96,9 +101,65 @@ public class RunnerSupervisorTests
     }
 
     [Test]
+    public async Task Start_WithDownloads_SavesThemInTheModelsFolder()
+    {
+        var models = Path.GetTempPath();
+        _settings = new FakeSettingsStore(new RunnerSettings { RunnerKey = Key, LocalModelsDirectory = models, DownloadModels = true });
+        var supervisor = await StartSupervisorAsync();
+
+        supervisor.RequestStart();
+        await WaitForStateAsync(SupervisorState.Running);
+
+        var run = _engine.Runs.Single();
+        Assert.Multiple(() =>
+        {
+            Assert.That(run.Volumes, Is.EqualTo(new[]
+            {
+                new VolumeMount(models, "/local", true),
+                new VolumeMount(models, RunnerSupervisor.ModelLibraryContainerPath, false),
+            }), "Read-only for sessions, writable where only the agent reaches it.");
+            Assert.That(run.Environment["RUNNER_MODEL_LIBRARY_DIR"], Is.EqualTo(RunnerSupervisor.ModelLibraryContainerPath));
+        });
+    }
+
+    [Test]
+    public async Task Start_WithoutDownloads_SharesTheModelsFolderReadOnlyOnly()
+    {
+        var models = Path.GetTempPath();
+        _settings = new FakeSettingsStore(new RunnerSettings { RunnerKey = Key, LocalModelsDirectory = models });
+        var supervisor = await StartSupervisorAsync();
+
+        supervisor.RequestStart();
+        await WaitForStateAsync(SupervisorState.Running);
+
+        var run = _engine.Runs.Single();
+        Assert.Multiple(() =>
+        {
+            Assert.That(run.Volumes, Is.EqualTo(new[] { new VolumeMount(models, "/local", true) }));
+            Assert.That(run.Environment.ContainsKey("RUNNER_MODEL_LIBRARY_DIR"), Is.False);
+        });
+    }
+
+    [Test]
+    public async Task Start_WithDownloadsButNoModelsFolder_AsksForOne()
+    {
+        _settings = new FakeSettingsStore(new RunnerSettings { RunnerKey = Key, DownloadModels = true });
+        var supervisor = await StartSupervisorAsync();
+
+        supervisor.RequestStart();
+        await WaitForStateAsync(SupervisorState.Faulted);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(supervisor.View.Message, Does.Contain("Choose a models folder"));
+            Assert.That(_engine.Runs, Is.Empty);
+        });
+    }
+
+    [Test]
     public async Task TurningModelDownloadsOn_RecreatesTheRunner()
     {
-        _settings = new FakeSettingsStore(new RunnerSettings { RunnerKey = Key });
+        _settings = new FakeSettingsStore(new RunnerSettings { RunnerKey = Key, LocalModelsDirectory = Path.GetTempPath() });
         _engine.StatusJson = Status(activeSessionId: "");
         var supervisor = await StartSupervisorAsync();
         supervisor.RequestStart();

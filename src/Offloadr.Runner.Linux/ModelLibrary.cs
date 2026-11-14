@@ -1,0 +1,250 @@
+using System.Security.Cryptography;
+using System.Text;
+using Offloadr.Runner.V1;
+
+namespace Offloadr.Runner.Linux;
+
+/// <summary>
+/// Saves the models the runner downloads into the owner's local models folder, beside their own, instead of
+/// inside the container: there they are kept, and any other app can use them. The folder is reached twice:
+/// <see cref="Directory"/> is a writable mount only the agent and aria2 can reach, and the read-only mount
+/// sessions see it through. A download is written to <see cref="StagingFolderName"/> in the folder, so other
+/// apps never see half a model, and renamed into place once complete. The editor's path for the model becomes
+/// a link to it in the read-only mount.
+/// </summary>
+internal sealed class ModelLibrary : IModelDownloadStaging
+{
+    /// <summary>Where downloads in progress are kept, inside the models folder.</summary>
+    public const string StagingFolderName = ".offloadr-downloads";
+
+    private readonly string _readOnlyDirectory;
+    private readonly string _editorModelsDirectory;
+    private readonly string _stagingDirectory;
+
+    /// <param name="directory">The models folder, writable.</param>
+    /// <param name="readOnlyDirectory">The same folder as sessions see it, read-only.</param>
+    /// <param name="editorModelsDirectory">Where the editor finds its models: requests for paths there are sent to the folder.</param>
+    public ModelLibrary(string directory, string readOnlyDirectory, string editorModelsDirectory)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(directory);
+        ArgumentException.ThrowIfNullOrWhiteSpace(readOnlyDirectory);
+        ArgumentException.ThrowIfNullOrWhiteSpace(editorModelsDirectory);
+        Directory = Normalize(directory);
+        _readOnlyDirectory = Normalize(readOnlyDirectory);
+        _editorModelsDirectory = Normalize(editorModelsDirectory);
+        _stagingDirectory = Path.Combine(Directory, StagingFolderName);
+    }
+
+    public string Directory { get; }
+
+    /// <summary>
+    /// Sends each remote request for the editor's models directory to the same relative path in the models
+    /// folder, and links the editor's path there. A request is left as it was, and downloaded inside the
+    /// container as before, when something already holds either place: a file of the owner's of another
+    /// size, or a link or file at the editor's path. A file of the requested size there counts as the model.
+    /// </summary>
+    public ModelDownloadRequest[] Redirect(IEnumerable<ModelDownloadRequest> downloads)
+        => downloads.Select(Redirect).ToArray();
+
+    private ModelDownloadRequest Redirect(ModelDownloadRequest download)
+    {
+        if (LocalModelProjector.IsLocalProjectionRequest(download) ||
+            string.IsNullOrWhiteSpace(download.DestinationPath) ||
+            download.SizeBytes <= 0)
+        {
+            return download;
+        }
+
+        var editorPath = Normalize(download.DestinationPath);
+        if (!IsStrictlyBeneath(editorPath, _editorModelsDirectory))
+        {
+            return download;
+        }
+
+        var relative = Path.GetRelativePath(_editorModelsDirectory, editorPath);
+        var libraryPath = Path.Combine(Directory, relative);
+        if (IsStrictlyBeneath(libraryPath, _stagingDirectory) || !IsFreeOrSameSize(libraryPath, download.SizeBytes))
+        {
+            return download;
+        }
+
+        if (!TryLinkEditorPath(relative, Path.Combine(_readOnlyDirectory, relative)))
+        {
+            return download;
+        }
+
+        var redirected = download.Clone();
+        redirected.DestinationPath = libraryPath;
+        return redirected;
+    }
+
+    private static bool IsFreeOrSameSize(string path, long size)
+    {
+        var existing = new FileInfo(path);
+        if (existing.LinkTarget is not null)
+        {
+            return false;
+        }
+
+        return !existing.Exists || existing.Length == size;
+    }
+
+    private bool TryLinkEditorPath(string relative, string target)
+    {
+        try
+        {
+            System.IO.Directory.CreateDirectory(_editorModelsDirectory);
+            using var root = new LinuxSecureDirectoryRoot(_editorModelsDirectory);
+            var relativePath = relative.Replace(Path.DirectorySeparatorChar, '/');
+            switch (root.ReadSymbolicLink(relativePath, out var existing))
+            {
+                case SecureLinkKind.SymbolicLink:
+                    // Ours already, or another (a local model's): either way, nothing to change.
+                    return string.Equals(existing, target, StringComparison.Ordinal);
+                case SecureLinkKind.Other:
+                    // A model downloaded inside the container earlier, or a path that is not plain directories.
+                    return false;
+            }
+
+            root.CreateSymbolicLink(relativePath, target);
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            RunnerLog.Warning(nameof(ModelLibrary), $"Could not link '{relative}' to the models folder ({ex.GetType().Name}); it is downloaded inside the container.");
+            return false;
+        }
+    }
+
+    public string? GetStagingPath(string destinationPath)
+    {
+        var destination = Normalize(destinationPath);
+        if (!IsStrictlyBeneath(destination, Directory) || IsStrictlyBeneath(destination, _stagingDirectory))
+        {
+            return null;
+        }
+
+        // Keep the file name: a Metalink names the file it describes.
+        return Path.Combine(_stagingDirectory, StagingKey(destination), Path.GetFileName(destination));
+    }
+
+    public void Publish(string stagingPath, string destinationPath)
+    {
+        var destination = Normalize(destinationPath);
+        var expected = GetStagingPath(destination);
+        if (expected is null || !string.Equals(expected, Normalize(stagingPath), StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException($"'{stagingPath}' is not the staging file for '{destination}'.");
+        }
+
+        bool moved;
+        using (var root = new LinuxSecureDirectoryRoot(Directory))
+        {
+            moved = root.MoveRegularFileWithoutReplacing(
+                Path.GetRelativePath(Directory, expected).Replace(Path.DirectorySeparatorChar, '/'),
+                Path.GetRelativePath(Directory, destination).Replace(Path.DirectorySeparatorChar, '/'));
+        }
+
+        if (!moved)
+        {
+            // Something was put there meanwhile: it is the owner's, and it stays.
+            Discard(destination);
+            throw new IOException($"A file appeared at '{Path.GetRelativePath(Directory, destination)}' in the models folder while it was downloaded; it is kept.");
+        }
+
+        DeleteStagingDirectory(Path.GetDirectoryName(expected)!);
+    }
+
+    public void Discard(string destinationPath)
+    {
+        var stagingPath = GetStagingPath(destinationPath);
+        if (stagingPath is not null)
+        {
+            DeleteStagingDirectory(Path.GetDirectoryName(stagingPath)!);
+        }
+    }
+
+    /// <summary>Returns true for files aria2 writes beneath the folder's download area.</summary>
+    public bool IsStagingPath(string? path)
+        => !string.IsNullOrWhiteSpace(path) && IsStrictlyBeneath(Normalize(path), _stagingDirectory);
+
+    /// <summary>Removes what an earlier run left half downloaded.</summary>
+    public void DiscardAll()
+    {
+        if (!System.IO.Directory.Exists(_stagingDirectory) || new DirectoryInfo(_stagingDirectory).LinkTarget is not null)
+        {
+            return;
+        }
+
+        foreach (var entry in System.IO.Directory.EnumerateFileSystemEntries(_stagingDirectory))
+        {
+            if (System.IO.Directory.Exists(entry) && new DirectoryInfo(entry).LinkTarget is null)
+            {
+                DeleteStagingDirectory(entry);
+            }
+            else
+            {
+                try
+                {
+                    File.Delete(entry);
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    RunnerLog.Warning(nameof(ModelLibrary), $"Could not remove '{entry}': {ex.Message}");
+                }
+            }
+        }
+    }
+
+    private static void DeleteStagingDirectory(string directory)
+    {
+        try
+        {
+            // Recursive deletion removes symbolic links without following them.
+            System.IO.Directory.Delete(directory, recursive: true);
+        }
+        catch (DirectoryNotFoundException)
+        {
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            RunnerLog.Warning(nameof(ModelLibrary), $"Could not remove downloaded part '{directory}': {ex.Message}");
+        }
+    }
+
+    private static string StagingKey(string destination)
+        => Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(destination)))[..32];
+
+    private static bool IsStrictlyBeneath(string path, string root)
+    {
+        var prefix = root.EndsWith(Path.DirectorySeparatorChar) ? root : root + Path.DirectorySeparatorChar;
+        return path.Length > prefix.Length && path.StartsWith(prefix, StringComparison.Ordinal);
+    }
+
+    private static string Normalize(string path)
+        => Path.TrimEndingDirectorySeparator(Path.GetFullPath(path.Trim()));
+}
+
+/// <summary>Stages a download in a session home or in the models folder, whichever its destination is in.</summary>
+internal sealed class CombinedStaging(IModelDownloadStaging? sessionStaging, ModelLibrary library) : IModelDownloadStaging
+{
+    public string? GetStagingPath(string destinationPath)
+        => library.GetStagingPath(destinationPath) ?? sessionStaging?.GetStagingPath(destinationPath);
+
+    public void Publish(string stagingPath, string destinationPath)
+    {
+        if (library.GetStagingPath(destinationPath) is not null)
+        {
+            library.Publish(stagingPath, destinationPath);
+            return;
+        }
+
+        (sessionStaging ?? throw new InvalidOperationException($"'{destinationPath}' is not staged.")).Publish(stagingPath, destinationPath);
+    }
+
+    public void Discard(string destinationPath)
+    {
+        library.Discard(destinationPath);
+        sessionStaging?.Discard(destinationPath);
+    }
+}

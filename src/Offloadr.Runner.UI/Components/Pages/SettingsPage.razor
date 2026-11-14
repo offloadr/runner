@@ -32,7 +32,7 @@
 
         <MudStack Row="true" AlignItems="AlignItems.Start" Spacing="2">
             <MudTextField T="string" @bind-Value="_modelsDirectory" Label="Models folder (optional)" Variant="Variant.Outlined" Clearable="true"
-                          HelperText="Your model files, shared read-only with the runner. Offloadr uses the ones that match what a workflow needs." />
+                          HelperText="Your model files. Offloadr uses the ones that match what a workflow needs, and saves the models it downloads here." />
             @if (Host.CanPickFolder)
             {
                 <MudButton Variant="Variant.Outlined" Class="mt-2" OnClick="PickModelsFolderAsync">Browse</MudButton>
@@ -40,9 +40,17 @@
         </MudStack>
 
         <MudStack Spacing="0">
-            <MudSwitch T="bool" @bind-Value="_downloadModels" Color="Color.Primary" Label="Download models this computer does not have" />
+            <MudSwitch T="bool" @bind-Value="_downloadModels" Color="Color.Primary" Label="Download models this computer does not have"
+                       Disabled="@(string.IsNullOrWhiteSpace(_modelsDirectory) && !_downloadModels)" />
             <MudText Typo="Typo.caption" Class="mud-text-secondary ml-14">
-                Models are often several gigabytes each. When this is off, workflows can use only the models in your models folder.
+                @if (string.IsNullOrWhiteSpace(_modelsDirectory))
+                {
+                    <text>Choose a models folder first: downloaded models are saved there, where you can see them, delete them and use them in other apps.</text>
+                }
+                else
+                {
+                    <text>Downloaded models are saved in your models folder. They are often several gigabytes each. When this is off, workflows can use only the models already there.</text>
+                }
             </MudText>
         </MudStack>
 

@@ -119,6 +119,22 @@ public class Aria2SettingsTests
     }
 
     [Test]
+    public void FromEnvironment_WithAModelsFolderForDownloads_DoesNotPreallocateUnlessToldTo()
+    {
+        static string? Library(string name) => name == "RUNNER_MODEL_LIBRARY_DIR" ? "/var/lib/offloadr-library/models" : null;
+        var library = Aria2Settings.FromEnvironment(Library, () => "generated-secret");
+        var explicitlySet = Aria2Settings.FromEnvironment(
+            name => name == "ARIA2_FILE_ALLOCATION" ? "trunc" : Library(name),
+            () => "generated-secret");
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(library.FileAllocation, Is.EqualTo("none"), "A folder shared from Windows cannot preallocate.");
+            Assert.That(explicitlySet.FileAllocation, Is.EqualTo("trunc"));
+        });
+    }
+
+    [Test]
     public void FromEnvironment_FallsBackForEmptyMinSplitSize_AndInvalidFileAllocation()
     {
         var env = new Dictionary<string, string?>

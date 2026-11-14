@@ -82,6 +82,8 @@ public sealed class RunnerStartupValidator
             ValidateDirectoryExists(options.LocalModelsDirectory, "RUNNER_LOCAL_MODELS_DIR", errors);
         }
 
+        ValidateModelLibrary(options, errors);
+
         var socketDirectory = Path.GetDirectoryName(options.ModelFetchSocket);
         if (!string.IsNullOrWhiteSpace(socketDirectory))
         {
@@ -108,6 +110,33 @@ public sealed class RunnerStartupValidator
         if (errors.Count > 0)
         {
             throw new InvalidOperationException($"Runner startup validation failed:{Environment.NewLine} - {string.Join($"{Environment.NewLine} - ", errors)}");
+        }
+    }
+
+    /// <summary>
+    /// The writable models folder must be the local models folder itself: sessions reach downloads saved
+    /// there only through the read-only one.
+    /// </summary>
+    private static void ValidateModelLibrary(RunnerAgentOptions options, ICollection<string> errors)
+    {
+        if (string.IsNullOrWhiteSpace(options.ModelLibraryDirectory))
+        {
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(options.LocalModelsDirectory))
+        {
+            errors.Add("RUNNER_MODEL_LIBRARY_DIR needs RUNNER_LOCAL_MODELS_DIR: the same folder, mounted read-only for sessions.");
+            return;
+        }
+
+        ValidateDirectoryExists(options.ModelLibraryDirectory, "RUNNER_MODEL_LIBRARY_DIR", errors);
+        if (OperatingSystem.IsLinux() &&
+            LinuxFileIdentityReader.TryRead(options.ModelLibraryDirectory, out var library) &&
+            LinuxFileIdentityReader.TryRead(options.LocalModelsDirectory, out var local) &&
+            (library.DeviceId != local.DeviceId || library.Inode != local.Inode))
+        {
+            errors.Add($"RUNNER_MODEL_LIBRARY_DIR '{options.ModelLibraryDirectory}' must be the folder mounted at RUNNER_LOCAL_MODELS_DIR '{options.LocalModelsDirectory}'.");
         }
     }
 

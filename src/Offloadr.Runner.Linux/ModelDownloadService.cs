@@ -18,11 +18,16 @@ internal sealed class ModelDownloadService : IAsyncDisposable
     private readonly ModelDestinationPolicy? _destinationPolicy;
     private readonly IModelTransferBackend _transferBackend;
     private readonly SessionModelDownloadStaging? _staging;
+    private readonly ModelLibrary? _library;
     private readonly bool _downloadsEnabled;
 
     /// <param name="downloadsEnabled">
     /// False when <c>RUNNER_MODEL_DOWNLOADS</c> is off: no remote model is registered, so nothing can start
     /// a transfer; each one is reported as failed, and a prompt that needs one is refused.
+    /// </param>
+    /// <param name="library">
+    /// The owner's models folder, when downloads are saved there: each one is downloaded whole into the
+    /// folder and linked to from the editor's models directory (<see cref="ModelLibrary"/>).
     /// </param>
     public ModelDownloadService(
         IModelTransferBackend transferBackend,
@@ -30,16 +35,18 @@ internal sealed class ModelDownloadService : IAsyncDisposable
         ModelHydrationRuntimeCapabilities? capabilities = null,
         ModelDestinationPolicy? destinationPolicy = null,
         SessionModelDownloadStaging? staging = null,
-        bool downloadsEnabled = true)
+        bool downloadsEnabled = true,
+        ModelLibrary? library = null)
     {
         _downloadsEnabled = downloadsEnabled;
         _destinationPolicy = destinationPolicy;
         _transferBackend = transferBackend ?? throw new ArgumentNullException(nameof(transferBackend));
         _staging = staging;
+        _library = library;
         _fullDownloadCoordinator = new DownloadCoordinator(
             transferBackend,
             settings ?? throw new ArgumentNullException(nameof(settings)),
-            staging: staging);
+            staging: library is null ? staging : new CombinedStaging(staging, library));
         if (capabilities?.SupportsPersistentRangeHydration == true)
         {
             _hydrationCoordinator = new DemandAwareModelHydrationCoordinator(
@@ -95,13 +102,14 @@ internal sealed class ModelDownloadService : IAsyncDisposable
     /// </summary>
     private async Task DiscardStagedDownloadsAsync(CancellationToken cancellationToken)
     {
-        if (_staging is null)
+        if (_staging is null && _library is null)
         {
             return;
         }
 
         var snapshots = await _transferBackend.ListAsync(cancellationToken).ConfigureAwait(false);
-        foreach (var snapshot in snapshots.Where(snapshot => snapshot.Files.Any(file => _staging.IsStagingPath(file.Path))))
+        foreach (var snapshot in snapshots.Where(snapshot => snapshot.Files.Any(file =>
+                     _staging?.IsStagingPath(file.Path) == true || _library?.IsStagingPath(file.Path) == true)))
         {
             try
             {
@@ -113,8 +121,13 @@ internal sealed class ModelDownloadService : IAsyncDisposable
             }
         }
 
-        _staging.DiscardAll();
+        _staging?.DiscardAll();
+        _library?.DiscardAll();
     }
+
+    /// <summary>Sends downloads to the owner's models folder when they are saved there.</summary>
+    private ModelDownloadRequest[] Redirect(ModelDownloadRequest[] downloads)
+        => _library is null || !_downloadsEnabled ? downloads : _library.Redirect(downloads);
 
     public void SetActiveSession(string? sessionId)
     {
@@ -136,7 +149,7 @@ internal sealed class ModelDownloadService : IAsyncDisposable
 
     public void RegisterDownloads(string sessionId, IEnumerable<ModelDownloadRequest> downloads)
     {
-        var snapshot = FilterRemoteDownloadRequests(downloads);
+        var snapshot = Redirect(FilterRemoteDownloadRequests(downloads));
         if (!_downloadsEnabled)
         {
             ReportRefused(sessionId, snapshot);
@@ -155,7 +168,7 @@ internal sealed class ModelDownloadService : IAsyncDisposable
 
     public void SeedDownloads(string sessionId, IEnumerable<ModelDownloadRequest> downloads)
     {
-        var snapshot = FilterRemoteDownloadRequests(downloads);
+        var snapshot = Redirect(FilterRemoteDownloadRequests(downloads));
         if (!_downloadsEnabled)
         {
             ReportRefused(sessionId, snapshot);
@@ -174,6 +187,12 @@ internal sealed class ModelDownloadService : IAsyncDisposable
 
     private string? CreateConventionalPlaceholder(string path)
     {
+        if (_library?.GetStagingPath(path) is not null)
+        {
+            // Never an empty file among the owner's models: the editor sees the link until the model is there.
+            return null;
+        }
+
         if (_destinationPolicy is null || !OperatingSystem.IsLinux())
         {
             return ModelPlaceholderFiles.TryCreate(path, expectedLength: 0);
@@ -326,6 +345,7 @@ internal sealed class ModelDownloadService : IAsyncDisposable
             // Transfers for the path were removed before this runs, so nothing writes the
             // staged file any more.
             _staging?.Discard(path);
+            _library?.Discard(path);
             if (!_ownedConventionalPlaceholders.TryGetValue(path, out var ownedIdentity))
             {
                 continue;
@@ -735,7 +755,7 @@ internal sealed class ModelDownloadService : IAsyncDisposable
         CancellationToken demandCancellation,
         bool highPriority)
     {
-        var snapshot = FilterRemoteDownloadRequests(downloads);
+        var snapshot = Redirect(FilterRemoteDownloadRequests(downloads));
         if (!_downloadsEnabled && snapshot.Length > 0)
         {
             // Registration already reported each one; nothing was registered, so the editor would only fail later.
