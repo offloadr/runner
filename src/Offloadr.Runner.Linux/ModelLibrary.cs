@@ -295,16 +295,16 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
 
     /// <summary>
     /// Whether every folder that exists between the models folder and <paramref name="path"/> is a real one,
-    /// on the folder's own filesystem: a download is published only through real directories, an owner's
-    /// link (a <c>checkpoints</c> folder on another drive, say) is never written through, and a download
-    /// staged in the folder can be moved into place only on the filesystem it was staged on (a folder
-    /// mounted there from elsewhere cannot take it).
+    /// on the folder's own mount: a download is published only through real directories, an owner's link (a
+    /// <c>checkpoints</c> folder on another drive, say) is never written through, and a download staged in
+    /// the folder can be moved into place only on the mount it was staged on (a folder mounted there from
+    /// another filesystem, or bound there from elsewhere on the same one, cannot take it).
     /// </summary>
     private bool HasRealDirectoriesUpTo(string path)
     {
-        if (!LinuxFileIdentityReader.TryRead(Directory, out var folder) ||
-            !IsOnFilesystem(_downloadFolder, folder.DeviceId) ||
-            !IsOnFilesystem(_stagingDirectory, folder.DeviceId))
+        if (!LinuxFileIdentityReader.TryReadMount(Directory, out var folder) ||
+            !IsOnMount(_downloadFolder, folder) ||
+            !IsOnMount(_stagingDirectory, folder))
         {
             return false;
         }
@@ -316,7 +316,7 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
         {
             current = Path.Combine(current, part);
             var entry = new DirectoryInfo(current);
-            if (entry.LinkTarget is not null || File.Exists(current) || !IsOnFilesystem(current, folder.DeviceId))
+            if (entry.LinkTarget is not null || File.Exists(current) || !IsOnMount(current, folder))
             {
                 return false;
             }
@@ -331,9 +331,14 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
         return true;
     }
 
-    /// <summary>Whether <paramref name="path"/> is missing, or on the filesystem <paramref name="device"/> names.</summary>
-    private static bool IsOnFilesystem(string path, ulong device)
-        => !LinuxFileIdentityReader.TryRead(path, out var entry) ? !Path.Exists(path) : entry.DeviceId == device;
+    /// <summary>
+    /// Whether <paramref name="path"/> is missing, or on <paramref name="mount"/>: the same device, and the same
+    /// mount where the kernel tells mounts apart.
+    /// </summary>
+    private static bool IsOnMount(string path, (ulong DeviceId, ulong? MountId) mount)
+        => !LinuxFileIdentityReader.TryReadMount(path, out var entry)
+            ? !Path.Exists(path)
+            : entry.DeviceId == mount.DeviceId && (entry.MountId is null || mount.MountId is null || entry.MountId == mount.MountId);
 
     private static bool IsFreeOrSameSize(string path, long size)
     {

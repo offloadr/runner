@@ -757,12 +757,17 @@ public class ModelLibraryTests
         });
     }
 
-    [Test]
-    public async Task ADownloadForAFolderMountedFromAnotherFilesystem_IsDownloadedInsideTheContainer()
+    // Staged in the models folder, the download could not be moved onto another mount: another filesystem,
+    // or a folder of the same one bound there from elsewhere.
+    [TestCase(false)]
+    [TestCase(true)]
+    public async Task ADownloadForAFolderMountedThere_IsDownloadedInsideTheContainer(bool boundFromTheSameFilesystem)
     {
-        // Staged in the models folder, the download could not be moved onto another filesystem.
         var checkpoints = Directory.CreateDirectory(Path.Combine(_library, "checkpoints")).FullName;
-        if (!TryRun("mount", "-t", "tmpfs", "tmpfs", checkpoints))
+        var mounted = boundFromTheSameFilesystem
+            ? TryRun("mount", "--bind", Directory.CreateDirectory(Path.Combine(_root, "elsewhere")).FullName, checkpoints)
+            : TryRun("mount", "-t", "tmpfs", "tmpfs", checkpoints);
+        if (!mounted)
         {
             Assert.Ignore("Mounting a filesystem needs CAP_SYS_ADMIN, which this container does not have.");
         }
