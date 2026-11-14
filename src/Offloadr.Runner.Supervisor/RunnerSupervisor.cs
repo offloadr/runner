@@ -804,6 +804,10 @@ public sealed class RunnerSupervisor : BackgroundService
 
         var cancellationToken = operation.Token;
         RunnerSettings? usedSettings = null;
+        // The image the runner ran before, on the engine it ran on: once this start runs another, that one
+        // is removed if nothing names or uses it any more.
+        var previousImageId = _runningImageId;
+        var previousEngine = _engineSelection.Current;
         try
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -1175,6 +1179,11 @@ public sealed class RunnerSupervisor : BackgroundService
                 RunnerStatus = null,
             });
 
+            if (previousImageId is not null && !string.Equals(previousImageId, _runningImageId, StringComparison.Ordinal))
+            {
+                await RemoveSupersededImageAsync(previousImageId, previousEngine, cancellationToken).ConfigureAwait(false);
+            }
+
             if (View.GpuAccess is null)
             {
                 // The first runner of this app run fills in the GPU check the person would otherwise
@@ -1211,6 +1220,43 @@ public sealed class RunnerSupervisor : BackgroundService
                 _operation = null;
             }
         }
+    }
+
+    /// <summary>
+    /// Removes the image a runner ran before this one, now that the new runner runs: only when no name
+    /// points at it any more (its tag moved to the newer image), never by force, so the engine keeps it
+    /// while a container uses it, and an image another template still names stays for a switch back.
+    /// Each runner image takes many gigabytes; nothing else is pruned.
+    /// </summary>
+    private async Task RemoveSupersededImageAsync(string imageId, ContainerEngineSelection.Selected engine, CancellationToken cancellationToken)
+    {
+        try
+        {
+            using (_engineSelection.Use(engine))
+            {
+                var image = await _engine.InspectImageAsync(imageId, cancellationToken).ConfigureAwait(false);
+                if (image?.RepoTags is not { Count: 0 })
+                {
+                    return;
+                }
+
+                if (await _engine.RemoveImageAsync(imageId, cancellationToken).ConfigureAwait(false))
+                {
+                    AppendLog($"supervisor: removed the runner image this one replaced ({ShortImageId(imageId)}).");
+                }
+            }
+        }
+        catch (Exception ex) when (ex is ContainerEngineException or ProcessStartException)
+        {
+            // Left for the person to remove; the new runner runs either way.
+            AppendLog($"supervisor: could not remove the runner image this one replaced: {ex.Message}");
+        }
+    }
+
+    private static string ShortImageId(string imageId)
+    {
+        var hex = imageId.StartsWith("sha256:", StringComparison.Ordinal) ? imageId["sha256:".Length..] : imageId;
+        return hex.Length > 12 ? hex[..12] : hex;
     }
 
     private async Task MonitorAsync(long stopGeneration, CancellationToken cancellationToken)

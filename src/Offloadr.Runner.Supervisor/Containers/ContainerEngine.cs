@@ -114,7 +114,8 @@ public sealed record ContainerInfo(
     IReadOnlyDictionary<string, string> Labels,
     string? ImageId = null);
 
-public sealed record ImageInfo(string Id, string? RepoDigest);
+/// <param name="RepoTags">The names that point at the image; none once its tag moved to a newer one.</param>
+public sealed record ImageInfo(string Id, string? RepoDigest, IReadOnlyList<string>? RepoTags = null);
 
 public sealed record GpuAccessCheck(bool Succeeded, string Output);
 
@@ -146,6 +147,12 @@ public interface IContainerEngine
     Task PullAsync(string image, Action<string> onProgress, CancellationToken cancellationToken);
 
     Task<ImageInfo?> InspectImageAsync(string image, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Removes the image with this ID, never by force: the engine keeps one a container still uses, and
+    /// one another name points at. False when it was kept, or is gone.
+    /// </summary>
+    Task<bool> RemoveImageAsync(string imageId, CancellationToken cancellationToken);
 
     /// <summary>Starts the container detached and returns its id.</summary>
     Task<string> RunDetachedAsync(ContainerSpec spec, CancellationToken cancellationToken);

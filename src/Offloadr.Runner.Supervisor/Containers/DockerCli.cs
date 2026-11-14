@@ -289,7 +289,14 @@ internal static class DockerCliJson
             digest = digests.EnumerateArray().Select(element => element.GetString()).FirstOrDefault(value => !string.IsNullOrEmpty(value));
         }
 
-        return new ImageInfo(String(image, "Id") ?? string.Empty, digest);
+        var tags = image.TryGetProperty("RepoTags", out var repoTags) && repoTags.ValueKind == JsonValueKind.Array
+            ? repoTags.EnumerateArray()
+                .Where(static element => element.ValueKind == JsonValueKind.String)
+                .Select(static element => element.GetString()!)
+                .Where(static tag => !string.IsNullOrEmpty(tag) && !tag.EndsWith("<none>", StringComparison.Ordinal))
+                .ToArray()
+            : [];
+        return new ImageInfo(String(image, "Id") ?? string.Empty, digest, tags);
     }
 
     private static JsonDocument? Parse(string json)

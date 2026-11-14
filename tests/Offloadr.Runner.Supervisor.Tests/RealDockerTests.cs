@@ -98,6 +98,8 @@ public class RealDockerTests
 
         public Task<ImageInfo?> InspectImageAsync(string image, CancellationToken cancellationToken) => inner.InspectImageAsync(image, cancellationToken);
 
+        public Task<bool> RemoveImageAsync(string imageId, CancellationToken cancellationToken) => inner.RemoveImageAsync(imageId, cancellationToken);
+
         public Task<string> RunDetachedAsync(ContainerSpec spec, CancellationToken cancellationToken) => inner.RunDetachedAsync(spec with { Gpus = false }, cancellationToken);
 
         public Task<ContainerInfo?> InspectContainerAsync(string name, CancellationToken cancellationToken) => inner.InspectContainerAsync(name, cancellationToken);

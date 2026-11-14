@@ -144,7 +144,54 @@ internal sealed class FakeContainerEngine : IContainerEngine
 
         lock (_gate)
         {
-            return Task.FromResult(_images.Contains(image) ? new ImageInfo(ImageId(image), image + "@sha256:digest") : null);
+            if (image.StartsWith("sha256:", StringComparison.Ordinal))
+            {
+                // By ID, as for an image no name may point at any more.
+                var tags = _images.Where(reference => ImageId(reference) == image).ToArray();
+                return Task.FromResult(tags.Length > 0 || (_seenImageIds.Contains(image) && !RemovedImages.Contains(image))
+                    ? new ImageInfo(image, null, tags)
+                    : null);
+            }
+
+            if (!_images.Contains(image))
+            {
+                return Task.FromResult<ImageInfo?>(null);
+            }
+
+            var id = ImageId(image);
+            _seenImageIds.Add(id);
+            return Task.FromResult<ImageInfo?>(new ImageInfo(id, image + "@sha256:digest", [image]));
+        }
+    }
+
+    private readonly HashSet<string> _seenImageIds = new(StringComparer.Ordinal);
+
+    /// <summary>The image IDs removed, in order.</summary>
+    public List<string> RemovedImages { get; } = [];
+
+    /// <summary>Thrown by RemoveImageAsync, as when the engine does not answer.</summary>
+    public Exception? RemoveImageFailure { get; set; }
+
+    public Task<bool> RemoveImageAsync(string imageId, CancellationToken cancellationToken)
+    {
+        if (RemoveImageFailure is { } failure)
+        {
+            return Task.FromException<bool>(failure);
+        }
+
+        lock (_gate)
+        {
+            // The engine keeps an image a container uses, or a name points at, unless forced.
+            if (_containers.Values.Any(container => container.ImageId == imageId) ||
+                _images.Any(reference => ImageId(reference) == imageId) ||
+                !_seenImageIds.Contains(imageId) ||
+                RemovedImages.Contains(imageId))
+            {
+                return Task.FromResult(false);
+            }
+
+            RemovedImages.Add(imageId);
+            return Task.FromResult(true);
         }
     }
 
@@ -219,6 +266,7 @@ internal sealed class FakeContainerEngine : IContainerEngine
 
             id = $"runner-container-{Runs.Count:D4}";
             _containers[Key(spec.Name)] = new FakeContainer(spec.Image, true, null, new Dictionary<string, string>(spec.Labels), ImageId(spec.Image), new Dictionary<string, string>(spec.Environment), id);
+            _seenImageIds.Add(ImageId(spec.Image));
         }
 
         if (OnRun is not null)
@@ -234,6 +282,7 @@ internal sealed class FakeContainerEngine : IContainerEngine
         lock (_gate)
         {
             _containers[Key(name)] = new FakeContainer(image, running, running ? null : 0, labels, ImageId(image), environment, $"added-container-{Guid.NewGuid():N}");
+            _seenImageIds.Add(ImageId(image));
         }
     }
 
