@@ -12,7 +12,7 @@ internal static class PlatformWindow
     /// <see cref="MainPage.RequestCloseAsync"/>. An app that could not start gets no tray icon and
     /// keeps its window, which shows why.
     /// </summary>
-    public static void Attach(Window window, MainPage page, RunnerSupervisor supervisor, SingleInstanceLock instanceLock)
+    public static void Attach(Window window, MainPage page, RunnerSupervisor supervisor, SingleInstanceLock instanceLock, IRunnerSettingsStore settings, ILoggerFactory loggers)
     {
         if (_attached || window.Handler?.PlatformView is not Microsoft.UI.Xaml.Window native)
         {
@@ -25,6 +25,9 @@ internal static class PlatformWindow
         var activated = false;
         TrayIcon? tray = null;
         TrayStateIcons? icons = null;
+        WindowLifecycleHook? lifecycle = null;
+        WindowsKeepAwake? keepAwake = null;
+        SessionKeepAwake? sessionKeepAwake = null;
         native.Activated += (_, _) => activated = true;
         PaintTitleBar(native, Application.Current?.RequestedTheme);
         if (Application.Current is { } app)
@@ -103,6 +106,9 @@ internal static class PlatformWindow
         {
             tray?.Dispose();
             icons?.Dispose();
+            lifecycle?.Dispose();
+            sessionKeepAwake?.Dispose();
+            keepAwake?.Dispose();
         };
 
         native.AppWindow.Closing += (_, args) =>
@@ -140,6 +146,16 @@ internal static class PlatformWindow
             icons = stateIcons;
             tray = new TrayIcon(handle, stateIcons[TrayStateIcons.BadgeFor(supervisor.View.State)], Tooltip(supervisor.View), Open, Menu);
             instanceLock.OpenRequested += () => native.DispatcherQueue.TryEnqueue(Open);
+
+            // Sleep and the end of the Windows session, and keeping awake while a session runs.
+            var logger = loggers.CreateLogger(typeof(WindowLifecycleHook));
+            lifecycle = new WindowLifecycleHook(handle, supervisor, page.StopForWindowsSessionEndAsync, logger);
+            keepAwake = new WindowsKeepAwake(logger);
+            var awake = new SessionKeepAwake(keepAwake);
+            sessionKeepAwake = awake;
+            awake.Apply(supervisor.View, settings.Current);
+            supervisor.Changed += () => awake.Apply(supervisor.View, settings.Current);
+            settings.Changed += current => awake.Apply(supervisor.View, current);
 
             // Changed is raised on several threads, so the posted update reads the view itself, on the UI
             // thread: whichever post runs last shows the current state. The check here only skips

@@ -33,6 +33,12 @@ public sealed record RunnerSettings
     /// <summary>Start the runner when the app opens.</summary>
     public bool AutoStart { get; init; }
 
+    /// <summary>
+    /// Keep the computer from sleeping while a session runs on it; sleep would cut the session off. On
+    /// by default. The display can still turn off.
+    /// </summary>
+    public bool KeepAwakeDuringSessions { get; init; } = true;
+
     public bool HasRunnerKey => !string.IsNullOrWhiteSpace(RunnerKey);
 
     /// <summary>True when the Offloadr address is an https origin, the only kind the runner key may be sent to.</summary>

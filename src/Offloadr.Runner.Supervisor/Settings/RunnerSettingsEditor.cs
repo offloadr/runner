@@ -10,7 +10,8 @@ public sealed record SettingsForm(
     string? OffloadrApiOrigin,
     string? ContainerEngineExecutable,
     bool AutoStart,
-    bool DownloadModels = false);
+    bool DownloadModels = false,
+    bool KeepAwakeDuringSessions = true);
 
 /// <param name="Saved">False when the settings could not be written; <paramref name="Error"/> says why.</param>
 /// <param name="Problems">What is still wrong with saved settings; the runner does not start until it is fixed.</param>
@@ -33,7 +34,8 @@ public sealed class RunnerSettingsEditor(IRunnerSettingsStore store)
             settings.OffloadrApiOrigin,
             settings.ContainerEngineExecutable,
             settings.AutoStart,
-            settings.DownloadModels);
+            settings.DownloadModels,
+            settings.KeepAwakeDuringSessions);
     }
 
     /// <summary>Saves the form. Settings with problems are saved too, so nothing typed is lost; the problems are returned.</summary>
@@ -48,6 +50,7 @@ public sealed class RunnerSettingsEditor(IRunnerSettingsStore store)
             ContainerEngineExecutable = form.ContainerEngineExecutable,
             AutoStart = form.AutoStart,
             DownloadModels = form.DownloadModels,
+            KeepAwakeDuringSessions = form.KeepAwakeDuringSessions,
         };
 
         try

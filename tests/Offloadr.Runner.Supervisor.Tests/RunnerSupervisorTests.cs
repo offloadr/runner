@@ -2221,6 +2221,70 @@ public class RunnerSupervisorTests
     }
 
     [Test]
+    public async Task WindowsShuttingDown_StopsTheRunnerWithTheShortGracePeriod_AndRemovesIt()
+    {
+        var supervisor = await StartSupervisorAsync();
+        supervisor.RequestStart();
+        await WaitForStateAsync(SupervisorState.Running);
+
+        supervisor.UseFastStop();
+        await supervisor.StopAsync(CancellationToken.None);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(_engine.StopTimeouts, Is.EqualTo(new[] { TimeSpan.FromSeconds(5) }));
+            Assert.That(_engine.Exists(Name), Is.False, "The container, which holds the runner key, is removed.");
+        });
+    }
+
+    [Test]
+    public async Task AQuit_StopsTheRunnerWithItsUsualGracePeriod()
+    {
+        var supervisor = await StartSupervisorAsync();
+        supervisor.RequestStart();
+        await WaitForStateAsync(SupervisorState.Running);
+
+        await supervisor.StopAsync(CancellationToken.None);
+
+        Assert.That(_engine.StopTimeouts, Is.EqualTo(new[] { TimeSpan.FromSeconds(1) }));
+    }
+
+    [Test]
+    public async Task WakingFromSleep_ChecksTheRunnerAndTheGpuAgainAtOnce()
+    {
+        var supervisor = await StartSupervisorAsync();
+        supervisor.RequestStart();
+        await WaitForStateAsync(SupervisorState.Running);
+        await WaitUntilAsync(() => _engine.GpuChecks == 1);
+
+        supervisor.NotifySuspending();
+        supervisor.NotifyResumed();
+
+        await WaitUntilAsync(() => _engine.GpuChecks == 2);
+        Assert.Multiple(() =>
+        {
+            Assert.That(supervisor.LogLines, Has.Some.Contains("going to sleep"));
+            Assert.That(supervisor.LogLines, Has.Some.Contains("woke from sleep"));
+            Assert.That(supervisor.View.State, Is.EqualTo(SupervisorState.Running));
+        });
+    }
+
+    [Test]
+    public async Task WakingFromSleep_RetriesAWaitingRestartNow()
+    {
+        // Started with the app while Docker was down, and waiting a long backoff to try again.
+        _settings = new FakeSettingsStore(new RunnerSettings { RunnerKey = Key, AutoStart = true });
+        _engine.Info = ContainerEngineInfo.Unavailable("Docker is installed but its engine is not running.", errorKind: FaultKind.EngineNotRunning);
+        var supervisor = await StartSupervisorAsync(restartBackoff: TimeSpan.FromHours(1));
+        await WaitForStateAsync(SupervisorState.WaitingToRestart);
+        _engine.Info = new FakeContainerEngine().Info;
+
+        supervisor.NotifyResumed();
+
+        await WaitForStateAsync(SupervisorState.Running);
+    }
+
+    [Test]
     public async Task ContainerThatTookTheName_IsNotAdoptedEvenWithTheAppsLabel()
     {
         var supervisor = await StartSupervisorAsync();
