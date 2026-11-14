@@ -293,7 +293,7 @@ static async Task<int> RunAgentAsync()
             options.LocalModelsDirectory,
             modelProjectionRoot,
             options.Session.RuntimeKind,
-            modelLibrary is null ? null : modelLibrary.KeepsEditorLink);
+            modelLibrary);
         RunnerLog.Info(
             $"Local model scanning enabled dir='{options.LocalModelsDirectory}' interval={options.LocalModelsScanInterval.TotalSeconds:F0}s");
     }

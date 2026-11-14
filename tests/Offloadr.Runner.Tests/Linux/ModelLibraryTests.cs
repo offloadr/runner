@@ -330,6 +330,66 @@ public class ModelLibraryTests
     }
 
     [Test]
+    public void ARedirectRacingTheProjectorsCleanupOfItsLink_KeepsALink()
+    {
+        var library = CreateLibrary();
+        library.Redirect([Remote("checkpoints/base.safetensors", 8)], Session);
+        // Its session ended, so the projector may clean the link up.
+        library.ReleaseSession(Session);
+        Task<ModelDownloadRequest[]>? redirect = null;
+        var links = new RacingLinks(
+            library,
+            () => redirect = Task.Run(() => library.Redirect([Remote("checkpoints/base.safetensors", 8)], "session-2")));
+        var projector = new LocalModelProjector(_library, _editorModels, downloadLinks: links);
+
+        projector.SetRequestedModels([]);
+
+        Assert.That(redirect, Is.Not.Null, "The redirect ran while the projector was removing the link.");
+        Assert.That(redirect!.Wait(TimeSpan.FromSeconds(10)), Is.True);
+        var saved = Path.Combine(_library, "checkpoints", "base.safetensors");
+        Assert.Multiple(() =>
+        {
+            Assert.That(redirect.Result.Single().DestinationPath, Is.EqualTo(saved));
+            Assert.That(new FileInfo(Path.Combine(_editorModels, "checkpoints", "base.safetensors")).LinkTarget, Is.EqualTo(saved));
+        });
+    }
+
+    /// <summary>
+    /// Starts a redirect at the moment the projector, about to change a link, has found it unclaimed, and gives
+    /// it time to claim that link before the change is made.
+    /// </summary>
+    private sealed class RacingLinks(ModelLibrary library, Func<Task> race) : IDownloadLinks
+    {
+        private bool _changing;
+        private Task? _racer;
+
+        public bool KeepsEditorLink(string editorPath)
+        {
+            var kept = library.KeepsEditorLink(editorPath);
+            if (_changing && !kept && _racer is null)
+            {
+                _racer = race();
+                _racer.Wait(TimeSpan.FromMilliseconds(300));
+            }
+
+            return kept;
+        }
+
+        public void WhileLinksAreHeld(Action change) => library.WhileLinksAreHeld(() =>
+        {
+            _changing = true;
+            try
+            {
+                change();
+            }
+            finally
+            {
+                _changing = false;
+            }
+        });
+    }
+
+    [Test]
     public void TheProjector_LeavesTheLinksDownloadsWentThrough_AndRemovesItsOwnStaleOnes()
     {
         var library = CreateLibrary();
@@ -340,7 +400,7 @@ public class ModelLibraryTests
         var staleProjection = Path.Combine(_editorModels, "loras", "other.safetensors");
         Directory.CreateDirectory(Path.GetDirectoryName(staleProjection)!);
         File.CreateSymbolicLink(staleProjection, other);
-        var projector = new LocalModelProjector(_library, _editorModels, keepsLink: library.KeepsEditorLink);
+        var projector = new LocalModelProjector(_library, _editorModels, downloadLinks: library);
 
         // While the model downloads, and once it is saved and found by the scan.
         projector.SetRequestedModels([]);
@@ -386,7 +446,7 @@ public class ModelLibraryTests
             DestinationPath = editorPath,
             LocalSelectionHash = LocalModelSelectionHash.Compute("base.safetensors", 12, ModelCategory.Checkpoint)
         };
-        var projector = new LocalModelProjector(_library, _editorModels, keepsLink: library.KeepsEditorLink);
+        var projector = new LocalModelProjector(_library, _editorModels, downloadLinks: library);
         projector.UpdateSnapshot(new LocalModelScanner("runner-1", _library).Scan());
         Assert.That(() => projector.SetRequestedModels([local]), Throws.InvalidOperationException, "While its session lasts, the download's link stays.");
 

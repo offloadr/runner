@@ -12,7 +12,7 @@ namespace Offloadr.Runner.Linux;
 /// apps never see half a model, and renamed into place once complete. The editor's path for the model becomes
 /// a link to it in the read-only mount.
 /// </summary>
-internal sealed class ModelLibrary : IModelDownloadStaging
+internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
 {
     /// <summary>Where downloads in progress are kept, inside the models folder.</summary>
     public const string StagingFolderName = ".offloadr-downloads";
@@ -132,6 +132,17 @@ internal sealed class ModelLibrary : IModelDownloadStaging
         {
             return _linkSessions.ContainsKey(relative.Replace(Path.DirectorySeparatorChar, '/')) &&
                    PointsAtLibrary(relative, Path.Combine(_readOnlyDirectory, relative));
+        }
+    }
+
+    /// <summary>
+    /// Runs <paramref name="change"/> under the lock every redirect takes to claim, make or remove a link.
+    /// </summary>
+    public void WhileLinksAreHeld(Action change)
+    {
+        lock (_gate)
+        {
+            change();
         }
     }
 
