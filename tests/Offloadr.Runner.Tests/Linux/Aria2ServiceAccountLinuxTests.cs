@@ -142,6 +142,27 @@ public class LinuxAria2FileAccessLinuxTests
     }
 
     [Test]
+    public void PrepareModelLibrary_RefusesAParentThatHoldsAnythingElse()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = Aria2AccountTestSupport.CreateRoot();
+        try
+        {
+            // Like /tmp/models: closing /tmp would cut sessions off from it.
+            var shared = Directory.CreateDirectory(Path.Combine(root, "shared")).FullName;
+            var library = Directory.CreateDirectory(Path.Combine(shared, "models")).FullName;
+            Directory.CreateDirectory(Path.Combine(shared, "something-else"));
+            var access = new LinuxAria2FileAccess(null, [library], Path.Combine(root, "staging"));
+
+            Assert.That(() => access.PrepareModelLibrary(library), Throws.InvalidOperationException.With.Message.Contains("of its own"));
+        }
+        finally
+        {
+            Aria2AccountTestSupport.TryDelete(root);
+        }
+    }
+
+    [Test]
     public void Constructor_DropsModelRootsInsideTheSessionRoot()
     {
         LinuxTestPrerequisites.RequireLinux();

@@ -162,6 +162,43 @@ public class ModelLibraryTests
     }
 
     [Test]
+    public void Publish_LeavesTheFileAndItsNewFoldersToTheFoldersOwner()
+    {
+        LinuxTestPrerequisites.RequireRoot();
+        // The owner's folder on a Linux host, as aria2 leaves what it downloads.
+        Chown("12345:12345", _library);
+        var library = CreateLibrary();
+        var destination = Path.Combine(_library, "loras", "sdxl", "style.safetensors");
+        var staging = Stage(library, destination, 8);
+        Chown("62000:62000", staging);
+
+        library.Publish(staging, destination);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(OwnerOf(destination), Is.EqualTo("12345:12345"), "The owner can delete and rename it.");
+            Assert.That(OwnerOf(Path.Combine(_library, "loras")), Is.EqualTo("12345:12345"));
+            Assert.That(OwnerOf(Path.Combine(_library, "loras", "sdxl")), Is.EqualTo("12345:12345"));
+        });
+    }
+
+    private static void Chown(string owner, string path)
+    {
+        using var chown = System.Diagnostics.Process.Start("/bin/chown", [owner, path])!;
+        chown.WaitForExit();
+        Assert.That(chown.ExitCode, Is.Zero);
+    }
+
+    private static string OwnerOf(string path)
+    {
+        var start = new System.Diagnostics.ProcessStartInfo("/usr/bin/stat", ["-c", "%u:%g", path]) { RedirectStandardOutput = true };
+        using var stat = System.Diagnostics.Process.Start(start)!;
+        var owner = stat.StandardOutput.ReadToEnd().Trim();
+        stat.WaitForExit();
+        return owner;
+    }
+
+    [Test]
     public void Publish_NeverReplacesAFilePutThereMeanwhile()
     {
         var library = CreateLibrary();

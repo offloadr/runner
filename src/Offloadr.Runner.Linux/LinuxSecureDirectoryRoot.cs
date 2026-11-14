@@ -479,17 +479,24 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
                 throw CreateException($"opening '{relativeSource}'");
             }
 
-            using (var entry = new SafeFileHandle((nint)descriptor, ownsHandle: true))
+            using var entry = new SafeFileHandle((nint)descriptor, ownsHandle: true);
+            if (ReadStatus(entry, relativeSource).Kind != SecureEntryKind.RegularFile)
             {
-                if (ReadStatus(entry, relativeSource).Kind != SecureEntryKind.RegularFile)
-                {
-                    throw NotRegularFile(relativeSource);
-                }
+                throw NotRegularFile(relativeSource);
             }
 
-            var (destinationParent, destinationName) = OpenParent(relativeDestination, createDirectories: true);
+            // The file and any directory made for it go to the owner of the directory it lands in, so whoever
+            // owns the folder can delete, rename and add beside it. The file opened above is what changes owner,
+            // never whatever its name leads to by then.
+            var (destinationParent, destinationName) = OpenParentInheritingOwner(relativeDestination);
             using (destinationParent)
             {
+                if (ReadOwner(destinationParent) is { } owner &&
+                    fchownat(GetDescriptor(entry), string.Empty, owner.UserId, owner.GroupId, AtEmptyPath | AtSymlinkNoFollow) != 0)
+                {
+                    throw CreateException($"handing '{relativeSource}' to the owner of where it goes");
+                }
+
                 if (!RenameWithoutReplacingUnsupportedForTests &&
                     renameat2(GetDescriptor(sourceParent), sourceName, GetDescriptor(destinationParent), destinationName, RenameNoReplace) == 0)
                 {
@@ -556,6 +563,28 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
         finally
         {
             current.Dispose();
+        }
+    }
+
+    private (SafeFileHandle Parent, string LeafName) OpenParentInheritingOwner(string relativePath)
+    {
+        var parts = SplitRelativePath(relativePath);
+        var current = DuplicateDirectory(_rootHandle);
+        try
+        {
+            for (var index = 0; index < parts.Length - 1; index++)
+            {
+                var next = OpenOrCreateDirectoryInheritingOwner(current, parts[index]);
+                current.Dispose();
+                current = next;
+            }
+
+            return (current, parts[^1]);
+        }
+        catch
+        {
+            current.Dispose();
+            throw;
         }
     }
 

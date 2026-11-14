@@ -200,9 +200,14 @@ internal sealed class LinuxAria2FileAccess : IAria2FileAccess
         ArgumentException.ThrowIfNullOrWhiteSpace(libraryDirectory);
         var library = Normalize(libraryDirectory);
         var parent = Path.GetDirectoryName(library);
-        if (string.IsNullOrEmpty(parent) || parent == "/" || !Directory.Exists(library))
+        // Never a shared directory such as /tmp or /var/lib: closing that would cut sessions off from it.
+        if (string.IsNullOrEmpty(parent) ||
+            parent == "/" ||
+            !Directory.Exists(library) ||
+            Directory.EnumerateFileSystemEntries(parent).Any(entry => !string.Equals(Normalize(entry), library, StringComparison.Ordinal)))
         {
-            throw new InvalidOperationException($"The models folder '{library}' must be a mounted directory inside a directory of its own.");
+            throw new InvalidOperationException(
+                $"The models folder '{library}' must be mounted in a directory of its own, such as /var/lib/offloadr-library/models, that holds nothing else.");
         }
 
         using var handle = OpenDirectory(parent);
