@@ -436,6 +436,7 @@ public partial class SessionProcessManagerOwnershipTests
 
         string? sessionModelsLinkTarget = null;
         var sessionModelsDirectoryExists = false;
+        string? modelCacheDirectory = null;
 
         try
         {
@@ -450,6 +451,7 @@ public partial class SessionProcessManagerOwnershipTests
                     {
                         sessionModelsLinkTarget = Directory.ResolveLinkTarget(paths.ModelsDirectory, returnFinalTarget: false)?.FullName;
                         sessionModelsDirectoryExists = Directory.Exists(paths.ModelsDirectory);
+                        modelCacheDirectory = paths.ModelCacheDirectory;
                         return Task.CompletedTask;
                     },
                     CancellationToken.None);
@@ -461,7 +463,8 @@ public partial class SessionProcessManagerOwnershipTests
 
             Assert.That(launchError, Is.Not.Null);
             Assert.That(sessionModelsLinkTarget, Is.Null);
-            Assert.That(sessionModelsDirectoryExists, Is.True);
+            Assert.That(sessionModelsDirectoryExists, Is.True, "The session's own models directory stays writable for Forge.");
+            Assert.That(modelCacheDirectory, Is.EqualTo(options.ModelCacheDirectory), "Its models come from the runner's cache.");
             Assert.That(Directory.ResolveLinkTarget(Path.Combine(tempRoot, "extensions"), returnFinalTarget: false)?.FullName, Is.EqualTo(Path.Combine(homeDirectory, "custom_nodes")));
             Assert.That(Directory.ResolveLinkTarget(Path.Combine(tempRoot, "output"), returnFinalTarget: false)?.FullName, Is.EqualTo(Path.Combine(homeDirectory, "output")));
             Assert.That(Directory.ResolveLinkTarget(Path.Combine(tempRoot, "cache"), returnFinalTarget: false)?.FullName, Is.EqualTo(Path.Combine(homeDirectory, ".cache")));

@@ -42,6 +42,8 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
     private const uint StatxType = 0x0001;
     private const uint StatxNlink = 0x0004;
     private const uint StatxUid = 0x0008;
+    private const uint StatxGid = 0x0010;
+    private const int StatxGidOffset = 24;
     private const uint StatxMtime = 0x0040;
     private const uint StatxSize = 0x0200;
     private const uint StatxIno = 0x0100;
@@ -453,6 +455,98 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
             {
                 throw CreateException($"creating link '{relativePath}'");
             }
+        }
+    }
+
+    /// <summary>
+    /// Creates a symbolic link like <see cref="CreateSymbolicLink"/>, but gives each directory it has to
+    /// create to the owner of the directory it creates it in. Links made in a directory a user owns then
+    /// leave that user able to write beside them.
+    /// </summary>
+    public void CreateSymbolicLinkInheritingOwner(string relativePath, string target)
+    {
+        var parts = SplitRelativePath(relativePath);
+        var current = DuplicateDirectory(_rootHandle);
+        try
+        {
+            for (var index = 0; index < parts.Length - 1; index++)
+            {
+                var next = OpenOrCreateDirectoryInheritingOwner(current, parts[index]);
+                current.Dispose();
+                current = next;
+            }
+
+            if (symlinkat(target, GetDescriptor(current), parts[^1]) != 0)
+            {
+                throw CreateException($"creating link '{relativePath}'");
+            }
+        }
+        finally
+        {
+            current.Dispose();
+        }
+    }
+
+    private static SafeFileHandle OpenOrCreateDirectoryInheritingOwner(SafeFileHandle parent, string name)
+    {
+        var descriptor = openat(GetDescriptor(parent), name, OPath | ODirectory | ONoFollow | OCloseOnExec);
+        if (descriptor >= 0)
+        {
+            return new SafeFileHandle((nint)descriptor, ownsHandle: true);
+        }
+
+        var error = Marshal.GetLastPInvokeError();
+        if (error != ENoEntry)
+        {
+            throw CreateException($"opening directory component '{name}'", error);
+        }
+
+        var created = mkdirat(GetDescriptor(parent), name, Convert.ToUInt32("755", 8)) == 0;
+        if (!created && Marshal.GetLastPInvokeError() is var mkdirError && mkdirError != EExists)
+        {
+            throw CreateException($"creating directory component '{name}'", mkdirError);
+        }
+
+        // The parent is the user's, who may swap the new entry before it is handed over, even for a hard
+        // link to a file they do not own. So the directory is opened first, refusing anything but a real
+        // directory, and the owner of that open directory is changed, never of whatever the name leads to.
+        descriptor = openat(GetDescriptor(parent), name, OPath | ODirectory | ONoFollow | OCloseOnExec);
+        if (descriptor < 0)
+        {
+            throw CreateException($"opening newly-created directory component '{name}'");
+        }
+
+        var directory = new SafeFileHandle((nint)descriptor, ownsHandle: true);
+        try
+        {
+            if (created &&
+                ReadOwner(parent) is { } owner &&
+                fchownat(GetDescriptor(directory), string.Empty, owner.UserId, owner.GroupId, AtEmptyPath | AtSymlinkNoFollow) != 0)
+            {
+                throw CreateException($"handing directory component '{name}' to its parent's owner");
+            }
+
+            return directory;
+        }
+        catch
+        {
+            directory.Dispose();
+            throw;
+        }
+    }
+
+    private static (uint UserId, uint GroupId)? ReadOwner(SafeFileHandle directory)
+    {
+        var buffer = Marshal.AllocHGlobal(StatxBufferSize);
+        try
+        {
+            return statx(GetDescriptor(directory), string.Empty, AtEmptyPath | AtSymlinkNoFollow, StatxUid | StatxGid, buffer) == 0
+                ? (unchecked((uint)Marshal.ReadInt32(buffer, StatxUidOffset)), unchecked((uint)Marshal.ReadInt32(buffer, StatxGidOffset)))
+                : null;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
         }
     }
 
@@ -1211,6 +1305,9 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
 
     [DllImport("libc", SetLastError = true)]
     private static extern int symlinkat(string target, int directoryFileDescriptor, string linkPath);
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int fchownat(int directoryFileDescriptor, string path, uint owner, uint group, int flags);
 }
 
 internal enum SecureLinkKind

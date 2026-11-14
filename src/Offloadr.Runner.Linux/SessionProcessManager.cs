@@ -50,6 +50,7 @@ internal sealed partial class SessionProcessManager : IAsyncDisposable
     private readonly string _seedVirtualEnvPath;
     private readonly string _uvBinaryPath;
     private readonly string _runtimeKind;
+    private readonly string _modelCacheDirectory;
     private readonly string _readyPath;
     private readonly int _comfyPort;
     private readonly TimeSpan _shutdownGracePeriod;
@@ -126,6 +127,7 @@ internal sealed partial class SessionProcessManager : IAsyncDisposable
         _seedVirtualEnvPath = options.SeedVirtualEnvPath;
         _uvBinaryPath = options.UvBinaryPath;
         _runtimeKind = string.IsNullOrWhiteSpace(options.RuntimeKind) ? "comfyui" : options.RuntimeKind.Trim().ToLowerInvariant();
+        _modelCacheDirectory = options.ModelCacheDirectory;
         _readyPath = string.IsNullOrWhiteSpace(options.ReadyPath) ? "/" : options.ReadyPath.Trim();
         _comfyPort = options.ComfyPort;
         _shutdownGracePeriod = options.ShutdownGracePeriod;
@@ -1669,6 +1671,9 @@ internal sealed partial class SessionProcessManager : IAsyncDisposable
             UserDirectory = Path.Combine(dataDirectory, "user"),
             CustomNodesDirectory = Path.Combine(homeDirectory, "custom_nodes"),
             ModelsDirectory = Path.Combine(homeDirectory, "models"),
+            ModelCacheDirectory = string.Equals(_runtimeKind, "forge-neo", StringComparison.OrdinalIgnoreCase)
+                ? _modelCacheDirectory
+                : null,
             VirtualEnvDirectory = Path.Combine(homeDirectory, ".venv"),
             OutputDirectory = Path.Combine(dataDirectory, "output"),
             InputDirectory = Path.Combine(dataDirectory, "input"),
@@ -3696,6 +3701,13 @@ internal sealed partial class SessionProcessManager : IAsyncDisposable
         public string UserDirectory { get; init; }
         public string CustomNodesDirectory { get; init; }
         public string ModelsDirectory { get; init; }
+
+        /// <summary>
+        /// Forge Neo only: the runner's shared model cache. Catalog and local models live there, and
+        /// <see cref="ModelsDirectory"/> holds a link to each one the session uses.
+        /// </summary>
+        public string? ModelCacheDirectory { get; init; }
+
         public string VirtualEnvDirectory { get; init; }
         public string OutputDirectory { get; init; }
         public string InputDirectory { get; init; }

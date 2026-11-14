@@ -33,6 +33,7 @@ Repeat for each editor you release: ComfyUI `latest` and `master`, Forge Neo `ne
 5. Run one prompt that needs a model the runner has not downloaded yet. It finishes, the output appears in the editor, and the log shows the download progressing.
 6. Run a second prompt with the same model. It starts without downloading again.
 7. Stop the session from the web app. The container keeps running, and the status file's `active_session_id` is empty again.
+   On Forge Neo, start a new session on the same runner and run the prompt from step 5 again: it starts without downloading the model again. Then use an upscaler Forge fetches itself (an ESRGAN model in Extras, say): Forge can still write it into the session's models folder.
    Once, not in the sealed repeat below: restart the runner without `-e RUNNER_MODEL_DOWNLOADS=on`, start a session and run a prompt that needs a model the runner does not have. The log says model downloads are off, nothing is downloaded, and the prompt is refused with a message naming the model.
 8. Repeat steps 4 to 7 with sealed storage, on a GPU pod with a few GiB of `/dev/shm` (a rental provider, or `--shm-size=8g` locally) and `-e RUNNER_SEALED_STORAGE=required`:
    1. Before starting the session, `touch /tmp/sealed-marker` in the container.

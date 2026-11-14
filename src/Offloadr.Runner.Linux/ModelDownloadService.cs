@@ -12,6 +12,8 @@ internal sealed class ModelDownloadService : IAsyncDisposable
     private readonly object _conventionalPlaceholderGate = new();
     private readonly Dictionary<string, HashSet<string>> _conventionalPathsBySession = new(StringComparer.Ordinal);
     private readonly Dictionary<string, LinuxFileIdentity> _ownedConventionalPlaceholders = new(StringComparer.Ordinal);
+    // The size each full download was registered with, so an in-use copy can be told apart from another model.
+    private readonly Dictionary<string, long> _conventionalExpectedSizes = new(StringComparer.Ordinal);
     private readonly Dictionary<string, HashSet<Task>> _conventionalOperations = new(StringComparer.Ordinal);
     private readonly ModelDestinationPolicy? _destinationPolicy;
     private readonly IModelTransferBackend _transferBackend;
@@ -207,6 +209,13 @@ internal sealed class ModelDownloadService : IAsyncDisposable
                 .Where(static path => path is not null)
                 .Select(static path => path!)
                 .ToHashSet(StringComparer.Ordinal);
+            foreach (var download in downloads)
+            {
+                if (NormalizeDestination(download.DestinationPath) is { } path && download.SizeBytes > 0)
+                {
+                    _conventionalExpectedSizes[path] = download.SizeBytes;
+                }
+            }
 
             foreach (var path in paths)
             {
@@ -419,11 +428,6 @@ internal sealed class ModelDownloadService : IAsyncDisposable
     {
         ArgumentNullException.ThrowIfNull(canLink);
         var requested = downloads.Where(static download => download is not null).ToArray();
-        if (_hydrationCoordinator is null)
-        {
-            return requested;
-        }
-
         var inUse = new HashSet<string>(StringComparer.Ordinal);
         // A path depends only on a model's category and file name, so the download there may be another
         // model of another size. That one is never given up: it stays in the way, and the projector
@@ -444,9 +448,16 @@ internal sealed class ModelDownloadService : IAsyncDisposable
             {
                 var release = cancellationToken.IsCancellationRequested
                     ? LocalModelRelease.InUse
-                    : await hydrationCoordinator
-                        .ReleaseForLocalModelAsync(entry.Path!, cancellationToken, () => canLink(entry.Download))
-                        .ConfigureAwait(false);
+                    : hydrationCoordinator?.IsRangeManaged(entry.Path!) == true
+                        ? await hydrationCoordinator
+                            .ReleaseForLocalModelAsync(entry.Path!, cancellationToken, () => canLink(entry.Download))
+                            .ConfigureAwait(false)
+                        : await ReleaseFullDownloadForLocalModelAsync(
+                                entry.Download,
+                                entry.Path!,
+                                () => canLink(entry.Download),
+                                cancellationToken)
+                            .ConfigureAwait(false);
                 if (release == LocalModelRelease.Released)
                 {
                     LinkFreed(linkFreed, entry.Download);
@@ -502,11 +513,37 @@ internal sealed class ModelDownloadService : IAsyncDisposable
     private bool HasIntactCopyAt(string path)
         => _hydrationCoordinator?.IsRangeManaged(path) == true
             ? _hydrationCoordinator.HasIntactCopyAt(path)
-            : File.Exists(path);
+            : File.Exists(path) && !File.Exists($"{path}.aria2") && !HasRunningFullDownload(path);
+
+    private bool HasRunningFullDownload(string path)
+    {
+        lock (_conventionalPlaceholderGate)
+        {
+            return _conventionalOperations.TryGetValue(path, out var operations) &&
+                   operations.Any(static operation => !operation.IsCompleted);
+        }
+    }
 
     /// <summary>The size the download at <paramref name="path"/> was asked for with, not how far it has got.</summary>
     private long? ExpectedSizeOfDownloadAt(string path)
-        => _hydrationCoordinator?.ExpectedLengthAt(path);
+    {
+        if (_hydrationCoordinator?.IsRangeManaged(path) == true)
+        {
+            return _hydrationCoordinator.ExpectedLengthAt(path);
+        }
+
+        // A finished file is the model it is: what was registered there since may be another model whose
+        // download never started. Only an unfinished one goes by the size it is being downloaded for.
+        if (HasIntactCopyAt(path) && new FileInfo(path) is { Exists: true, LinkTarget: null } finished)
+        {
+            return finished.Length;
+        }
+
+        lock (_conventionalPlaceholderGate)
+        {
+            return _conventionalExpectedSizes.TryGetValue(path, out var size) ? size : null;
+        }
+    }
 
     private static void LinkFreed(Action<ModelDownloadRequest>? linkFreed, ModelDownloadRequest download)
     {
@@ -519,6 +556,114 @@ internal sealed class ModelDownloadService : IAsyncDisposable
             // Reported again when the whole request is projected.
             RunnerLog.Warning(nameof(ModelDownloadService), $"Could not link a local model at once ({ex.GetType().Name}).");
         }
+    }
+
+    /// <summary>
+    /// Gives up a fully downloaded file to a local model, as the hydration coordinator does for its own:
+    /// only in a model root no session can write (not a session home, whose downloads are staged), and
+    /// only a regular file, which there only the agent's downloads are. One still downloading stays.
+    /// </summary>
+    private async Task<LocalModelRelease> ReleaseFullDownloadForLocalModelAsync(
+        ModelDownloadRequest download,
+        string path,
+        Func<bool> canStillLink,
+        CancellationToken cancellationToken)
+    {
+        if (_destinationPolicy is null || _staging?.GetStagingPath(path) is not null)
+        {
+            return LocalModelRelease.NotManaged;
+        }
+
+        try
+        {
+            // Also refuses a path whose leaf is a link: the local model may be linked there already.
+            _destinationPolicy.Confine(path);
+        }
+        catch (InvalidOperationException)
+        {
+            return LocalModelRelease.NotManaged;
+        }
+
+        // A download still running there is waited for, as a prompt waits for its full downloads, so the
+        // editor never reads a partial file in place of the local model.
+        Task[] pending;
+        lock (_conventionalPlaceholderGate)
+        {
+            pending = _conventionalOperations.TryGetValue(path, out var operations)
+                ? operations.Where(static operation => !operation.IsCompleted).ToArray()
+                : [];
+        }
+
+        if (pending.Length > 0)
+        {
+            try
+            {
+                await Task.WhenAll(pending).WaitAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                return LocalModelRelease.InUse;
+            }
+            catch
+            {
+                // The download failed; what it left is judged below like any other file.
+            }
+        }
+
+        lock (_conventionalPlaceholderGate)
+        {
+            if (_conventionalOperations.TryGetValue(path, out var operations) &&
+                operations.Any(static operation => !operation.IsCompleted))
+            {
+                return LocalModelRelease.InUse;
+            }
+
+            var file = new FileInfo(path);
+            if (!file.Exists || file.LinkTarget is not null || File.Exists($"{path}.aria2"))
+            {
+                // Nothing there, a link, or an unfinished download: left for the projector to judge.
+                return LocalModelRelease.NotManaged;
+            }
+
+            // Deleted only as the requested model, judged by the finished file itself: what was registered
+            // there may be another model not yet downloaded over it. A file of another size, or a request of
+            // no known size, may be another model, and nothing is deleted.
+            if (download.SizeBytes <= 0 || file.Length != download.SizeBytes)
+            {
+                return LocalModelRelease.NotManaged;
+            }
+
+            if (!canStillLink())
+            {
+                // The local model left its folder meanwhile: the download keeps serving.
+                return LocalModelRelease.InUse;
+            }
+
+            try
+            {
+                File.Delete(path);
+                File.Delete($"{path}.aria2");
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // Only an optimisation: the copy keeps serving, and a later request tries again.
+                RunnerLog.Warning(
+                    nameof(ModelDownloadService),
+                    $"Could not remove the downloaded copy at '{path}' ({ex.GetType().Name}); it is kept until a later request frees it.");
+                return File.Exists(path) ? LocalModelRelease.InUse : LocalModelRelease.Released;
+            }
+
+            _ownedConventionalPlaceholders.Remove(path);
+            foreach (var sessionPaths in _conventionalPathsBySession.Values)
+            {
+                sessionPaths.Remove(path);
+            }
+        }
+
+        RunnerLog.Info(
+            nameof(ModelDownloadService),
+            $"Removed the downloaded copy at '{path}': the same model is linked from the local models folder.");
+        return LocalModelRelease.Released;
     }
 
     private void ReportRefused(string sessionId, IReadOnlyCollection<ModelDownloadRequest> downloads)

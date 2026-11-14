@@ -121,9 +121,23 @@ static async Task<int> RunAgentAsync()
     var logicalSessionState = new ServiceClientManager.LogicalSessionState(sessionManager.GetActiveSessionId());
     var hydrationCapabilities = ModelHydrationRuntimeCapabilities.FromEnvironment(
         options.Session.RuntimeKind);
+    // Where models live for every session: ComfyUI's own models folder, or for Forge Neo, which writes
+    // files of its own into its models folder, the runner's cache, linked into each session's folder.
     var modelProjectionRoot = string.Equals(options.Session.RuntimeKind, "forge-neo", StringComparison.OrdinalIgnoreCase)
-        ? options.Session.SessionRoot
+        ? options.Session.ModelCacheDirectory
         : "/comfyui/models";
+    try
+    {
+        // Root's alone; aria2 is granted group write on the directories a download lands in.
+        Directory.CreateDirectory(modelProjectionRoot);
+    }
+    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+    {
+        RunnerLog.Error($"Could not create the model folder '{modelProjectionRoot}': {ex.Message}");
+        return 1;
+    }
+
+    var sessionModelLinks = new SessionModelLinks(options.Session.SessionRoot);
     string[] modelRoots = [options.Aria2.DownloadDirectory, modelProjectionRoot, .. hydrationCapabilities.PersistentModelRoots];
     LinuxAria2FileAccess aria2FileAccess;
     try
@@ -279,21 +293,30 @@ static async Task<int> RunAgentAsync()
             options.SupportedEditorTemplates,
             scanner is null ? null : () => scanner.Scan(),
             projector is null ? null : snapshot => projector.UpdateSnapshot(snapshot),
-            projector is null ? null : async (downloads, replaceExisting, token) =>
+            async (sessionPaths, downloads, replaceExisting, token) =>
             {
-                // A local model wins over the agent's own download of it at the same path.
-                var projected = await downloadService.ReleaseForLocalModelsAsync(
-                    downloads,
-                    projector.CanProject,
-                    token,
-                    linkFreed: freed => projector.AddRequestedModels([freed]));
-                if (replaceExisting)
+                var requested = downloads.ToArray();
+                if (projector is not null)
                 {
-                    projector.SetRequestedModels(projected);
+                    // A local model wins over the agent's own download of it at the same path.
+                    var projected = await downloadService.ReleaseForLocalModelsAsync(
+                        requested,
+                        projector.CanProject,
+                        token,
+                        linkFreed: freed => projector.AddRequestedModels([freed]));
+                    if (replaceExisting)
+                    {
+                        projector.SetRequestedModels(projected);
+                    }
+                    else
+                    {
+                        projector.AddRequestedModels(projected);
+                    }
                 }
-                else
+
+                if (sessionPaths is { } paths)
                 {
-                    projector.AddRequestedModels(projected);
+                    sessionModelLinks.Ensure(paths, requested);
                 }
             },
             options.LocalModelsScanInterval,

@@ -14,6 +14,7 @@ public sealed class SessionProcessOptions
     private const string DefaultSeedVirtualEnvPath = "/opt/venv";
     private const string DefaultUvBinaryPath = "/usr/local/bin/uv";
     private const string DefaultRuntimeKind = "comfyui";
+    private const string DefaultModelCacheDirectory = "/var/lib/offloadr/models";
     private const string DefaultReadyPath = "/system_stats";
     private const int DefaultPort = 8188;
     private const int DefaultShutdownSeconds = 20;
@@ -27,6 +28,14 @@ public sealed class SessionProcessOptions
     public string SeedVirtualEnvPath { get; init; } = DefaultSeedVirtualEnvPath;
     public string UvBinaryPath { get; init; } = DefaultUvBinaryPath;
     public string RuntimeKind { get; init; } = DefaultRuntimeKind;
+
+    /// <summary>
+    /// Where a Forge Neo runner keeps its models across sessions (<c>RUNNER_MODEL_CACHE_DIR</c>): downloads,
+    /// and links to the local models folder. Forge writes files of its own into its models folder, so each
+    /// session gets a writable one that links to these. ComfyUI keeps its models in <c>/comfyui/models</c>.
+    /// </summary>
+    public string ModelCacheDirectory { get; init; } = DefaultModelCacheDirectory;
+
     public string ReadyPath { get; init; } = DefaultReadyPath;
     public required int ComfyPort { get; init; }
     public required TimeSpan ShutdownGracePeriod { get; init; }
@@ -51,6 +60,7 @@ public sealed class SessionProcessOptions
             SeedVirtualEnvPath = GetTrimmedOrDefault(env("RUNNER_SEED_VENV_PATH"), DefaultSeedVirtualEnvPath),
             UvBinaryPath = GetTrimmedOrDefault(env("RUNNER_UV_BINARY"), DefaultUvBinaryPath),
             RuntimeKind = GetTrimmedOrDefault(env("EDITOR_RUNTIME"), DefaultRuntimeKind).ToLowerInvariant(),
+            ModelCacheDirectory = GetTrimmedOrDefault(env("RUNNER_MODEL_CACHE_DIR"), DefaultModelCacheDirectory),
             ReadyPath = GetTrimmedOrDefault(env("EDITOR_READY_PATH"), DefaultReadyPath),
             ComfyPort = ParseInt(env, "COMFY_PORT", DefaultPort, 1, 65535),
             ShutdownGracePeriod = TimeSpan.FromSeconds(shutdownSeconds),
