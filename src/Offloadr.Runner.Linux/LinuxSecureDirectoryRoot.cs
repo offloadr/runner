@@ -501,27 +501,38 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
             throw CreateException($"opening directory component '{name}'", error);
         }
 
-        if (mkdirat(GetDescriptor(parent), name, Convert.ToUInt32("755", 8)) == 0)
-        {
-            // Never follows a link put there since: a swapped entry is refused by the open below.
-            if (ReadOwner(parent) is { } owner &&
-                fchownat(GetDescriptor(parent), name, owner.UserId, owner.GroupId, AtSymlinkNoFollow) != 0)
-            {
-                throw CreateException($"handing directory component '{name}' to its parent's owner");
-            }
-        }
-        else if (Marshal.GetLastPInvokeError() is var mkdirError && mkdirError != EExists)
+        var created = mkdirat(GetDescriptor(parent), name, Convert.ToUInt32("755", 8)) == 0;
+        if (!created && Marshal.GetLastPInvokeError() is var mkdirError && mkdirError != EExists)
         {
             throw CreateException($"creating directory component '{name}'", mkdirError);
         }
 
+        // The parent is the user's, who may swap the new entry before it is handed over, even for a hard
+        // link to a file they do not own. So the directory is opened first, refusing anything but a real
+        // directory, and the owner of that open directory is changed, never of whatever the name leads to.
         descriptor = openat(GetDescriptor(parent), name, OPath | ODirectory | ONoFollow | OCloseOnExec);
         if (descriptor < 0)
         {
             throw CreateException($"opening newly-created directory component '{name}'");
         }
 
-        return new SafeFileHandle((nint)descriptor, ownsHandle: true);
+        var directory = new SafeFileHandle((nint)descriptor, ownsHandle: true);
+        try
+        {
+            if (created &&
+                ReadOwner(parent) is { } owner &&
+                fchownat(GetDescriptor(directory), string.Empty, owner.UserId, owner.GroupId, AtEmptyPath | AtSymlinkNoFollow) != 0)
+            {
+                throw CreateException($"handing directory component '{name}' to its parent's owner");
+            }
+
+            return directory;
+        }
+        catch
+        {
+            directory.Dispose();
+            throw;
+        }
     }
 
     private static (uint UserId, uint GroupId)? ReadOwner(SafeFileHandle directory)
