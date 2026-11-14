@@ -34,6 +34,7 @@ internal sealed class SessionModelLinks(string sessionRoot)
         }
 
         using var secureRoot = new LinuxSecureDirectoryRoot(_sessionRoot);
+        InvalidOperationException? conflict = null;
         foreach (var (download, target) in links)
         {
             var linkPath = ServiceClientManager.BuildModelPath(
@@ -55,13 +56,20 @@ internal sealed class SessionModelLinks(string sessionRoot)
                     secureRoot.DeleteSymbolicLink(relative);
                     break;
                 case SecureLinkKind.Other:
-                    // Something the session made itself; it keeps it, and the editor uses it.
-                    RunnerLog.Warning<SessionModelLinks>(
-                        $"Model '{download.RelativeModelPath}' is not linked into the session: its place in the session's models directory is taken.");
+                    // Something the session made itself. It keeps it, but the request fails rather than the
+                    // editor running on weights other than those asked for; the other models are still linked.
+                    conflict ??= new InvalidOperationException(
+                        $"Model '{download.RelativeModelPath}' cannot be linked into the session: a file of the session's own is in its place in its models folder.");
                     continue;
             }
 
-            secureRoot.CreateSymbolicLink(relative, target);
+            // A category folder made here is the session's, so Forge can still write its own files into it.
+            secureRoot.CreateSymbolicLinkInheritingOwner(relative, target);
+        }
+
+        if (conflict is not null)
+        {
+            throw conflict;
         }
     }
 

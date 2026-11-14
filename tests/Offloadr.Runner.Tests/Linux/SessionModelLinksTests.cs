@@ -73,18 +73,22 @@ public class SessionModelLinksTests
     }
 
     [Test]
-    public void Ensure_LeavesAFileTheSessionPutThere()
+    public void Ensure_RefusesTheModelWhenTheSessionPutAFileOfItsOwnThere_AndLinksTheRest()
     {
         var linkPath = Path.Combine(_paths.ModelsDirectory, "Stable-diffusion", "base.safetensors");
         Directory.CreateDirectory(Path.GetDirectoryName(linkPath)!);
         File.WriteAllText(linkPath, "the session's own");
+        var other = Model("Lora/style.safetensors");
 
-        new SessionModelLinks(_sessionRoot).Ensure(_paths, [Model("Stable-diffusion/base.safetensors")]);
-
+        Assert.That(
+            () => new SessionModelLinks(_sessionRoot).Ensure(_paths, [Model("Stable-diffusion/base.safetensors"), other]),
+            Throws.InvalidOperationException,
+            "The editor must not run on weights other than those asked for.");
         Assert.Multiple(() =>
         {
-            Assert.That(File.ReadAllText(linkPath), Is.EqualTo("the session's own"));
+            Assert.That(File.ReadAllText(linkPath), Is.EqualTo("the session's own"), "The session's file is kept.");
             Assert.That(new FileInfo(linkPath).LinkTarget, Is.Null);
+            Assert.That(LinkTarget("Lora/style.safetensors"), Is.EqualTo(other.DestinationPath), "The other model is linked all the same.");
         });
     }
 
@@ -95,9 +99,43 @@ public class SessionModelLinksTests
         Directory.CreateDirectory(outside);
         Directory.CreateSymbolicLink(Path.Combine(_paths.ModelsDirectory, "Stable-diffusion"), outside);
 
-        new SessionModelLinks(_sessionRoot).Ensure(_paths, [Model("Stable-diffusion/base.safetensors")]);
-
+        Assert.That(
+            () => new SessionModelLinks(_sessionRoot).Ensure(_paths, [Model("Stable-diffusion/base.safetensors")]),
+            Throws.InvalidOperationException);
         Assert.That(Directory.EnumerateFileSystemEntries(outside), Is.Empty, "Nothing is created through the session's link.");
+    }
+
+    [Test]
+    public void Ensure_GivesTheFoldersItMakesToTheSessionUser()
+    {
+        LinuxTestPrerequisites.RequireRoot();
+        // The session owns its models folder, as it does once its home has been handed over.
+        RunChown("12345:12345", _paths.ModelsDirectory);
+
+        new SessionModelLinks(_sessionRoot).Ensure(_paths, [Model("ESRGAN/upscaler.pth")]);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(OwnerOf(Path.Combine(_paths.ModelsDirectory, "ESRGAN")), Is.EqualTo("12345:12345"),
+                "Forge can still write the upscalers it fetches itself beside the link.");
+            Assert.That(LinkTarget("ESRGAN/upscaler.pth"), Is.EqualTo(Path.Combine(_cache, "ESRGAN", "upscaler.pth")));
+        });
+    }
+
+    private static void RunChown(string owner, string path)
+    {
+        using var chown = System.Diagnostics.Process.Start("/bin/chown", [owner, path])!;
+        chown.WaitForExit();
+        Assert.That(chown.ExitCode, Is.Zero);
+    }
+
+    private static string OwnerOf(string path)
+    {
+        var start = new System.Diagnostics.ProcessStartInfo("/usr/bin/stat", ["-c", "%u:%g", path]) { RedirectStandardOutput = true };
+        using var stat = System.Diagnostics.Process.Start(start)!;
+        var owner = stat.StandardOutput.ReadToEnd().Trim();
+        stat.WaitForExit();
+        return owner;
     }
 
     [Test]
