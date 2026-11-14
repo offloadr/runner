@@ -397,6 +397,59 @@ public class ModelLibraryTests
     }
 
     [Test]
+    public async Task Starting_GivesUpTransfersAria2RestoredForAnEndedRun_ButNotForOneStillGoing()
+    {
+        // aria2 restores from its saved state what an earlier run of this runner was downloading.
+        var ended = CreateLibrary();
+        var endedStaging = Stage(ended, Path.Combine(_library, "loras", "ended.safetensors"), 3);
+        ended.Dispose();
+        using var going = CreateLibrary();
+        var goingStaging = Stage(going, Path.Combine(_library, "loras", "going.safetensors"), 3);
+        var backend = new RestoringBackend(endedStaging, goingStaging);
+        var settings = Aria2Settings.FromEnvironment(name => name == "ARIA2_STATE_DIR" ? Path.Combine(_root, "aria2-state") : null, static () => "generated-secret");
+        await using var service = new ModelDownloadService(
+            backend,
+            settings,
+            destinationPolicy: new ModelDestinationPolicy([_editorModels, _library]),
+            library: CreateLibrary());
+
+        await service.InitializeAsync(CancellationToken.None);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(backend.Removed, Is.EqualTo(new[] { new ModelTransferHandle("restored-0") }), "Only the ended run's transfer is given up.");
+            Assert.That(backend.RemovedWhileFileWasThere, Is.True, "Before its folder is cleared.");
+            Assert.That(File.Exists(endedStaging), Is.False);
+            Assert.That(File.Exists(goingStaging), Is.True);
+        });
+    }
+
+    /// <summary>Lists one transfer for each path, as aria2 does after restoring its saved state.</summary>
+    private sealed class RestoringBackend(params string[] paths) : TestModelTransferBackend
+    {
+        public List<ModelTransferHandle> Removed { get; } = [];
+
+        public bool RemovedWhileFileWasThere { get; private set; }
+
+        public override Task<IReadOnlyList<ModelTransferSnapshot>> ListAsync(CancellationToken cancellationToken)
+            => Task.FromResult<IReadOnlyList<ModelTransferSnapshot>>(paths
+                .Select((path, index) => Snapshot(
+                    new ModelTransferHandle($"restored-{index}"),
+                    "active",
+                    1,
+                    3,
+                    files: [new ModelTransferFileSnapshot(path, 1, 3, ["https://models.example.test/model"])]))
+                .ToArray());
+
+        public override Task RemoveAsync(ModelTransferHandle handle, CancellationToken cancellationToken)
+        {
+            Removed.Add(handle);
+            RemovedWhileFileWasThere = File.Exists(paths[int.Parse(handle.ToString()!["restored-".Length..], System.Globalization.CultureInfo.InvariantCulture)]);
+            return Task.CompletedTask;
+        }
+    }
+
+    [Test]
     public async Task ASecondRunStarting_LeavesTheFirstRunsDownloadInProgress()
     {
         using var first = CreateLibrary();

@@ -786,6 +786,48 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks, IDis
     public bool IsStagingPath(string? path)
         => !string.IsNullOrWhiteSpace(path) && IsStrictlyBeneath(Normalize(path), _stagingDirectory);
 
+    /// <summary>
+    /// Whether <paramref name="path"/> is a download in progress of this run or of an ended run of this runner,
+    /// as aria2 restores them from its saved state after a restart: those are given up before
+    /// <see cref="DiscardAll"/> clears their folders. A run still going, whose lease is held, keeps its own.
+    /// </summary>
+    public bool IsStagingPathOfThisOrAnEndedRun(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return false;
+        }
+
+        var normalized = Normalize(path);
+        if (IsStrictlyBeneath(normalized, _stagingDirectory))
+        {
+            return true;
+        }
+
+        if (!IsStrictlyBeneath(normalized, _runnerDirectory))
+        {
+            return false;
+        }
+
+        var run = Path.GetRelativePath(_runnerDirectory, normalized).Split(Path.DirectorySeparatorChar)[0];
+        if (run.EndsWith(LeaseSuffix, StringComparison.Ordinal) || !IsMissingOrRealDirectory(_runnerDirectory))
+        {
+            return false;
+        }
+
+        try
+        {
+            using var root = new LinuxSecureDirectoryRoot(Directory);
+            var result = root.TryLockFile(RelativeToFolder(Path.Combine(_runnerDirectory, run)) + LeaseSuffix, out var lease);
+            lease?.Dispose();
+            return result != SecureLockResult.Held;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
     /// <summary>Removes what an earlier run of this runner left half downloaded; other runners' stay.</summary>
     public void DiscardAll()
     {
