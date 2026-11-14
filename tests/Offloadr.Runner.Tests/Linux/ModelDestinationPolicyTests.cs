@@ -298,6 +298,38 @@ public class ModelDestinationPolicyTests
     }
 
     [Test]
+    public async Task ReleaseForLocalModels_FreesAFinishedDownloadDespiteAnotherSizeRegisteredThereSince()
+    {
+        await using var service = new ModelDownloadService(
+            new NoopTransferBackend(),
+            DefaultAria2Settings,
+            capabilities: null,
+            new ModelDestinationPolicy([_modelsRoot]));
+        var destination = Path.Combine(_modelsRoot, "Lora", "x.safetensors");
+        Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+        File.WriteAllBytes(destination, new byte[8]);
+
+        // Another session registered a 4-byte model there and stopped before downloading it.
+        service.SeedDownloads("session-1", [new ModelDownloadRequest
+        {
+            ModelId = "model-4",
+            Filename = "x.safetensors",
+            DestinationPath = destination,
+            SizeBytes = 4,
+            SourceUrl = "https://models.example.test/x.safetensors",
+        }]);
+        service.CancelSession("session-1");
+        var local = LocalModel(destination, 8);
+        var projected = await service.ReleaseForLocalModelsAsync([local], static _ => true, CancellationToken.None);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(projected, Is.EqualTo(new[] { local }));
+            Assert.That(File.Exists(destination), Is.False, "The finished 8-byte copy is the model asked for, so it is replaced.");
+        });
+    }
+
+    [Test]
     public async Task ReleaseForLocalModels_KeepsAFullDownloadWhenTheLocalModelGoesMeanwhile()
     {
         await using var service = new ModelDownloadService(

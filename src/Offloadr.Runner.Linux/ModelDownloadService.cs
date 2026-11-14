@@ -532,6 +532,13 @@ internal sealed class ModelDownloadService : IAsyncDisposable
             return _hydrationCoordinator.ExpectedLengthAt(path);
         }
 
+        // A finished file is the model it is: what was registered there since may be another model whose
+        // download never started. Only an unfinished one goes by the size it is being downloaded for.
+        if (HasIntactCopyAt(path) && new FileInfo(path) is { Exists: true, LinkTarget: null } finished)
+        {
+            return finished.Length;
+        }
+
         lock (_conventionalPlaceholderGate)
         {
             return _conventionalExpectedSizes.TryGetValue(path, out var size) ? size : null;
