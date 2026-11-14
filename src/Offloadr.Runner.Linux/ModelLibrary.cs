@@ -212,8 +212,17 @@ internal sealed class ModelLibrary : IModelDownloadStaging
 
         if (!moved)
         {
-            // Something was put there meanwhile: it is the owner's, and it stays.
+            // Something was put there meanwhile: another runner sharing the folder saved the same model, or
+            // the owner copied it in. Of the same size it is that model, and the download is done; of another
+            // size it is the owner's, and it stays.
+            var staged = new FileInfo(expected).Length;
+            var there = new FileInfo(destination);
             Discard(destination);
+            if (there.Exists && there.LinkTarget is null && there.Length == staged)
+            {
+                return;
+            }
+
             throw new IOException($"A file appeared at '{Path.GetRelativePath(Directory, destination)}' in the models folder while it was downloaded; it is kept.");
         }
 

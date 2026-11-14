@@ -188,6 +188,23 @@ public class ModelLibraryTests
     }
 
     [Test]
+    public void Publish_FindingTheSameModelAlreadyThere_CountsTheDownloadAsDone()
+    {
+        var library = CreateLibrary();
+        var destination = Path.Combine(_library, "loras", "shared.safetensors");
+        var staging = Stage(library, destination, 8);
+        // Another runner sharing the folder saved the same model first.
+        WriteLibraryFile("loras/shared.safetensors", 8);
+
+        Assert.That(() => library.Publish(staging, destination), Throws.Nothing);
+        Assert.Multiple(() =>
+        {
+            Assert.That(new FileInfo(destination).Length, Is.EqualTo(8));
+            Assert.That(File.Exists(staging), Is.False, "The second copy is dropped.");
+        });
+    }
+
+    [Test]
     public void DiscardAll_LeavesTheDownloadsOfAnotherRunnerSharingTheFolder()
     {
         var mine = CreateLibrary("11111111-1111-4111-8111-111111111111");

@@ -113,6 +113,35 @@ public class LinuxAria2FileAccessLinuxTests
     }
 
     [Test]
+    public async Task PrepareModelLibrary_ClosesTheWritableFoldersParentToEveryoneButRootAndAria2()
+    {
+        LinuxTestPrerequisites.RequireRoot();
+        LinuxTestPrerequisites.RequireCommand("/usr/bin/stat");
+        await using var user = await LinuxTestUser.CreateAsync();
+        var account = await Aria2AccountTestSupport.ReadAccountAsync(user);
+        var root = Aria2AccountTestSupport.CreateRoot();
+        try
+        {
+            // As Docker makes a mount point's parent: root's, open to all.
+            var parent = Path.Combine(root, "offloadr-library");
+            var library = Directory.CreateDirectory(Path.Combine(parent, "models")).FullName;
+            if (OperatingSystem.IsLinux())
+            {
+                File.SetUnixFileMode(parent, (UnixFileMode)Convert.ToInt32("755", 8));
+            }
+            var access = new LinuxAria2FileAccess(account, [library], Path.Combine(root, "staging"));
+
+            access.PrepareModelLibrary(library);
+
+            Assert.That(await Aria2AccountTestSupport.StatAsync(parent), Is.EqualTo($"0:{account.GroupId}:750"));
+        }
+        finally
+        {
+            Aria2AccountTestSupport.TryDelete(root);
+        }
+    }
+
+    [Test]
     public void Constructor_DropsModelRootsInsideTheSessionRoot()
     {
         LinuxTestPrerequisites.RequireLinux();

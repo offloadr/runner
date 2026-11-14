@@ -156,9 +156,15 @@ static async Task<int> RunAgentAsync()
         // aria2 runs unprivileged and writes in place only beneath model roots no session can
         // write; destinations inside session homes are staged and published by the agent.
         aria2FileAccess = LinuxAria2FileAccess.Create(options.Aria2, modelRoots, options.Session.SessionRoot);
+        if (options.ModelLibraryDirectory is { } writableFolder)
+        {
+            // Whether or not downloads are on: a writable mount left reachable would let sessions change
+            // the owner's models.
+            aria2FileAccess.PrepareModelLibrary(writableFolder);
+        }
+
         if (libraryDirectory is not null)
         {
-            aria2FileAccess.PrepareModelLibrary(libraryDirectory);
             modelLibrary = new ModelLibrary(libraryDirectory, options.LocalModelsDirectory!, modelProjectionRoot, options.RunnerId);
             RunnerLog.Info($"Downloaded models are saved in the local models folder ('{options.LocalModelsDirectory}').");
         }
