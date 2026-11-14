@@ -712,6 +712,111 @@ public class ModelLibraryTests
     }
 
     [Test]
+    public void DiscardAll_RemovesLinksInTheDownloadFolderButNeverWhatTheyPointAt()
+    {
+        var library = CreateLibrary();
+        var staging = Stage(library, Path.Combine(_library, "loras", "partial.safetensors"), 3);
+        var key = Path.GetDirectoryName(staging)!;
+        var outside = Directory.CreateDirectory(Path.Combine(_root, "outside", "nested")).FullName;
+        var sentinel = Path.Combine(outside, "keep.txt");
+        File.WriteAllText(sentinel, "not the runner's");
+        Directory.CreateSymbolicLink(Path.Combine(key, "folder-link"), outside);
+        File.CreateSymbolicLink(Path.Combine(key, "file-link"), sentinel);
+        Directory.CreateDirectory(Path.Combine(key, "deeper", "still"));
+        File.WriteAllText(Path.Combine(key, "deeper", "still", "part.bin"), "part");
+
+        library.DiscardAll();
+
+        var runnerFolder = Path.GetDirectoryName(key)!;
+        Assert.Multiple(() =>
+        {
+            Assert.That(Directory.Exists(runnerFolder), Is.True, "This runner's folder stays.");
+            Assert.That(Directory.EnumerateFileSystemEntries(runnerFolder), Is.Empty);
+            Assert.That(File.Exists(sentinel), Is.True, "Nothing a link points at is deleted.");
+        });
+    }
+
+    [Test]
+    public void DiscardAll_NeverFollowsTheRunnersFolderSwappedForALink()
+    {
+        var library = CreateLibrary();
+        var staging = Stage(library, Path.Combine(_library, "loras", "partial.safetensors"), 3);
+        var runnerFolder = Path.GetDirectoryName(Path.GetDirectoryName(staging)!)!;
+        var outside = Directory.CreateDirectory(Path.Combine(_root, "outside")).FullName;
+        var sentinel = Path.Combine(outside, "keep.txt");
+        File.WriteAllText(sentinel, "not the runner's");
+        Directory.Delete(runnerFolder, recursive: true);
+        Directory.CreateSymbolicLink(runnerFolder, outside);
+
+        library.DiscardAll();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(File.Exists(sentinel), Is.True, "Nothing outside the models folder is deleted.");
+            Assert.That(new DirectoryInfo(runnerFolder).LinkTarget, Is.EqualTo(outside));
+        });
+    }
+
+    [Test]
+    public async Task ADownloadForAFolderMountedFromAnotherFilesystem_IsDownloadedInsideTheContainer()
+    {
+        // Staged in the models folder, the download could not be moved onto another filesystem.
+        var checkpoints = Directory.CreateDirectory(Path.Combine(_library, "checkpoints")).FullName;
+        if (!TryRun("mount", "-t", "tmpfs", "tmpfs", checkpoints))
+        {
+            Assert.Ignore("Mounting a filesystem needs CAP_SYS_ADMIN, which this container does not have.");
+        }
+
+        try
+        {
+            var backend = new WritingBackend();
+            var settings = Aria2Settings.FromEnvironment(name => name == "ARIA2_STATE_DIR" ? Path.Combine(_root, "aria2-state") : null, static () => "generated-secret");
+            await using var service = new ModelDownloadService(
+                backend,
+                settings,
+                destinationPolicy: new ModelDestinationPolicy([_editorModels, _library]),
+                library: CreateLibrary());
+            await service.InitializeAsync(CancellationToken.None);
+            service.SetActiveSession(Session);
+
+            await await service.PreparePromptDownloadsAsync(
+                [Remote("checkpoints/base.safetensors", 8)],
+                CancellationToken.None,
+                highPriority: true);
+
+            var editorPath = new FileInfo(Path.Combine(_editorModels, "checkpoints", "base.safetensors"));
+            Assert.Multiple(() =>
+            {
+                Assert.That(editorPath.LinkTarget, Is.Null);
+                Assert.That(editorPath.Length, Is.EqualTo(8), "The editor opens the finished model.");
+                Assert.That(Directory.EnumerateFileSystemEntries(checkpoints), Is.Empty);
+            });
+        }
+        finally
+        {
+            TryRun("umount", checkpoints);
+        }
+    }
+
+    private static bool TryRun(string fileName, params string[] arguments)
+    {
+        try
+        {
+            using var process = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(fileName, arguments)
+            {
+                RedirectStandardError = true,
+                RedirectStandardOutput = true
+            })!;
+            process.WaitForExit();
+            return process.ExitCode == 0;
+        }
+        catch (System.ComponentModel.Win32Exception)
+        {
+            return false;
+        }
+    }
+
+    [Test]
     public async Task APromptsDownload_IsSavedInTheFolderAndLinkedForTheEditor()
     {
         var backend = new WritingBackend();

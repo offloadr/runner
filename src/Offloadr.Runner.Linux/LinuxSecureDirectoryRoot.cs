@@ -39,6 +39,8 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
     private const int ETooManySymbolicLinks = 40;
     private const int AtEmptyPath = 0x1000;
     private const int AtSymlinkNoFollow = 0x100;
+    private const int AtRemoveDirectory = 0x200;
+    private const int MaxDeleteDepth = 64;
     private const uint StatxType = 0x0001;
     private const uint StatxNlink = 0x0004;
     private const uint StatxUid = 0x0008;
@@ -458,6 +460,101 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
         }
     }
 
+    /// <summary>Makes <see cref="MoveRegularFileWithoutReplacing"/> act as on a Windows folder, for tests.</summary>
+    internal static bool RenameWithoutReplacingUnsupportedForTests { get; set; }
+
+    /// <summary>
+    /// Deletes the directory at <paramref name="relativeDirectory"/> and everything in it, or only what is in
+    /// it when <paramref name="keepDirectory"/> is set. No link is ever followed: each directory is opened
+    /// without following links, relative to the one above it, and its entries are removed relative to it, so a
+    /// folder swapped for a link meanwhile is never deleted through. Returns false when there is no real
+    /// directory there.
+    /// </summary>
+    public bool DeleteDirectoryTree(string relativeDirectory, bool keepDirectory = false)
+    {
+        var (_, parent, leafName) = TryOpenExistingParent(relativeDirectory);
+        if (parent is null)
+        {
+            return false;
+        }
+
+        using (parent)
+        {
+            var descriptor = openat(GetDescriptor(parent), leafName, OPath | ODirectory | ONoFollow | OCloseOnExec);
+            if (descriptor < 0)
+            {
+                var error = Marshal.GetLastPInvokeError();
+                return error is ENoEntry or ENotDirectory or ETooManySymbolicLinks
+                    ? false
+                    : throw CreateException($"opening directory '{relativeDirectory}'", error);
+            }
+
+            using (var directory = new SafeFileHandle((nint)descriptor, ownsHandle: true))
+            {
+                DeleteDirectoryContents(directory, relativeDirectory, depth: 0);
+            }
+
+            if (!keepDirectory && unlinkat(GetDescriptor(parent), leafName, AtRemoveDirectory) != 0 &&
+                Marshal.GetLastPInvokeError() is var removeError && removeError != ENoEntry)
+            {
+                throw CreateException($"removing directory '{relativeDirectory}'", removeError);
+            }
+
+            return true;
+        }
+    }
+
+    private static void DeleteDirectoryContents(SafeFileHandle directory, string relativePath, int depth)
+    {
+        if (depth > MaxDeleteDepth)
+        {
+            throw new IOException($"'{relativePath}' is nested too deeply to delete.");
+        }
+
+        // The descriptor's own entry in /proc names the directory it holds, whatever happened to its path.
+        var names = System.IO.Directory
+            .EnumerateFileSystemEntries($"/proc/self/fd/{GetDescriptor(directory)}")
+            .Select(static entry => Path.GetFileName(entry))
+            .ToArray();
+        foreach (var name in names)
+        {
+            var child = openat(GetDescriptor(directory), name, OPath | ODirectory | ONoFollow | OCloseOnExec);
+            if (child >= 0)
+            {
+                using (var childDirectory = new SafeFileHandle((nint)child, ownsHandle: true))
+                {
+                    DeleteDirectoryContents(childDirectory, $"{relativePath}/{name}", depth + 1);
+                }
+
+                if (unlinkat(GetDescriptor(directory), name, AtRemoveDirectory) != 0 &&
+                    Marshal.GetLastPInvokeError() is var removeError && removeError != ENoEntry)
+                {
+                    throw CreateException($"removing directory '{relativePath}/{name}'", removeError);
+                }
+
+                continue;
+            }
+
+            var error = Marshal.GetLastPInvokeError();
+            if (error is ENoEntry)
+            {
+                continue;
+            }
+
+            if (error is not (ENotDirectory or ETooManySymbolicLinks))
+            {
+                throw CreateException($"opening '{relativePath}/{name}'", error);
+            }
+
+            // A file or a link: the link itself goes, never what it points at.
+            if (unlinkat(GetDescriptor(directory), name, 0) != 0 &&
+                Marshal.GetLastPInvokeError() is var unlinkError && unlinkError != ENoEntry)
+            {
+                throw CreateException($"removing '{relativePath}/{name}'", unlinkError);
+            }
+        }
+    }
+
     /// <summary>
     /// Moves the regular file at <paramref name="relativeSource"/> to <paramref name="relativeDestination"/>
     /// beneath this root, creating missing directories, but never over anything already there. Returns false
@@ -465,9 +562,6 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
     /// shared into a container), the file is hard-linked to its new name, which is refused just as atomically
     /// when the name is taken, and its old name removed.
     /// </summary>
-    /// <summary>Makes <see cref="MoveRegularFileWithoutReplacing"/> act as on a Windows folder, for tests.</summary>
-    internal static bool RenameWithoutReplacingUnsupportedForTests { get; set; }
-
     public bool MoveRegularFileWithoutReplacing(string relativeSource, string relativeDestination)
     {
         var (sourceParent, sourceName) = OpenParent(relativeSource, createDirectories: false);

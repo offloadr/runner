@@ -294,12 +294,21 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
     }
 
     /// <summary>
-    /// Whether every folder that exists between the models folder and <paramref name="path"/> is a real one:
-    /// a download is published only through real directories, and an owner's link (a <c>checkpoints</c>
-    /// folder on another drive, say) is never written through.
+    /// Whether every folder that exists between the models folder and <paramref name="path"/> is a real one,
+    /// on the folder's own filesystem: a download is published only through real directories, an owner's
+    /// link (a <c>checkpoints</c> folder on another drive, say) is never written through, and a download
+    /// staged in the folder can be moved into place only on the filesystem it was staged on (a folder
+    /// mounted there from elsewhere cannot take it).
     /// </summary>
     private bool HasRealDirectoriesUpTo(string path)
     {
+        if (!LinuxFileIdentityReader.TryRead(Directory, out var folder) ||
+            !IsOnFilesystem(_downloadFolder, folder.DeviceId) ||
+            !IsOnFilesystem(_stagingDirectory, folder.DeviceId))
+        {
+            return false;
+        }
+
         var current = Directory;
         foreach (var part in Path.GetRelativePath(Directory, Path.GetDirectoryName(path)!)
                      .Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries)
@@ -307,7 +316,7 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
         {
             current = Path.Combine(current, part);
             var entry = new DirectoryInfo(current);
-            if (entry.LinkTarget is not null || File.Exists(current))
+            if (entry.LinkTarget is not null || File.Exists(current) || !IsOnFilesystem(current, folder.DeviceId))
             {
                 return false;
             }
@@ -321,6 +330,10 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
 
         return true;
     }
+
+    /// <summary>Whether <paramref name="path"/> is missing, or on the filesystem <paramref name="device"/> names.</summary>
+    private static bool IsOnFilesystem(string path, ulong device)
+        => !LinuxFileIdentityReader.TryRead(path, out var entry) ? !Path.Exists(path) : entry.DeviceId == device;
 
     private static bool IsFreeOrSameSize(string path, long size)
     {
@@ -487,62 +500,24 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
         }
     }
 
-    /// <summary>
-    /// Whether the download folder and this runner's folder in it are real directories. aria2 can write
-    /// there; a link put in their place would lead a deletion out of the models folder.
-    /// </summary>
-    private bool StagingFoldersAreReal()
-        => new DirectoryInfo(_downloadFolder).LinkTarget is null && new DirectoryInfo(_stagingDirectory).LinkTarget is null;
-
     /// <summary>Returns true for files aria2 writes beneath the folder's download area.</summary>
     public bool IsStagingPath(string? path)
         => !string.IsNullOrWhiteSpace(path) && IsStrictlyBeneath(Normalize(path), _stagingDirectory);
 
     /// <summary>Removes what an earlier run of this runner left half downloaded; other runners' stay.</summary>
-    public void DiscardAll()
-    {
-        if (!System.IO.Directory.Exists(_stagingDirectory) ||
-            new DirectoryInfo(_downloadFolder).LinkTarget is not null ||
-            new DirectoryInfo(_stagingDirectory).LinkTarget is not null)
-        {
-            return;
-        }
+    public void DiscardAll() => DeleteStagingDirectory(_stagingDirectory, keepDirectory: true);
 
-        foreach (var entry in System.IO.Directory.EnumerateFileSystemEntries(_stagingDirectory))
-        {
-            if (System.IO.Directory.Exists(entry) && new DirectoryInfo(entry).LinkTarget is null)
-            {
-                DeleteStagingDirectory(entry);
-            }
-            else
-            {
-                try
-                {
-                    File.Delete(entry);
-                }
-                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-                {
-                    RunnerLog.Warning(nameof(ModelLibrary), $"Could not remove '{entry}': {ex.Message}");
-                }
-            }
-        }
-    }
-
-    private void DeleteStagingDirectory(string directory)
+    /// <summary>
+    /// Deletes a folder in the download folder. Others sharing the models folder can change it, so the
+    /// deletion goes through no link: the download folder, this runner's folder and everything in them are
+    /// opened without following links, and a folder swapped for one meanwhile is left alone.
+    /// </summary>
+    private void DeleteStagingDirectory(string directory, bool keepDirectory = false)
     {
         try
         {
-            if (!StagingFoldersAreReal())
-            {
-                RunnerLog.Warning(nameof(ModelLibrary), $"Not removing '{directory}': the download folder is not a real directory.");
-                return;
-            }
-
-            // Recursive deletion removes symbolic links without following them.
-            System.IO.Directory.Delete(directory, recursive: true);
-        }
-        catch (DirectoryNotFoundException)
-        {
+            using var root = new LinuxSecureDirectoryRoot(Directory);
+            root.DeleteDirectoryTree(Path.GetRelativePath(Directory, directory).Replace(Path.DirectorySeparatorChar, '/'), keepDirectory);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
