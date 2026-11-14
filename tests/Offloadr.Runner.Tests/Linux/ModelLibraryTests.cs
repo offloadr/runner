@@ -227,6 +227,23 @@ public class ModelLibraryTests
     }
 
     [Test]
+    public void Publish_OfADownloadTheOwnersFileTookThePlaceOf_LeavesTheLinkTheProjectorUsesForIt()
+    {
+        var library = CreateLibrary();
+        library.Redirect([Remote("loras/style.safetensors", 8)], Session);
+        // The owner copies in a file of the same name while it downloads, and the session picks it as a
+        // local model, through the same link.
+        var destination = WriteLibraryFile("loras/style.safetensors", 4);
+        var projector = new LocalModelProjector(_library, _editorModels, downloadLinks: library);
+        projector.UpdateSnapshot(new LocalModelScanner("runner-1", _library).Scan());
+        projector.SetRequestedModels([LocalAt("loras/style.safetensors", 4, ModelCategory.Lora)]);
+        var staging = Stage(library, destination, 8);
+
+        Assert.That(() => library.Publish(staging, destination), Throws.InstanceOf<IOException>());
+        Assert.That(new FileInfo(Path.Combine(_editorModels, "loras", "style.safetensors")).LinkTarget, Is.EqualTo(destination));
+    }
+
+    [Test]
     public void Publish_WhereRenamesCannotRefuseATakenName_StillNeverReplacesIt()
     {
         LinuxSecureDirectoryRoot.RenameWithoutReplacingUnsupportedForTests = true;

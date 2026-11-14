@@ -488,7 +488,9 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
     {
         lock (_gate)
         {
-            if (HoldsOwnLink(relative, Path.Combine(_readOnlyDirectory, relative)))
+            // Unless the projector now links the owner's file there as the local model the session asked for.
+            if (!_projectedLinks.Contains(relative.Replace(Path.DirectorySeparatorChar, '/')) &&
+                HoldsOwnLink(relative, Path.Combine(_readOnlyDirectory, relative)))
             {
                 DetachEditorLink(relative);
             }

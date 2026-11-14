@@ -8,7 +8,15 @@ namespace Offloadr.Runner.Linux;
 public sealed class SealedHostPreparation
 {
     private readonly object _gate = new();
+    private readonly IReadOnlyCollection<string> _closedMounts;
     private bool _applied;
+
+    /// <param name="closedMounts">
+    /// Mounts the agent closes to sessions itself before any starts (the owner's writable models folder):
+    /// the lockdown leaves them, and the owner's files in them, alone.
+    /// </param>
+    public SealedHostPreparation(IReadOnlyCollection<string>? closedMounts = null)
+        => _closedMounts = closedMounts ?? [];
 
     /// <summary>Applies the lockdown once it holds; returns why it cannot, or null when it does.</summary>
     public string? EnsureApplied()
@@ -20,7 +28,7 @@ public sealed class SealedHostPreparation
                 return null;
             }
 
-            var scan = SealedHostLockdown.Scan();
+            var scan = SealedHostLockdown.Scan(closedMounts: _closedMounts);
             // Residue of an earlier session user first: its uid may come back.
             var handed = SealedHostLockdown.HandToRoot(scan.ReusablyOwned);
             var lockdown = SealedHostLockdown.RemoveSharedWriteAccess(

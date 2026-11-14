@@ -77,7 +77,10 @@ static async Task<int> RunAgentAsync()
         $"tmpfs-noswap={sealedStorageStatus.Swap.TmpfsNoswap}" +
         (sealedStorageStatus.Reason is null ? string.Empty : $" reason='{sealedStorageStatus.Reason}'"));
     // Auto mode applies it before its first sealed start.
-    var sealedHostPreparation = new SealedHostPreparation();
+    // The writable models folder is closed to sessions below (PrepareModelLibrary) before any starts, or the
+    // agent exits; the lockdown must not take the owner's files from them.
+    var sealedHostPreparation = new SealedHostPreparation(
+        options.ModelLibraryDirectory is { } closedLibrary ? [closedLibrary] : null);
     if (options.Session.Sealing.Mode == SealedStorageMode.Required)
     {
         try

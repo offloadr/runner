@@ -45,7 +45,16 @@ public static class SealedHostLockdown
     /// An unreadable mount table, or an entry whose metadata cannot be read, is reported as
     /// unchecked, since what lies there would go unseen.
     /// </summary>
-    public static ScanResult Scan(string root = "/", string passwdPath = "/etc/passwd", string groupPath = "/etc/group")
+    /// <param name="closedMounts">
+    /// Mounts the agent itself keeps out of sessions' reach (the owner's models folder, mounted writable in a
+    /// directory only root and aria2 may enter): they are left alone, since handing the owner's files to root
+    /// or closing them would take the folder from its owner.
+    /// </param>
+    public static ScanResult Scan(
+        string root = "/",
+        string passwdPath = "/etc/passwd",
+        string groupPath = "/etc/group",
+        IReadOnlyCollection<string>? closedMounts = null)
     {
         var users = LinuxSessionResidue.ReadUsers(passwdPath);
         var liveUserIds = users.Select(static user => user.UserId).ToHashSet();
@@ -84,7 +93,8 @@ public static class SealedHostLockdown
             groups.Count == 0
                 ? static _ => false
                 : groupId => groupId != 0 && (!liveGroupIds.Contains(groupId) || sessionGroupIds.Contains(groupId)),
-            HasAccessAcl);
+            HasAccessAcl,
+            closedMounts);
         return accountsUnread.Count == 0
             ? scan
             : scan with { Unchecked = [.. accountsUnread, .. scan.Unchecked] };
@@ -141,8 +151,13 @@ public static class SealedHostLockdown
         IReadOnlyList<Mount>? mounts,
         Func<uint, bool> isReusableOwner,
         Func<uint, bool>? isReusableGroup = null,
-        Func<string, bool>? hasAccessAcl = null)
+        Func<string, bool>? hasAccessAcl = null,
+        IReadOnlyCollection<string>? closedMounts = null)
     {
+        var closed = (closedMounts ?? [])
+            .Where(static path => !string.IsNullOrWhiteSpace(path))
+            .Select(static path => Path.TrimEndingDirectorySeparator(Path.GetFullPath(path)))
+            .ToArray();
         isReusableGroup ??= static _ => false;
         hasAccessAcl ??= static _ => false;
         var found = new List<string>();
@@ -177,7 +192,7 @@ public static class SealedHostLockdown
                      .Where(mount => mount.MountPoint.StartsWith(prefix, StringComparison.Ordinal))
                      .OrderBy(static mount => mount.MountPoint, StringComparer.Ordinal))
         {
-            if (mount.ReadOnly || NotDiskBackedTypes.Contains(mount.Type))
+            if (mount.ReadOnly || NotDiskBackedTypes.Contains(mount.Type) || IsClosed(mount.MountPoint))
             {
                 continue;
             }
@@ -210,6 +225,9 @@ public static class SealedHostLockdown
         }
 
         return result;
+
+        bool IsClosed(string path)
+            => closed.Any(closedPath => path == closedPath || path.StartsWith(closedPath + "/", StringComparison.Ordinal));
 
         bool IsSharedOrBelowShared(string path)
         {
@@ -244,6 +262,12 @@ public static class SealedHostLockdown
 
             foreach (var child in children)
             {
+                // Its mount point too: as listed from the directory above, it shows the owner's folder.
+                if (IsClosed(child))
+                {
+                    continue;
+                }
+
                 var status = statEntry(child);
                 if (status is { IsSymbolicLink: true })
                 {
