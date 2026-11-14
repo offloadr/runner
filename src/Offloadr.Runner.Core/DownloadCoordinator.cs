@@ -346,13 +346,6 @@ public sealed class DownloadCoordinator
             throw new InvalidOperationException($"Download destination '{normalized}' does not contain a directory.");
         }
 
-        if (stagingPath is not null)
-        {
-            _staging!.PrepareStagingDirectory(stagingPath);
-        }
-
-        _fileSystem.CreateDirectory(directory);
-
         var gate = _locks.GetOrAdd(normalized, _ => new SemaphoreSlim(1, 1));
         await gate.WaitAsync(effectiveCancellationToken).ConfigureAwait(false);
 
@@ -382,6 +375,14 @@ public sealed class DownloadCoordinator
                 await ReportProgressAsync(tracked, ModelDownloadState.Complete, tracked.Request.SizeBytes, tracked.Request.SizeBytes, 100, "complete").ConfigureAwait(false);
                 return;
             }
+
+            // Only now that something is to be downloaded: a model already there leaves no folder behind.
+            if (stagingPath is not null)
+            {
+                _staging!.PrepareStagingDirectory(stagingPath);
+            }
+
+            _fileSystem.CreateDirectory(directory);
 
             while (true)
             {

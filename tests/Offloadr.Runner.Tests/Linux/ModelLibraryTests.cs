@@ -206,6 +206,44 @@ public class ModelLibraryTests
         });
     }
 
+    [TestCase(false)]
+    [TestCase(true)]
+    public async Task AModelAlreadySaved_LeavesNoDownloadFolderBehind(bool downloadedFirst)
+    {
+        var backend = new WritingBackend();
+        var settings = Aria2Settings.FromEnvironment(name => name == "ARIA2_STATE_DIR" ? Path.Combine(_root, "aria2-state") : null, static () => "generated-secret");
+        await using var service = new ModelDownloadService(
+            backend,
+            settings,
+            destinationPolicy: new ModelDestinationPolicy([_editorModels, _library]),
+            library: CreateLibrary());
+        await service.InitializeAsync(CancellationToken.None);
+        service.SetActiveSession(Session);
+        var request = Remote("loras/style.safetensors", 4);
+        if (downloadedFirst)
+        {
+            await await service.PreparePromptDownloadsAsync([request], CancellationToken.None, highPriority: true);
+        }
+        else
+        {
+            WriteLibraryFile("loras/style.safetensors", 4);
+        }
+
+        // Prompt after prompt, the model is already there.
+        for (var prompt = 0; prompt < 3; prompt++)
+        {
+            service.RegisterDownloads(Session, [request]);
+            await await service.PreparePromptDownloadsAsync([request], CancellationToken.None, highPriority: true);
+        }
+
+        var downloadFolder = Path.Combine(_library, ModelLibrary.StagingFolderName);
+        Assert.That(
+            Directory.Exists(downloadFolder) ? Directory.EnumerateDirectories(downloadFolder, "*", SearchOption.AllDirectories).Where(static folder => Path.GetFileName(Path.GetDirectoryName(folder)) != ModelLibrary.StagingFolderName) : [],
+            Is.Empty,
+            "No download folder is left for a model already saved.");
+        Assert.That(backend.Destinations, Has.Count.EqualTo(downloadedFirst ? 1 : 0));
+    }
+
     [Test]
     public async Task ADownload_MakesItsDownloadFoldersTheFoldersOwners()
     {
