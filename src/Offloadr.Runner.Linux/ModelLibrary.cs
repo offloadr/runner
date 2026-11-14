@@ -27,6 +27,10 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
     // Editor links a download was sent through (made here, or found in place), under _gate, each with the
     // session that last asked for its model: until that session ends it may be using the model.
     private readonly Dictionary<string, string?> _linkSessions = new(StringComparer.Ordinal);
+    // Sessions that have ended, under _gate: a prompt of one still finishing claims nothing for it. And the
+    // session last made active, whose end is seen when another becomes active.
+    private readonly HashSet<string> _endedSessions = new(StringComparer.Ordinal);
+    private string? _activeSession;
     // The redirect that last claimed each of those links, under _gate: undoing another redirect leaves it.
     private readonly Dictionary<string, RedirectBatch> _claimedBy = new(StringComparer.Ordinal);
     // Editor paths where the projector links a local model for the session now, under _gate.
@@ -91,12 +95,28 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
         var active = NormalizeSession(activeSessionId);
         lock (_gate)
         {
+            // The session that was active has ended, unless it is the one active again.
+            if (_activeSession is { } previous && !string.Equals(previous, active, StringComparison.Ordinal))
+            {
+                _endedSessions.Add(previous);
+            }
+
+            _activeSession = active;
+            if (active is not null)
+            {
+                _endedSessions.Remove(active);
+            }
+
             foreach (var (path, sessionId) in _linkSessions.ToArray())
             {
                 if (!string.Equals(sessionId, active, StringComparison.Ordinal))
                 {
                     _linkSessions.Remove(path);
                     _claimedBy.Remove(path);
+                    if (sessionId is not null)
+                    {
+                        _endedSessions.Add(sessionId);
+                    }
                 }
             }
         }
@@ -108,6 +128,11 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
         var ended = NormalizeSession(sessionId);
         lock (_gate)
         {
+            if (ended is not null)
+            {
+                _endedSessions.Add(ended);
+            }
+
             foreach (var (path, linkSessionId) in _linkSessions.ToArray())
             {
                 if (string.Equals(linkSessionId, ended, StringComparison.Ordinal))
@@ -315,6 +340,12 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
 
     private void Claim(string relativePath, string? sessionId)
     {
+        // A prompt of an ended session, stopped while it waited here, keeps no link from the session after.
+        if (sessionId is not null && _endedSessions.Contains(sessionId))
+        {
+            return;
+        }
+
         if (_batch is { } batch)
         {
             batch.ClaimsBefore.TryAdd(
@@ -434,7 +465,10 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
     /// </summary>
     private bool HasRealDirectoriesUpTo(string path)
     {
+        // The download folders too: a download is staged only through real ones, never through a link.
         if (!LinuxFileIdentityReader.TryReadMount(Directory, out var folder) ||
+            !IsMissingOrRealDirectory(_downloadFolder) ||
+            !IsMissingOrRealDirectory(_stagingDirectory) ||
             !IsOnMount(_downloadFolder, folder) ||
             !IsOnMount(_stagingDirectory, folder))
         {
@@ -467,6 +501,12 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
     /// Whether <paramref name="path"/> is missing, or on <paramref name="mount"/>: the same device, and the same
     /// mount where the kernel tells mounts apart.
     /// </summary>
+    private static bool IsMissingOrRealDirectory(string path)
+    {
+        var entry = new DirectoryInfo(path);
+        return entry.LinkTarget is null && (entry.Exists || !File.Exists(path));
+    }
+
     private static bool IsOnMount(string path, (ulong DeviceId, ulong? MountId) mount)
         => !LinuxFileIdentityReader.TryReadMount(path, out var entry)
             ? !Path.Exists(path)

@@ -571,6 +571,82 @@ public class ModelLibraryTests
         });
     }
 
+    [TestCase(false)]
+    [TestCase(true)]
+    public void APromptOfAnEndedSession_ClaimsNoLinkFromTheNextOne(bool cancelled)
+    {
+        var library = CreateLibrary();
+        library.ReleaseSessionsOtherThan(Session);
+        // The session ends, and the next one is active, while one of its prompts still waits to redirect.
+        if (cancelled)
+        {
+            library.ReleaseSession(Session);
+        }
+
+        library.ReleaseSessionsOtherThan("session-2");
+
+        library.Redirect([Remote("loras/style.safetensors", 4)], Session);
+
+        var style = Path.Combine(_editorModels, "loras", "style.safetensors");
+        Assert.That(library.KeepsEditorLink(style), Is.False);
+        // The new session may have another local model linked there.
+        var mine = WriteLibraryFile("loras/mine/style.safetensors", 6);
+        var projector = new LocalModelProjector(_library, _editorModels, downloadLinks: library);
+        projector.UpdateSnapshot(new LocalModelScanner("runner-1", _library).Scan());
+        projector.SetRequestedModels([LocalAt("loras/style.safetensors", 6, ModelCategory.Lora)]);
+        Assert.That(new FileInfo(style).LinkTarget, Is.EqualTo(mine));
+    }
+
+    [Test]
+    public void ASessionActiveAgain_ClaimsItsLinksAgain()
+    {
+        var library = CreateLibrary();
+        library.ReleaseSessionsOtherThan(Session);
+        library.ReleaseSessionsOtherThan(null);
+        library.ReleaseSessionsOtherThan(Session);
+
+        library.Redirect([Remote("loras/style.safetensors", 4)], Session);
+
+        Assert.That(library.KeepsEditorLink(Path.Combine(_editorModels, "loras", "style.safetensors")), Is.True);
+    }
+
+    [TestCase(true)]
+    [TestCase(false)]
+    public async Task ADownloadFolderThatIsALink_IsNeverWrittenThrough(bool linkTheRunnersFolder)
+    {
+        var elsewhere = Directory.CreateDirectory(Path.Combine(_root, "elsewhere")).FullName;
+        var downloadFolder = Path.Combine(_library, ModelLibrary.StagingFolderName);
+        if (linkTheRunnersFolder)
+        {
+            Directory.CreateDirectory(downloadFolder);
+            Directory.CreateSymbolicLink(Path.Combine(downloadFolder, "11111111-1111-4111-8111-111111111111"), elsewhere);
+        }
+        else
+        {
+            Directory.CreateSymbolicLink(downloadFolder, elsewhere);
+        }
+
+        var backend = new WritingBackend();
+        var settings = Aria2Settings.FromEnvironment(name => name == "ARIA2_STATE_DIR" ? Path.Combine(_root, "aria2-state") : null, static () => "generated-secret");
+        await using var service = new ModelDownloadService(
+            backend,
+            settings,
+            destinationPolicy: new ModelDestinationPolicy([_editorModels, _library]),
+            library: CreateLibrary());
+        await service.InitializeAsync(CancellationToken.None);
+        service.SetActiveSession(Session);
+
+        await await service.PreparePromptDownloadsAsync([Remote("loras/style.safetensors", 4)], CancellationToken.None, highPriority: true);
+
+        var editorPath = new FileInfo(Path.Combine(_editorModels, "loras", "style.safetensors"));
+        Assert.Multiple(() =>
+        {
+            Assert.That(editorPath.LinkTarget, Is.Null, "Downloaded inside the container instead.");
+            Assert.That(editorPath.Length, Is.EqualTo(4));
+            Assert.That(Directory.EnumerateFileSystemEntries(elsewhere), Is.Empty, "Nothing is written through the link.");
+        });
+    }
+
     [Test]
     public void CommittedBatches_AreNotKept()
     {
