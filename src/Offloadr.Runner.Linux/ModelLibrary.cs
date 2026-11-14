@@ -22,6 +22,8 @@ internal sealed class ModelLibrary : IModelDownloadStaging
     private readonly string _downloadFolder;
     private readonly string _stagingDirectory;
     private readonly object _gate = new();
+    // Editor links this library made, under _gate: the only ones it ever removes.
+    private readonly HashSet<string> _ownLinks = new(StringComparer.Ordinal);
 
     /// <param name="directory">The models folder, writable.</param>
     /// <param name="readOnlyDirectory">The same folder as sessions see it, read-only.</param>
@@ -131,8 +133,9 @@ internal sealed class ModelLibrary : IModelDownloadStaging
     private static bool IsFreeOrSameSize(string path, long size)
     {
         var existing = new FileInfo(path);
-        if (existing.LinkTarget is not null)
+        if (existing.LinkTarget is not null || System.IO.Directory.Exists(path))
         {
+            // A link, or a folder of the owner's of that name: the place is taken.
             return false;
         }
 
@@ -150,10 +153,13 @@ internal sealed class ModelLibrary : IModelDownloadStaging
 
             using var root = new LinuxSecureDirectoryRoot(_editorModelsDirectory);
             var relativePath = relative.Replace(Path.DirectorySeparatorChar, '/');
-            if (root.ReadSymbolicLink(relativePath, out var existing) == SecureLinkKind.SymbolicLink &&
+            // Only a link this library made: the projector links local models to the same place.
+            if (_ownLinks.Contains(relativePath) &&
+                root.ReadSymbolicLink(relativePath, out var existing) == SecureLinkKind.SymbolicLink &&
                 string.Equals(existing, target, StringComparison.Ordinal))
             {
                 root.DeleteSymbolicLink(relativePath);
+                _ownLinks.Remove(relativePath);
             }
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -180,6 +186,7 @@ internal sealed class ModelLibrary : IModelDownloadStaging
             }
 
             root.CreateSymbolicLink(relativePath, target);
+            _ownLinks.Add(relativePath);
             return true;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -246,6 +253,13 @@ internal sealed class ModelLibrary : IModelDownloadStaging
         }
     }
 
+    /// <summary>
+    /// Whether the download folder and this runner's folder in it are real directories. aria2 can write
+    /// there; a link put in their place would lead a deletion out of the models folder.
+    /// </summary>
+    private bool StagingFoldersAreReal()
+        => new DirectoryInfo(_downloadFolder).LinkTarget is null && new DirectoryInfo(_stagingDirectory).LinkTarget is null;
+
     /// <summary>Returns true for files aria2 writes beneath the folder's download area.</summary>
     public bool IsStagingPath(string? path)
         => !string.IsNullOrWhiteSpace(path) && IsStrictlyBeneath(Normalize(path), _stagingDirectory);
@@ -280,10 +294,16 @@ internal sealed class ModelLibrary : IModelDownloadStaging
         }
     }
 
-    private static void DeleteStagingDirectory(string directory)
+    private void DeleteStagingDirectory(string directory)
     {
         try
         {
+            if (!StagingFoldersAreReal())
+            {
+                RunnerLog.Warning(nameof(ModelLibrary), $"Not removing '{directory}': the download folder is not a real directory.");
+                return;
+            }
+
             // Recursive deletion removes symbolic links without following them.
             System.IO.Directory.Delete(directory, recursive: true);
         }

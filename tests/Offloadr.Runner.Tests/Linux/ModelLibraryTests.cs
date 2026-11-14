@@ -346,6 +346,57 @@ public class ModelLibraryTests
     }
 
     [Test]
+    public void Discard_NeverFollowsADownloadFolderSwappedForALink()
+    {
+        var library = CreateLibrary();
+        var destination = Path.Combine(_library, "loras", "style.safetensors");
+        var staging = library.GetStagingPath(destination)!;
+        var runnerFolder = Path.GetDirectoryName(Path.GetDirectoryName(staging)!)!;
+        var downloadFolder = Path.GetDirectoryName(runnerFolder)!;
+
+        // Elsewhere, a tree laid out like this runner's downloads, and the download folder pointed at it.
+        var outside = Path.Combine(_root, "outside");
+        var outsideKey = Path.Combine(outside, Path.GetFileName(runnerFolder), Path.GetFileName(Path.GetDirectoryName(staging)!));
+        Directory.CreateDirectory(outsideKey);
+        var sentinel = Path.Combine(outsideKey, "keep.txt");
+        File.WriteAllText(sentinel, "not the runner's");
+        Directory.CreateSymbolicLink(downloadFolder, outside);
+
+        library.Discard(destination);
+
+        Assert.That(File.Exists(sentinel), Is.True, "Nothing outside the models folder is deleted.");
+    }
+
+    [Test]
+    public void Redirect_TreatsAFolderOfTheOwnersAtThePathAsTaken()
+    {
+        var folder = Directory.CreateDirectory(Path.Combine(_library, "checkpoints", "base.safetensors")).FullName;
+        var request = Remote("checkpoints/base.safetensors", 8);
+
+        var redirected = CreateLibrary().Redirect([request]).Single();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(redirected.DestinationPath, Is.EqualTo(request.DestinationPath), "Downloaded inside the container instead.");
+            Assert.That(Directory.Exists(folder), Is.True);
+        });
+    }
+
+    [Test]
+    public void Redirect_NeverRemovesALinkItDidNotMake()
+    {
+        // The projector's link to the owner's model of the same name, pointing where this library's would.
+        WriteLibraryFile("checkpoints/base.safetensors", 4);
+        var editorPath = Path.Combine(_editorModels, "checkpoints", "base.safetensors");
+        Directory.CreateDirectory(Path.GetDirectoryName(editorPath)!);
+        File.CreateSymbolicLink(editorPath, Path.Combine(_library, "checkpoints", "base.safetensors"));
+
+        CreateLibrary().Redirect([Remote("checkpoints/base.safetensors", 8)]);
+
+        Assert.That(new FileInfo(editorPath).LinkTarget, Is.EqualTo(Path.Combine(_library, "checkpoints", "base.safetensors")));
+    }
+
+    [Test]
     public void DiscardAll_EmptiesTheDownloadFolderOnly()
     {
         var library = CreateLibrary();
