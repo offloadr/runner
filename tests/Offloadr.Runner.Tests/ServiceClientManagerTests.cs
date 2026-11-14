@@ -1930,10 +1930,11 @@ public partial class ServiceClientManagerTests
             (_, _, _, _) => Task.FromResult(new SessionProcessManager.PromptSubmissionResult(true, 200, System.Text.Encoding.UTF8.GetBytes("{}"), "Prompt submitted")),
             (_, _, _, _) => { },
                         CancellationToken.None,
-            (downloads, replace) =>
+            (downloads, replace, _) =>
             {
                 projectedDownloads = downloads.ToArray();
                 replaceExisting = replace;
+                return Task.CompletedTask;
             });
 
         Assert.That(projectedDownloads, Is.Not.Null);

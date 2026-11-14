@@ -41,6 +41,160 @@ public class LocalModelProjectorTests
     }
 
     [Test]
+    public void CanProject_OnlyAReadableModelInTheInventory()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var sourceRoot = Path.Combine(root, "local");
+            var destinationRoot = Path.Combine(root, "models");
+            Directory.CreateDirectory(Path.Combine(sourceRoot, "checkpoints"));
+            var sourceFile = Path.Combine(sourceRoot, "checkpoints", "demo.safetensors");
+            File.WriteAllText(sourceFile, "checkpoint");
+            var projected = Path.Combine(destinationRoot, "checkpoints", "demo.safetensors");
+            var request = CreateLocalProjectionRequest(sourceFile, ModelCategory.Checkpoint, projected);
+            var projector = new LocalModelProjector(sourceRoot, destinationRoot);
+
+            var beforeScan = projector.CanProject(request);
+            projector.UpdateSnapshot(CreateSnapshot(CreateModel(sourceFile, ModelCategory.Checkpoint)));
+            var scanned = projector.CanProject(request);
+            var remote = projector.CanProject(new ModelDownloadRequest { Filename = "demo.safetensors", DestinationPath = projected });
+            var outsideRoot = projector.CanProject(
+                CreateLocalProjectionRequest(sourceFile, ModelCategory.Checkpoint, Path.Combine(root, "elsewhere", "demo.safetensors")));
+            File.Delete(sourceFile);
+            var deleted = projector.CanProject(request);
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(beforeScan, Is.False, "Not in the inventory yet.");
+                Assert.That(scanned, Is.True);
+                Assert.That(remote, Is.False);
+                Assert.That(outsideRoot, Is.False, "A target the projector would refuse.");
+                Assert.That(deleted, Is.False, "Gone from the folder since the last scan.");
+            });
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
+    public void CanProject_RefusesATargetBehindALinkedDirectory()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var sourceRoot = Path.Combine(root, "local");
+            var destinationRoot = Path.Combine(root, "models");
+            Directory.CreateDirectory(Path.Combine(sourceRoot, "checkpoints"));
+            var sourceFile = Path.Combine(sourceRoot, "checkpoints", "demo.safetensors");
+            File.WriteAllText(sourceFile, "checkpoint");
+
+            // A download's directory moved out of the model root and linked back in.
+            var outside = Path.Combine(root, "outside", "checkpoints");
+            Directory.CreateDirectory(outside);
+            File.WriteAllText(Path.Combine(outside, "demo.safetensors"), "downloaded");
+            Directory.CreateDirectory(destinationRoot);
+            Directory.CreateSymbolicLink(Path.Combine(destinationRoot, "checkpoints"), outside);
+            var projected = Path.Combine(destinationRoot, "checkpoints", "demo.safetensors");
+
+            var projector = new LocalModelProjector(sourceRoot, destinationRoot);
+            projector.UpdateSnapshot(CreateSnapshot(CreateModel(sourceFile, ModelCategory.Checkpoint)));
+
+            Assert.That(
+                projector.CanProject(CreateLocalProjectionRequest(sourceFile, ModelCategory.Checkpoint, projected)),
+                Is.False,
+                "Linking would be refused there, so the download must not be given up for it.");
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
+    public void CanProject_RefusesWhenTheLocalFolderIsTheModelFolder()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var destinationRoot = Path.Combine(root, "models");
+            Directory.CreateDirectory(Path.Combine(destinationRoot, "checkpoints"));
+            var file = Path.Combine(destinationRoot, "checkpoints", "demo.safetensors");
+            File.WriteAllText(file, "the only copy");
+            // Both roots reach the same directory.
+            var sourceRoot = Path.Combine(root, "local");
+            Directory.CreateSymbolicLink(sourceRoot, destinationRoot);
+            var sourceFile = Path.Combine(sourceRoot, "checkpoints", "demo.safetensors");
+
+            var projector = new LocalModelProjector(sourceRoot, destinationRoot);
+            projector.UpdateSnapshot(CreateSnapshot(CreateModel(sourceFile, ModelCategory.Checkpoint)));
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(
+                    projector.CanProject(CreateLocalProjectionRequest(sourceFile, ModelCategory.Checkpoint, file)),
+                    Is.False,
+                    "Freeing the target would delete the source.");
+                Assert.That(File.ReadAllText(file), Is.EqualTo("the only copy"));
+            });
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
+    public void SetRequestedModels_LinksEveryModelItCanWhenOneIsRefused()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var sourceRoot = Path.Combine(root, "local");
+            var destinationRoot = Path.Combine(root, "models");
+            Directory.CreateDirectory(Path.Combine(sourceRoot, "checkpoints"));
+            Directory.CreateDirectory(Path.Combine(sourceRoot, "loras"));
+            var refusedSource = Path.Combine(sourceRoot, "checkpoints", "refused.safetensors");
+            var linkedSource = Path.Combine(sourceRoot, "loras", "linked.safetensors");
+            File.WriteAllText(refusedSource, "checkpoint");
+            File.WriteAllText(linkedSource, "lora");
+
+            // The first target is behind a linked directory; the second one's download was already given up.
+            var outside = Path.Combine(root, "outside");
+            Directory.CreateDirectory(outside);
+            Directory.CreateDirectory(destinationRoot);
+            Directory.CreateSymbolicLink(Path.Combine(destinationRoot, "checkpoints"), outside);
+            var refused = Path.Combine(destinationRoot, "checkpoints", "refused.safetensors");
+            var linked = Path.Combine(destinationRoot, "loras", "linked.safetensors");
+
+            var projector = new LocalModelProjector(sourceRoot, destinationRoot);
+            projector.UpdateSnapshot(CreateSnapshot(
+                CreateModel(refusedSource, ModelCategory.Checkpoint),
+                CreateModel(linkedSource, ModelCategory.Lora)));
+
+            Assert.That(
+                () => projector.SetRequestedModels(
+                [
+                    CreateLocalProjectionRequest(refusedSource, ModelCategory.Checkpoint, refused),
+                    CreateLocalProjectionRequest(linkedSource, ModelCategory.Lora, linked),
+                ]),
+                Throws.InvalidOperationException,
+                "The refused one is still reported.");
+            Assert.Multiple(() =>
+            {
+                Assert.That(new FileInfo(linked).LinkTarget, Is.EqualTo(linkedSource), "The other model is linked all the same.");
+                Assert.That(Directory.EnumerateFileSystemEntries(outside), Is.Empty);
+            });
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
     public void SetRequestedModels_DoesNotRemoveLinksThroughSymlinkedDirectory()
     {
         var root = CreateTempDirectory();

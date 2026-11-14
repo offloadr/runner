@@ -4467,6 +4467,218 @@ public class DemandAwareModelHydrationCoordinatorTests
             Path.Combine(root, "state"),
             shutdownCleanupTimeout);
 
+    [Test]
+    public async Task ReleaseForLocalModel_OfAStickyTransferTheSchedulerIsDriving_LeavesNothingBehind()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var stateDirectory = Path.Combine(root, "state");
+            var request = CreateRequest(root, "background.bin");
+            var backend = new DemandBackend();
+            await using var coordinator = new DemandAwareModelHydrationCoordinator(
+                backend,
+                new ModelHydrationRuntimeCapabilities("synthetic-editor", SupportsPersistentRangeHydration: true, PersistentModelRoots: [root]),
+                stateDirectory);
+            await coordinator.InitializeAsync(CancellationToken.None);
+            coordinator.RegisterDownloads("session-1", [request], replaceExisting: true);
+
+            // A read promotes the unfinished transfer, which the scheduler then keeps downloading with no lease open.
+            var opened = await coordinator.OpenAsync(request.DestinationPath, "session-1", CancellationToken.None);
+            await coordinator.EnsureRangeAsync(opened.LeaseId, opened.TransferEpoch, 0, 4, CancellationToken.None)
+                .WaitAsync(TimeSpan.FromSeconds(5));
+            await coordinator.ReleaseAsync(opened.LeaseId);
+
+            var result = await coordinator.ReleaseForLocalModelAsync(request.DestinationPath, CancellationToken.None)
+                .WaitAsync(TimeSpan.FromSeconds(5));
+            await Task.Delay(TimeSpan.FromMilliseconds(500));
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(result, Is.EqualTo(LocalModelRelease.Released));
+                Assert.That(File.Exists(request.DestinationPath), Is.False, "The scheduler does not recreate it.");
+                Assert.That(backend.CreateCallCount, Is.EqualTo(1));
+                Assert.That(new ModelTransferIndex(stateDirectory).Snapshot(), Is.Empty, "Nor write its record back.");
+            });
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
+    public async Task ReleaseForLocalModel_ThatFailsAfterAria2DroppedAnUnfinishedTransfer_StillServesTheModel()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var stateDirectory = Path.Combine(root, "state");
+            var request = CreateRequest(root, "unfinished.bin");
+            var backend = new DemandBackend();
+            await using var coordinator = new DemandAwareModelHydrationCoordinator(
+                backend,
+                new ModelHydrationRuntimeCapabilities("synthetic-editor", SupportsPersistentRangeHydration: true, PersistentModelRoots: [root]),
+                stateDirectory);
+            await coordinator.InitializeAsync(CancellationToken.None);
+            coordinator.RegisterDownloads("session-1", [request], replaceExisting: true);
+            var opened = await coordinator.OpenAsync(request.DestinationPath, "session-1", CancellationToken.None);
+            await coordinator.EnsureRangeAsync(opened.LeaseId, opened.TransferEpoch, 0, 4, CancellationToken.None)
+                .WaitAsync(TimeSpan.FromSeconds(5));
+            await coordinator.ReleaseAsync(opened.LeaseId);
+
+            backend.AfterRemove = static () => throw new IOException("simulated failure after removal");
+            var result = await coordinator.ReleaseForLocalModelAsync(request.DestinationPath, CancellationToken.None)
+                .WaitAsync(TimeSpan.FromSeconds(5));
+            backend.AfterRemove = null;
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(result, Is.EqualTo(LocalModelRelease.InUse), "The copy is kept and keeps serving.");
+                Assert.That(File.Exists(request.DestinationPath), Is.True);
+            });
+
+            // The part never downloaded is still served, from a transfer started again.
+            backend.BitfieldOnUnpause = "c0";
+            var reopened = await coordinator.OpenAsync(request.DestinationPath, "session-1", CancellationToken.None);
+            Assert.That(
+                async () => await coordinator.EnsureRangeAsync(reopened.LeaseId, reopened.TransferEpoch, 4, 4, CancellationToken.None)
+                    .WaitAsync(TimeSpan.FromSeconds(5)),
+                Throws.Nothing);
+            await coordinator.ReleaseAsync(reopened.LeaseId);
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
+    public async Task ReleaseForLocalModel_WhileTheSchedulerIsHeldUp_DoesNotHoldTheCommandUp()
+    {
+        var root = CreateTempDirectory();
+        var originalTimeout = DemandAwareModelHydrationCoordinator.LocalReleaseStartTimeout;
+        DemandAwareModelHydrationCoordinator.LocalReleaseStartTimeout = TimeSpan.FromMilliseconds(200);
+        try
+        {
+            var stateDirectory = Path.Combine(root, "state");
+            var downloaded = CreateRequest(root, "downloaded.bin");
+            var busy = CreateRequest(root, "busy.bin");
+            var backend = new DemandBackend { BitfieldOnUnpause = "c0" };
+            await using var coordinator = new DemandAwareModelHydrationCoordinator(
+                backend,
+                new ModelHydrationRuntimeCapabilities("synthetic-editor", SupportsPersistentRangeHydration: true, PersistentModelRoots: [root]),
+                stateDirectory);
+            await coordinator.InitializeAsync(CancellationToken.None);
+            coordinator.RegisterDownloads("session-1", [downloaded, busy], replaceExisting: true);
+            var finished = await coordinator.OpenAsync(downloaded.DestinationPath, "session-1", CancellationToken.None);
+            await coordinator.EnsureRangeAsync(finished.LeaseId, finished.TransferEpoch, 0, 8, CancellationToken.None)
+                .WaitAsync(TimeSpan.FromSeconds(5));
+            await coordinator.ReleaseAsync(finished.LeaseId);
+
+            // Another model is being read, so the scheduler keeps polling its unfinished transfer.
+            backend.BitfieldOnUnpause = "80";
+            var reading = await coordinator.OpenAsync(busy.DestinationPath, "session-1", CancellationToken.None);
+            await coordinator.EnsureRangeAsync(reading.LeaseId, reading.TransferEpoch, 0, 4, CancellationToken.None)
+                .WaitAsync(TimeSpan.FromSeconds(5));
+
+            // aria2 stops answering while the scheduler polls it.
+            var held = new TaskCompletionSource();
+            backend.StatusAttemptStarted = held;
+            backend.StatusAttemptRelease = new TaskCompletionSource().Task;
+            await held.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            var neverDownloaded = await coordinator
+                .ReleaseForLocalModelAsync(Path.Combine(root, "models", "never.bin"), CancellationToken.None)
+                .WaitAsync(TimeSpan.FromSeconds(1));
+            var duplicate = await coordinator
+                .ReleaseForLocalModelAsync(downloaded.DestinationPath, CancellationToken.None)
+                .WaitAsync(TimeSpan.FromSeconds(5));
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(neverDownloaded, Is.EqualTo(LocalModelRelease.NotManaged), "Answered without the scheduler.");
+                Assert.That(duplicate, Is.EqualTo(LocalModelRelease.InUse), "Given up on in time; the download stays.");
+                Assert.That(File.Exists(downloaded.DestinationPath), Is.True);
+            });
+        }
+        finally
+        {
+            DemandAwareModelHydrationCoordinator.LocalReleaseStartTimeout = originalTimeout;
+            TryDelete(root);
+        }
+    }
+
+    [Test]
+    public async Task ReleaseForLocalModels_OfSeveralModelsWhileTheSchedulerIsHeldUp_WaitsOneTimeoutInAll()
+    {
+        var root = CreateTempDirectory();
+        var originalTimeout = DemandAwareModelHydrationCoordinator.LocalReleaseStartTimeout;
+        DemandAwareModelHydrationCoordinator.LocalReleaseStartTimeout = TimeSpan.FromMilliseconds(500);
+        try
+        {
+            var backend = new DemandBackend { BitfieldOnUnpause = "c0" };
+            var settings = Aria2Settings.FromEnvironment(name => name switch
+            {
+                "ARIA2_DOWNLOAD_DIR" => root,
+                "ARIA2_STATE_DIR" => Path.Combine(root, "aria2-state"),
+                _ => null
+            }, () => "generated-secret");
+            await using var service = new ModelDownloadService(
+                backend,
+                settings,
+                new ModelHydrationRuntimeCapabilities("synthetic-editor", SupportsPersistentRangeHydration: true, PersistentModelRoots: [root]));
+            await service.InitializeAsync(CancellationToken.None);
+            var downloaded = Enumerable.Range(1, 4).Select(index => CreateRequest(root, $"downloaded-{index}.bin")).ToArray();
+            var busy = CreateRequest(root, "busy.bin");
+            service.SetActiveSession("session-1");
+            service.SeedDownloads("session-1", [.. downloaded, busy]);
+            foreach (var model in downloaded)
+            {
+                var finished = await service.OpenRangeManagedAsync(model.DestinationPath, "session-1", CancellationToken.None);
+                await service.EnsureRangeAsync(finished.LeaseId, finished.TransferEpoch, 0, 8, CancellationToken.None)
+                    .WaitAsync(TimeSpan.FromSeconds(5));
+                await service.ReleaseAsync(finished.LeaseId);
+            }
+
+            // Another model is being read, and aria2 stops answering while the scheduler polls it.
+            backend.BitfieldOnUnpause = "80";
+            var reading = await service.OpenRangeManagedAsync(busy.DestinationPath, "session-1", CancellationToken.None);
+            await service.EnsureRangeAsync(reading.LeaseId, reading.TransferEpoch, 0, 4, CancellationToken.None)
+                .WaitAsync(TimeSpan.FromSeconds(5));
+            var held = new TaskCompletionSource();
+            backend.StatusAttemptStarted = held;
+            backend.StatusAttemptRelease = new TaskCompletionSource().Task;
+            await held.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            var locals = downloaded
+                .Select(model => new ModelDownloadRequest
+                {
+                    ModelId = model.ModelId,
+                    Filename = model.Filename,
+                    DestinationPath = model.DestinationPath,
+                    LocalSelectionHash = new string('a', 64),
+                })
+                .ToArray();
+            var watch = System.Diagnostics.Stopwatch.StartNew();
+            var projected = await service.ReleaseForLocalModelsAsync(locals, static _ => true, CancellationToken.None)
+                .WaitAsync(TimeSpan.FromSeconds(10));
+            watch.Stop();
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(projected, Is.Empty, "Every download is kept.");
+                Assert.That(downloaded.All(model => File.Exists(model.DestinationPath)), Is.True);
+                Assert.That(watch.Elapsed, Is.LessThan(TimeSpan.FromMilliseconds(1500)), "One timeout for the batch, not one per model.");
+            });
+        }
+        finally
+        {
+            DemandAwareModelHydrationCoordinator.LocalReleaseStartTimeout = originalTimeout;
+            TryDelete(root);
+        }
+    }
+
     private static ModelDownloadRequest CreateRequest(string root, string filename)
         => new()
         {
@@ -4880,6 +5092,10 @@ public class DemandAwareModelHydrationCoordinatorTests
 
             RemovedHandles.Add(handle);
             _snapshots.Remove(handle);
+            AfterRemove?.Invoke();
         }
+
+        /// <summary>Runs once a transfer is gone from aria2; throwing from it fails the removal after the fact.</summary>
+        public Action? AfterRemove { get; set; }
     }
 }

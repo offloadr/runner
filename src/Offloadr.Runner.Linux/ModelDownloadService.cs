@@ -397,6 +397,130 @@ internal sealed class ModelDownloadService : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Frees the paths that local models are about to be linked at from the agent's own downloads of
+    /// them (see <see cref="DemandAwareModelHydrationCoordinator.ReleaseForLocalModelAsync"/>), and returns
+    /// the requests to project now: all of them but the local ones whose download is in use, which keeps
+    /// serving the editor until a later request finds it free.
+    /// </summary>
+    /// <param name="canLink">
+    /// Whether the local model a request names can be linked now. A download is never given up for one
+    /// that cannot: the local file may be gone from the folder since Offloadr chose it.
+    /// </param>
+    /// <param name="linkFreed">
+    /// Links the local model of a request whose path was just freed, so the path is not left empty while
+    /// the rest of the batch is released. The returned requests are projected again afterwards.
+    /// </param>
+    public async Task<IReadOnlyList<ModelDownloadRequest>> ReleaseForLocalModelsAsync(
+        IEnumerable<ModelDownloadRequest> downloads,
+        Func<ModelDownloadRequest, bool> canLink,
+        CancellationToken cancellationToken,
+        Action<ModelDownloadRequest>? linkFreed = null)
+    {
+        ArgumentNullException.ThrowIfNull(canLink);
+        var requested = downloads.Where(static download => download is not null).ToArray();
+        if (_hydrationCoordinator is null)
+        {
+            return requested;
+        }
+
+        var inUse = new HashSet<string>(StringComparer.Ordinal);
+        // A path depends only on a model's category and file name, so the download there may be another
+        // model of another size. That one is never given up: it stays in the way, and the projector
+        // refuses the local request, rather than deleting a model that was not asked to be replaced.
+        var releasable = requested
+            .Where(LocalModelProjector.IsLocalProjectionRequest)
+            .Where(canLink)
+            .Select(download => (Download: download, Path: NormalizeDestination(download.DestinationPath)))
+            .Where(static entry => entry.Path is not null)
+            .Where(entry => IsSameSize(entry.Download, ExpectedSizeOfDownloadAt(entry.Path!)))
+            .DistinctBy(static entry => entry.Path, StringComparer.Ordinal)
+            .ToArray();
+        // All at once, so a held-up scheduler costs the command one start timeout, not one per model.
+        // Once the command is cancelled no further download is given up, but those already freed are
+        // still returned, so their local models get linked.
+        var hydrationCoordinator = _hydrationCoordinator;
+        var releases = await Task.WhenAll(releasable.Select(async entry =>
+            {
+                var release = cancellationToken.IsCancellationRequested
+                    ? LocalModelRelease.InUse
+                    : await hydrationCoordinator
+                        .ReleaseForLocalModelAsync(entry.Path!, cancellationToken, () => canLink(entry.Download))
+                        .ConfigureAwait(false);
+                if (release == LocalModelRelease.Released)
+                {
+                    LinkFreed(linkFreed, entry.Download);
+                }
+
+                return (entry.Download, Path: entry.Path!, Release: release);
+            }))
+            .ConfigureAwait(false);
+        var keptSizes = new Dictionary<string, long?>(StringComparer.Ordinal);
+        foreach (var (download, path, release) in releases)
+        {
+            // Only the copy the agent downloaded, still at its path, can stand in for the local model;
+            // otherwise the request goes on to the projector.
+            if (release != LocalModelRelease.InUse || !HasIntactCopyAt(path))
+            {
+                continue;
+            }
+
+            // The copy keeps serving only as the same model: one of another size stays in the way, and
+            // the projector refuses the request as it did before, rather than the editor using other weights.
+            var downloadedSize = ExpectedSizeOfDownloadAt(path);
+            if (!IsSameSize(download, downloadedSize))
+            {
+                RunnerLog.Warning(
+                    nameof(ModelDownloadService),
+                    $"The downloaded copy at '{path}' is in use and is not the local model requested there.");
+                continue;
+            }
+
+            RunnerLog.Info(
+                nameof(ModelDownloadService),
+                $"Keeping the downloaded copy at '{path}' while it is in use; the local model is linked there once it is free.");
+            inUse.Add(path);
+            keptSizes[path] = downloadedSize;
+        }
+
+        // Every request for a kept path is checked, not only the one that was released: another selection
+        // of another size at the same path still reaches the projector.
+        return inUse.Count == 0
+            ? requested
+            : requested
+                .Where(download => !LocalModelProjector.IsLocalProjectionRequest(download) ||
+                                   NormalizeDestination(download.DestinationPath) is not { } path ||
+                                   !inUse.Contains(path) ||
+                                   !IsSameSize(download, keptSizes[path]))
+                .ToArray();
+    }
+
+    private static bool IsSameSize(ModelDownloadRequest download, long? downloadedSize)
+        => download.SizeBytes <= 0 || downloadedSize is not { } size || size == download.SizeBytes;
+
+    /// <summary>Whether the file at <paramref name="path"/> is still the one the agent downloaded there.</summary>
+    private bool HasIntactCopyAt(string path)
+        => _hydrationCoordinator?.IsRangeManaged(path) == true
+            ? _hydrationCoordinator.HasIntactCopyAt(path)
+            : File.Exists(path);
+
+    /// <summary>The size the download at <paramref name="path"/> was asked for with, not how far it has got.</summary>
+    private long? ExpectedSizeOfDownloadAt(string path)
+        => _hydrationCoordinator?.ExpectedLengthAt(path);
+
+    private static void LinkFreed(Action<ModelDownloadRequest>? linkFreed, ModelDownloadRequest download)
+    {
+        try
+        {
+            linkFreed?.Invoke(download);
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or IOException or UnauthorizedAccessException)
+        {
+            // Reported again when the whole request is projected.
+            RunnerLog.Warning(nameof(ModelDownloadService), $"Could not link a local model at once ({ex.GetType().Name}).");
+        }
+    }
+
     private void ReportRefused(string sessionId, IReadOnlyCollection<ModelDownloadRequest> downloads)
     {
         var normalizedSessionId = string.IsNullOrWhiteSpace(sessionId) ? null : sessionId.Trim();

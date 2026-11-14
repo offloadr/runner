@@ -104,6 +104,91 @@ internal sealed class LocalModelProjector
     public static bool IsLocalProjectionRequest(ModelDownloadRequest? download)
         => !string.IsNullOrWhiteSpace(download?.LocalSelectionHash);
 
+    /// <summary>
+    /// Whether the local file <paramref name="download"/> names is in the current inventory and readable,
+    /// so a link to it can be made now.
+    /// </summary>
+    public bool CanProject(ModelDownloadRequest download)
+    {
+        if (!IsLocalProjectionRequest(download))
+        {
+            return false;
+        }
+
+        // The checks AddProjectionRequests and EnsureProjectedLink make, so a request they would refuse
+        // is refused here too.
+        var selectionHash = LocalModelSelectionHash.NormalizeSelectionHash(download.LocalSelectionHash);
+        if (!LocalModelSelectionHash.IsValidSelectionHash(selectionHash) ||
+            string.IsNullOrWhiteSpace(download.DestinationPath) ||
+            !IsUnderRoot(NormalizePath(download.DestinationPath), _destinationRoot) ||
+            !IsReachableThroughRealDirectories(NormalizePath(download.DestinationPath)))
+        {
+            return false;
+        }
+
+        lock (_gate)
+        {
+            if (!_modelsBySelectionHash.TryGetValue(selectionHash, out var model))
+            {
+                return false;
+            }
+
+            try
+            {
+                var sourcePath = BuildSourcePath(model);
+                return !string.IsNullOrWhiteSpace(sourcePath) &&
+                       File.Exists(sourcePath) &&
+                       !IsSameFile(sourcePath, NormalizePath(download.DestinationPath));
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                return false;
+            }
+        }
+    }
+
+    /// <summary>
+    /// True when <paramref name="sourcePath"/> and <paramref name="targetPath"/> are one file, as when the
+    /// local folder and the model folder are the same directory: freeing the target would delete the source.
+    /// </summary>
+    private static bool IsSameFile(string sourcePath, string targetPath)
+    {
+        if (PathsEqual(sourcePath, targetPath))
+        {
+            return true;
+        }
+
+        return OperatingSystem.IsLinux() &&
+               LinuxFileIdentityReader.TryRead(Path.GetFullPath(LinuxPathCanonicalizer.ResolveExistingPath(sourcePath)), out var source) &&
+               LinuxFileIdentityReader.TryRead(targetPath, out var target) &&
+               source.DeviceId == target.DeviceId &&
+               source.Inode == target.Inode;
+    }
+
+    /// <summary>
+    /// Whether every directory between the destination root and <paramref name="targetPath"/> is a real
+    /// one, as <see cref="EnsureProjectedLink"/> requires: a link there makes it refuse the target.
+    /// </summary>
+    private bool IsReachableThroughRealDirectories(string targetPath)
+    {
+        if (!OperatingSystem.IsLinux() || !Directory.Exists(_destinationRoot))
+        {
+            return true;
+        }
+
+        try
+        {
+            using var secureRoot = new LinuxSecureDirectoryRoot(_destinationRoot);
+            var relativePath = GetRelativeTargetPath(targetPath);
+            return secureRoot.GetStatus(relativePath).Kind is SecureEntryKind.RegularFile or SecureEntryKind.Missing ||
+                   secureRoot.ReadSymbolicLink(relativePath, out _) == SecureLinkKind.SymbolicLink;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException)
+        {
+            return false;
+        }
+    }
+
     private void AddProjectionRequests(
         IEnumerable<ModelDownloadRequest>? downloads,
         bool reportRemoteFallbacks)
@@ -288,7 +373,16 @@ internal sealed class LocalModelProjector
                 continue;
             }
 
-            EnsureProjectedLink(sourcePath!, targetPath);
+            try
+            {
+                EnsureProjectedLink(sourcePath!, targetPath);
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or IOException or UnauthorizedAccessException)
+            {
+                // The other models are still linked: a download may already have been given up for one of
+                // them. The first failure is reported once they are done.
+                failure ??= ex as InvalidOperationException ?? new InvalidOperationException(ex.Message, ex);
+            }
         }
 
         foreach (var stale in _managedTargets.ToArray())

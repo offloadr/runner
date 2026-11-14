@@ -180,6 +180,7 @@ Local model notes:
 - The runner reports only opaque selection hashes derived from `filename + size + category`; raw local filenames and directory paths do not leave the runner.
 - Runtime model folders only receive symlinks for registered studio models whose selection hash matches the active runner's local inventory.
 - When a prompt references a catalog model whose filename exists locally but whose size or category differs, the runner logs the mismatched metadata and downloads the catalog version instead of silently substituting different weights; with model downloads off, the prompt is refused instead.
+- When a model in the local folder is to be linked where the runner already downloaded the same model (downloaded before the file was added, say), the downloaded copy is deleted so the model is not kept twice. While the editor has that copy open, it stays and keeps being used; the next session or prompt replaces it. This covers ComfyUI's persistent model folder; on Forge Neo, whose models live in the session, a downloaded file there is still refused.
 - Runner-only local files do not appear in Installed until you add the same model to your studio catalog.
 - If you add/remove files under the mounted directory, the runner auto-rescans and updates inventory on the next scan interval. Unchanged inventories refresh by digest only to keep the Offloadr API lease alive. The Model Manager also supports manual refresh.
 

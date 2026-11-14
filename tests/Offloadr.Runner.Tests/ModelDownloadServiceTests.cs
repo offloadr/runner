@@ -848,6 +848,673 @@ public class ModelDownloadServiceTests
         }
     }
 
+    [Test]
+    public async Task ReleaseForLocalModels_DeletesAFinishedDownloadSoTheLocalModelCanBeLinked()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var destinationPath = Path.Combine(root, "diffusion_models", "shared.safetensors");
+            var aria = new CompletingAria2Client(destinationPath, expectedBytes: 8);
+            await using var service = CreateRangeManagedService(aria, root);
+            await service.InitializeAsync(CancellationToken.None);
+            service.SetActiveSession("session-1");
+            service.SeedDownloads("session-1", [RemoteModel(destinationPath)]);
+            await ReadWholeModelAsync(service, destinationPath);
+            Assert.That(aria.AddUriCallCount, Is.EqualTo(1), "The download finished first.");
+
+            var local = LocalModel(destinationPath);
+            var projected = await service.ReleaseForLocalModelsAsync([local], AnyLocalModel, CancellationToken.None);
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(projected, Is.EqualTo(new[] { local }));
+                Assert.That(File.Exists(destinationPath), Is.False, "The local copy replaces the download; it is not kept twice.");
+                Assert.That(aria.RemoveCallCount, Is.EqualTo(1));
+            });
+
+            // Forgotten too: asked for as a download again, it is downloaded again rather than trusted.
+            service.SeedDownloads("session-1", [RemoteModel(destinationPath)]);
+            await ReadWholeModelAsync(service, destinationPath);
+            Assert.That(aria.AddUriCallCount, Is.EqualTo(2));
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
+    public async Task ReleaseForLocalModels_KeepsADownloadTheEditorHasOpenUntilItIsClosed()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var destinationPath = Path.Combine(root, "diffusion_models", "open.safetensors");
+            var aria = new CompletingAria2Client(destinationPath, expectedBytes: 8);
+            await using var service = CreateRangeManagedService(aria, root);
+            await service.InitializeAsync(CancellationToken.None);
+            service.SetActiveSession("session-1");
+            service.SeedDownloads("session-1", [RemoteModel(destinationPath)]);
+            var opened = await service.OpenRangeManagedAsync(destinationPath, "session-1", CancellationToken.None);
+
+            var local = LocalModel(destinationPath);
+            var whileOpen = await service.ReleaseForLocalModelsAsync([local], AnyLocalModel, CancellationToken.None);
+            Assert.Multiple(() =>
+            {
+                Assert.That(whileOpen, Is.Empty, "No link is made over a model the editor is reading.");
+                Assert.That(File.Exists(destinationPath), Is.True);
+                Assert.That(aria.RemoveCallCount, Is.Zero);
+            });
+
+            await service.ReleaseAsync(opened.LeaseId);
+            var afterClose = await service.ReleaseForLocalModelsAsync([local], AnyLocalModel, CancellationToken.None);
+            Assert.Multiple(() =>
+            {
+                Assert.That(afterClose, Is.EqualTo(new[] { local }));
+                Assert.That(File.Exists(destinationPath), Is.False);
+            });
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
+    public async Task ReleaseForLocalModels_ThatFails_KeepsTheDownloadServingAndTriesAgainLater()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var destinationPath = Path.Combine(root, "diffusion_models", "stuck.safetensors");
+            var aria = new CompletingAria2Client(destinationPath, expectedBytes: 8);
+            await using var service = CreateRangeManagedService(aria, root);
+            await service.InitializeAsync(CancellationToken.None);
+            service.SetActiveSession("session-1");
+            service.SeedDownloads("session-1", [RemoteModel(destinationPath)]);
+            await ReadWholeModelAsync(service, destinationPath);
+            var local = LocalModel(destinationPath);
+
+            aria.FailRemoval = true;
+            var projected = await service.ReleaseForLocalModelsAsync([local], AnyLocalModel, CancellationToken.None);
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(projected, Is.Empty, "The command carries on, without a link over the download.");
+                Assert.That(File.Exists(destinationPath), Is.True);
+            });
+            Assert.That(
+                async () => await ReadWholeModelAsync(service, destinationPath),
+                Throws.Nothing,
+                "The download keeps serving; it is not left refused as pending cleanup.");
+
+            aria.FailRemoval = false;
+            var retried = await service.ReleaseForLocalModelsAsync([local], AnyLocalModel, CancellationToken.None);
+            Assert.Multiple(() =>
+            {
+                Assert.That(retried, Is.EqualTo(new[] { local }));
+                Assert.That(File.Exists(destinationPath), Is.False);
+            });
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
+    public async Task ReleaseForLocalModels_LeavesAFileItDidNotDownload()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var destinationPath = Path.Combine(root, "diffusion_models", "theirs.safetensors");
+            Directory.CreateDirectory(Path.GetDirectoryName(destinationPath)!);
+            await File.WriteAllTextAsync(destinationPath, "not the agent's");
+            var aria = new CompletingAria2Client(destinationPath, expectedBytes: 8);
+            await using var service = CreateRangeManagedService(aria, root);
+            await service.InitializeAsync(CancellationToken.None);
+
+            var local = LocalModel(destinationPath);
+            var remote = RemoteModel(Path.Combine(root, "loras", "other.safetensors"));
+            var projected = await service.ReleaseForLocalModelsAsync([local, remote], AnyLocalModel, CancellationToken.None);
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(projected, Is.EqualTo(new[] { local, remote }), "The projector decides about it, and refuses it.");
+                Assert.That(File.ReadAllText(destinationPath), Is.EqualTo("not the agent's"));
+                Assert.That(aria.RemoveCallCount, Is.Zero);
+            });
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
+    public async Task ReleaseForLocalModels_KeepsTheDownloadWhenTheLocalModelCannotBeLinked()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var destinationPath = Path.Combine(root, "diffusion_models", "gone.safetensors");
+            var aria = new CompletingAria2Client(destinationPath, expectedBytes: 8);
+            await using var service = CreateRangeManagedService(aria, root);
+            await service.InitializeAsync(CancellationToken.None);
+            service.SetActiveSession("session-1");
+            service.SeedDownloads("session-1", [RemoteModel(destinationPath)]);
+            await ReadWholeModelAsync(service, destinationPath);
+            var local = LocalModel(destinationPath);
+
+            // The local file left the folder after Offloadr chose it.
+            var projected = await service.ReleaseForLocalModelsAsync([local], static _ => false, CancellationToken.None);
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(projected, Is.EqualTo(new[] { local }), "The projector reports the missing local model.");
+                Assert.That(File.Exists(destinationPath), Is.True, "The download is not given up for a model that cannot replace it.");
+                Assert.That(aria.RemoveCallCount, Is.Zero);
+            });
+            Assert.That(async () => await ReadWholeModelAsync(service, destinationPath), Throws.Nothing);
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
+    public async Task ReleaseForLocalModels_CancelledOnceStarted_FinishesAndSaysSo()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var destinationPath = Path.Combine(root, "diffusion_models", "cancelled.safetensors");
+            var aria = new CompletingAria2Client(destinationPath, expectedBytes: 8);
+            await using var service = CreateRangeManagedService(aria, root);
+            await service.InitializeAsync(CancellationToken.None);
+            service.SetActiveSession("session-1");
+            service.SeedDownloads("session-1", [RemoteModel(destinationPath)]);
+            await ReadWholeModelAsync(service, destinationPath);
+            var local = LocalModel(destinationPath);
+
+            aria.BlockRemoval = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            using var stop = new CancellationTokenSource();
+            var release = service.ReleaseForLocalModelsAsync([local], AnyLocalModel, stop.Token);
+            await aria.BlockRemoval.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            stop.Cancel();
+            aria.RemovalGate.TrySetResult();
+
+            // The caller learns the path is free, so the local model is linked rather than nothing being there.
+            var projected = await release.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Multiple(() =>
+            {
+                Assert.That(projected, Is.EqualTo(new[] { local }));
+                Assert.That(File.Exists(destinationPath), Is.False);
+            });
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
+    public async Task ReleaseForLocalModels_ThatFailsAfterDeletingTheFile_LeavesThePathUnmanaged()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var destinationPath = Path.Combine(root, "diffusion_models", "half.safetensors");
+            var aria = new CompletingAria2Client(destinationPath, expectedBytes: 8);
+            await using var service = CreateRangeManagedService(aria, root);
+            await service.InitializeAsync(CancellationToken.None);
+            service.SetActiveSession("session-1");
+            service.SeedDownloads("session-1", [RemoteModel(destinationPath)]);
+            await ReadWholeModelAsync(service, destinationPath);
+            var local = LocalModel(destinationPath);
+
+            aria.FailSaveSession = true;
+            var projected = await service.ReleaseForLocalModelsAsync([local], AnyLocalModel, CancellationToken.None);
+            aria.FailSaveSession = false;
+
+            // The local model is linked where the download was, and its opens are not checked against it.
+            File.WriteAllText(destinationPath, "the local model");
+            var opened = await service.OpenRangeManagedAsync(destinationPath, "session-1", CancellationToken.None);
+            Assert.Multiple(() =>
+            {
+                Assert.That(projected, Is.EqualTo(new[] { local }), "The file is gone, so the local model is linked.");
+                Assert.That(opened.Disposition, Is.EqualTo(ModelHydrationOpenDisposition.Unmanaged));
+            });
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
+    public async Task ReleaseForLocalModels_CancelledAfterTheTransferIsRemoved_RecoversInTheSameSession()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var destinationPath = Path.Combine(root, "diffusion_models", "partly.safetensors");
+            var aria = new CompletingAria2Client(destinationPath, expectedBytes: 8);
+            await using var service = CreateRangeManagedService(aria, root);
+            await service.InitializeAsync(CancellationToken.None);
+            service.SetActiveSession("session-1");
+            service.SeedDownloads("session-1", [RemoteModel(destinationPath)]);
+            await ReadWholeModelAsync(service, destinationPath);
+
+            // Stop arrives once aria2 has dropped the transfer, before its index entry goes. The release
+            // finishes anyway, so nothing is left half done.
+            using var stop = new CancellationTokenSource();
+            aria.AfterRemoval = stop.Cancel;
+            var projected = await service.ReleaseForLocalModelsAsync([LocalModel(destinationPath)], AnyLocalModel, stop.Token);
+            aria.AfterRemoval = null;
+            Assert.That(projected, Has.Count.EqualTo(1), "The caller links the local model.");
+
+            var opened = await service.OpenRangeManagedAsync(destinationPath, "session-1", CancellationToken.None);
+            Assert.Multiple(() =>
+            {
+                Assert.That(File.Exists(destinationPath), Is.False);
+                Assert.That(opened.Disposition, Is.EqualTo(ModelHydrationOpenDisposition.Unmanaged), "No state of the removed transfer is left.");
+            });
+
+            // Asked for as a download again, it is downloaded again rather than tied to the removed transfer.
+            service.SeedDownloads("session-1", [RemoteModel(destinationPath)]);
+            await ReadWholeModelAsync(service, destinationPath);
+            Assert.Multiple(() =>
+            {
+                Assert.That(aria.AddUriCallCount, Is.EqualTo(2));
+                Assert.That(new FileInfo(destinationPath).Length, Is.EqualTo(8));
+            });
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
+    public async Task ReleaseForLocalModels_CancelledBetweenModels_LinksTheFreedOneAndKeepsTheRest()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var first = Path.Combine(root, "diffusion_models", "first.safetensors");
+            var second = Path.Combine(root, "loras", "second.safetensors");
+            var aria = new PerPathAria2Client(expectedBytes: 8);
+            await using var service = CreateRangeManagedService(aria, root);
+            await service.InitializeAsync(CancellationToken.None);
+            service.SetActiveSession("session-1");
+            var secondRemote = RemoteModel(second);
+            secondRemote.ModelId = "model-2";
+            service.SeedDownloads("session-1", [RemoteModel(first), secondRemote]);
+            await ReadWholeModelAsync(service, first);
+            await ReadWholeModelAsync(service, second);
+            var firstLocal = LocalModel(first);
+            var secondLocal = LocalModel(second);
+
+            // Stop arrives while the first download is being given up.
+            using var stop = new CancellationTokenSource();
+            aria.AfterRemoval = stop.Cancel;
+            var projected = await service.ReleaseForLocalModelsAsync([firstLocal, secondLocal], AnyLocalModel, stop.Token);
+            aria.AfterRemoval = null;
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(projected, Is.EqualTo(new[] { firstLocal }), "The freed path still gets its local link.");
+                Assert.That(File.Exists(first), Is.False);
+                Assert.That(File.Exists(second), Is.True, "No further download is given up once cancelled.");
+            });
+            Assert.That(async () => await ReadWholeModelAsync(service, second), Throws.Nothing);
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
+    public async Task ReleaseForLocalModels_LinksEachFreedPathWithoutWaitingForTheRest()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var first = Path.Combine(root, "diffusion_models", "first.safetensors");
+            var second = Path.Combine(root, "loras", "second.safetensors");
+            var aria = new PerPathAria2Client(expectedBytes: 8);
+            await using var service = CreateRangeManagedService(aria, root);
+            await service.InitializeAsync(CancellationToken.None);
+            service.SetActiveSession("session-1");
+            var secondRemote = RemoteModel(second);
+            secondRemote.ModelId = "model-2";
+            service.SeedDownloads("session-1", [RemoteModel(first), secondRemote]);
+            await ReadWholeModelAsync(service, first);
+            await ReadWholeModelAsync(service, second);
+            var firstLocal = LocalModel(first);
+            var secondLocal = LocalModel(second);
+
+            aria.BlockRemovalOf = second;
+            var linked = new TaskCompletionSource<ModelDownloadRequest>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var release = service.ReleaseForLocalModelsAsync(
+                [firstLocal, secondLocal],
+                AnyLocalModel,
+                CancellationToken.None,
+                linkFreed: freed => linked.TrySetResult(freed));
+
+            await aria.RemovalBlocked.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            var linkedFirst = await linked.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Multiple(() =>
+            {
+                Assert.That(linkedFirst, Is.SameAs(firstLocal), "Linked while the second is still being released.");
+                Assert.That(release.IsCompleted, Is.False);
+            });
+
+            aria.RemovalGate.TrySetResult();
+            Assert.That(await release.WaitAsync(TimeSpan.FromSeconds(5)), Is.EqualTo(new[] { firstLocal, secondLocal }));
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
+    public async Task ReleaseForLocalModels_DoesNotLetAnOpenCopyOfAnotherSizeStandInForTheLocalModel()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var destinationPath = Path.Combine(root, "diffusion_models", "same-name.safetensors");
+            var aria = new CompletingAria2Client(destinationPath, expectedBytes: 8);
+            await using var service = CreateRangeManagedService(aria, root);
+            await service.InitializeAsync(CancellationToken.None);
+            service.SetActiveSession("session-1");
+            service.SeedDownloads("session-1", [RemoteModel(destinationPath)]);
+            var opened = await service.OpenRangeManagedAsync(destinationPath, "session-1", CancellationToken.None);
+
+            // Another model of the same name, but another size.
+            var other = LocalModel(destinationPath);
+            other.SizeBytes = 16;
+            var projected = await service.ReleaseForLocalModelsAsync([other], AnyLocalModel, CancellationToken.None);
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(projected, Is.EqualTo(new[] { other }), "Handed to the projector, which refuses the occupied path.");
+                Assert.That(File.Exists(destinationPath), Is.True);
+            });
+            await service.ReleaseAsync(opened.LeaseId);
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
+    public async Task ReleaseForLocalModels_KeepsTheDownloadWhenTheLocalModelGoesWhileItWaits()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var destinationPath = Path.Combine(root, "diffusion_models", "vanishing.safetensors");
+            var aria = new CompletingAria2Client(destinationPath, expectedBytes: 8);
+            await using var service = CreateRangeManagedService(aria, root);
+            await service.InitializeAsync(CancellationToken.None);
+            service.SetActiveSession("session-1");
+            service.SeedDownloads("session-1", [RemoteModel(destinationPath)]);
+            await ReadWholeModelAsync(service, destinationPath);
+
+            var localStillThere = true;
+            aria.BlockRemoval = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var release = service.ReleaseForLocalModelsAsync(
+                [LocalModel(destinationPath)],
+                _ => Volatile.Read(ref localStillThere),
+                CancellationToken.None);
+            await aria.BlockRemoval.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            // The local file leaves its folder while aria2 is still dropping the transfer.
+            Volatile.Write(ref localStillThere, false);
+            aria.BlockRemoval = null;
+            aria.RemovalGate.TrySetResult();
+            var projected = await release.WaitAsync(TimeSpan.FromSeconds(5));
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(projected, Is.Empty, "No link is made where there is nothing to link.");
+                Assert.That(File.Exists(destinationPath), Is.True, "The download is kept.");
+            });
+            Assert.That(async () => await ReadWholeModelAsync(service, destinationPath), Throws.Nothing, "And keeps serving.");
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
+    public async Task ReleaseForLocalModels_LinksTheLocalModelWhenTheKeptCopyIsGone()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var destinationPath = Path.Combine(root, "diffusion_models", "deleted.safetensors");
+            var aria = new CompletingAria2Client(destinationPath, expectedBytes: 8);
+            await using var service = CreateRangeManagedService(aria, root);
+            await service.InitializeAsync(CancellationToken.None);
+            service.SetActiveSession("session-1");
+            service.SeedDownloads("session-1", [RemoteModel(destinationPath)]);
+            var opened = await service.OpenRangeManagedAsync(destinationPath, "session-1", CancellationToken.None);
+            File.Delete(destinationPath);
+            var local = LocalModel(destinationPath);
+
+            var projected = await service.ReleaseForLocalModelsAsync([local], AnyLocalModel, CancellationToken.None);
+
+            Assert.That(projected, Is.EqualTo(new[] { local }), "Nothing is left to stand in for it, so it is linked.");
+            await service.ReleaseAsync(opened.LeaseId);
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
+    public async Task ReleaseForLocalModels_HoldsBackOnlyTheSelectionTheOpenCopyMatches()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var destinationPath = Path.Combine(root, "diffusion_models", "shared.safetensors");
+            var aria = new CompletingAria2Client(destinationPath, expectedBytes: 8);
+            await using var service = CreateRangeManagedService(aria, root);
+            await service.InitializeAsync(CancellationToken.None);
+            service.SetActiveSession("session-1");
+            service.SeedDownloads("session-1", [RemoteModel(destinationPath)]);
+            var opened = await service.OpenRangeManagedAsync(destinationPath, "session-1", CancellationToken.None);
+
+            var matching = LocalModel(destinationPath);
+            var conflicting = LocalModel(destinationPath);
+            conflicting.SizeBytes = 16;
+            var projected = await service.ReleaseForLocalModelsAsync([matching, conflicting], AnyLocalModel, CancellationToken.None);
+
+            Assert.That(projected, Is.EqualTo(new[] { conflicting }), "The other selection still reaches the projector.");
+            await service.ReleaseAsync(opened.LeaseId);
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
+    public async Task ReleaseForLocalModels_DoesNotTakeAFilePutInTheCopysPlaceForIt()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var destinationPath = Path.Combine(root, "diffusion_models", "replaced.safetensors");
+            var aria = new CompletingAria2Client(destinationPath, expectedBytes: 8);
+            await using var service = CreateRangeManagedService(aria, root);
+            await service.InitializeAsync(CancellationToken.None);
+            service.SetActiveSession("session-1");
+            service.SeedDownloads("session-1", [RemoteModel(destinationPath)]);
+            await ReadWholeModelAsync(service, destinationPath);
+            var opened = await service.OpenRangeManagedAsync(destinationPath, "session-1", CancellationToken.None);
+
+            // The open copy's name now leads to another file, made before the copy is unlinked so it
+            // cannot reuse its inode.
+            var replacement = destinationPath + ".other";
+            File.WriteAllBytes(replacement, new byte[8]);
+            File.Move(replacement, destinationPath, overwrite: true);
+            var local = LocalModel(destinationPath);
+            var projected = await service.ReleaseForLocalModelsAsync([local], AnyLocalModel, CancellationToken.None);
+
+            Assert.That(projected, Is.EqualTo(new[] { local }), "Handed to the projector, which refuses the file it did not make.");
+            await service.ReleaseAsync(opened.LeaseId);
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
+    public async Task ReleaseForLocalModels_LetsAFinishedCopyBeOpenedWhileAria2DropsIt()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var destinationPath = Path.Combine(root, "diffusion_models", "busy.safetensors");
+            var aria = new CompletingAria2Client(destinationPath, expectedBytes: 8);
+            await using var service = CreateRangeManagedService(aria, root);
+            await service.InitializeAsync(CancellationToken.None);
+            service.SetActiveSession("session-1");
+            service.SeedDownloads("session-1", [RemoteModel(destinationPath)]);
+            await ReadWholeModelAsync(service, destinationPath);
+
+            aria.BlockRemoval = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var release = service.ReleaseForLocalModelsAsync([LocalModel(destinationPath)], AnyLocalModel, CancellationToken.None);
+            await aria.BlockRemoval.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            // Another prompt starts loading the model meanwhile.
+            var opened = await service.OpenRangeManagedAsync(destinationPath, "session-1", CancellationToken.None);
+            await service.EnsureRangeAsync(opened.LeaseId, opened.TransferEpoch, offset: 0, length: 8, CancellationToken.None)
+                .WaitAsync(TimeSpan.FromSeconds(5));
+
+            aria.BlockRemoval = null;
+            aria.RemovalGate.TrySetResult();
+            var projected = await release.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Multiple(() =>
+            {
+                Assert.That(projected, Is.Empty, "The copy it opened is kept.");
+                Assert.That(File.Exists(destinationPath), Is.True);
+            });
+            await service.ReleaseAsync(opened.LeaseId);
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
+    public async Task ReleaseForLocalModels_NeverFreesTheDownloadOfAnotherModelAtThePath()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var destinationPath = Path.Combine(root, "checkpoints", "foo.safetensors");
+            var aria = new CompletingAria2Client(destinationPath, expectedBytes: 8);
+            await using var service = CreateRangeManagedService(aria, root);
+            await service.InitializeAsync(CancellationToken.None);
+            service.SetActiveSession("session-1");
+            service.SeedDownloads("session-1", [RemoteModel(destinationPath)]);
+            await ReadWholeModelAsync(service, destinationPath);
+
+            // A local model of the same name, but another size: another model.
+            var other = LocalModel(destinationPath);
+            other.SizeBytes = 16;
+            var projected = await service.ReleaseForLocalModelsAsync([other], AnyLocalModel, CancellationToken.None);
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(projected, Is.EqualTo(new[] { other }), "Handed to the projector, which refuses the occupied path.");
+                Assert.That(File.Exists(destinationPath), Is.True, "The other model's download is not deleted.");
+                Assert.That(aria.RemoveCallCount, Is.Zero);
+            });
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [Test]
+    public async Task ReleaseForLocalModels_AnswersBeforeAria2HasSavedItsSession()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var destinationPath = Path.Combine(root, "diffusion_models", "slow-save.safetensors");
+            var aria = new CompletingAria2Client(destinationPath, expectedBytes: 8);
+            await using var service = CreateRangeManagedService(aria, root);
+            await service.InitializeAsync(CancellationToken.None);
+            service.SetActiveSession("session-1");
+            service.SeedDownloads("session-1", [RemoteModel(destinationPath)]);
+            await ReadWholeModelAsync(service, destinationPath);
+
+            var save = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            aria.SaveGate = save.Task;
+            var local = LocalModel(destinationPath);
+            var projected = await service.ReleaseForLocalModelsAsync([local], AnyLocalModel, CancellationToken.None)
+                .WaitAsync(TimeSpan.FromSeconds(5));
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(projected, Is.EqualTo(new[] { local }), "The local model is linked without waiting for the save.");
+                Assert.That(File.Exists(destinationPath), Is.False);
+            });
+            save.TrySetResult();
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    private static bool AnyLocalModel(ModelDownloadRequest _) => true;
+
+    private static async Task ReadWholeModelAsync(ModelDownloadService service, string destinationPath)
+    {
+        var opened = await service.OpenRangeManagedAsync(destinationPath, "session-1", CancellationToken.None);
+        await service.EnsureRangeAsync(opened.LeaseId, opened.TransferEpoch, offset: 0, length: 8, CancellationToken.None);
+        await service.ReleaseAsync(opened.LeaseId);
+    }
+
+    private static ModelDownloadRequest RemoteModel(string destinationPath) => new()
+    {
+        ModelId = "model-1",
+        Filename = Path.GetFileName(destinationPath),
+        DestinationPath = destinationPath,
+        SizeBytes = 8,
+        SourceUrl = "https://models.example.test/" + Path.GetFileName(destinationPath),
+    };
+
+    private static ModelDownloadRequest LocalModel(string destinationPath) => new()
+    {
+        ModelId = "model-1",
+        Filename = Path.GetFileName(destinationPath),
+        DestinationPath = destinationPath,
+        SizeBytes = 8,
+        LocalSelectionHash = new string('a', 64),
+    };
+
     private static string CreateTempDirectory()
     {
         var path = Path.Combine(Path.GetTempPath(), $"model-download-tests-{Guid.NewGuid():N}");
@@ -959,11 +1626,108 @@ public class ModelDownloadServiceTests
         }
     }
 
+    /// <summary>Completes each transfer at once, at the path it was created for.</summary>
+    private sealed class PerPathAria2Client(int expectedBytes) : TestModelTransferBackend
+    {
+        private readonly Dictionary<ModelTransferHandle, string> _paths = [];
+
+        public Action? AfterRemoval { get; set; }
+
+        public override Task<IReadOnlyList<ModelTransferHandle>> CreateAsync(
+            ModelTransferCreateRequest request,
+            CancellationToken cancellationToken)
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(request.DestinationPath)!);
+            File.WriteAllBytes(request.DestinationPath, Enumerable.Repeat((byte)1, expectedBytes).ToArray());
+            var handle = new ModelTransferHandle(request.PreferredIdentifier ?? $"gid-{_paths.Count + 1}");
+            _paths[handle] = request.DestinationPath;
+            IReadOnlyList<ModelTransferHandle> handles = [handle];
+            return Task.FromResult(handles);
+        }
+
+        public override Task<ModelTransferSnapshot> GetStatusAsync(ModelTransferHandle handle, CancellationToken cancellationToken)
+            => _paths.TryGetValue(handle, out var path)
+                ? Task.FromResult(Snapshot(
+                    handle,
+                    "complete",
+                    expectedBytes,
+                    expectedBytes,
+                    files: [new ModelTransferFileSnapshot(path, expectedBytes, expectedBytes, ["https://models.example.test/model"])]))
+                : throw new ModelTransferStatusUnavailableException($"Transfer '{handle}' is unavailable.");
+
+        /// <summary>Removal of the transfer for this path waits for <see cref="RemovalGate"/>.</summary>
+        public string? BlockRemovalOf { get; set; }
+
+        public TaskCompletionSource RemovalBlocked { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource RemovalGate { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public override async Task RemoveAsync(ModelTransferHandle handle, CancellationToken cancellationToken)
+        {
+            if (_paths.TryGetValue(handle, out var path) && string.Equals(path, BlockRemovalOf, StringComparison.Ordinal))
+            {
+                RemovalBlocked.TrySetResult();
+                await RemovalGate.Task.WaitAsync(cancellationToken);
+            }
+
+            _paths.Remove(handle);
+            AfterRemoval?.Invoke();
+        }
+    }
+
     private sealed class CompletingAria2Client(string destinationPath, int expectedBytes) : TestModelTransferBackend
     {
         private readonly HashSet<ModelTransferHandle> _createdHandles = [];
 
         public int AddUriCallCount { get; private set; }
+
+        public int RemoveCallCount { get; private set; }
+
+        public bool FailRemoval { get; set; }
+
+        public bool FailSaveSession { get; set; }
+
+        /// <summary>When set, saving the session waits for it.</summary>
+        public Task? SaveGate { get; set; }
+
+        public override async Task SaveSessionAsync(CancellationToken cancellationToken)
+        {
+            if (FailSaveSession)
+            {
+                throw new IOException("simulated aria2 failure");
+            }
+
+            if (SaveGate is { } gate)
+            {
+                await gate.WaitAsync(cancellationToken);
+            }
+        }
+
+        /// <summary>Set to make removal wait for <see cref="RemovalGate"/>; completed when it starts waiting.</summary>
+        public TaskCompletionSource? BlockRemoval { get; set; }
+
+        public TaskCompletionSource RemovalGate { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public override async Task RemoveAsync(ModelTransferHandle handle, CancellationToken cancellationToken)
+        {
+            RemoveCallCount++;
+            if (FailRemoval)
+            {
+                throw new IOException("simulated aria2 failure");
+            }
+
+            if (BlockRemoval is { } blocked)
+            {
+                blocked.TrySetResult();
+                await RemovalGate.Task.WaitAsync(cancellationToken);
+            }
+
+            _createdHandles.Remove(handle);
+            AfterRemoval?.Invoke();
+        }
+
+        /// <summary>Runs once a transfer is removed, before the caller goes on.</summary>
+        public Action? AfterRemoval { get; set; }
 
         public override Task<IReadOnlyList<ModelTransferHandle>> CreateAsync(
             ModelTransferCreateRequest request,
