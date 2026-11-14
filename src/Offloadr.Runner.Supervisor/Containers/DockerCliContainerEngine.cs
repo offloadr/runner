@@ -149,6 +149,27 @@ public sealed class DockerCliContainerEngine(IProcessRunner processes, Func<stri
         return IsImageNotFound(result) ? null : throw new ContainerEngineException($"Could not look up {image}.", result.StandardError);
     }
 
+    public async Task<bool> RemoveImageAsync(string reference, CancellationToken cancellationToken)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(reference);
+        var result = await RunQuickAsync(Require(), ["image", "rm", reference], cancellationToken).ConfigureAwait(false);
+        if (result.Succeeded)
+        {
+            return true;
+        }
+
+        // Kept by the engine (a container uses it, or another name points at it), or already gone.
+        return IsImageNotFound(result) || IsImageKept(result)
+            ? false
+            : throw new ContainerEngineException($"Could not remove image {reference}.", result.StandardError);
+    }
+
+    private static bool IsImageKept(ProcessResult result)
+        => result.StandardError.Contains("conflict", StringComparison.OrdinalIgnoreCase) ||
+           result.StandardError.Contains("must be forced", StringComparison.OrdinalIgnoreCase) ||
+           result.StandardError.Contains("in use", StringComparison.OrdinalIgnoreCase) ||
+           result.StandardError.Contains("referenced in multiple", StringComparison.OrdinalIgnoreCase);
+
     public async Task<string> RunDetachedAsync(ContainerSpec spec, CancellationToken cancellationToken)
     {
         var engine = Require();

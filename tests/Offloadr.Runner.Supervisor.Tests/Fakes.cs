@@ -144,7 +144,79 @@ internal sealed class FakeContainerEngine : IContainerEngine
 
         lock (_gate)
         {
-            return Task.FromResult(_images.Contains(image) ? new ImageInfo(ImageId(image), image + "@sha256:digest") : null);
+            if (image.StartsWith("sha256:", StringComparison.Ordinal))
+            {
+                // By ID, as for an image no name may point at any more.
+                // A digest reference is no name: the engine lists only tags.
+                var tags = _images.Where(reference => !reference.Contains('@', StringComparison.Ordinal) && ImageId(reference) == image).ToArray();
+                return Task.FromResult(tags.Length > 0 || (_seenImageIds.Contains(image) && !RemovedImages.Contains(image))
+                    ? new ImageInfo(image, DigestReference(image), tags)
+                    : null);
+            }
+
+            if (!_images.Contains(image))
+            {
+                return Task.FromResult<ImageInfo?>(null);
+            }
+
+            var id = ImageId(image);
+            _seenImageIds.Add(id);
+            return Task.FromResult<ImageInfo?>(new ImageInfo(id, image + "@sha256:digest", [image]));
+        }
+    }
+
+    private readonly HashSet<string> _seenImageIds = new(StringComparer.Ordinal);
+
+    /// <summary>The digest reference an image pulled from a registry keeps after its tag moves.</summary>
+    public static string DigestReference(string imageId) => $"ghcr.io/offloadr/runner-comfyui@{imageId}";
+
+    /// <summary>The image IDs removed, in order.</summary>
+    public List<string> RemovedImages { get; } = [];
+
+    /// <summary>What RemoveImageAsync was asked to remove, in order.</summary>
+    public List<string> RemovalRequests { get; } = [];
+
+    /// <summary>Thrown by RemoveImageAsync, as when the engine does not answer.</summary>
+    public Exception? RemoveImageFailure { get; set; }
+
+    /// <summary>Runs as a removal reaches the engine, for example to tag the image meanwhile.</summary>
+    public Action? BeforeRemoveImage { get; set; }
+
+    public Task<bool> RemoveImageAsync(string reference, CancellationToken cancellationToken)
+    {
+        if (RemoveImageFailure is { } failure)
+        {
+            return Task.FromException<bool>(failure);
+        }
+
+        BeforeRemoveImage?.Invoke();
+        lock (_gate)
+        {
+            RemovalRequests.Add(reference);
+            var imageId = reference.StartsWith("sha256:", StringComparison.Ordinal) ? reference : reference[(reference.IndexOf('@', StringComparison.Ordinal) + 1)..];
+            var tags = _images.Where(name => !name.Contains('@', StringComparison.Ordinal) && ImageId(name) == imageId).ToArray();
+            if (_containers.Values.Any(container => container.ImageId == imageId) ||
+                !_seenImageIds.Contains(imageId) ||
+                RemovedImages.Contains(imageId))
+            {
+                // Kept for a container that uses it, unless forced, or already gone.
+                return Task.FromResult(false);
+            }
+
+            if (reference.StartsWith("sha256:", StringComparison.Ordinal) ? tags.Length > 1 : tags.Length > 0)
+            {
+                // By ID the engine removes an image with a single tag, tag and all, and refuses one with
+                // several; by a digest reference it drops only that reference while a name remains.
+                return Task.FromResult(!reference.StartsWith("sha256:", StringComparison.Ordinal));
+            }
+
+            foreach (var name in _images.Where(name => ImageId(name) == imageId).ToArray())
+            {
+                _images.Remove(name);
+            }
+
+            RemovedImages.Add(imageId);
+            return Task.FromResult(true);
         }
     }
 
@@ -219,6 +291,7 @@ internal sealed class FakeContainerEngine : IContainerEngine
 
             id = $"runner-container-{Runs.Count:D4}";
             _containers[Key(spec.Name)] = new FakeContainer(spec.Image, true, null, new Dictionary<string, string>(spec.Labels), ImageId(spec.Image), new Dictionary<string, string>(spec.Environment), id);
+            _seenImageIds.Add(ImageId(spec.Image));
         }
 
         if (OnRun is not null)
@@ -234,6 +307,7 @@ internal sealed class FakeContainerEngine : IContainerEngine
         lock (_gate)
         {
             _containers[Key(name)] = new FakeContainer(image, running, running ? null : 0, labels, ImageId(image), environment, $"added-container-{Guid.NewGuid():N}");
+            _seenImageIds.Add(ImageId(image));
         }
     }
 

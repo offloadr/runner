@@ -126,7 +126,25 @@ public class DockerCliJsonTests
     {
         var image = DockerCliJson.Image("""[{"Id":"sha256:1","RepoDigests":["ghcr.io/offloadr/runner-comfyui@sha256:2"]}]""");
 
-        Assert.That(image, Is.EqualTo(new ImageInfo("sha256:1", "ghcr.io/offloadr/runner-comfyui@sha256:2")));
+        Assert.Multiple(() =>
+        {
+            Assert.That(image!.Id, Is.EqualTo("sha256:1"));
+            Assert.That(image.RepoDigest, Is.EqualTo("ghcr.io/offloadr/runner-comfyui@sha256:2"));
+            Assert.That(image.RepoTags, Is.Empty);
+        });
+    }
+
+    [Test]
+    public void Image_ReadsItsNames_ButNotTheNoneThatAnUntaggedImageShows()
+    {
+        var tagged = DockerCliJson.Image("""[{"Id":"sha256:1","RepoTags":["ghcr.io/offloadr/runner-comfyui:latest"]}]""");
+        var untagged = DockerCliJson.Image("""[{"Id":"sha256:2","RepoTags":["<none>:<none>"]}]""");
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(tagged!.RepoTags, Is.EqualTo(new[] { "ghcr.io/offloadr/runner-comfyui:latest" }));
+            Assert.That(untagged!.RepoTags, Is.Empty);
+        });
     }
 }
 
@@ -292,6 +310,39 @@ public class DockerCliContainerEngineTests
             Assert.That(info.ErrorKind, Is.EqualTo(FaultKind.EngineMissing));
             Assert.That(SupervisorFault.For(info.ErrorKind, info.Error!, info.Kind).Title, Is.EqualTo("Podman was not found"));
         });
+    }
+
+    [Test]
+    public async Task RemoveImage_RemovesByIdNeverByForce()
+    {
+        var processes = new FakeProcessRunner().On("image rm", 0);
+        var engine = new DockerCliContainerEngine(processes, () => Docker);
+
+        Assert.That(await engine.RemoveImageAsync("sha256:old", CancellationToken.None), Is.True);
+        Assert.That(processes.Calls.Single().Arguments, Is.EqualTo(new[] { "image", "rm", "sha256:old" }));
+    }
+
+    [TestCase("Error response from daemon: conflict: unable to delete 0123 (must be forced) - image is being used by stopped container 4567")]
+    [TestCase("Error response from daemon: conflict: unable to delete 0123 (must be forced) - image is referenced in multiple repositories")]
+    [TestCase("Error: image used by 4567: image is in use by a container")]
+    [TestCase("Error response from daemon: No such image: sha256:old")]
+    public async Task RemoveImage_ReportsAnImageTheEngineKeepsOrNoLongerHas(string stderr)
+    {
+        var processes = new FakeProcessRunner().On("image rm", 1, stderr: stderr);
+        var engine = new DockerCliContainerEngine(processes, () => Docker);
+
+        Assert.That(await engine.RemoveImageAsync("sha256:old", CancellationToken.None), Is.False);
+    }
+
+    [Test]
+    public void RemoveImage_ReportsAnEngineThatDoesNotAnswer()
+    {
+        var processes = new FakeProcessRunner().On("image rm", 1, stderr: "error during connect: the docker daemon is not running");
+        var engine = new DockerCliContainerEngine(processes, () => Docker);
+
+        Assert.That(
+            async () => await engine.RemoveImageAsync("sha256:old", CancellationToken.None),
+            Throws.InstanceOf<ContainerEngineException>());
     }
 
     [Test]
