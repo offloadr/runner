@@ -27,6 +27,8 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
     // Editor links a download was sent through (made here, or found in place), under _gate, each with the
     // session that last asked for its model: until that session ends it may be using the model.
     private readonly Dictionary<string, string?> _linkSessions = new(StringComparer.Ordinal);
+    // The redirect that last claimed each of those links, under _gate: undoing another redirect leaves it.
+    private readonly Dictionary<string, RedirectBatch> _claimedBy = new(StringComparer.Ordinal);
     // Editor paths where the projector links a local model for the session now, under _gate.
     private readonly HashSet<string> _projectedLinks = new(StringComparer.Ordinal);
     // What the redirect in progress changes, under _gate.
@@ -94,6 +96,7 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
                 if (!string.Equals(sessionId, active, StringComparison.Ordinal))
                 {
                     _linkSessions.Remove(path);
+                    _claimedBy.Remove(path);
                 }
             }
         }
@@ -110,6 +113,7 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
                 if (string.Equals(linkSessionId, ended, StringComparison.Ordinal))
                 {
                     _linkSessions.Remove(path);
+                    _claimedBy.Remove(path);
                 }
             }
         }
@@ -209,19 +213,20 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
 
     private void UndoLocked(RedirectBatch batch)
     {
+        // Another redirect, of this session or another, may have sent its download through a link since: then
+        // the link is that redirect's as well, and it stays with its claim.
         foreach (var relative in batch.LinksMade)
         {
-            if (HoldsOwnLink(relative, Path.Combine(_readOnlyDirectory, relative)))
+            if (!ClaimedByAnother(relative, batch) && HoldsOwnLink(relative, Path.Combine(_readOnlyDirectory, relative)))
             {
                 DetachEditorLink(relative);
             }
         }
 
-        // A link removed meanwhile keeps no claim, and one claimed again since keeps that claim.
+        // A link removed meanwhile keeps no claim.
         foreach (var (path, before) in batch.ClaimsBefore)
         {
-            if (!_linkSessions.TryGetValue(path, out var current) ||
-                !string.Equals(current, batch.SessionId, StringComparison.Ordinal))
+            if (ClaimedByAnother(path, batch) || !_linkSessions.ContainsKey(path))
             {
                 continue;
             }
@@ -229,11 +234,28 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
             if (before.Existed)
             {
                 _linkSessions[path] = before.SessionId;
+                SetClaimedBy(path, before.By);
             }
             else
             {
                 _linkSessions.Remove(path);
+                _claimedBy.Remove(path);
             }
+        }
+    }
+
+    private bool ClaimedByAnother(string relativePath, RedirectBatch batch)
+        => _claimedBy.TryGetValue(relativePath, out var by) && !ReferenceEquals(by, batch);
+
+    private void SetClaimedBy(string relativePath, RedirectBatch? batch)
+    {
+        if (batch is null)
+        {
+            _claimedBy.Remove(relativePath);
+        }
+        else
+        {
+            _claimedBy[relativePath] = batch;
         }
     }
 
@@ -243,10 +265,13 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
         {
             batch.ClaimsBefore.TryAdd(
                 relativePath,
-                _linkSessions.TryGetValue(relativePath, out var before) ? (true, before) : (false, null));
+                _linkSessions.TryGetValue(relativePath, out var before)
+                    ? (true, before, _claimedBy.GetValueOrDefault(relativePath))
+                    : (false, null, null));
         }
 
         _linkSessions[relativePath] = sessionId;
+        SetClaimedBy(relativePath, _batch);
     }
 
     /// <summary>What one redirect changed: the links it made, and the claims it set, with what they were.</summary>
@@ -256,7 +281,7 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
 
         public List<string> LinksMade { get; } = [];
 
-        public Dictionary<string, (bool Existed, string? SessionId)> ClaimsBefore { get; } = new(StringComparer.Ordinal);
+        public Dictionary<string, (bool Existed, string? SessionId, RedirectBatch? By)> ClaimsBefore { get; } = new(StringComparer.Ordinal);
     }
 
     public void SetProjected(string editorPath, bool projected)
@@ -437,6 +462,7 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
             }
 
             _linkSessions.Remove(relative.Replace(Path.DirectorySeparatorChar, '/'));
+            _claimedBy.Remove(relative.Replace(Path.DirectorySeparatorChar, '/'));
         }
     }
 
@@ -449,6 +475,7 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
             root.DeleteSymbolicLink(relativePath);
             _ownLinks.Remove(relativePath);
             _linkSessions.Remove(relativePath);
+            _claimedBy.Remove(relativePath);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {

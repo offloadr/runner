@@ -485,6 +485,28 @@ public class ModelLibraryTests
         Assert.That(new FileInfo(style).LinkTarget, Is.EqualTo(mine));
     }
 
+    // A batch is refused only after its redirect; meanwhile another, of the same session or another, sends its
+    // download through the link the first one made.
+    [TestCase(Session)]
+    [TestCase("session-2")]
+    public void UndoingABatch_LeavesALinkAnotherRedirectClaimedSince(string otherSession)
+    {
+        var library = CreateLibrary();
+        var request = Remote("loras/style.safetensors", 4);
+        library.Redirect([request], Session, out var refused);
+        var other = library.Redirect([request], otherSession).Single();
+
+        library.Undo(refused);
+
+        var style = Path.Combine(_editorModels, "loras", "style.safetensors");
+        Assert.Multiple(() =>
+        {
+            Assert.That(other.DestinationPath, Is.EqualTo(Path.Combine(_library, "loras", "style.safetensors")));
+            Assert.That(new FileInfo(style).LinkTarget, Is.EqualTo(other.DestinationPath), "The other download's link stays.");
+            Assert.That(library.KeepsEditorLink(style), Is.True, "And so does its claim.");
+        });
+    }
+
     [Test]
     public async Task APromptRefusedAfterItIsRedirected_UndoesItsLinks()
     {
