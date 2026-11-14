@@ -133,6 +133,8 @@ internal sealed class ModelDownloadService : IAsyncDisposable
     {
         _hydrationCoordinator?.ActivateSession(sessionId);
         _fullDownloadCoordinator.SetActiveSession(sessionId);
+        // A session that is no longer active is done with the models it had saved in the folder.
+        _library?.ReleaseSessionsOtherThan(sessionId);
     }
 
     public void CancelSession(string? sessionId)
@@ -141,6 +143,7 @@ internal sealed class ModelDownloadService : IAsyncDisposable
         _hydrationCoordinator?.CancelSession(normalizedSessionId);
         _fullDownloadCoordinator.CancelSession(normalizedSessionId);
         RemoveConventionalSession(normalizedSessionId);
+        _library?.ReleaseSession(normalizedSessionId);
         if (string.Equals(_fullDownloadCoordinator.GetActiveSessionId(), normalizedSessionId, StringComparison.Ordinal))
         {
             _fullDownloadCoordinator.SetActiveSession(null);

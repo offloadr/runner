@@ -22,11 +22,11 @@ internal sealed class ModelLibrary : IModelDownloadStaging
     private readonly string _downloadFolder;
     private readonly string _stagingDirectory;
     private readonly object _gate = new();
-    // Editor links this library made, under _gate: the only ones it ever removes. Each maps to the session
-    // that last asked for its model, which may still be using it.
-    private readonly Dictionary<string, string?> _ownLinks = new(StringComparer.Ordinal);
-    // Editor links downloads were sent through, under _gate: those above, and matching ones found in place.
-    private readonly HashSet<string> _usedLinks = new(StringComparer.Ordinal);
+    // Editor links this library made, under _gate: the only ones it ever removes.
+    private readonly HashSet<string> _ownLinks = new(StringComparer.Ordinal);
+    // Editor links a download was sent through (made here, or found in place), under _gate, each with the
+    // session that last asked for its model: until that session ends it may be using the model.
+    private readonly Dictionary<string, string?> _linkSessions = new(StringComparer.Ordinal);
 
     /// <param name="directory">The models folder, writable.</param>
     /// <param name="readOnlyDirectory">The same folder as sessions see it, read-only.</param>
@@ -77,9 +77,47 @@ internal sealed class ModelLibrary : IModelDownloadStaging
     public string Directory { get; }
 
     /// <summary>
-    /// Whether <paramref name="editorPath"/> is a link a download was sent through, still pointing at that
-    /// download: the projector, whose links point into the same folder, must leave it, since a prompt may be
-    /// waiting for the model or using it.
+    /// Ends the claim of every session but <paramref name="activeSessionId"/> on the links its downloads went
+    /// through: none of them can be using those models any more.
+    /// </summary>
+    public void ReleaseSessionsOtherThan(string? activeSessionId)
+    {
+        var active = NormalizeSession(activeSessionId);
+        lock (_gate)
+        {
+            foreach (var (path, sessionId) in _linkSessions.ToArray())
+            {
+                if (!string.Equals(sessionId, active, StringComparison.Ordinal))
+                {
+                    _linkSessions.Remove(path);
+                }
+            }
+        }
+    }
+
+    /// <summary>Ends <paramref name="sessionId"/>'s claim on the links its downloads went through.</summary>
+    public void ReleaseSession(string? sessionId)
+    {
+        var ended = NormalizeSession(sessionId);
+        lock (_gate)
+        {
+            foreach (var (path, linkSessionId) in _linkSessions.ToArray())
+            {
+                if (string.Equals(linkSessionId, ended, StringComparison.Ordinal))
+                {
+                    _linkSessions.Remove(path);
+                }
+            }
+        }
+    }
+
+    private static string? NormalizeSession(string? sessionId)
+        => string.IsNullOrWhiteSpace(sessionId) ? null : sessionId.Trim();
+
+    /// <summary>
+    /// Whether <paramref name="editorPath"/> is a link a download was sent through for a session that has not
+    /// ended, still pointing at that download: the projector, whose links point into the same folder, must
+    /// leave it, since a prompt may be waiting for the model or using it.
     /// </summary>
     public bool KeepsEditorLink(string editorPath)
     {
@@ -92,7 +130,7 @@ internal sealed class ModelLibrary : IModelDownloadStaging
         var relative = Path.GetRelativePath(_editorModelsDirectory, normalized);
         lock (_gate)
         {
-            return _usedLinks.Contains(relative.Replace(Path.DirectorySeparatorChar, '/')) &&
+            return _linkSessions.ContainsKey(relative.Replace(Path.DirectorySeparatorChar, '/')) &&
                    PointsAtLibrary(relative, Path.Combine(_readOnlyDirectory, relative));
         }
     }
@@ -112,7 +150,7 @@ internal sealed class ModelLibrary : IModelDownloadStaging
     {
         // Prompts are prepared concurrently: two naming the same new model must not both find its link
         // missing, and the second fall back to downloading over the first one's link.
-        var session = string.IsNullOrWhiteSpace(sessionId) ? null : sessionId.Trim();
+        var session = NormalizeSession(sessionId);
         lock (_gate)
         {
             return downloads.Select(download => Redirect(download, session)).ToArray();
@@ -147,9 +185,10 @@ internal sealed class ModelLibrary : IModelDownloadStaging
             // Another model is saved there. If this library linked the editor's path to it for another
             // session, that link goes, so this one can be downloaded inside the container at that path; the
             // session that asked for the model linked there may still be using it, and is refused this one.
-            if (HoldsOwnLink(relative, linkTarget, out var linkSessionId))
+            if (HoldsOwnLink(relative, linkTarget))
             {
-                if (string.Equals(linkSessionId, sessionId, StringComparison.Ordinal))
+                if (_linkSessions.TryGetValue(relative.Replace(Path.DirectorySeparatorChar, '/'), out var linkSessionId) &&
+                    string.Equals(linkSessionId, sessionId, StringComparison.Ordinal))
                 {
                     throw new InvalidOperationException(
                         $"Model '{relative}' cannot be downloaded in this session: another model of the same name, saved in the models folder, is already in use at that path.");
@@ -213,11 +252,8 @@ internal sealed class ModelLibrary : IModelDownloadStaging
     }
 
     /// <summary>Whether the editor's path holds a link this library made (the projector links to the same place).</summary>
-    private bool HoldsOwnLink(string relative, string target, out string? sessionId)
-    {
-        return _ownLinks.TryGetValue(relative.Replace(Path.DirectorySeparatorChar, '/'), out sessionId) &&
-               PointsAtLibrary(relative, target);
-    }
+    private bool HoldsOwnLink(string relative, string target)
+        => _ownLinks.Contains(relative.Replace(Path.DirectorySeparatorChar, '/')) && PointsAtLibrary(relative, target);
 
     /// <summary>Whether the editor's path is a link to <paramref name="target"/>.</summary>
     private bool PointsAtLibrary(string relative, string target)
@@ -247,7 +283,7 @@ internal sealed class ModelLibrary : IModelDownloadStaging
             using var root = new LinuxSecureDirectoryRoot(_editorModelsDirectory);
             root.DeleteSymbolicLink(relativePath);
             _ownLinks.Remove(relativePath);
-            _usedLinks.Remove(relativePath);
+            _linkSessions.Remove(relativePath);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
@@ -266,19 +302,13 @@ internal sealed class ModelLibrary : IModelDownloadStaging
             {
                 case SecureLinkKind.SymbolicLink:
                     // Ours already, or another to the same place (a local model's, or one an earlier run made):
-                    // either way, nothing to change, except that the download now goes through it, and a link
-                    // of ours belongs to this session as well, which may be using its model.
+                    // either way, nothing to change, except that this session's download now goes through it.
                     if (!string.Equals(existing, target, StringComparison.Ordinal))
                     {
                         return false;
                     }
 
-                    if (_ownLinks.ContainsKey(relativePath))
-                    {
-                        _ownLinks[relativePath] = sessionId;
-                    }
-
-                    _usedLinks.Add(relativePath);
+                    _linkSessions[relativePath] = sessionId;
                     return true;
                 case SecureLinkKind.Other:
                     // A model downloaded inside the container earlier, or a path that is not plain directories.
@@ -286,8 +316,8 @@ internal sealed class ModelLibrary : IModelDownloadStaging
             }
 
             root.CreateSymbolicLink(relativePath, target);
-            _ownLinks[relativePath] = sessionId;
-            _usedLinks.Add(relativePath);
+            _ownLinks.Add(relativePath);
+            _linkSessions[relativePath] = sessionId;
             return true;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)

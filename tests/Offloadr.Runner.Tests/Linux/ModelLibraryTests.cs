@@ -1,3 +1,4 @@
+using Offloadr.Common.V1;
 using Offloadr.Runner.V1;
 
 namespace Offloadr.Runner.Tests.Linux;
@@ -353,6 +354,54 @@ public class ModelLibraryTests
             Assert.That(new FileInfo(staleProjection).LinkTarget, Is.Null, "The projector still clears its own stale links.");
             Assert.That(File.Exists(other), Is.True);
         });
+    }
+
+    [TestCase(false)]
+    [TestCase(true)]
+    public async Task OnceItsSessionEnds_ADownloadsLinkGivesWayToAnotherLocalModelAtThatPath(bool cancelled)
+    {
+        var backend = new WritingBackend();
+        var settings = Aria2Settings.FromEnvironment(name => name == "ARIA2_STATE_DIR" ? Path.Combine(_root, "aria2-state") : null, static () => "generated-secret");
+        var library = CreateLibrary();
+        await using var service = new ModelDownloadService(
+            backend,
+            settings,
+            destinationPolicy: new ModelDestinationPolicy([_editorModels, _library]),
+            library: library);
+        await service.InitializeAsync(CancellationToken.None);
+        service.SetActiveSession(Session);
+        await await service.PreparePromptDownloadsAsync(
+            [Remote("checkpoints/base.safetensors", 8)],
+            CancellationToken.None,
+            highPriority: true);
+
+        // The owner's own model of the same name, which a later session asks to have at that path.
+        var mine = WriteLibraryFile("checkpoints/sdxl/base.safetensors", 12);
+        var editorPath = Path.Combine(_editorModels, "checkpoints", "base.safetensors");
+        var local = new ModelDownloadRequest
+        {
+            Filename = "base.safetensors",
+            Category = ModelCategory.Checkpoint,
+            SizeBytes = 12,
+            DestinationPath = editorPath,
+            LocalSelectionHash = LocalModelSelectionHash.Compute("base.safetensors", 12, ModelCategory.Checkpoint)
+        };
+        var projector = new LocalModelProjector(_library, _editorModels, keepsLink: library.KeepsEditorLink);
+        projector.UpdateSnapshot(new LocalModelScanner("runner-1", _library).Scan());
+        Assert.That(() => projector.SetRequestedModels([local]), Throws.InvalidOperationException, "While its session lasts, the download's link stays.");
+
+        if (cancelled)
+        {
+            service.CancelSession(Session);
+        }
+        else
+        {
+            service.SetActiveSession("session-2");
+        }
+
+        projector.SetRequestedModels([local]);
+
+        Assert.That(new FileInfo(editorPath).LinkTarget, Is.EqualTo(mine));
     }
 
     [Test]

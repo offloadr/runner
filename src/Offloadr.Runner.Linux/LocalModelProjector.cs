@@ -465,7 +465,10 @@ internal sealed class LocalModelProjector
                 case SecureLinkKind.SymbolicLink when LinkPointsTo(targetPath, existingTarget!, sourcePath):
                     _managedTargets.Add(targetPath);
                     return;
-                case SecureLinkKind.SymbolicLink when _managedTargets.Contains(targetPath) && !IsKeptLink(targetPath):
+                // A link into the local root is a projection, or a download's link no session needs any more:
+                // either gives way to the model asked for now.
+                case SecureLinkKind.SymbolicLink when (_managedTargets.Contains(targetPath) || PointsIntoSource(targetPath, existingTarget!)) &&
+                                                      !IsKeptLink(targetPath):
                     secureRoot.DeleteSymbolicLink(relativePath);
                     break;
                 case SecureLinkKind.SymbolicLink:
@@ -485,6 +488,9 @@ internal sealed class LocalModelProjector
     }
 
     private bool IsKeptLink(string targetPath) => _keepsLink?.Invoke(targetPath) == true;
+
+    private bool PointsIntoSource(string targetPath, string linkTarget)
+        => IsUnderRoot(Path.GetFullPath(linkTarget, Path.GetDirectoryName(targetPath)!), _sourceRoot);
 
     private void RemoveManagedLink(string targetPath)
     {
