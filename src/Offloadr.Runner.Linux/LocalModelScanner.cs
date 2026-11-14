@@ -110,6 +110,12 @@ internal sealed class LocalModelScanner
                 });
             foreach (var path in files)
             {
+                if (IsInDownloadFolder(path))
+                {
+                    // Downloads in progress: half a model is not a model.
+                    continue;
+                }
+
                 ModelInfo? model = null;
                 try
                 {
@@ -144,6 +150,13 @@ internal sealed class LocalModelScanner
         });
 
         return CreateSnapshot(items);
+    }
+
+    private bool IsInDownloadFolder(string path)
+    {
+        var relative = Path.GetRelativePath(_rootDirectory, path);
+        var first = relative.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)[0];
+        return ModelLibrary.IsStagingFolderName(first);
     }
 
     private static LocalModelSnapshot CreateSnapshot(IReadOnlyList<ModelInfo> models)

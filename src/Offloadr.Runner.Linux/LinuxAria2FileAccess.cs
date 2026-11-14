@@ -191,6 +191,54 @@ internal sealed class LinuxAria2FileAccess : IAria2FileAccess
         SetOwnerAndMode(staging, 0, account.GroupId, StagingDirectoryMode, _stagingDirectory);
     }
 
+    /// <summary>
+    /// Closes the directory holding the writable models folder to everyone but root and aria2's group, so
+    /// sessions cannot reach the folder through it: a folder shared from Windows is open to everyone inside.
+    /// </summary>
+    public void PrepareModelLibrary(string libraryDirectory)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(libraryDirectory);
+        var library = Normalize(libraryDirectory);
+        var parent = Path.GetDirectoryName(library);
+        // Never a shared directory such as /tmp or /var/lib: closing that would cut sessions off from it.
+        if (string.IsNullOrEmpty(parent) ||
+            parent == "/" ||
+            !Directory.Exists(library) ||
+            Directory.EnumerateFileSystemEntries(parent).Any(entry => !string.Equals(Normalize(entry), library, StringComparison.Ordinal)))
+        {
+            throw new InvalidOperationException(
+                $"The models folder '{library}' must be mounted in a directory of its own, such as /var/lib/offloadr-library/models, that holds nothing else.");
+        }
+
+        // The directory closed is the container's own: one mounted from the host (the models folder bound in
+        // as a subfolder of a writable host folder) would be taken from its owner on the host.
+        if (!IsOnContainersOwnFilesystem(parent))
+        {
+            throw new InvalidOperationException(
+                $"The models folder '{library}' must be mounted in a directory of the container's own, such as /var/lib/offloadr-library/models, not inside a folder mounted from the host.");
+        }
+
+        using var handle = OpenDirectory(parent);
+        if (Account is { } account)
+        {
+            SetOwnerAndMode(handle, 0, account.GroupId, LibraryParentMode, parent);
+        }
+        else
+        {
+            SetOwnerAndMode(handle, 0, 0, PrivateDirectoryMode, parent);
+        }
+    }
+
+    /// <summary>Whether <paramref name="path"/> is on the mount the container's root is on.</summary>
+    private static bool IsOnContainersOwnFilesystem(string path)
+        => LinuxFileIdentityReader.TryReadMount("/", out var root) &&
+           LinuxFileIdentityReader.TryReadMount(path, out var directory) &&
+           directory.DeviceId == root.DeviceId &&
+           (directory.MountId is null || root.MountId is null || directory.MountId == root.MountId);
+
+    internal const uint LibraryParentMode = 0x1E8; // 0750
+    internal const uint PrivateDirectoryMode = 0x1C0; // 0700
+
     public void PrepareTransferTarget(string destinationPath)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(destinationPath);

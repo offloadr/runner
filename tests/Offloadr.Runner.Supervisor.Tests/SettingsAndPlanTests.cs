@@ -49,6 +49,19 @@ public class RunnerSettingsTests
             Assert.That(problems, Has.Some.Contains("/missing"));
         });
     }
+
+    [Test]
+    public void Validate_DownloadsNeedAModelsFolder()
+    {
+        var withoutFolder = new RunnerSettings { DownloadModels = true };
+        var withFolder = new RunnerSettings { DownloadModels = true, LocalModelsDirectory = Path.GetTempPath() };
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(withoutFolder.Validate(_ => true), Has.Member(RunnerSettings.DownloadsNeedFolderProblem));
+            Assert.That(withFolder.Validate(_ => true), Has.No.Member(RunnerSettings.DownloadsNeedFolderProblem));
+        });
+    }
 }
 
 public class FileRunnerSettingsStoreTests

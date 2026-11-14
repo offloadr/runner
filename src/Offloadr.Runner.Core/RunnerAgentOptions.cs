@@ -107,6 +107,14 @@ public sealed class RunnerAgentOptions
     public required TimeSpan RegistrationRpcTimeout { get; init; }
     public required string ModelFetchSocket { get; init; }
     public string? LocalModelsDirectory { get; init; }
+
+    /// <summary>
+    /// The local models folder again, writable this time (<c>RUNNER_MODEL_LIBRARY_DIR</c>): models the runner
+    /// downloads are saved there, beside the owner's own, instead of inside the container. Sessions still
+    /// see the folder only through <see cref="LocalModelsDirectory"/>, read-only; this path is kept where
+    /// they cannot reach it.
+    /// </summary>
+    public string? ModelLibraryDirectory { get; init; }
     public IReadOnlyList<string> SupportedEditorTemplates { get; init; } = ["comfyui-latest", "comfyui-master"];
     public required TimeSpan LocalModelsScanInterval { get; init; }
     public required TimeSpan RuntimeTelemetryInterval { get; init; }
@@ -155,6 +163,7 @@ public sealed class RunnerAgentOptions
             RegistrationRpcTimeout = rpcTimeout,
             ModelFetchSocket = GetTrimmedOrDefault(env("RUNNER_MODEL_FETCH_SOCKET"), "/tmp/runner-agent/model-fetch.sock"),
             LocalModelsDirectory = localModelsDirectory,
+            ModelLibraryDirectory = GetTrimmedOrNull(env("RUNNER_MODEL_LIBRARY_DIR")),
             SupportedEditorTemplates = ParseSupportedEditorTemplates(env),
             LocalModelsScanInterval = TimeSpan.FromSeconds(ParseInt(env, "RUNNER_LOCAL_MODELS_SCAN_INTERVAL_SEC", 15, 5, 600)),
             RuntimeTelemetryInterval = TimeSpan.FromSeconds(ParseInt(env, "RUNNER_GPU_STATS_INTERVAL_SEC", 5, 0, 300)),

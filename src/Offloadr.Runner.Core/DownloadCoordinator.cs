@@ -29,6 +29,11 @@ public interface IModelDownloadStaging
     /// <summary>Returns where the downloader writes <paramref name="destinationPath"/>, or null to write it in place.</summary>
     string? GetStagingPath(string destinationPath);
 
+    /// <summary>Makes the directory <paramref name="stagingPath"/> is written in, before the download starts.</summary>
+    void PrepareStagingDirectory(string stagingPath)
+    {
+    }
+
     /// <summary>Moves the completed <paramref name="stagingPath"/> to <paramref name="destinationPath"/>.</summary>
     void Publish(string stagingPath, string destinationPath);
 
@@ -341,8 +346,6 @@ public sealed class DownloadCoordinator
             throw new InvalidOperationException($"Download destination '{normalized}' does not contain a directory.");
         }
 
-        _fileSystem.CreateDirectory(directory);
-
         var gate = _locks.GetOrAdd(normalized, _ => new SemaphoreSlim(1, 1));
         await gate.WaitAsync(effectiveCancellationToken).ConfigureAwait(false);
 
@@ -372,6 +375,14 @@ public sealed class DownloadCoordinator
                 await ReportProgressAsync(tracked, ModelDownloadState.Complete, tracked.Request.SizeBytes, tracked.Request.SizeBytes, 100, "complete").ConfigureAwait(false);
                 return;
             }
+
+            // Only now that something is to be downloaded: a model already there leaves no folder behind.
+            if (stagingPath is not null)
+            {
+                _staging!.PrepareStagingDirectory(stagingPath);
+            }
+
+            _fileSystem.CreateDirectory(directory);
 
             while (true)
             {

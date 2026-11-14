@@ -188,6 +188,55 @@ public class SealedHostLockdownLinuxTests
     }
 
     [Test]
+    public void Scan_LeavesTheOwnersWritableModelsFolderAlone()
+    {
+        var shared = Mode0755 | UnixFileMode.OtherWrite;
+        const UnixFileMode Private = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
+        // The owner's models folder, mounted writable in a folder only root and aria2 may enter: the
+        // owner's uid (1000) has no account here, and a Windows share shows everything as 0777.
+        var entries = new Dictionary<string, (LinuxEntryStatus Status, ulong Device, string[] Children)>(StringComparer.Ordinal)
+        {
+            ["/"] = (new(true, false, 0, Mode0755), 1, ["/var"]),
+            ["/var"] = (new(true, false, 0, Mode0755), 1, ["/var/lib"]),
+            ["/var/lib"] = (new(true, false, 0, Mode0755), 1, ["/var/lib/offloadr-library"]),
+            ["/var/lib/offloadr-library"] = (new(true, false, 0, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute | UnixFileMode.GroupRead | UnixFileMode.GroupExecute), 1, ["/var/lib/offloadr-library/models"]),
+            ["/var/lib/offloadr-library/models"] = (new(true, false, 1000, shared), 5, ["/var/lib/offloadr-library/models/checkpoints"]),
+            ["/var/lib/offloadr-library/models/checkpoints"] = (new(true, false, 1000, Private), 5, ["/var/lib/offloadr-library/models/checkpoints/base.safetensors"]),
+            ["/var/lib/offloadr-library/models/checkpoints/base.safetensors"] = (new(false, false, 1000, shared, IsRegularFile: true), 5, []),
+        };
+        var mounts = new SealedHostLockdown.Mount[]
+        {
+            new("/", "overlay", false),
+            new("/var/lib/offloadr-library/models", "9p", false),
+        };
+
+        var scan = SealedHostLockdown.Scan(
+            "/",
+            path => entries.TryGetValue(path, out var entry) ? entry.Status : null,
+            path => entries.TryGetValue(path, out var entry) ? new LinuxFileIdentity(entry.Device, InodeOf(path), 0) : null,
+            path => entries[path].Children,
+            mounts,
+            isReusableOwner: userId => userId == 1000,
+            closedMounts: ["/var/lib/offloadr-library/models"]);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(scan.SharedWritable, Is.Empty, "Nothing in the owner's folder is closed.");
+            Assert.That(scan.ReusablyOwned, Is.Empty, "Nothing in it is handed to root.");
+            Assert.That(scan.Unchecked, Is.Empty);
+        });
+
+        var unclosed = SealedHostLockdown.Scan(
+            "/",
+            path => entries.TryGetValue(path, out var entry) ? entry.Status : null,
+            path => entries.TryGetValue(path, out var entry) ? new LinuxFileIdentity(entry.Device, InodeOf(path), 0) : null,
+            path => entries[path].Children,
+            mounts,
+            isReusableOwner: userId => userId == 1000);
+        Assert.That(unclosed.ReusablyOwned, Is.Not.Empty, "Without it, the scan would take the owner's files.");
+    }
+
+    [Test]
     public void Scan_ReportsResidueOfReusableUidsAndAnUnreadableMountTable()
     {
         var shared = Mode0755 | UnixFileMode.OtherWrite;

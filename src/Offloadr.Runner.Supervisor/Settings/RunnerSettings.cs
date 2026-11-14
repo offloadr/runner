@@ -19,7 +19,8 @@ public sealed record RunnerSettings
 
     /// <summary>
     /// Let the runner download models a session needs and the models folder lacks. Off by default: models
-    /// are often several gigabytes each, and the disk and bandwidth are the person's own.
+    /// are often several gigabytes each, and the disk and bandwidth are the person's own. Needs a models
+    /// folder: downloads are saved there, never hidden inside Docker.
     /// </summary>
     public bool DownloadModels { get; init; }
 
@@ -39,6 +40,9 @@ public sealed record RunnerSettings
         => Uri.TryCreate(OffloadrApiOrigin, UriKind.Absolute, out var origin) &&
            origin.Scheme == Uri.UriSchemeHttps &&
            origin.PathAndQuery is "" or "/";
+
+    public const string DownloadsNeedFolderProblem =
+        "Choose a models folder to download models: they are saved there, where you can see them, delete them and use them in other apps.";
 
     public const string MissingKeyProblem = "Add your personal runner key. Create one under Settings in the Offloadr web app.";
 
@@ -81,6 +85,11 @@ public sealed record RunnerSettings
         else if (!string.IsNullOrWhiteSpace(LocalModelsDirectory) && !directoryExists(LocalModelsDirectory))
         {
             errors.Add($"The models folder '{LocalModelsDirectory}' does not exist.");
+        }
+
+        if (DownloadModels && string.IsNullOrWhiteSpace(LocalModelsDirectory))
+        {
+            errors.Add(DownloadsNeedFolderProblem);
         }
 
         return errors;

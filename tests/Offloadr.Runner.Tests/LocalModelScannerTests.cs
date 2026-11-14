@@ -34,6 +34,30 @@ public class LocalModelScannerTests
         }
     }
 
+    // On a case-insensitive share, downloads go into a folder of that name in whatever case it was made.
+    [TestCase(ModelLibrary.StagingFolderName)]
+    [TestCase(".OFFLOADR-Downloads")]
+    public void Scan_SkipsDownloadsInProgress(string downloadFolder)
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(root, "loras"));
+            File.WriteAllText(Path.Combine(root, "loras", "style.safetensors"), "lora");
+            var partial = Path.Combine(root, downloadFolder, "0123", "loras");
+            Directory.CreateDirectory(partial);
+            File.WriteAllText(Path.Combine(partial, "half.safetensors"), "ha");
+
+            var snapshot = new LocalModelScanner("runner-1", root).Scan();
+
+            Assert.That(snapshot.Models.Select(static model => model.Filename), Is.EqualTo(new[] { "style.safetensors" }));
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
     [Test]
     public void Scan_GivesCaseDistinctFilesDistinctModelIds()
     {

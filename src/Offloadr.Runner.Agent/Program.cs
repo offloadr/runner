@@ -77,7 +77,10 @@ static async Task<int> RunAgentAsync()
         $"tmpfs-noswap={sealedStorageStatus.Swap.TmpfsNoswap}" +
         (sealedStorageStatus.Reason is null ? string.Empty : $" reason='{sealedStorageStatus.Reason}'"));
     // Auto mode applies it before its first sealed start.
-    var sealedHostPreparation = new SealedHostPreparation();
+    // The writable models folder is closed to sessions below (PrepareModelLibrary) before any starts, or the
+    // agent exits; the lockdown must not take the owner's files from them.
+    var sealedHostPreparation = new SealedHostPreparation(
+        options.ModelLibraryDirectory is { } closedLibrary ? [closedLibrary] : null);
     if (options.Session.Sealing.Mode == SealedStorageMode.Required)
     {
         try
@@ -138,13 +141,36 @@ static async Task<int> RunAgentAsync()
     }
 
     var sessionModelLinks = new SessionModelLinks(options.Session.SessionRoot);
-    string[] modelRoots = [options.Aria2.DownloadDirectory, modelProjectionRoot, .. hydrationCapabilities.PersistentModelRoots];
+    // Downloads are saved in the owner's models folder when it is shared writable too.
+    var libraryDirectory = options.ModelDownloads.Enabled && options.LocalModelsDirectory is not null
+        ? options.ModelLibraryDirectory
+        : null;
+    string[] modelRoots =
+    [
+        options.Aria2.DownloadDirectory,
+        modelProjectionRoot,
+        .. hydrationCapabilities.PersistentModelRoots,
+        .. libraryDirectory is null ? Array.Empty<string>() : [libraryDirectory],
+    ];
     LinuxAria2FileAccess aria2FileAccess;
+    ModelLibrary? modelLibrary = null;
     try
     {
         // aria2 runs unprivileged and writes in place only beneath model roots no session can
         // write; destinations inside session homes are staged and published by the agent.
         aria2FileAccess = LinuxAria2FileAccess.Create(options.Aria2, modelRoots, options.Session.SessionRoot);
+        if (options.ModelLibraryDirectory is { } writableFolder)
+        {
+            // Whether or not downloads are on: a writable mount left reachable would let sessions change
+            // the owner's models.
+            aria2FileAccess.PrepareModelLibrary(writableFolder);
+        }
+
+        if (libraryDirectory is not null)
+        {
+            modelLibrary = new ModelLibrary(libraryDirectory, options.LocalModelsDirectory!, modelProjectionRoot, options.RunnerId, instanceId);
+            RunnerLog.Info($"Downloaded models are saved in the local models folder ('{options.LocalModelsDirectory}').");
+        }
     }
     catch (Exception ex)
     {
@@ -190,7 +216,8 @@ static async Task<int> RunAgentAsync()
         hydrationCapabilities,
         new ModelDestinationPolicy(modelRoots),
         new SessionModelDownloadStaging(options.Session.SessionRoot, options.Aria2.StagingDirectory),
-        downloadsEnabled: options.ModelDownloads.Enabled);
+        downloadsEnabled: options.ModelDownloads.Enabled,
+        library: modelLibrary);
     await using var sessionEventRelay = new ComfySessionEventRelay(
         sessionManager.SignalRuntimeActivity,
         options.RunnerId,
@@ -265,7 +292,11 @@ static async Task<int> RunAgentAsync()
     if (!string.IsNullOrWhiteSpace(options.LocalModelsDirectory))
     {
         scanner = new LocalModelScanner(options.RunnerId, options.LocalModelsDirectory);
-        projector = new LocalModelProjector(options.LocalModelsDirectory, modelProjectionRoot, options.Session.RuntimeKind);
+        projector = new LocalModelProjector(
+            options.LocalModelsDirectory,
+            modelProjectionRoot,
+            options.Session.RuntimeKind,
+            modelLibrary);
         RunnerLog.Info(
             $"Local model scanning enabled dir='{options.LocalModelsDirectory}' interval={options.LocalModelsScanInterval.TotalSeconds:F0}s");
     }

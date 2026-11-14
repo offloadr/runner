@@ -1427,7 +1427,8 @@ internal static partial class ServiceClientManager
                             (sessionId, editorSid, owner, artifacts, token) => artifactUploadService.SeedSessionAsync(sessionId, editorSid, owner, artifacts, token),
                             artifactUploadService.CaptureSessionRefresh,
                             downloadService.RegisterDownloads,
-                            (downloads, token, highPriority) => downloadService.PreparePromptDownloadsAsync(downloads, token, highPriority),
+                            // As the prompt's own session: another may be active by the time its downloads are prepared.
+                            (downloads, token, highPriority) => downloadService.PreparePromptDownloadsAsync(downloads, token, highPriority, captured.SessionId),
                             (submitPromptCommand, responseChunkSink, onNativeRequestAttempt, token) => sessionManager.SubmitEditorActionAsync(submitPromptCommand, responseChunkSink, token, onNativeRequestAttempt),
                             (sessionId, clientId, promptId, _) => sessionEventRelay.MapPrompt(sessionId, clientId, captured, promptId),
                             physicalCancellation,

@@ -127,7 +127,11 @@ public sealed class Aria2Settings
         var maxConnPerServer = ParseInt(env, "ARIA2_MAX_CONNECTION_PER_SERVER", DefaultMaxConnectionPerServer, 1, 32);
         var split = ParseInt(env, "ARIA2_SPLIT", DefaultSplit, 1, 32);
         var minSplitSize = ParseSizeToken(env, "ARIA2_MIN_SPLIT_SIZE", DefaultMinSplitSize);
-        var fileAllocation = ParseFileAllocation(env, "ARIA2_FILE_ALLOCATION", DefaultFileAllocation);
+        // A models folder shared from Windows cannot preallocate, so with one aria2 writes as it goes.
+        var fileAllocation = ParseFileAllocation(
+            env,
+            "ARIA2_FILE_ALLOCATION",
+            string.IsNullOrWhiteSpace(env("RUNNER_MODEL_LIBRARY_DIR")) ? DefaultFileAllocation : "none");
         var modelDownloadRetryInitialDelay = ParseTimeSpan(
             env,
             "RUNNER_MODEL_DOWNLOAD_RETRY_INITIAL_SEC",

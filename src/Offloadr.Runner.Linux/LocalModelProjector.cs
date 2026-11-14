@@ -19,9 +19,18 @@ internal sealed class LocalModelProjector
     private readonly Dictionary<string, LocalProjectionRequest> _desiredProjections = new(StringComparer.Ordinal);
     private readonly HashSet<string> _managedTargets = new(StringComparer.Ordinal);
     private const int MaxDiscoveryEntries = 200_000;
+    private readonly IDownloadLinks? _downloadLinks;
     private bool _discoveredEarlierProjections;
 
-    public LocalModelProjector(string sourceRoot, string destinationRoot = "/comfyui/models", string runtimeKind = "comfyui")
+    /// <param name="downloadLinks">
+    /// The links of downloads saved in the local folder: they point into the source root as projections do,
+    /// and are left in place while a session may use them.
+    /// </param>
+    public LocalModelProjector(
+        string sourceRoot,
+        string destinationRoot = "/comfyui/models",
+        string runtimeKind = "comfyui",
+        IDownloadLinks? downloadLinks = null)
     {
         if (string.IsNullOrWhiteSpace(sourceRoot))
         {
@@ -35,6 +44,7 @@ internal sealed class LocalModelProjector
 
         _sourceRoot = NormalizePath(sourceRoot);
         _destinationRoot = NormalizePath(destinationRoot);
+        _downloadLinks = downloadLinks;
         _ = runtimeKind;
     }
 
@@ -316,7 +326,7 @@ internal sealed class LocalModelProjector
                 if (entry.LinkTarget is { } linkTarget)
                 {
                     var resolved = Path.GetFullPath(linkTarget, Path.GetDirectoryName(entry.FullName)!);
-                    if (IsUnderRoot(resolved, _sourceRoot))
+                    if (IsUnderRoot(resolved, _sourceRoot) && !IsKeptLink(NormalizePath(entry.FullName)))
                     {
                         _managedTargets.Add(NormalizePath(entry.FullName));
                     }
@@ -450,22 +460,32 @@ internal sealed class LocalModelProjector
             // relative to the root without following symlinked components.
             Directory.CreateDirectory(_destinationRoot);
             using var secureRoot = new LinuxSecureDirectoryRoot(_destinationRoot);
-            switch (secureRoot.ReadSymbolicLink(relativePath, out var existingTarget))
+            // A download may claim or make a link at this path meanwhile: the path is read and changed while
+            // none can.
+            WhileDownloadLinksAreHeld(() =>
             {
-                case SecureLinkKind.SymbolicLink when LinkPointsTo(targetPath, existingTarget!, sourcePath):
-                    _managedTargets.Add(targetPath);
-                    return;
-                case SecureLinkKind.SymbolicLink when _managedTargets.Contains(targetPath):
-                    secureRoot.DeleteSymbolicLink(relativePath);
-                    break;
-                case SecureLinkKind.SymbolicLink:
-                    throw new InvalidOperationException($"Projection target '{targetPath}' already exists as an unmanaged symbolic link.");
-                case SecureLinkKind.Other:
-                    throw new InvalidOperationException($"Projection target '{targetPath}' already exists or is not beneath real directories.");
-            }
+                switch (secureRoot.ReadSymbolicLink(relativePath, out var existingTarget))
+                {
+                    case SecureLinkKind.SymbolicLink when LinkPointsTo(targetPath, existingTarget!, sourcePath):
+                        _managedTargets.Add(targetPath);
+                        _downloadLinks?.SetProjected(targetPath, true);
+                        return;
+                    // A link into the local root is a projection, or a download's link no session needs any
+                    // more: either gives way to the model asked for now.
+                    case SecureLinkKind.SymbolicLink when (_managedTargets.Contains(targetPath) || PointsIntoSource(targetPath, existingTarget!)) &&
+                                                          !IsKeptLink(targetPath):
+                        secureRoot.DeleteSymbolicLink(relativePath);
+                        break;
+                    case SecureLinkKind.SymbolicLink:
+                        throw new InvalidOperationException($"Projection target '{targetPath}' already exists as an unmanaged symbolic link.");
+                    case SecureLinkKind.Other:
+                        throw new InvalidOperationException($"Projection target '{targetPath}' already exists or is not beneath real directories.");
+                }
 
-            secureRoot.CreateSymbolicLink(relativePath, sourcePath);
-            _managedTargets.Add(targetPath);
+                secureRoot.CreateSymbolicLink(relativePath, sourcePath);
+                _managedTargets.Add(targetPath);
+                _downloadLinks?.SetProjected(targetPath, true);
+            });
         }
         catch (Exception ex)
         {
@@ -474,6 +494,23 @@ internal sealed class LocalModelProjector
         }
     }
 
+    private bool IsKeptLink(string targetPath) => _downloadLinks?.KeepsEditorLink(targetPath) == true;
+
+    private void WhileDownloadLinksAreHeld(Action change)
+    {
+        if (_downloadLinks is null)
+        {
+            change();
+        }
+        else
+        {
+            _downloadLinks.WhileLinksAreHeld(change);
+        }
+    }
+
+    private bool PointsIntoSource(string targetPath, string linkTarget)
+        => IsUnderRoot(Path.GetFullPath(linkTarget, Path.GetDirectoryName(targetPath)!), _sourceRoot);
+
     private void RemoveManagedLink(string targetPath)
     {
         try
@@ -481,7 +518,14 @@ internal sealed class LocalModelProjector
             if (Directory.Exists(_destinationRoot))
             {
                 using var secureRoot = new LinuxSecureDirectoryRoot(_destinationRoot);
-                secureRoot.DeleteSymbolicLink(GetRelativeTargetPath(targetPath));
+                WhileDownloadLinksAreHeld(() =>
+                {
+                    // A download is going through this link, or went through it and its model may be in use.
+                    if (!IsKeptLink(targetPath))
+                    {
+                        secureRoot.DeleteSymbolicLink(GetRelativeTargetPath(targetPath));
+                    }
+                });
             }
         }
         catch (Exception ex)
@@ -491,6 +535,7 @@ internal sealed class LocalModelProjector
         finally
         {
             _managedTargets.Remove(targetPath);
+            _downloadLinks?.SetProjected(targetPath, false);
         }
     }
 

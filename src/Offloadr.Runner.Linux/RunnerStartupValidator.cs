@@ -82,6 +82,8 @@ public sealed class RunnerStartupValidator
             ValidateDirectoryExists(options.LocalModelsDirectory, "RUNNER_LOCAL_MODELS_DIR", errors);
         }
 
+        ValidateModelLibrary(options, errors);
+
         var socketDirectory = Path.GetDirectoryName(options.ModelFetchSocket);
         if (!string.IsNullOrWhiteSpace(socketDirectory))
         {
@@ -108,6 +110,56 @@ public sealed class RunnerStartupValidator
         if (errors.Count > 0)
         {
             throw new InvalidOperationException($"Runner startup validation failed:{Environment.NewLine} - {string.Join($"{Environment.NewLine} - ", errors)}");
+        }
+    }
+
+    /// <summary>
+    /// The writable models folder must be the local models folder itself: sessions reach downloads saved
+    /// there only through the read-only one.
+    /// </summary>
+    private static void ValidateModelLibrary(RunnerAgentOptions options, ICollection<string> errors)
+    {
+        if (string.IsNullOrWhiteSpace(options.ModelLibraryDirectory))
+        {
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(options.LocalModelsDirectory))
+        {
+            errors.Add("RUNNER_MODEL_LIBRARY_DIR needs RUNNER_LOCAL_MODELS_DIR: the same folder, mounted read-only for sessions.");
+            return;
+        }
+
+        ValidateDirectoryExists(options.ModelLibraryDirectory, "RUNNER_MODEL_LIBRARY_DIR", errors);
+        // Two mounts of one folder: sessions see it only through the read-only one, and the writable one's
+        // parent is closed to them, which would close the read-only one too if it were the same or inside it.
+        var libraryPath = Path.TrimEndingDirectorySeparator(Path.GetFullPath(options.ModelLibraryDirectory));
+        var localPath = Path.TrimEndingDirectorySeparator(Path.GetFullPath(options.LocalModelsDirectory));
+        if (string.Equals(libraryPath, localPath, StringComparison.Ordinal) ||
+            libraryPath.StartsWith(localPath + "/", StringComparison.Ordinal) ||
+            localPath.StartsWith(libraryPath + "/", StringComparison.Ordinal))
+        {
+            errors.Add($"RUNNER_MODEL_LIBRARY_DIR '{options.ModelLibraryDirectory}' must be a second mount of the folder at RUNNER_LOCAL_MODELS_DIR '{options.LocalModelsDirectory}', apart from it: not the same path, nor one inside the other.");
+            return;
+        }
+
+        if (OperatingSystem.IsLinux() &&
+            LinuxFileIdentityReader.TryRead(options.ModelLibraryDirectory, out var library) &&
+            LinuxFileIdentityReader.TryRead(options.LocalModelsDirectory, out var local) &&
+            (library.DeviceId != local.DeviceId || library.Inode != local.Inode))
+        {
+            errors.Add($"RUNNER_MODEL_LIBRARY_DIR '{options.ModelLibraryDirectory}' must be the folder mounted at RUNNER_LOCAL_MODELS_DIR '{options.LocalModelsDirectory}'.");
+            return;
+        }
+
+        // The same folder by another path (a link to it) is still the one mount.
+        if (OperatingSystem.IsLinux() &&
+            LinuxFileIdentityReader.TryReadMount(options.ModelLibraryDirectory, out var libraryMount) &&
+            LinuxFileIdentityReader.TryReadMount(options.LocalModelsDirectory, out var localMount) &&
+            libraryMount.MountId is { } libraryMountId &&
+            libraryMountId == localMount.MountId)
+        {
+            errors.Add($"RUNNER_MODEL_LIBRARY_DIR '{options.ModelLibraryDirectory}' and RUNNER_LOCAL_MODELS_DIR '{options.LocalModelsDirectory}' are one mount: the local models folder must be a read-only mount of its own.");
         }
     }
 

@@ -39,6 +39,10 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
     private const int ETooManySymbolicLinks = 40;
     private const int AtEmptyPath = 0x1000;
     private const int AtSymlinkNoFollow = 0x100;
+    private const int AtRemoveDirectory = 0x200;
+    private const int LockExclusive = 2;
+    private const int LockNonBlocking = 4;
+    private const int MaxDeleteDepth = 64;
     private const uint StatxType = 0x0001;
     private const uint StatxNlink = 0x0004;
     private const uint StatxUid = 0x0008;
@@ -459,10 +463,267 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
     }
 
     /// <summary>
+    /// Opens the regular file at <paramref name="relativePath"/>, creating it, without following links, and
+    /// takes an exclusive lock on it without waiting: <see cref="SecureLockResult.Held"/> when another process
+    /// holds it, <see cref="SecureLockResult.Unsupported"/> when the filesystem takes no locks. A lock on a
+    /// file removed from that name meanwhile locks nothing, so it is taken again on the file there now.
+    /// </summary>
+    public SecureLockResult TryLockFile(string relativePath, out SafeFileHandle? handle)
+    {
+        handle = null;
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            var (parent, leafName) = OpenParent(relativePath, createDirectories: false);
+            using (parent)
+            {
+                var descriptor = openat(GetDescriptor(parent), leafName, OReadWrite | OCreate | ONoFollow | OCloseOnExec, Convert.ToUInt32("600", 8));
+                if (descriptor < 0)
+                {
+                    throw CreateException($"opening lock '{relativePath}'");
+                }
+
+                var file = new SafeFileHandle((nint)descriptor, ownsHandle: true);
+                if (flock(descriptor, LockExclusive | LockNonBlocking) != 0)
+                {
+                    var error = Marshal.GetLastPInvokeError();
+                    file.Dispose();
+                    return error == ETryAgain ? SecureLockResult.Held : SecureLockResult.Unsupported;
+                }
+
+                if (ReadVersion(file, relativePath) is { } locked &&
+                    ReadVersion(parent, leafName, relativePath) is { } named &&
+                    locked.Inode == named.Inode)
+                {
+                    handle = file;
+                    return SecureLockResult.Locked;
+                }
+
+                file.Dispose();
+            }
+        }
+
+        throw new IOException($"The lock '{relativePath}' kept being replaced.");
+    }
+
+    /// <summary>Removes the file (or link) at <paramref name="relativePath"/>, not a directory, following no link.</summary>
+    public bool DeleteFile(string relativePath)
+    {
+        var (_, parent, leafName) = TryOpenExistingParent(relativePath);
+        if (parent is null)
+        {
+            return false;
+        }
+
+        using (parent)
+        {
+            if (unlinkat(GetDescriptor(parent), leafName, 0) == 0)
+            {
+                return true;
+            }
+
+            var error = Marshal.GetLastPInvokeError();
+            return error == ENoEntry ? false : throw CreateException($"removing '{relativePath}'", error);
+        }
+    }
+
+    /// <summary>Makes <see cref="MoveRegularFileWithoutReplacing"/> act as on a Windows folder, for tests.</summary>
+    internal static bool RenameWithoutReplacingUnsupportedForTests { get; set; }
+
+    /// <summary>
+    /// Deletes the directory at <paramref name="relativeDirectory"/> and everything in it, or only what is in
+    /// it when <paramref name="keepDirectory"/> is set. No link is ever followed: each directory is opened
+    /// without following links, relative to the one above it, and its entries are removed relative to it, so a
+    /// folder swapped for a link meanwhile is never deleted through. Returns false when there is no real
+    /// directory there.
+    /// </summary>
+    public bool DeleteDirectoryTree(string relativeDirectory, bool keepDirectory = false)
+    {
+        var (_, parent, leafName) = TryOpenExistingParent(relativeDirectory);
+        if (parent is null)
+        {
+            return false;
+        }
+
+        using (parent)
+        {
+            var descriptor = openat(GetDescriptor(parent), leafName, OPath | ODirectory | ONoFollow | OCloseOnExec);
+            if (descriptor < 0)
+            {
+                var error = Marshal.GetLastPInvokeError();
+                return error is ENoEntry or ENotDirectory or ETooManySymbolicLinks
+                    ? false
+                    : throw CreateException($"opening directory '{relativeDirectory}'", error);
+            }
+
+            using (var directory = new SafeFileHandle((nint)descriptor, ownsHandle: true))
+            {
+                DeleteDirectoryContents(directory, relativeDirectory, depth: 0);
+            }
+
+            if (!keepDirectory && unlinkat(GetDescriptor(parent), leafName, AtRemoveDirectory) != 0 &&
+                Marshal.GetLastPInvokeError() is var removeError && removeError != ENoEntry)
+            {
+                throw CreateException($"removing directory '{relativeDirectory}'", removeError);
+            }
+
+            return true;
+        }
+    }
+
+    private static void DeleteDirectoryContents(SafeFileHandle directory, string relativePath, int depth)
+    {
+        if (depth > MaxDeleteDepth)
+        {
+            throw new IOException($"'{relativePath}' is nested too deeply to delete.");
+        }
+
+        // The descriptor's own entry in /proc names the directory it holds, whatever happened to its path.
+        var names = System.IO.Directory
+            .EnumerateFileSystemEntries($"/proc/self/fd/{GetDescriptor(directory)}")
+            .Select(static entry => Path.GetFileName(entry))
+            .ToArray();
+        foreach (var name in names)
+        {
+            var child = openat(GetDescriptor(directory), name, OPath | ODirectory | ONoFollow | OCloseOnExec);
+            if (child >= 0)
+            {
+                using (var childDirectory = new SafeFileHandle((nint)child, ownsHandle: true))
+                {
+                    DeleteDirectoryContents(childDirectory, $"{relativePath}/{name}", depth + 1);
+                }
+
+                if (unlinkat(GetDescriptor(directory), name, AtRemoveDirectory) != 0 &&
+                    Marshal.GetLastPInvokeError() is var removeError && removeError != ENoEntry)
+                {
+                    throw CreateException($"removing directory '{relativePath}/{name}'", removeError);
+                }
+
+                continue;
+            }
+
+            var error = Marshal.GetLastPInvokeError();
+            if (error is ENoEntry)
+            {
+                continue;
+            }
+
+            if (error is not (ENotDirectory or ETooManySymbolicLinks))
+            {
+                throw CreateException($"opening '{relativePath}/{name}'", error);
+            }
+
+            // A file or a link: the link itself goes, never what it points at.
+            if (unlinkat(GetDescriptor(directory), name, 0) != 0 &&
+                Marshal.GetLastPInvokeError() is var unlinkError && unlinkError != ENoEntry)
+            {
+                throw CreateException($"removing '{relativePath}/{name}'", unlinkError);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Moves the regular file at <paramref name="relativeSource"/> to <paramref name="relativeDestination"/>
+    /// beneath this root, creating missing directories, but never over anything already there. Returns false
+    /// when the destination is taken. On a filesystem that cannot rename without replacing (a Windows folder
+    /// shared into a container), the file is hard-linked to its new name, which is refused just as atomically
+    /// when the name is taken, and its old name removed.
+    /// </summary>
+    public bool MoveRegularFileWithoutReplacing(string relativeSource, string relativeDestination)
+    {
+        var (sourceParent, sourceName) = OpenParent(relativeSource, createDirectories: false);
+        using (sourceParent)
+        {
+            var descriptor = openat(GetDescriptor(sourceParent), sourceName, OPath | ONoFollow | OCloseOnExec);
+            if (descriptor < 0)
+            {
+                throw CreateException($"opening '{relativeSource}'");
+            }
+
+            using var entry = new SafeFileHandle((nint)descriptor, ownsHandle: true);
+            if (ReadStatus(entry, relativeSource).Kind != SecureEntryKind.RegularFile)
+            {
+                throw NotRegularFile(relativeSource);
+            }
+
+            // The file and any directory made for it go to the owner of the directory it lands in, so whoever
+            // owns the folder can delete, rename and add beside it. The file opened above is what changes owner,
+            // never whatever its name leads to by then.
+            var (destinationParent, destinationName) = OpenParentInheritingOwner(relativeDestination);
+            using (destinationParent)
+            {
+                if (ReadOwner(destinationParent) is { } owner &&
+                    fchownat(GetDescriptor(entry), string.Empty, owner.UserId, owner.GroupId, AtEmptyPath | AtSymlinkNoFollow) != 0)
+                {
+                    throw CreateException($"handing '{relativeSource}' to the owner of where it goes");
+                }
+
+                if (!RenameWithoutReplacingUnsupportedForTests &&
+                    renameat2(GetDescriptor(sourceParent), sourceName, GetDescriptor(destinationParent), destinationName, RenameNoReplace) == 0)
+                {
+                    return true;
+                }
+
+                var error = RenameWithoutReplacingUnsupportedForTests ? EInvalidArgument : Marshal.GetLastPInvokeError();
+                if (error == AlreadyExists)
+                {
+                    return false;
+                }
+
+                if (error != EInvalidArgument)
+                {
+                    throw CreateException($"moving '{relativeSource}' to '{relativeDestination}'", error);
+                }
+
+                // A hard link refuses a taken name as atomically as the rename would have; then the file's
+                // old name goes. Where hard links do not work either, the move fails rather than risk replacing.
+                if (linkat(GetDescriptor(sourceParent), sourceName, GetDescriptor(destinationParent), destinationName, 0) != 0)
+                {
+                    var linkError = Marshal.GetLastPInvokeError();
+                    if (linkError == AlreadyExists)
+                    {
+                        return false;
+                    }
+
+                    throw CreateException($"linking '{relativeSource}' to '{relativeDestination}'", linkError);
+                }
+
+                if (unlinkat(GetDescriptor(sourceParent), sourceName, 0) != 0)
+                {
+                    throw CreateException($"removing '{relativeSource}' once moved");
+                }
+
+                return true;
+            }
+        }
+    }
+
+    /// <summary>
     /// Creates a symbolic link like <see cref="CreateSymbolicLink"/>, but gives each directory it has to
     /// create to the owner of the directory it creates it in. Links made in a directory a user owns then
     /// leave that user able to write beside them.
     /// </summary>
+    /// <summary>
+    /// Creates every missing directory of <paramref name="relativeDirectory"/> beneath the root without
+    /// following links, each handed to the owner of the directory it is made in.
+    /// </summary>
+    public void EnsureDirectoryInheritingOwner(string relativeDirectory)
+    {
+        var current = DuplicateDirectory(_rootHandle);
+        try
+        {
+            foreach (var part in SplitRelativePath(relativeDirectory))
+            {
+                var next = OpenOrCreateDirectoryInheritingOwner(current, part);
+                current.Dispose();
+                current = next;
+            }
+        }
+        finally
+        {
+            current.Dispose();
+        }
+    }
+
     public void CreateSymbolicLinkInheritingOwner(string relativePath, string target)
     {
         var parts = SplitRelativePath(relativePath);
@@ -484,6 +745,28 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
         finally
         {
             current.Dispose();
+        }
+    }
+
+    private (SafeFileHandle Parent, string LeafName) OpenParentInheritingOwner(string relativePath)
+    {
+        var parts = SplitRelativePath(relativePath);
+        var current = DuplicateDirectory(_rootHandle);
+        try
+        {
+            for (var index = 0; index < parts.Length - 1; index++)
+            {
+                var next = OpenOrCreateDirectoryInheritingOwner(current, parts[index]);
+                current.Dispose();
+                current = next;
+            }
+
+            return (current, parts[^1]);
+        }
+        catch
+        {
+            current.Dispose();
+            throw;
         }
     }
 
@@ -1250,6 +1533,9 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
     private static extern int mkdirat(int directoryFileDescriptor, string path, uint mode);
 
     [DllImport("libc", SetLastError = true)]
+    private static extern int flock(int fileDescriptor, int operation);
+
+    [DllImport("libc", SetLastError = true)]
     private static extern int fchmod(int fileDescriptor, uint mode);
 
     [DllImport("libc", SetLastError = true)]
@@ -1308,6 +1594,9 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
 
     [DllImport("libc", SetLastError = true)]
     private static extern int fchownat(int directoryFileDescriptor, string path, uint owner, uint group, int flags);
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int linkat(int oldDirectoryFileDescriptor, string oldPath, int newDirectoryFileDescriptor, string newPath, int flags);
 }
 
 internal enum SecureLinkKind
@@ -1315,6 +1604,13 @@ internal enum SecureLinkKind
     Missing,
     SymbolicLink,
     Other
+}
+
+internal enum SecureLockResult
+{
+    Locked,
+    Held,
+    Unsupported
 }
 
 internal enum SecureEntryKind
