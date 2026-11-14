@@ -825,7 +825,7 @@ public class ModelDownloadServiceTests
     }
 
     [Test]
-    public async Task ReleaseForLocalModels_KeepsAFullDownloadThatIsStillRunning()
+    public async Task ReleaseForLocalModels_WaitsForAFullDownloadThatIsStillRunning()
     {
         var root = CreateTempDirectory();
         try
@@ -841,12 +841,18 @@ public class ModelDownloadServiceTests
             var download = service.EnsureDownloadedAsync(destinationPath, CancellationToken.None, highPriority: false);
             await backend.StatusRequested.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
-            var projected = await service.ReleaseForLocalModelsAsync([LocalModel(destinationPath)], AnyLocalModel, CancellationToken.None);
+            using var stop = new CancellationTokenSource();
+            var local = LocalModel(destinationPath);
+            var release = service.ReleaseForLocalModelsAsync([local], AnyLocalModel, stop.Token);
+            await Task.Delay(TimeSpan.FromMilliseconds(300));
+            Assert.That(release.IsCompleted, Is.False, "It waits for the download rather than judging a partial file.");
 
+            stop.Cancel();
+            var projected = await release.WaitAsync(TimeSpan.FromSeconds(5));
             Assert.Multiple(() =>
             {
-                Assert.That(projected, Is.Empty, "No link over a download in progress.");
-                Assert.That(File.Exists(destinationPath), Is.True);
+                Assert.That(projected, Is.EqualTo(new[] { local }), "A partial file never stands in for the local model.");
+                Assert.That(File.Exists(destinationPath), Is.True, "Nor is it deleted.");
             });
 
             service.CancelSession("session-1");

@@ -224,7 +224,7 @@ public class ModelDestinationPolicyTests
         var destination = Path.Combine(_modelsRoot, "Stable-diffusion", "model.safetensors");
         Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
         File.WriteAllText(destination, "downloaded earlier");
-        var local = LocalModel(destination);
+        var local = LocalModel(destination, new FileInfo(destination).Length);
 
         var projected = await service.ReleaseForLocalModelsAsync([local], static _ => true, CancellationToken.None);
 
@@ -232,6 +232,62 @@ public class ModelDestinationPolicyTests
         {
             Assert.That(projected, Is.EqualTo(new[] { local }));
             Assert.That(File.Exists(destination), Is.False, "The local model is linked there instead; it is not kept twice.");
+        });
+    }
+
+    [Test]
+    public async Task ReleaseForLocalModels_NeverDeletesAFullDownloadOfAnotherOrUnknownSize()
+    {
+        // A fresh service, as after a restart: it registered nothing, and the files were there before it.
+        await using var service = new ModelDownloadService(
+            new NoopTransferBackend(),
+            DefaultAria2Settings,
+            capabilities: null,
+            new ModelDestinationPolicy([_modelsRoot]));
+        var otherSize = Path.Combine(_modelsRoot, "Lora", "x.safetensors");
+        var unknownSize = Path.Combine(_modelsRoot, "Lora", "y.safetensors");
+        var unfinished = Path.Combine(_modelsRoot, "Lora", "z.safetensors");
+        Directory.CreateDirectory(Path.GetDirectoryName(otherSize)!);
+        File.WriteAllText(otherSize, "someone else's model");
+        File.WriteAllText(unknownSize, "a model");
+        File.WriteAllText(unfinished, "partly");
+        File.WriteAllText($"{unfinished}.aria2", "control");
+
+        var projected = await service.ReleaseForLocalModelsAsync(
+            [LocalModel(otherSize, 999), LocalModel(unknownSize, 0), LocalModel(unfinished, new FileInfo(unfinished).Length)],
+            static _ => true,
+            CancellationToken.None);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(projected, Has.Count.EqualTo(3), "All go on to the projector, which refuses the occupied paths.");
+            Assert.That(File.ReadAllText(otherSize), Is.EqualTo("someone else's model"));
+            Assert.That(File.Exists(unknownSize), Is.True);
+            Assert.That(File.Exists(unfinished), Is.True);
+        });
+    }
+
+    [Test]
+    public async Task ReleaseForLocalModels_KeepsAFullDownloadWhenTheLocalModelGoesMeanwhile()
+    {
+        await using var service = new ModelDownloadService(
+            new NoopTransferBackend(),
+            DefaultAria2Settings,
+            capabilities: null,
+            new ModelDestinationPolicy([_modelsRoot]));
+        var destination = Path.Combine(_modelsRoot, "Stable-diffusion", "model.safetensors");
+        Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+        File.WriteAllText(destination, "downloaded earlier");
+        var local = LocalModel(destination, new FileInfo(destination).Length);
+
+        // The local model can be linked when it is chosen, but no longer when its download would go.
+        var asked = 0;
+        var projected = await service.ReleaseForLocalModelsAsync([local], _ => Interlocked.Increment(ref asked) == 1, CancellationToken.None);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(projected, Is.Empty, "The download keeps serving.");
+            Assert.That(File.Exists(destination), Is.True);
         });
     }
 
@@ -260,11 +316,12 @@ public class ModelDestinationPolicyTests
         });
     }
 
-    private static ModelDownloadRequest LocalModel(string destination) => new()
+    private static ModelDownloadRequest LocalModel(string destination, long sizeBytes = 0) => new()
     {
         ModelId = "model-1",
         Filename = Path.GetFileName(destination),
         DestinationPath = destination,
+        SizeBytes = sizeBytes,
         LocalSelectionHash = new string('a', 64),
     };
 
