@@ -65,6 +65,21 @@ public class ModelLibraryTests
     }
 
     [Test]
+    public async Task Redirect_FromPromptsAtOnce_SendsThemAllToTheSameDownload()
+    {
+        var library = CreateLibrary();
+        var request = Remote("checkpoints/base.safetensors", 8);
+
+        var prompts = await Task.WhenAll(Enumerable.Range(0, 16)
+            .Select(_ => Task.Run(() => library.Redirect([request]).Single())));
+
+        Assert.That(
+            prompts.Select(static redirected => redirected.DestinationPath),
+            Has.All.EqualTo(Path.Combine(_library, "checkpoints", "base.safetensors")),
+            "None falls back to downloading over another's link.");
+    }
+
+    [Test]
     public void Redirect_CountsAFileOfTheRequestedSizeAsTheModel()
     {
         WriteLibraryFile("checkpoints/base.safetensors", 8);

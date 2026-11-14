@@ -21,6 +21,7 @@ internal sealed class ModelLibrary : IModelDownloadStaging
     private readonly string _editorModelsDirectory;
     private readonly string _downloadFolder;
     private readonly string _stagingDirectory;
+    private readonly object _gate = new();
 
     /// <param name="directory">The models folder, writable.</param>
     /// <param name="readOnlyDirectory">The same folder as sessions see it, read-only.</param>
@@ -77,7 +78,14 @@ internal sealed class ModelLibrary : IModelDownloadStaging
     /// size, or a link or file at the editor's path. A file of the requested size there counts as the model.
     /// </summary>
     public ModelDownloadRequest[] Redirect(IEnumerable<ModelDownloadRequest> downloads)
-        => downloads.Select(Redirect).ToArray();
+    {
+        // Prompts are prepared concurrently: two naming the same new model must not both find its link
+        // missing, and the second fall back to downloading over the first one's link.
+        lock (_gate)
+        {
+            return downloads.Select(Redirect).ToArray();
+        }
+    }
 
     private ModelDownloadRequest Redirect(ModelDownloadRequest download)
     {
