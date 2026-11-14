@@ -40,6 +40,8 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
     private const int AtEmptyPath = 0x1000;
     private const int AtSymlinkNoFollow = 0x100;
     private const int AtRemoveDirectory = 0x200;
+    private const int LockExclusive = 2;
+    private const int LockNonBlocking = 4;
     private const int MaxDeleteDepth = 64;
     private const uint StatxType = 0x0001;
     private const uint StatxNlink = 0x0004;
@@ -457,6 +459,70 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
             {
                 throw CreateException($"creating link '{relativePath}'");
             }
+        }
+    }
+
+    /// <summary>
+    /// Opens the regular file at <paramref name="relativePath"/>, creating it, without following links, and
+    /// takes an exclusive lock on it without waiting: <see cref="SecureLockResult.Held"/> when another process
+    /// holds it, <see cref="SecureLockResult.Unsupported"/> when the filesystem takes no locks. A lock on a
+    /// file removed from that name meanwhile locks nothing, so it is taken again on the file there now.
+    /// </summary>
+    public SecureLockResult TryLockFile(string relativePath, out SafeFileHandle? handle)
+    {
+        handle = null;
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            var (parent, leafName) = OpenParent(relativePath, createDirectories: false);
+            using (parent)
+            {
+                var descriptor = openat(GetDescriptor(parent), leafName, OReadWrite | OCreate | ONoFollow | OCloseOnExec, Convert.ToUInt32("600", 8));
+                if (descriptor < 0)
+                {
+                    throw CreateException($"opening lock '{relativePath}'");
+                }
+
+                var file = new SafeFileHandle((nint)descriptor, ownsHandle: true);
+                if (flock(descriptor, LockExclusive | LockNonBlocking) != 0)
+                {
+                    var error = Marshal.GetLastPInvokeError();
+                    file.Dispose();
+                    return error == ETryAgain ? SecureLockResult.Held : SecureLockResult.Unsupported;
+                }
+
+                if (ReadVersion(file, relativePath) is { } locked &&
+                    ReadVersion(parent, leafName, relativePath) is { } named &&
+                    locked.Inode == named.Inode)
+                {
+                    handle = file;
+                    return SecureLockResult.Locked;
+                }
+
+                file.Dispose();
+            }
+        }
+
+        throw new IOException($"The lock '{relativePath}' kept being replaced.");
+    }
+
+    /// <summary>Removes the file (or link) at <paramref name="relativePath"/>, not a directory, following no link.</summary>
+    public bool DeleteFile(string relativePath)
+    {
+        var (_, parent, leafName) = TryOpenExistingParent(relativePath);
+        if (parent is null)
+        {
+            return false;
+        }
+
+        using (parent)
+        {
+            if (unlinkat(GetDescriptor(parent), leafName, 0) == 0)
+            {
+                return true;
+            }
+
+            var error = Marshal.GetLastPInvokeError();
+            return error == ENoEntry ? false : throw CreateException($"removing '{relativePath}'", error);
         }
     }
 
@@ -1467,6 +1533,9 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
     private static extern int mkdirat(int directoryFileDescriptor, string path, uint mode);
 
     [DllImport("libc", SetLastError = true)]
+    private static extern int flock(int fileDescriptor, int operation);
+
+    [DllImport("libc", SetLastError = true)]
     private static extern int fchmod(int fileDescriptor, uint mode);
 
     [DllImport("libc", SetLastError = true)]
@@ -1535,6 +1604,13 @@ internal enum SecureLinkKind
     Missing,
     SymbolicLink,
     Other
+}
+
+internal enum SecureLockResult
+{
+    Locked,
+    Held,
+    Unsupported
 }
 
 internal enum SecureEntryKind

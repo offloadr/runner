@@ -1,3 +1,4 @@
+using Microsoft.Win32.SafeHandles;
 using System.Security.Cryptography;
 using System.Text;
 using Offloadr.Runner.V1;
@@ -12,7 +13,7 @@ namespace Offloadr.Runner.Linux;
 /// apps never see half a model, and renamed into place once complete. The editor's path for the model becomes
 /// a link to it in the read-only mount.
 /// </summary>
-internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
+internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks, IDisposable
 {
     /// <summary>Where downloads in progress are kept, inside the models folder.</summary>
     public const string StagingFolderName = ".offloadr-downloads";
@@ -20,7 +21,12 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
     private readonly string _readOnlyDirectory;
     private readonly string _editorModelsDirectory;
     private readonly string _downloadFolder;
+    private readonly string _runnerDirectory;
+    private readonly string _instanceName;
     private readonly string _stagingDirectory;
+    private readonly object _leaseGate = new();
+    private SafeFileHandle? _lease;
+    private bool _leaseTaken;
     private readonly object _gate = new();
     // Editor links this library made, under _gate: the only ones it ever removes.
     private readonly HashSet<string> _ownLinks = new(StringComparer.Ordinal);
@@ -30,6 +36,9 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
     // Sessions that have ended, under _gate: a prompt of one still finishing claims nothing for it. And the
     // session last made active, whose end is seen when another becomes active.
     private readonly HashSet<string> _endedSessions = new(StringComparer.Ordinal);
+    // The size of the model each claim on a link was made for, under _gate: a download that cannot be saved
+    // gives up only a claim made for it, not one made for the owner's file of another size there.
+    private readonly Dictionary<string, long> _claimSizes = new(StringComparer.Ordinal);
     private string? _activeSession;
     // The redirect that last claimed each of those links, under _gate: undoing another redirect leaves it.
     private readonly Dictionary<string, RedirectBatch> _claimedBy = new(StringComparer.Ordinal);
@@ -45,7 +54,11 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
     /// This runner's id. Several runners may share one folder, so each keeps its downloads in progress in a
     /// folder of its own and clears only that one.
     /// </param>
-    public ModelLibrary(string directory, string readOnlyDirectory, string editorModelsDirectory, string runnerId)
+    /// <param name="instanceId">
+    /// This run's id: two runs of one runner may overlap (a relaunch), so each stages in a folder of its own,
+    /// leased for as long as it runs, and clears only those of runs that have ended.
+    /// </param>
+    public ModelLibrary(string directory, string readOnlyDirectory, string editorModelsDirectory, string runnerId, string? instanceId = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(directory);
         ArgumentException.ThrowIfNullOrWhiteSpace(readOnlyDirectory);
@@ -55,8 +68,56 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
         _readOnlyDirectory = Normalize(readOnlyDirectory);
         _editorModelsDirectory = Normalize(editorModelsDirectory);
         _downloadFolder = Path.Combine(Directory, StagingFolderName);
-        _stagingDirectory = Path.Combine(_downloadFolder, RunnerFolderName(runnerId));
+        _runnerDirectory = Path.Combine(_downloadFolder, RunnerFolderName(runnerId));
+        _instanceName = string.IsNullOrWhiteSpace(instanceId) ? Guid.NewGuid().ToString("N") : RunnerFolderName(instanceId);
+        _stagingDirectory = Path.Combine(_runnerDirectory, _instanceName);
     }
+
+    private const string LeaseSuffix = ".lease";
+
+    /// <summary>Gives up this run's lease: its downloads in progress are then another run's to clear.</summary>
+    public void Dispose()
+    {
+        lock (_leaseGate)
+        {
+            _lease?.Dispose();
+            _lease = null;
+        }
+    }
+
+    /// <summary>
+    /// Takes this run's lease, once: a lock on <c>&lt;instance&gt;.lease</c> beside its folder, taken before the
+    /// folder is made, so a run clearing ended ones never takes a live run's folder for an ended one's.
+    /// </summary>
+    private void EnsureLease()
+    {
+        lock (_leaseGate)
+        {
+            if (_leaseTaken)
+            {
+                return;
+            }
+
+            using var root = new LinuxSecureDirectoryRoot(Directory);
+            root.EnsureDirectoryInheritingOwner(RelativeToFolder(_runnerDirectory));
+            switch (root.TryLockFile(RelativeToFolder(_stagingDirectory + LeaseSuffix), out var lease))
+            {
+                case SecureLockResult.Locked:
+                    _lease = lease;
+                    break;
+                case SecureLockResult.Unsupported:
+                    RunnerLog.Warning(nameof(ModelLibrary), "The models folder takes no file locks: an overlapping run of this runner may clear this run's downloads in progress.");
+                    break;
+                default:
+                    throw new IOException($"This run's download folder lease is held by another process.");
+            }
+
+            _leaseTaken = true;
+        }
+    }
+
+    private string RelativeToFolder(string path)
+        => Path.GetRelativePath(Directory, path).Replace(Path.DirectorySeparatorChar, '/');
 
     private static string RunnerFolderName(string runnerId)
     {
@@ -302,10 +363,13 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
                 before = earlier;
             }
 
-            if (before.Existed && before.By is not { Undone: true })
+            // Nor does a claim of a session that has ended since come back.
+            if (before.Existed && before.By is not { Undone: true } &&
+                (before.SessionId is null || !_endedSessions.Contains(before.SessionId)))
             {
                 _linkSessions[path] = before.SessionId;
                 SetClaimedBy(path, before.By);
+                _claimSizes[path] = before.Size;
             }
             else
             {
@@ -345,7 +409,7 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
         }
     }
 
-    private void Claim(string relativePath, string? sessionId)
+    private void Claim(string relativePath, string? sessionId, long size)
     {
         // A prompt of an ended session, stopped while it waited here, keeps no link from the session after.
         if (sessionId is not null && _endedSessions.Contains(sessionId))
@@ -358,12 +422,13 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
             batch.ClaimsBefore.TryAdd(
                 relativePath,
                 _linkSessions.TryGetValue(relativePath, out var before)
-                    ? (true, before, _claimedBy.GetValueOrDefault(relativePath))
-                    : (false, null, null));
+                    ? (true, before, _claimedBy.GetValueOrDefault(relativePath), _claimSizes.GetValueOrDefault(relativePath))
+                    : (false, null, null, 0));
         }
 
         _linkSessions[relativePath] = sessionId;
         SetClaimedBy(relativePath, _batch);
+        _claimSizes[relativePath] = size;
     }
 
     /// <summary>What one redirect changed: the links it made, and the claims it set, with what they were.</summary>
@@ -379,7 +444,7 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
 
         public List<string> LinksMade { get; } = [];
 
-        public Dictionary<string, (bool Existed, string? SessionId, RedirectBatch? By)> ClaimsBefore { get; } = new(StringComparer.Ordinal);
+        public Dictionary<string, (bool Existed, string? SessionId, RedirectBatch? By, long Size)> ClaimsBefore { get; } = new(StringComparer.Ordinal);
     }
 
     public void SetProjected(string editorPath, bool projected)
@@ -453,7 +518,7 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
             return download;
         }
 
-        if (!TryLinkEditorPath(relative, linkTarget, sessionId))
+        if (!TryLinkEditorPath(relative, linkTarget, sessionId, download.SizeBytes))
         {
             return download;
         }
@@ -475,8 +540,10 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
         // The download folders too: a download is staged only through real ones, never through a link.
         if (!LinuxFileIdentityReader.TryReadMount(Directory, out var folder) ||
             !IsMissingOrRealDirectory(_downloadFolder) ||
+            !IsMissingOrRealDirectory(_runnerDirectory) ||
             !IsMissingOrRealDirectory(_stagingDirectory) ||
             !IsOnMount(_downloadFolder, folder) ||
+            !IsOnMount(_runnerDirectory, folder) ||
             !IsOnMount(_stagingDirectory, folder))
         {
             return false;
@@ -559,10 +626,18 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
     /// Gives up the editor's link to a download that was never saved: removed if this library made it, and no
     /// longer kept from the projector otherwise.
     /// </summary>
-    private void ReleaseEditorLink(string relative)
+    /// <param name="size">The size of the download: only a claim made for a model of that size is given up.</param>
+    private void ReleaseEditorLink(string relative, long size)
     {
         lock (_gate)
         {
+            // A request for the owner's file, of its own size, claimed the link: it is that request's now.
+            var key = relative.Replace(Path.DirectorySeparatorChar, '/');
+            if (_linkSessions.ContainsKey(key) && _claimSizes.TryGetValue(key, out var claimed) && claimed != size)
+            {
+                return;
+            }
+
             // Unless the projector now links the owner's file there as the local model the session asked for.
             if (!_projectedLinks.Contains(relative.Replace(Path.DirectorySeparatorChar, '/')) &&
                 HoldsOwnLink(relative, Path.Combine(_readOnlyDirectory, relative)))
@@ -592,7 +667,7 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
         }
     }
 
-    private bool TryLinkEditorPath(string relative, string target, string? sessionId)
+    private bool TryLinkEditorPath(string relative, string target, string? sessionId, long size)
     {
         try
         {
@@ -609,7 +684,7 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
                         return false;
                     }
 
-                    Claim(relativePath, sessionId);
+                    Claim(relativePath, sessionId, size);
                     return true;
                 case SecureLinkKind.Other:
                     // A model downloaded inside the container earlier, or a path that is not plain directories.
@@ -619,7 +694,7 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
             root.CreateSymbolicLink(relativePath, target);
             _ownLinks.Add(relativePath);
             _batch?.LinksMade.Add(relativePath);
-            Claim(relativePath, sessionId);
+            Claim(relativePath, sessionId, size);
             return true;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -641,6 +716,7 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
             throw new InvalidOperationException($"'{stagingPath}' is not in this runner's download folder.");
         }
 
+        EnsureLease();
         using var root = new LinuxSecureDirectoryRoot(Directory);
         root.EnsureDirectoryInheritingOwner(
             Path.GetRelativePath(Directory, Path.GetDirectoryName(normalized)!).Replace(Path.DirectorySeparatorChar, '/'));
@@ -667,6 +743,7 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
             throw new InvalidOperationException($"'{stagingPath}' is not the staging file for '{destination}'.");
         }
 
+        var relativeDestination = Path.GetRelativePath(Directory, destination);
         bool moved;
         using (var root = new LinuxSecureDirectoryRoot(Directory))
         {
@@ -689,7 +766,7 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
             }
 
             // The editor's link would now open the owner's file under this model's name.
-            ReleaseEditorLink(Path.GetRelativePath(Directory, destination));
+            ReleaseEditorLink(relativeDestination, staged);
             throw new IOException($"A file appeared at '{Path.GetRelativePath(Directory, destination)}' in the models folder while it was downloaded; it is kept.");
         }
 
@@ -710,7 +787,68 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
         => !string.IsNullOrWhiteSpace(path) && IsStrictlyBeneath(Normalize(path), _stagingDirectory);
 
     /// <summary>Removes what an earlier run of this runner left half downloaded; other runners' stay.</summary>
-    public void DiscardAll() => DeleteStagingDirectory(_stagingDirectory, keepDirectory: true);
+    public void DiscardAll()
+    {
+        DeleteStagingDirectory(_stagingDirectory, keepDirectory: true);
+
+        // And what ended runs of this runner left: a run still going holds its lease, and keeps its folder.
+        // Where the folder takes no locks, no run can be told from an ended one, and all are cleared as ever.
+        string[] entries;
+        try
+        {
+            if (!IsMissingOrRealDirectory(_downloadFolder) || !IsMissingOrRealDirectory(_runnerDirectory) ||
+                !System.IO.Directory.Exists(_runnerDirectory))
+            {
+                return;
+            }
+
+            entries = System.IO.Directory.GetFileSystemEntries(_runnerDirectory);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            RunnerLog.Warning(nameof(ModelLibrary), $"Could not list earlier downloads in progress: {ex.Message}");
+            return;
+        }
+
+        foreach (var entry in entries)
+        {
+            var name = Path.GetFileName(entry);
+            var run = name.EndsWith(LeaseSuffix, StringComparison.Ordinal) ? name[..^LeaseSuffix.Length] : name;
+            if (string.Equals(run, _instanceName, StringComparison.Ordinal) ||
+                (name != run && entries.Contains(Path.Combine(_runnerDirectory, run), StringComparer.Ordinal)))
+            {
+                // This run's own, or a lease handled with its folder.
+                continue;
+            }
+
+            ClearEndedRun(run);
+        }
+    }
+
+    private void ClearEndedRun(string run)
+    {
+        var folder = RelativeToFolder(Path.Combine(_runnerDirectory, run));
+        var lease = folder + LeaseSuffix;
+        try
+        {
+            using var root = new LinuxSecureDirectoryRoot(Directory);
+            var result = root.TryLockFile(lease, out var handle);
+            using (handle)
+            {
+                if (result == SecureLockResult.Held)
+                {
+                    return;
+                }
+
+                root.DeleteDirectoryTree(folder);
+                root.DeleteFile(lease);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            RunnerLog.Warning(nameof(ModelLibrary), $"Could not remove an earlier run's downloads in progress: {ex.Message}");
+        }
+    }
 
     /// <summary>
     /// Deletes a folder in the download folder. Others sharing the models folder can change it, so the

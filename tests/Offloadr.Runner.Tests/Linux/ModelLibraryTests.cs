@@ -193,7 +193,8 @@ public class ModelLibraryTests
         var library = CreateLibrary();
         var staging = library.GetStagingPath(Path.Combine(_library, "loras", "style.safetensors"))!;
         var key = Path.GetDirectoryName(staging)!;
-        var runnerFolder = Path.GetDirectoryName(key)!;
+        var runFolder = Path.GetDirectoryName(key)!;
+        var runnerFolder = Path.GetDirectoryName(runFolder)!;
 
         library.PrepareStagingDirectory(staging);
 
@@ -202,6 +203,7 @@ public class ModelLibraryTests
         {
             Assert.That(OwnerOf(Path.Combine(_library, ModelLibrary.StagingFolderName)), Is.EqualTo("12345:12345"));
             Assert.That(OwnerOf(runnerFolder), Is.EqualTo("12345:12345"));
+            Assert.That(OwnerOf(runFolder), Is.EqualTo("12345:12345"));
             Assert.That(OwnerOf(key), Is.EqualTo("12345:12345"));
         });
     }
@@ -238,7 +240,7 @@ public class ModelLibraryTests
 
         var downloadFolder = Path.Combine(_library, ModelLibrary.StagingFolderName);
         Assert.That(
-            Directory.Exists(downloadFolder) ? Directory.EnumerateDirectories(downloadFolder, "*", SearchOption.AllDirectories).Where(static folder => Path.GetFileName(Path.GetDirectoryName(folder)) != ModelLibrary.StagingFolderName) : [],
+            Directory.Exists(downloadFolder) ? Directory.EnumerateDirectories(downloadFolder, "*", SearchOption.AllDirectories).Where(folder => Path.GetRelativePath(downloadFolder, folder).Split('/').Length > 2) : [],
             Is.Empty,
             "No download folder is left for a model already saved.");
         Assert.That(backend.Destinations, Has.Count.EqualTo(downloadedFirst ? 1 : 0));
@@ -326,6 +328,89 @@ public class ModelLibraryTests
 
         Assert.That(() => library.Publish(staging, destination), Throws.InstanceOf<IOException>());
         Assert.That(new FileInfo(Path.Combine(_editorModels, "loras", "style.safetensors")).LinkTarget, Is.EqualTo(destination));
+    }
+
+    [Test]
+    public void Publish_OfADownloadTheOwnersFileTookThePlaceOf_LeavesALinkClaimedForTheOwnersFile()
+    {
+        var library = CreateLibrary();
+        library.Redirect([Remote("loras/style.safetensors", 8)], Session);
+        // The owner copies in a file of the same name while it downloads, and the next session asks for a
+        // model of just that size there, through the same link.
+        var destination = WriteLibraryFile("loras/style.safetensors", 4);
+        library.ReleaseSessionsOtherThan("session-2");
+        library.Redirect([Remote("loras/style.safetensors", 4)], "session-2");
+        var staging = Stage(library, destination, 8);
+
+        Assert.That(() => library.Publish(staging, destination), Throws.InstanceOf<IOException>());
+        var editorPath = Path.Combine(_editorModels, "loras", "style.safetensors");
+        Assert.Multiple(() =>
+        {
+            Assert.That(new FileInfo(editorPath).LinkTarget, Is.EqualTo(destination), "The next session's link stays.");
+            Assert.That(library.KeepsEditorLink(editorPath), Is.True, "And so does its claim.");
+        });
+    }
+
+    [Test]
+    public void UndoingABatch_BringsBackNoClaimOfASessionThatHasEnded()
+    {
+        var library = CreateLibrary();
+        library.ReleaseSessionsOtherThan(Session);
+        var request = Remote("loras/style.safetensors", 4);
+        library.Redirect([request], Session);
+        // The next session's prompt redirects as that session becomes active, before the first one's claims are
+        // released; then it is refused.
+        library.Redirect([request], "session-2", out var refused);
+        library.ReleaseSessionsOtherThan("session-2");
+
+        library.Undo(refused);
+
+        var style = Path.Combine(_editorModels, "loras", "style.safetensors");
+        Assert.That(library.KeepsEditorLink(style), Is.False);
+        var mine = WriteLibraryFile("loras/mine/style.safetensors", 6);
+        var projector = new LocalModelProjector(_library, _editorModels, downloadLinks: library);
+        projector.UpdateSnapshot(new LocalModelScanner("runner-1", _library).Scan());
+        projector.SetRequestedModels([LocalAt("loras/style.safetensors", 6, ModelCategory.Lora)]);
+        Assert.That(new FileInfo(style).LinkTarget, Is.EqualTo(mine));
+    }
+
+    [Test]
+    public void DiscardAll_LeavesTheDownloadsOfAnOverlappingRunOfThisRunner_AndClearsAnEndedOnes()
+    {
+        var first = CreateLibrary();
+        var firstStaging = Stage(first, Path.Combine(_library, "loras", "first.safetensors"), 3);
+        // The runner is launched again while the first run still downloads.
+        using var second = CreateLibrary();
+
+        second.DiscardAll();
+        Assert.That(File.Exists(firstStaging), Is.True, "A run still going keeps its downloads in progress.");
+
+        first.Dispose();
+        second.DiscardAll();
+
+        var runFolder = Path.GetDirectoryName(Path.GetDirectoryName(firstStaging)!)!;
+        Assert.Multiple(() =>
+        {
+            Assert.That(Directory.Exists(runFolder), Is.False, "An ended run's downloads in progress are cleared.");
+            Assert.That(File.Exists(runFolder + ".lease"), Is.False);
+        });
+    }
+
+    [Test]
+    public async Task ASecondRunStarting_LeavesTheFirstRunsDownloadInProgress()
+    {
+        using var first = CreateLibrary();
+        var firstStaging = Stage(first, Path.Combine(_library, "loras", "first.safetensors"), 3);
+        var settings = Aria2Settings.FromEnvironment(name => name == "ARIA2_STATE_DIR" ? Path.Combine(_root, "aria2-state") : null, static () => "generated-secret");
+        await using var second = new ModelDownloadService(
+            new WritingBackend(),
+            settings,
+            destinationPolicy: new ModelDestinationPolicy([_editorModels, _library]),
+            library: CreateLibrary());
+
+        await second.InitializeAsync(CancellationToken.None);
+
+        Assert.That(File.Exists(firstStaging), Is.True);
     }
 
     [Test]
@@ -997,7 +1082,7 @@ public class ModelLibraryTests
     private static string Stage(ModelLibrary library, string destination, int size)
     {
         var staging = library.GetStagingPath(destination)!;
-        Directory.CreateDirectory(Path.GetDirectoryName(staging)!);
+        library.PrepareStagingDirectory(staging);
         File.WriteAllBytes(staging, new byte[size]);
         return staging;
     }
@@ -1008,12 +1093,11 @@ public class ModelLibraryTests
         var library = CreateLibrary();
         var destination = Path.Combine(_library, "loras", "style.safetensors");
         var staging = library.GetStagingPath(destination)!;
-        var runnerFolder = Path.GetDirectoryName(Path.GetDirectoryName(staging)!)!;
-        var downloadFolder = Path.GetDirectoryName(runnerFolder)!;
+        var downloadFolder = Path.Combine(_library, ModelLibrary.StagingFolderName);
 
         // Elsewhere, a tree laid out like this runner's downloads, and the download folder pointed at it.
         var outside = Path.Combine(_root, "outside");
-        var outsideKey = Path.Combine(outside, Path.GetFileName(runnerFolder), Path.GetFileName(Path.GetDirectoryName(staging)!));
+        var outsideKey = Path.Combine(outside, Path.GetRelativePath(downloadFolder, Path.GetDirectoryName(staging)!));
         Directory.CreateDirectory(outsideKey);
         var sentinel = Path.Combine(outsideKey, "keep.txt");
         File.WriteAllText(sentinel, "not the runner's");
@@ -1225,7 +1309,8 @@ public class ModelLibraryTests
             Assert.That(backend.Destinations, Has.All.Contains(ModelLibrary.StagingFolderName), "Written in the download folder first.");
             Assert.That(new FileInfo(Path.Combine(_editorModels, "checkpoints", "base.safetensors")).LinkTarget, Is.EqualTo(saved));
             Assert.That(
-                Directory.EnumerateFiles(Path.Combine(_library, ModelLibrary.StagingFolderName), "*", SearchOption.AllDirectories),
+                Directory.EnumerateFiles(Path.Combine(_library, ModelLibrary.StagingFolderName), "*", SearchOption.AllDirectories)
+                    .Where(static file => !file.EndsWith(".lease", StringComparison.Ordinal)),
                 Is.Empty,
                 "Nothing half downloaded is left.");
         });

@@ -168,7 +168,7 @@ static async Task<int> RunAgentAsync()
 
         if (libraryDirectory is not null)
         {
-            modelLibrary = new ModelLibrary(libraryDirectory, options.LocalModelsDirectory!, modelProjectionRoot, options.RunnerId);
+            modelLibrary = new ModelLibrary(libraryDirectory, options.LocalModelsDirectory!, modelProjectionRoot, options.RunnerId, instanceId);
             RunnerLog.Info($"Downloaded models are saved in the local models folder ('{options.LocalModelsDirectory}').");
         }
     }
