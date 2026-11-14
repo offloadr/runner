@@ -618,11 +618,10 @@ internal sealed class ModelDownloadService : IAsyncDisposable
                 return LocalModelRelease.NotManaged;
             }
 
-            // Deleted only as the requested model: of the size it was downloaded for in this run or, after a
-            // restart, of the finished file's own length. A file of another size, or of a size not known, is
-            // another model, or one the agent cannot tell apart from one, and is never deleted.
-            var size = _conventionalExpectedSizes.TryGetValue(path, out var registered) ? registered : file.Length;
-            if (download.SizeBytes <= 0 || size != download.SizeBytes)
+            // Deleted only as the requested model, judged by the finished file itself: what was registered
+            // there may be another model not yet downloaded over it. A file of another size, or a request of
+            // no known size, may be another model, and nothing is deleted.
+            if (download.SizeBytes <= 0 || file.Length != download.SizeBytes)
             {
                 return LocalModelRelease.NotManaged;
             }

@@ -268,6 +268,36 @@ public class ModelDestinationPolicyTests
     }
 
     [Test]
+    public async Task ReleaseForLocalModels_JudgesAFullDownloadByTheFileNotByWhatWasRegisteredThere()
+    {
+        await using var service = new ModelDownloadService(
+            new NoopTransferBackend(),
+            DefaultAria2Settings,
+            capabilities: null,
+            new ModelDestinationPolicy([_modelsRoot]));
+        var destination = Path.Combine(_modelsRoot, "Lora", "x.safetensors");
+        Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+        File.WriteAllBytes(destination, new byte[8]);
+
+        // A 4-byte model is registered there before its download has started.
+        service.SeedDownloads("session-1", [new ModelDownloadRequest
+        {
+            ModelId = "model-4",
+            Filename = "x.safetensors",
+            DestinationPath = destination,
+            SizeBytes = 4,
+            SourceUrl = "https://models.example.test/x.safetensors",
+        }]);
+        var projected = await service.ReleaseForLocalModelsAsync([LocalModel(destination, 4)], static _ => true, CancellationToken.None);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(projected, Has.Count.EqualTo(1), "Handed to the projector, which refuses the occupied path.");
+            Assert.That(new FileInfo(destination).Length, Is.EqualTo(8), "The 8-byte model is not deleted.");
+        });
+    }
+
+    [Test]
     public async Task ReleaseForLocalModels_KeepsAFullDownloadWhenTheLocalModelGoesMeanwhile()
     {
         await using var service = new ModelDownloadService(
