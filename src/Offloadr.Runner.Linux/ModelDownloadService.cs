@@ -138,15 +138,19 @@ internal sealed class ModelDownloadService : IAsyncDisposable
         }
 
         var redirected = _library.Redirect(downloads, sessionId, out var batch);
+        T registered;
         try
         {
-            return register(redirected);
+            registered = register(redirected);
         }
         catch
         {
             _library.Undo(batch);
             throw;
         }
+
+        _library.Commit(batch);
+        return registered;
     }
 
     public void SetActiveSession(string? sessionId)

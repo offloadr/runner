@@ -525,6 +525,44 @@ public class ModelLibraryTests
     }
 
     [Test]
+    public void CommittedBatches_AreNotKept()
+    {
+        var library = CreateLibrary();
+        var request = Remote("loras/style.safetensors", 4);
+
+        // The same model, prompt after prompt in one session.
+        var earlier = RedirectAndCommit(library, request, times: 20);
+        library.Redirect([request], Session, out var pending);
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(earlier.Count(static batch => batch.TryGetTarget(out _)), Is.Zero, "No committed batch is kept.");
+            Assert.That(pending.ClaimsBefore.Values.Single().By, Is.SameAs(ModelLibrary.RedirectBatch.Committed));
+        });
+
+        // An undo of the pending one still leaves the committed claim and its link.
+        library.Undo(pending);
+        Assert.That(library.KeepsEditorLink(Path.Combine(_editorModels, "loras", "style.safetensors")), Is.True);
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static List<WeakReference<ModelLibrary.RedirectBatch>> RedirectAndCommit(ModelLibrary library, ModelDownloadRequest request, int times)
+    {
+        var batches = new List<WeakReference<ModelLibrary.RedirectBatch>>();
+        for (var index = 0; index < times; index++)
+        {
+            library.Redirect([request], Session, out var batch);
+            library.Commit(batch);
+            batches.Add(new WeakReference<ModelLibrary.RedirectBatch>(batch));
+        }
+
+        return batches;
+    }
+
+    [Test]
     public void UndoingABatch_LeavesALinkTheProjectorAdoptedSince()
     {
         var library = CreateLibrary();

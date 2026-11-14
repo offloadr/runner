@@ -166,11 +166,15 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
     /// model of another size there, as two models at one path always are.
     /// </param>
     public ModelDownloadRequest[] Redirect(IEnumerable<ModelDownloadRequest> downloads, string? sessionId)
-        => Redirect(downloads, sessionId, out _);
+    {
+        var redirected = Redirect(downloads, sessionId, out var batch);
+        Commit(batch);
+        return redirected;
+    }
 
     /// <param name="batch">
     /// What this redirect changed, for <see cref="Undo"/> when the batch is refused later on, before anything
-    /// of it is registered.
+    /// of it is registered, or <see cref="Commit"/> once it is registered.
     /// </param>
     public ModelDownloadRequest[] Redirect(IEnumerable<ModelDownloadRequest> downloads, string? sessionId, out RedirectBatch batch)
     {
@@ -208,6 +212,27 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
         lock (_gate)
         {
             UndoLocked(batch);
+        }
+    }
+
+    /// <summary>
+    /// Settles <paramref name="batch"/> once its downloads are registered: it can no longer be undone, and its
+    /// claims stand as committed ones. Nothing keeps the batch, or those before it, from then on.
+    /// </summary>
+    public void Commit(RedirectBatch batch)
+    {
+        lock (_gate)
+        {
+            foreach (var path in batch.ClaimsBefore.Keys)
+            {
+                if (_claimedBy.TryGetValue(path, out var by) && ReferenceEquals(by, batch))
+                {
+                    _claimedBy[path] = RedirectBatch.Committed;
+                }
+            }
+
+            batch.ClaimsBefore.Clear();
+            batch.LinksMade.Clear();
         }
     }
 
@@ -306,6 +331,9 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
     /// <summary>What one redirect changed: the links it made, and the claims it set, with what they were.</summary>
     internal sealed class RedirectBatch(string? sessionId)
     {
+        /// <summary>Stands for every committed batch: what it claimed is registered, and no undo takes it.</summary>
+        public static RedirectBatch Committed { get; } = new(null);
+
         public string? SessionId { get; } = sessionId;
 
         /// <summary>Whether the batch was refused and undone: the claims it set stand for nothing.</summary>
