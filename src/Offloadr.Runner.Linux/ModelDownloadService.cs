@@ -126,8 +126,8 @@ internal sealed class ModelDownloadService : IAsyncDisposable
     }
 
     /// <summary>Sends downloads to the owner's models folder when they are saved there.</summary>
-    private ModelDownloadRequest[] Redirect(ModelDownloadRequest[] downloads, bool newSession = false)
-        => _library is null || !_downloadsEnabled ? downloads : _library.Redirect(downloads, newSession);
+    private ModelDownloadRequest[] Redirect(ModelDownloadRequest[] downloads, string? sessionId)
+        => _library is null || !_downloadsEnabled ? downloads : _library.Redirect(downloads, sessionId);
 
     public void SetActiveSession(string? sessionId)
     {
@@ -149,7 +149,7 @@ internal sealed class ModelDownloadService : IAsyncDisposable
 
     public void RegisterDownloads(string sessionId, IEnumerable<ModelDownloadRequest> downloads)
     {
-        var snapshot = Redirect(FilterRemoteDownloadRequests(downloads));
+        var snapshot = Redirect(FilterRemoteDownloadRequests(downloads), sessionId);
         if (!_downloadsEnabled)
         {
             ReportRefused(sessionId, snapshot);
@@ -168,7 +168,7 @@ internal sealed class ModelDownloadService : IAsyncDisposable
 
     public void SeedDownloads(string sessionId, IEnumerable<ModelDownloadRequest> downloads)
     {
-        var snapshot = Redirect(FilterRemoteDownloadRequests(downloads), newSession: true);
+        var snapshot = Redirect(FilterRemoteDownloadRequests(downloads), sessionId);
         if (!_downloadsEnabled)
         {
             ReportRefused(sessionId, snapshot);
@@ -755,7 +755,7 @@ internal sealed class ModelDownloadService : IAsyncDisposable
         CancellationToken demandCancellation,
         bool highPriority)
     {
-        var snapshot = Redirect(FilterRemoteDownloadRequests(downloads));
+        var snapshot = Redirect(FilterRemoteDownloadRequests(downloads), _fullDownloadCoordinator.GetActiveSessionId());
         if (!_downloadsEnabled && snapshot.Length > 0)
         {
             // Registration already reported each one; nothing was registered, so the editor would only fail later.

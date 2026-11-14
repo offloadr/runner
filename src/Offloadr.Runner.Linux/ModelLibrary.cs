@@ -22,8 +22,9 @@ internal sealed class ModelLibrary : IModelDownloadStaging
     private readonly string _downloadFolder;
     private readonly string _stagingDirectory;
     private readonly object _gate = new();
-    // Editor links this library made, under _gate: the only ones it ever removes.
-    private readonly HashSet<string> _ownLinks = new(StringComparer.Ordinal);
+    // Editor links this library made, under _gate: the only ones it ever removes. Each maps to the session
+    // that last asked for its model, which may still be using it.
+    private readonly Dictionary<string, string?> _ownLinks = new(StringComparer.Ordinal);
 
     /// <param name="directory">The models folder, writable.</param>
     /// <param name="readOnlyDirectory">The same folder as sessions see it, read-only.</param>
@@ -79,22 +80,23 @@ internal sealed class ModelLibrary : IModelDownloadStaging
     /// container as before, when something already holds either place: a file of the owner's of another
     /// size, or a link or file at the editor's path. A file of the requested size there counts as the model.
     /// </summary>
-    /// <param name="newSession">
-    /// True for the models a session starts with. Only then may a link this library made to another model
-    /// at the same path give way: within a session an earlier prompt may still be using that model, so a
-    /// model of another size there is refused, as two models at one path always are.
+    /// <param name="sessionId">
+    /// The session asking. A link this library made to another model at the same path gives way only when
+    /// another session asked for that model: the session that did may still be using it, so it is refused a
+    /// model of another size there, as two models at one path always are.
     /// </param>
-    public ModelDownloadRequest[] Redirect(IEnumerable<ModelDownloadRequest> downloads, bool newSession = false)
+    public ModelDownloadRequest[] Redirect(IEnumerable<ModelDownloadRequest> downloads, string? sessionId)
     {
         // Prompts are prepared concurrently: two naming the same new model must not both find its link
         // missing, and the second fall back to downloading over the first one's link.
+        var session = string.IsNullOrWhiteSpace(sessionId) ? null : sessionId.Trim();
         lock (_gate)
         {
-            return downloads.Select(download => Redirect(download, newSession)).ToArray();
+            return downloads.Select(download => Redirect(download, session)).ToArray();
         }
     }
 
-    private ModelDownloadRequest Redirect(ModelDownloadRequest download, bool newSession)
+    private ModelDownloadRequest Redirect(ModelDownloadRequest download, string? sessionId)
     {
         if (LocalModelProjector.IsLocalProjectionRequest(download) ||
             string.IsNullOrWhiteSpace(download.DestinationPath) ||
@@ -119,12 +121,12 @@ internal sealed class ModelLibrary : IModelDownloadStaging
 
         if (!HasRealDirectoriesUpTo(libraryPath) || !IsFreeOrSameSize(libraryPath, download.SizeBytes))
         {
-            // Another model is saved there. If this library linked the editor's path to it, that link goes
-            // for a new session, so this one can be downloaded inside the container at that path; within a
-            // session the model linked there may still be in use, and this one is refused.
-            if (HoldsOwnLink(relative, linkTarget))
+            // Another model is saved there. If this library linked the editor's path to it for another
+            // session, that link goes, so this one can be downloaded inside the container at that path; the
+            // session that asked for the model linked there may still be using it, and is refused this one.
+            if (HoldsOwnLink(relative, linkTarget, out var linkSessionId))
             {
-                if (!newSession)
+                if (string.Equals(linkSessionId, sessionId, StringComparison.Ordinal))
                 {
                     throw new InvalidOperationException(
                         $"Model '{relative}' cannot be downloaded in this session: another model of the same name, saved in the models folder, is already in use at that path.");
@@ -136,7 +138,7 @@ internal sealed class ModelLibrary : IModelDownloadStaging
             return download;
         }
 
-        if (!TryLinkEditorPath(relative, linkTarget))
+        if (!TryLinkEditorPath(relative, linkTarget, sessionId))
         {
             return download;
         }
@@ -188,10 +190,10 @@ internal sealed class ModelLibrary : IModelDownloadStaging
     }
 
     /// <summary>Whether the editor's path holds a link this library made (the projector links to the same place).</summary>
-    private bool HoldsOwnLink(string relative, string target)
+    private bool HoldsOwnLink(string relative, string target, out string? sessionId)
     {
         var relativePath = relative.Replace(Path.DirectorySeparatorChar, '/');
-        if (!_ownLinks.Contains(relativePath) || !System.IO.Directory.Exists(_editorModelsDirectory))
+        if (!_ownLinks.TryGetValue(relativePath, out sessionId) || !System.IO.Directory.Exists(_editorModelsDirectory))
         {
             return false;
         }
@@ -223,7 +225,7 @@ internal sealed class ModelLibrary : IModelDownloadStaging
         }
     }
 
-    private bool TryLinkEditorPath(string relative, string target)
+    private bool TryLinkEditorPath(string relative, string target, string? sessionId)
     {
         try
         {
@@ -233,15 +235,26 @@ internal sealed class ModelLibrary : IModelDownloadStaging
             switch (root.ReadSymbolicLink(relativePath, out var existing))
             {
                 case SecureLinkKind.SymbolicLink:
-                    // Ours already, or another (a local model's): either way, nothing to change.
-                    return string.Equals(existing, target, StringComparison.Ordinal);
+                    // Ours already, or another (a local model's): either way, nothing to change, except that a
+                    // link of ours now belongs to this session as well, which may be using its model.
+                    if (!string.Equals(existing, target, StringComparison.Ordinal))
+                    {
+                        return false;
+                    }
+
+                    if (_ownLinks.ContainsKey(relativePath))
+                    {
+                        _ownLinks[relativePath] = sessionId;
+                    }
+
+                    return true;
                 case SecureLinkKind.Other:
                     // A model downloaded inside the container earlier, or a path that is not plain directories.
                     return false;
             }
 
             root.CreateSymbolicLink(relativePath, target);
-            _ownLinks.Add(relativePath);
+            _ownLinks[relativePath] = sessionId;
             return true;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)

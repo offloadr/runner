@@ -32,6 +32,8 @@ public class ModelLibraryTests
         }
     }
 
+    private const string Session = "session-1";
+
     // The read-only view is the same folder here; in the runner it is a second, read-only mount of it.
     private ModelLibrary CreateLibrary(string runnerId = "11111111-1111-4111-8111-111111111111") => new(_library, _library, _editorModels, runnerId);
 
@@ -40,7 +42,7 @@ public class ModelLibraryTests
     {
         var request = Remote("checkpoints/base.safetensors", 8);
 
-        var redirected = CreateLibrary().Redirect([request]).Single();
+        var redirected = CreateLibrary().Redirect([request], Session).Single();
 
         Assert.Multiple(() =>
         {
@@ -58,8 +60,8 @@ public class ModelLibraryTests
         var library = CreateLibrary();
         var request = Remote("loras/style.safetensors", 8);
 
-        var first = library.Redirect([request]).Single();
-        var second = library.Redirect([request]).Single();
+        var first = library.Redirect([request], Session).Single();
+        var second = library.Redirect([request], Session).Single();
 
         Assert.That(second.DestinationPath, Is.EqualTo(first.DestinationPath));
     }
@@ -71,7 +73,7 @@ public class ModelLibraryTests
         var request = Remote("checkpoints/base.safetensors", 8);
 
         var prompts = await Task.WhenAll(Enumerable.Range(0, 16)
-            .Select(_ => Task.Run(() => library.Redirect([request]).Single())));
+            .Select(_ => Task.Run(() => library.Redirect([request], Session).Single())));
 
         Assert.That(
             prompts.Select(static redirected => redirected.DestinationPath),
@@ -84,7 +86,7 @@ public class ModelLibraryTests
     {
         WriteLibraryFile("checkpoints/base.safetensors", 8);
 
-        var redirected = CreateLibrary().Redirect([Remote("checkpoints/base.safetensors", 8)]).Single();
+        var redirected = CreateLibrary().Redirect([Remote("checkpoints/base.safetensors", 8)], Session).Single();
 
         Assert.That(redirected.DestinationPath, Is.EqualTo(Path.Combine(_library, "checkpoints", "base.safetensors")));
     }
@@ -95,7 +97,7 @@ public class ModelLibraryTests
         WriteLibraryFile("checkpoints/base.safetensors", 16);
         var request = Remote("checkpoints/base.safetensors", 8);
 
-        var redirected = CreateLibrary().Redirect([request]).Single();
+        var redirected = CreateLibrary().Redirect([request], Session).Single();
 
         Assert.Multiple(() =>
         {
@@ -113,7 +115,7 @@ public class ModelLibraryTests
         File.WriteAllBytes(editorPath, new byte[8]);
         var request = Remote("checkpoints/base.safetensors", 8);
 
-        var redirected = CreateLibrary().Redirect([request]).Single();
+        var redirected = CreateLibrary().Redirect([request], Session).Single();
 
         Assert.That(redirected.DestinationPath, Is.EqualTo(request.DestinationPath));
     }
@@ -132,7 +134,7 @@ public class ModelLibraryTests
             SizeBytes = 8,
         };
 
-        var redirected = CreateLibrary().Redirect([local, unknownSize, elsewhere]);
+        var redirected = CreateLibrary().Redirect([local, unknownSize, elsewhere], Session);
 
         Assert.That(redirected.Select(static request => request.DestinationPath), Is.EqualTo(new[]
         {
@@ -277,11 +279,11 @@ public class ModelLibraryTests
     public void Redirect_OfAnotherSizeAtALinkedPath_InANewSession_RemovesTheLinkSoItDownloadsInTheContainer()
     {
         var library = CreateLibrary();
-        library.Redirect([Remote("checkpoints/base.safetensors", 8)]);
+        library.Redirect([Remote("checkpoints/base.safetensors", 8)], Session);
         WriteLibraryFile("checkpoints/base.safetensors", 8);
         var other = Remote("checkpoints/base.safetensors", 16);
 
-        var redirected = library.Redirect([other], newSession: true).Single();
+        var redirected = library.Redirect([other], "session-2").Single();
 
         var editorPath = Path.Combine(_editorModels, "checkpoints", "base.safetensors");
         Assert.Multiple(() =>
@@ -296,12 +298,12 @@ public class ModelLibraryTests
     public void Redirect_OfAnotherSizeAtALinkedPath_WithinASession_IsRefusedAndKeepsTheLink()
     {
         var library = CreateLibrary();
-        library.Redirect([Remote("checkpoints/base.safetensors", 8)]);
+        library.Redirect([Remote("checkpoints/base.safetensors", 8)], Session);
         WriteLibraryFile("checkpoints/base.safetensors", 8);
 
         // An earlier prompt may still be using the saved model.
         Assert.That(
-            () => library.Redirect([Remote("checkpoints/base.safetensors", 16)]),
+            () => library.Redirect([Remote("checkpoints/base.safetensors", 16)], Session),
             Throws.InvalidOperationException.With.Message.Contains("already in use"));
         Assert.That(
             new FileInfo(Path.Combine(_editorModels, "checkpoints", "base.safetensors")).LinkTarget,
@@ -309,10 +311,59 @@ public class ModelLibraryTests
     }
 
     [Test]
+    public void Redirect_OfAnotherSizeAtALinkedPath_IsRefusedToTheLatestSessionThatAskedForTheLinkedModel()
+    {
+        var library = CreateLibrary();
+        library.Redirect([Remote("checkpoints/base.safetensors", 8)], Session);
+        WriteLibraryFile("checkpoints/base.safetensors", 8);
+
+        // A later session asks for the same model, through the same link, and may be using it.
+        library.Redirect([Remote("checkpoints/base.safetensors", 8)], "session-2");
+
+        Assert.That(
+            () => library.Redirect([Remote("checkpoints/base.safetensors", 16)], "session-2"),
+            Throws.InvalidOperationException.With.Message.Contains("already in use"));
+        Assert.That(
+            library.Redirect([Remote("checkpoints/base.safetensors", 16)], "session-3").Single().DestinationPath,
+            Is.EqualTo(Path.Combine(_editorModels, "checkpoints", "base.safetensors")));
+    }
+
+    [Test]
+    public async Task APromptInANewSession_DownloadsAnotherModelAtAPathAnEarlierSessionLinked()
+    {
+        var backend = new WritingBackend();
+        var settings = Aria2Settings.FromEnvironment(name => name == "ARIA2_STATE_DIR" ? Path.Combine(_root, "aria2-state") : null, static () => "generated-secret");
+        await using var service = new ModelDownloadService(
+            backend,
+            settings,
+            destinationPolicy: new ModelDestinationPolicy([_editorModels, _library]),
+            library: CreateLibrary());
+        await service.InitializeAsync(CancellationToken.None);
+        service.SetActiveSession(Session);
+        var saved = Remote("checkpoints/base.safetensors", 8);
+        await await service.PreparePromptDownloadsAsync([saved], CancellationToken.None, highPriority: true);
+
+        // The next session seeds nothing, and its first prompt names another model at the same path.
+        service.SetActiveSession("session-2");
+        await await service.PreparePromptDownloadsAsync(
+            [Remote("checkpoints/base.safetensors", 16)],
+            CancellationToken.None,
+            highPriority: true);
+
+        var editorPath = new FileInfo(Path.Combine(_editorModels, "checkpoints", "base.safetensors"));
+        Assert.Multiple(() =>
+        {
+            Assert.That(editorPath.LinkTarget, Is.Null, "Downloaded inside the container, in place of the link.");
+            Assert.That(editorPath.Length, Is.EqualTo(16));
+            Assert.That(new FileInfo(Path.Combine(_library, "checkpoints", "base.safetensors")).Length, Is.EqualTo(8), "The saved model stays.");
+        });
+    }
+
+    [Test]
     public void LibraryPathFor_FindsTheDownloadBehindTheEditorsLinkOnly()
     {
         var library = CreateLibrary();
-        library.Redirect([Remote("checkpoints/base.safetensors", 8)]);
+        library.Redirect([Remote("checkpoints/base.safetensors", 8)], Session);
         var other = Path.Combine(_editorModels, "loras", "own.safetensors");
         Directory.CreateDirectory(Path.GetDirectoryName(other)!);
         File.WriteAllBytes(other, new byte[2]);
@@ -389,7 +440,7 @@ public class ModelLibraryTests
         var folder = Directory.CreateDirectory(Path.Combine(_library, "checkpoints", "base.safetensors")).FullName;
         var request = Remote("checkpoints/base.safetensors", 8);
 
-        var redirected = CreateLibrary().Redirect([request]).Single();
+        var redirected = CreateLibrary().Redirect([request], Session).Single();
 
         Assert.Multiple(() =>
         {
@@ -406,7 +457,7 @@ public class ModelLibraryTests
         Directory.CreateSymbolicLink(Path.Combine(_library, "checkpoints"), elsewhere);
         var request = Remote("checkpoints/base.safetensors", 8);
 
-        var redirected = CreateLibrary().Redirect([request]).Single();
+        var redirected = CreateLibrary().Redirect([request], Session).Single();
 
         Assert.Multiple(() =>
         {
@@ -426,7 +477,7 @@ public class ModelLibraryTests
         Directory.CreateDirectory(Path.GetDirectoryName(editorPath)!);
         File.CreateSymbolicLink(editorPath, Path.Combine(_library, "checkpoints", "base.safetensors"));
 
-        CreateLibrary().Redirect([Remote("checkpoints/base.safetensors", 8)]);
+        CreateLibrary().Redirect([Remote("checkpoints/base.safetensors", 8)], Session);
 
         Assert.That(new FileInfo(editorPath).LinkTarget, Is.EqualTo(Path.Combine(_library, "checkpoints", "base.safetensors")));
     }
