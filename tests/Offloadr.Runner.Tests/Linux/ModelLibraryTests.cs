@@ -383,6 +383,25 @@ public class ModelLibraryTests
     }
 
     [Test]
+    public void Redirect_LeavesAModelWhoseFolderTheOwnerLinkedElsewhere()
+    {
+        // The owner keeps checkpoints on another drive.
+        var elsewhere = Directory.CreateDirectory(Path.Combine(_root, "other-drive", "checkpoints")).FullName;
+        Directory.CreateSymbolicLink(Path.Combine(_library, "checkpoints"), elsewhere);
+        var request = Remote("checkpoints/base.safetensors", 8);
+
+        var redirected = CreateLibrary().Redirect([request]).Single();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(redirected.DestinationPath, Is.EqualTo(request.DestinationPath), "Downloaded inside the container.");
+            Assert.That(new DirectoryInfo(Path.Combine(_library, "checkpoints")).LinkTarget, Is.EqualTo(elsewhere));
+            Assert.That(Directory.EnumerateFileSystemEntries(elsewhere), Is.Empty);
+            Assert.That(File.Exists(Path.Combine(_editorModels, "checkpoints", "base.safetensors")), Is.False, "No link is made.");
+        });
+    }
+
+    [Test]
     public void Redirect_NeverRemovesALinkItDidNotMake()
     {
         // The projector's link to the owner's model of the same name, pointing where this library's would.

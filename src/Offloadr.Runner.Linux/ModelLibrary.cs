@@ -112,7 +112,7 @@ internal sealed class ModelLibrary : IModelDownloadStaging
             return download;
         }
 
-        if (!IsFreeOrSameSize(libraryPath, download.SizeBytes))
+        if (!HasRealDirectoriesUpTo(libraryPath) || !IsFreeOrSameSize(libraryPath, download.SizeBytes))
         {
             // Another model is saved there. If this library linked the editor's path to it, the link goes,
             // so this one can be downloaded inside the container at that path.
@@ -128,6 +128,35 @@ internal sealed class ModelLibrary : IModelDownloadStaging
         var redirected = download.Clone();
         redirected.DestinationPath = libraryPath;
         return redirected;
+    }
+
+    /// <summary>
+    /// Whether every folder that exists between the models folder and <paramref name="path"/> is a real one:
+    /// a download is published only through real directories, and an owner's link (a <c>checkpoints</c>
+    /// folder on another drive, say) is never written through.
+    /// </summary>
+    private bool HasRealDirectoriesUpTo(string path)
+    {
+        var current = Directory;
+        foreach (var part in Path.GetRelativePath(Directory, Path.GetDirectoryName(path)!)
+                     .Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries)
+                     .Where(static part => part != "."))
+        {
+            current = Path.Combine(current, part);
+            var entry = new DirectoryInfo(current);
+            if (entry.LinkTarget is not null || File.Exists(current))
+            {
+                return false;
+            }
+
+            if (!entry.Exists)
+            {
+                // The rest is made when the model is published.
+                return true;
+            }
+        }
+
+        return true;
     }
 
     private static bool IsFreeOrSameSize(string path, long size)
