@@ -96,14 +96,98 @@ public partial class RunnerStartupValidatorTests
             {
                 Assert.That(withoutLocal!.Message, Does.Contain("RUNNER_MODEL_LIBRARY_DIR needs RUNNER_LOCAL_MODELS_DIR"));
                 Assert.That(mismatched!.Message, Does.Contain("must be the folder mounted at RUNNER_LOCAL_MODELS_DIR"));
-                Assert.That(
-                    () => validator.ValidateOrThrow(BuildOptions(tempRoot, "/bin/sh", localModelsDirectory: local, modelLibraryDirectory: local)),
-                    Throws.Nothing);
             });
         }
         finally
         {
             TryDelete(tempRoot);
+        }
+    }
+
+    [Test]
+    public void ValidateOrThrow_TheWritableModelsFolderMustBeASecondMountApartFromTheLocalOne()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            Assert.Ignore("Runner startup validation is Linux-specific.");
+        }
+
+        var tempRoot = Path.Combine(Path.GetTempPath(), $"runner-validator-{Guid.NewGuid():N}");
+        try
+        {
+            var local = Directory.CreateDirectory(Path.Combine(tempRoot, "local")).FullName;
+            var inside = Directory.CreateDirectory(Path.Combine(local, "inside")).FullName;
+            // The local folder again, through a link to the folder it is in.
+            Directory.CreateSymbolicLink(Path.Combine(tempRoot, "alias"), tempRoot);
+            var alias = Path.Combine(tempRoot, "alias", "local");
+            var validator = new RunnerStartupValidator(new NoopIsolationStrategy());
+
+            // Closing the writable one's parent to sessions would close the local one with it.
+            string MessageFor(string localModels, string library)
+                => Assert.Throws<InvalidOperationException>(
+                    () => validator.ValidateOrThrow(BuildOptions(tempRoot, "/bin/sh", localModelsDirectory: localModels, modelLibraryDirectory: library)))!.Message;
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(MessageFor(local, local), Does.Contain("not the same path, nor one inside the other"));
+                Assert.That(MessageFor(local, local + "/"), Does.Contain("not the same path, nor one inside the other"));
+                Assert.That(MessageFor(local, inside), Does.Contain("not the same path, nor one inside the other"));
+                Assert.That(MessageFor(inside, local), Does.Contain("not the same path, nor one inside the other"));
+                Assert.That(MessageFor(local, alias), Does.Contain("are one mount"), "The same folder by another path is still one mount.");
+            });
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+        }
+    }
+
+    [Test]
+    public void ValidateOrThrow_AcceptsTheLocalFolderMountedTwice()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            Assert.Ignore("Runner startup validation is Linux-specific.");
+        }
+
+        var tempRoot = Path.Combine(Path.GetTempPath(), $"runner-validator-{Guid.NewGuid():N}");
+        var local = Directory.CreateDirectory(Path.Combine(tempRoot, "local")).FullName;
+        var library = Directory.CreateDirectory(Path.Combine(tempRoot, "library", "models")).FullName;
+        if (!TryRun("mount", "--bind", local, library))
+        {
+            TryDelete(tempRoot);
+            Assert.Ignore("Mounting a folder twice needs CAP_SYS_ADMIN, which this container does not have.");
+        }
+
+        try
+        {
+            Assert.That(
+                () => new RunnerStartupValidator(new NoopIsolationStrategy())
+                    .ValidateOrThrow(BuildOptions(tempRoot, "/bin/sh", localModelsDirectory: local, modelLibraryDirectory: library)),
+                Throws.Nothing);
+        }
+        finally
+        {
+            TryRun("umount", library);
+            TryDelete(tempRoot);
+        }
+    }
+
+    private static bool TryRun(string fileName, params string[] arguments)
+    {
+        try
+        {
+            using var process = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(fileName, arguments)
+            {
+                RedirectStandardError = true,
+                RedirectStandardOutput = true
+            })!;
+            process.WaitForExit();
+            return process.ExitCode == 0;
+        }
+        catch (System.ComponentModel.Win32Exception)
+        {
+            return false;
         }
     }
 
