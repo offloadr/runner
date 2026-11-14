@@ -13,6 +13,9 @@ internal sealed class SessionModelLinks(string sessionRoot)
 {
     private readonly string _sessionRoot = Normalize(sessionRoot);
 
+    // Prompts are prepared concurrently; two that name the same model must not both find its link missing.
+    private readonly object _gate = new();
+
     public void Ensure(SessionProcessManager.SessionPaths paths, IEnumerable<ModelDownloadRequest> downloads)
     {
         if (paths.ModelCacheDirectory is not { Length: > 0 } cacheDirectory)
@@ -33,6 +36,14 @@ internal sealed class SessionModelLinks(string sessionRoot)
             return;
         }
 
+        lock (_gate)
+        {
+            EnsureLinks(paths, links);
+        }
+    }
+
+    private void EnsureLinks(SessionProcessManager.SessionPaths paths, IReadOnlyList<(ModelDownloadRequest Download, string Target)> links)
+    {
         using var secureRoot = new LinuxSecureDirectoryRoot(_sessionRoot);
         InvalidOperationException? conflict = null;
         foreach (var (download, target) in links)

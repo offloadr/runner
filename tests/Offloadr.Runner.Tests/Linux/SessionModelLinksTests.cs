@@ -106,6 +106,25 @@ public class SessionModelLinksTests
     }
 
     [Test]
+    public async Task Ensure_FromPromptsAtOnce_LinksTheSameNewModelWithoutFailingAny()
+    {
+        var links = new SessionModelLinks(_sessionRoot);
+        var checkpoint = Model("Stable-diffusion/base.safetensors");
+        var lora = Model("Lora/style.safetensors");
+
+        var prompts = Enumerable.Range(0, 16)
+            .Select(_ => Task.Run(() => links.Ensure(_paths, [checkpoint, lora])))
+            .ToArray();
+
+        Assert.That(async () => await Task.WhenAll(prompts), Throws.Nothing);
+        Assert.Multiple(() =>
+        {
+            Assert.That(LinkTarget("Stable-diffusion/base.safetensors"), Is.EqualTo(checkpoint.DestinationPath));
+            Assert.That(LinkTarget("Lora/style.safetensors"), Is.EqualTo(lora.DestinationPath));
+        });
+    }
+
+    [Test]
     public void Ensure_GivesTheFoldersItMakesToTheSessionUser()
     {
         LinuxTestPrerequisites.RequireRoot();
