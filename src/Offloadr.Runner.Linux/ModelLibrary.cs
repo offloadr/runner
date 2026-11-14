@@ -209,6 +209,13 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks
         batch = new RedirectBatch(session);
         lock (_gate)
         {
+            // A prompt of a session that ended while it waited here changes no link: the next session's
+            // links may already be at its paths. It is stopped, and downloads nothing into the folder.
+            if (session is not null && _endedSessions.Contains(session))
+            {
+                return downloads.ToArray();
+            }
+
             // A refused request fails the whole batch, and nothing of it is registered: the links and claims
             // made for the requests before it are undone, so none keeps a path from a local model.
             _batch = batch;

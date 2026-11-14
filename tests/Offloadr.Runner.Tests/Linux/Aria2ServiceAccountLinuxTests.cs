@@ -142,6 +142,60 @@ public class LinuxAria2FileAccessLinuxTests
     }
 
     [Test]
+    public async Task PrepareModelLibrary_RefusesAParentMountedFromTheHost_AndLeavesItAsItWas()
+    {
+        LinuxTestPrerequisites.RequireRoot();
+        LinuxTestPrerequisites.RequireCommand("/usr/bin/stat");
+        var root = Aria2AccountTestSupport.CreateRoot();
+        // The owner's folder on the host, holding only the models folder, bound in writable.
+        var host = Path.Combine(root, "host", "library");
+        Directory.CreateDirectory(Path.Combine(host, "models"));
+        var mounted = Directory.CreateDirectory(Path.Combine(root, "mnt", "library")).FullName;
+        if (!Run("/bin/chown", "12345:12345", host) || !Run("mount", "--bind", host, mounted))
+        {
+            Aria2AccountTestSupport.TryDelete(root);
+            Assert.Ignore("Binding a folder needs CAP_SYS_ADMIN, which this container does not have.");
+        }
+
+        try
+        {
+            if (OperatingSystem.IsLinux())
+            {
+                File.SetUnixFileMode(host, (UnixFileMode)Convert.ToInt32("755", 8));
+            }
+
+            var library = Path.Combine(mounted, "models");
+            var access = new LinuxAria2FileAccess(null, [library], Path.Combine(root, "staging"));
+
+            Assert.That(() => access.PrepareModelLibrary(library), Throws.InvalidOperationException.With.Message.Contains("container's own"));
+            Assert.That(await Aria2AccountTestSupport.StatAsync(host), Is.EqualTo("12345:12345:755"), "The owner keeps their folder.");
+        }
+        finally
+        {
+            Run("umount", mounted);
+            Aria2AccountTestSupport.TryDelete(root);
+        }
+    }
+
+    private static bool Run(string fileName, params string[] arguments)
+    {
+        try
+        {
+            using var process = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(fileName, arguments)
+            {
+                RedirectStandardError = true,
+                RedirectStandardOutput = true
+            })!;
+            process.WaitForExit();
+            return process.ExitCode == 0;
+        }
+        catch (System.ComponentModel.Win32Exception)
+        {
+            return false;
+        }
+    }
+
+    [Test]
     public void PrepareModelLibrary_RefusesAParentThatHoldsAnythingElse()
     {
         LinuxTestPrerequisites.RequireLinux();

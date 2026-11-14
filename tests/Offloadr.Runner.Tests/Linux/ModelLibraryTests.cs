@@ -598,6 +598,29 @@ public class ModelLibraryTests
     }
 
     [Test]
+    public void APromptOfAnEndedSession_ChangesNoLinkOfTheNextOne()
+    {
+        var library = CreateLibrary();
+        library.ReleaseSessionsOtherThan(Session);
+        library.ReleaseSessionsOtherThan("session-2");
+        // The next session links a saved model; then the ended one's prompt, which waited, asks for another
+        // model of that name.
+        var saved = WriteLibraryFile("checkpoints/base.safetensors", 8);
+        library.Redirect([Remote("checkpoints/base.safetensors", 8)], "session-2");
+        var late = Remote("checkpoints/base.safetensors", 16);
+
+        var redirected = library.Redirect([late], Session).Single();
+
+        var editorPath = Path.Combine(_editorModels, "checkpoints", "base.safetensors");
+        Assert.Multiple(() =>
+        {
+            Assert.That(redirected.DestinationPath, Is.EqualTo(late.DestinationPath));
+            Assert.That(new FileInfo(editorPath).LinkTarget, Is.EqualTo(saved), "The next session's link stays.");
+            Assert.That(library.KeepsEditorLink(editorPath), Is.True);
+        });
+    }
+
+    [Test]
     public void ASessionActiveAgain_ClaimsItsLinksAgain()
     {
         var library = CreateLibrary();
