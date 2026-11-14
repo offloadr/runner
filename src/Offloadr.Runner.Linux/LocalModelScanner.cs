@@ -156,7 +156,7 @@ internal sealed class LocalModelScanner
     {
         var relative = Path.GetRelativePath(_rootDirectory, path);
         var first = relative.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)[0];
-        return string.Equals(first, ModelLibrary.StagingFolderName, StringComparison.Ordinal);
+        return ModelLibrary.IsStagingFolderName(first);
     }
 
     private static LocalModelSnapshot CreateSnapshot(IReadOnlyList<ModelInfo> models)

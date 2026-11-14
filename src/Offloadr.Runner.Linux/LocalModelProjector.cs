@@ -19,9 +19,18 @@ internal sealed class LocalModelProjector
     private readonly Dictionary<string, LocalProjectionRequest> _desiredProjections = new(StringComparer.Ordinal);
     private readonly HashSet<string> _managedTargets = new(StringComparer.Ordinal);
     private const int MaxDiscoveryEntries = 200_000;
+    private readonly Func<string, bool>? _keepsLink;
     private bool _discoveredEarlierProjections;
 
-    public LocalModelProjector(string sourceRoot, string destinationRoot = "/comfyui/models", string runtimeKind = "comfyui")
+    /// <param name="keepsLink">
+    /// Whether a link at a destination path belongs to downloads saved in the local folder: such links point
+    /// into the source root as projections do, and are left in place.
+    /// </param>
+    public LocalModelProjector(
+        string sourceRoot,
+        string destinationRoot = "/comfyui/models",
+        string runtimeKind = "comfyui",
+        Func<string, bool>? keepsLink = null)
     {
         if (string.IsNullOrWhiteSpace(sourceRoot))
         {
@@ -35,6 +44,7 @@ internal sealed class LocalModelProjector
 
         _sourceRoot = NormalizePath(sourceRoot);
         _destinationRoot = NormalizePath(destinationRoot);
+        _keepsLink = keepsLink;
         _ = runtimeKind;
     }
 
@@ -316,7 +326,7 @@ internal sealed class LocalModelProjector
                 if (entry.LinkTarget is { } linkTarget)
                 {
                     var resolved = Path.GetFullPath(linkTarget, Path.GetDirectoryName(entry.FullName)!);
-                    if (IsUnderRoot(resolved, _sourceRoot))
+                    if (IsUnderRoot(resolved, _sourceRoot) && !IsKeptLink(NormalizePath(entry.FullName)))
                     {
                         _managedTargets.Add(NormalizePath(entry.FullName));
                     }
@@ -455,7 +465,7 @@ internal sealed class LocalModelProjector
                 case SecureLinkKind.SymbolicLink when LinkPointsTo(targetPath, existingTarget!, sourcePath):
                     _managedTargets.Add(targetPath);
                     return;
-                case SecureLinkKind.SymbolicLink when _managedTargets.Contains(targetPath):
+                case SecureLinkKind.SymbolicLink when _managedTargets.Contains(targetPath) && !IsKeptLink(targetPath):
                     secureRoot.DeleteSymbolicLink(relativePath);
                     break;
                 case SecureLinkKind.SymbolicLink:
@@ -474,11 +484,14 @@ internal sealed class LocalModelProjector
         }
     }
 
+    private bool IsKeptLink(string targetPath) => _keepsLink?.Invoke(targetPath) == true;
+
     private void RemoveManagedLink(string targetPath)
     {
         try
         {
-            if (Directory.Exists(_destinationRoot))
+            // A download is going through this link, or went through it and its model may be in use.
+            if (Directory.Exists(_destinationRoot) && !IsKeptLink(targetPath))
             {
                 using var secureRoot = new LinuxSecureDirectoryRoot(_destinationRoot);
                 secureRoot.DeleteSymbolicLink(GetRelativeTargetPath(targetPath));

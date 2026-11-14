@@ -289,7 +289,11 @@ static async Task<int> RunAgentAsync()
     if (!string.IsNullOrWhiteSpace(options.LocalModelsDirectory))
     {
         scanner = new LocalModelScanner(options.RunnerId, options.LocalModelsDirectory);
-        projector = new LocalModelProjector(options.LocalModelsDirectory, modelProjectionRoot, options.Session.RuntimeKind);
+        projector = new LocalModelProjector(
+            options.LocalModelsDirectory,
+            modelProjectionRoot,
+            options.Session.RuntimeKind,
+            modelLibrary is null ? null : modelLibrary.KeepsEditorLink);
         RunnerLog.Info(
             $"Local model scanning enabled dir='{options.LocalModelsDirectory}' interval={options.LocalModelsScanInterval.TotalSeconds:F0}s");
     }

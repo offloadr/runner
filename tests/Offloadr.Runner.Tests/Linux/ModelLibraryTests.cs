@@ -329,6 +329,33 @@ public class ModelLibraryTests
     }
 
     [Test]
+    public void TheProjector_LeavesTheLinksDownloadsWentThrough_AndRemovesItsOwnStaleOnes()
+    {
+        var library = CreateLibrary();
+        library.Redirect([Remote("checkpoints/base.safetensors", 8)], Session);
+        var downloadLink = Path.Combine(_editorModels, "checkpoints", "base.safetensors");
+        // An earlier run's projection of another saved model, requested by nothing now.
+        var other = WriteLibraryFile("loras/other.safetensors", 4);
+        var staleProjection = Path.Combine(_editorModels, "loras", "other.safetensors");
+        Directory.CreateDirectory(Path.GetDirectoryName(staleProjection)!);
+        File.CreateSymbolicLink(staleProjection, other);
+        var projector = new LocalModelProjector(_library, _editorModels, keepsLink: library.KeepsEditorLink);
+
+        // While the model downloads, and once it is saved and found by the scan.
+        projector.SetRequestedModels([]);
+        WriteLibraryFile("checkpoints/base.safetensors", 8);
+        projector.UpdateSnapshot(new LocalModelScanner("runner-1", _library).Scan());
+        projector.AddRequestedModels([]);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(new FileInfo(downloadLink).LinkTarget, Is.EqualTo(Path.Combine(_library, "checkpoints", "base.safetensors")));
+            Assert.That(new FileInfo(staleProjection).LinkTarget, Is.Null, "The projector still clears its own stale links.");
+            Assert.That(File.Exists(other), Is.True);
+        });
+    }
+
+    [Test]
     public async Task APromptInANewSession_DownloadsAnotherModelAtAPathAnEarlierSessionLinked()
     {
         var backend = new WritingBackend();

@@ -25,6 +25,8 @@ internal sealed class ModelLibrary : IModelDownloadStaging
     // Editor links this library made, under _gate: the only ones it ever removes. Each maps to the session
     // that last asked for its model, which may still be using it.
     private readonly Dictionary<string, string?> _ownLinks = new(StringComparer.Ordinal);
+    // Editor links downloads were sent through, under _gate: those above, and matching ones found in place.
+    private readonly HashSet<string> _usedLinks = new(StringComparer.Ordinal);
 
     /// <param name="directory">The models folder, writable.</param>
     /// <param name="readOnlyDirectory">The same folder as sessions see it, read-only.</param>
@@ -75,6 +77,27 @@ internal sealed class ModelLibrary : IModelDownloadStaging
     public string Directory { get; }
 
     /// <summary>
+    /// Whether <paramref name="editorPath"/> is a link a download was sent through, still pointing at that
+    /// download: the projector, whose links point into the same folder, must leave it, since a prompt may be
+    /// waiting for the model or using it.
+    /// </summary>
+    public bool KeepsEditorLink(string editorPath)
+    {
+        var normalized = Normalize(editorPath);
+        if (!IsStrictlyBeneath(normalized, _editorModelsDirectory))
+        {
+            return false;
+        }
+
+        var relative = Path.GetRelativePath(_editorModelsDirectory, normalized);
+        lock (_gate)
+        {
+            return _usedLinks.Contains(relative.Replace(Path.DirectorySeparatorChar, '/')) &&
+                   PointsAtLibrary(relative, Path.Combine(_readOnlyDirectory, relative));
+        }
+    }
+
+    /// <summary>
     /// Sends each remote request for the editor's models directory to the same relative path in the models
     /// folder, and links the editor's path there. A request is left as it was, and downloaded inside the
     /// container as before, when something already holds either place: a file of the owner's of another
@@ -114,7 +137,7 @@ internal sealed class ModelLibrary : IModelDownloadStaging
         var relative = Path.GetRelativePath(_editorModelsDirectory, editorPath);
         var libraryPath = Path.Combine(Directory, relative);
         var linkTarget = Path.Combine(_readOnlyDirectory, relative);
-        if (IsStrictlyBeneath(libraryPath, _downloadFolder))
+        if (IsInDownloadFolder(libraryPath))
         {
             return download;
         }
@@ -192,8 +215,14 @@ internal sealed class ModelLibrary : IModelDownloadStaging
     /// <summary>Whether the editor's path holds a link this library made (the projector links to the same place).</summary>
     private bool HoldsOwnLink(string relative, string target, out string? sessionId)
     {
-        var relativePath = relative.Replace(Path.DirectorySeparatorChar, '/');
-        if (!_ownLinks.TryGetValue(relativePath, out sessionId) || !System.IO.Directory.Exists(_editorModelsDirectory))
+        return _ownLinks.TryGetValue(relative.Replace(Path.DirectorySeparatorChar, '/'), out sessionId) &&
+               PointsAtLibrary(relative, target);
+    }
+
+    /// <summary>Whether the editor's path is a link to <paramref name="target"/>.</summary>
+    private bool PointsAtLibrary(string relative, string target)
+    {
+        if (!System.IO.Directory.Exists(_editorModelsDirectory))
         {
             return false;
         }
@@ -201,7 +230,7 @@ internal sealed class ModelLibrary : IModelDownloadStaging
         try
         {
             using var root = new LinuxSecureDirectoryRoot(_editorModelsDirectory);
-            return root.ReadSymbolicLink(relativePath, out var existing) == SecureLinkKind.SymbolicLink &&
+            return root.ReadSymbolicLink(relative.Replace(Path.DirectorySeparatorChar, '/'), out var existing) == SecureLinkKind.SymbolicLink &&
                    string.Equals(existing, target, StringComparison.Ordinal);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -218,6 +247,7 @@ internal sealed class ModelLibrary : IModelDownloadStaging
             using var root = new LinuxSecureDirectoryRoot(_editorModelsDirectory);
             root.DeleteSymbolicLink(relativePath);
             _ownLinks.Remove(relativePath);
+            _usedLinks.Remove(relativePath);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
@@ -235,8 +265,9 @@ internal sealed class ModelLibrary : IModelDownloadStaging
             switch (root.ReadSymbolicLink(relativePath, out var existing))
             {
                 case SecureLinkKind.SymbolicLink:
-                    // Ours already, or another (a local model's): either way, nothing to change, except that a
-                    // link of ours now belongs to this session as well, which may be using its model.
+                    // Ours already, or another to the same place (a local model's, or one an earlier run made):
+                    // either way, nothing to change, except that the download now goes through it, and a link
+                    // of ours belongs to this session as well, which may be using its model.
                     if (!string.Equals(existing, target, StringComparison.Ordinal))
                     {
                         return false;
@@ -247,6 +278,7 @@ internal sealed class ModelLibrary : IModelDownloadStaging
                         _ownLinks[relativePath] = sessionId;
                     }
 
+                    _usedLinks.Add(relativePath);
                     return true;
                 case SecureLinkKind.Other:
                     // A model downloaded inside the container earlier, or a path that is not plain directories.
@@ -255,6 +287,7 @@ internal sealed class ModelLibrary : IModelDownloadStaging
 
             root.CreateSymbolicLink(relativePath, target);
             _ownLinks[relativePath] = sessionId;
+            _usedLinks.Add(relativePath);
             return true;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -267,7 +300,7 @@ internal sealed class ModelLibrary : IModelDownloadStaging
     public string? GetStagingPath(string destinationPath)
     {
         var destination = Normalize(destinationPath);
-        if (!IsStrictlyBeneath(destination, Directory) || IsStrictlyBeneath(destination, _downloadFolder))
+        if (!IsStrictlyBeneath(destination, Directory) || IsInDownloadFolder(destination))
         {
             return null;
         }
@@ -383,6 +416,18 @@ internal sealed class ModelLibrary : IModelDownloadStaging
             RunnerLog.Warning(nameof(ModelLibrary), $"Could not remove downloaded part '{directory}': {ex.Message}");
         }
     }
+
+    /// <summary>
+    /// Whether a folder of this name at the top of the models folder is the download folder. On a
+    /// case-insensitive share (a Windows folder) it is, in any case.
+    /// </summary>
+    public static bool IsStagingFolderName(string name)
+        => string.Equals(name, StagingFolderName, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Whether <paramref name="path"/> is inside the download folder, in whatever case it is named.</summary>
+    private bool IsInDownloadFolder(string path)
+        => IsStrictlyBeneath(path, Directory) &&
+           IsStagingFolderName(Path.GetRelativePath(Directory, path).Split(Path.DirectorySeparatorChar)[0]);
 
     private static string StagingKey(string destination)
         => Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(destination)))[..32];
