@@ -398,15 +398,18 @@ public class ModelLibraryTests
     }
 
     [Test]
-    public async Task Starting_GivesUpTransfersAria2RestoredForAnEndedRun_ButNotForOneStillGoing()
+    public async Task Starting_GivesUpEveryTransferAria2RestoredForThisRunner_AndClearsOnlyEndedRuns()
     {
-        // aria2 restores from its saved state what an earlier run of this runner was downloading.
+        // aria2 restores from its saved state what earlier runs of this runner were downloading: one ended, and
+        // one still going in an overlapping container whose aria2 restored the same state.
         var ended = CreateLibrary();
         var endedStaging = Stage(ended, Path.Combine(_library, "loras", "ended.safetensors"), 3);
         ended.Dispose();
         using var going = CreateLibrary();
         var goingStaging = Stage(going, Path.Combine(_library, "loras", "going.safetensors"), 3);
-        var backend = new RestoringBackend(endedStaging, goingStaging);
+        var firstBackend = new RestoringBackend(goingStaging);
+        var otherRunners = Stage(CreateLibrary("22222222-2222-4222-8222-222222222222"), Path.Combine(_library, "loras", "theirs.safetensors"), 3);
+        var backend = new RestoringBackend(endedStaging, goingStaging, otherRunners);
         var settings = Aria2Settings.FromEnvironment(name => name == "ARIA2_STATE_DIR" ? Path.Combine(_root, "aria2-state") : null, static () => "generated-secret");
         await using var service = new ModelDownloadService(
             backend,
@@ -418,10 +421,15 @@ public class ModelLibraryTests
 
         Assert.Multiple(() =>
         {
-            Assert.That(backend.Removed, Is.EqualTo(new[] { new ModelTransferHandle("restored-0") }), "Only the ended run's transfer is given up.");
-            Assert.That(backend.RemovedWhileFileWasThere, Is.True, "Before its folder is cleared.");
-            Assert.That(File.Exists(endedStaging), Is.False);
-            Assert.That(File.Exists(goingStaging), Is.True);
+            Assert.That(
+                backend.Removed,
+                Is.EqualTo(new[] { new ModelTransferHandle("restored-0"), new ModelTransferHandle("restored-1") }),
+                "This aria2 gives up both runs' transfers, not another runner's.");
+            Assert.That(backend.FileWasThereWhenRemoved, Is.All.True, "Before any folder is cleared.");
+            Assert.That(File.Exists(endedStaging), Is.False, "The ended run's folder is cleared.");
+            Assert.That(File.Exists(goingStaging), Is.True, "The run still going keeps its file.");
+            Assert.That(firstBackend.Removed, Is.Empty, "And its own aria2 keeps downloading it.");
+            Assert.That(File.Exists(otherRunners), Is.True);
         });
     }
 
@@ -430,7 +438,7 @@ public class ModelLibraryTests
     {
         public List<ModelTransferHandle> Removed { get; } = [];
 
-        public bool RemovedWhileFileWasThere { get; private set; }
+        public List<bool> FileWasThereWhenRemoved { get; } = [];
 
         public override Task<IReadOnlyList<ModelTransferSnapshot>> ListAsync(CancellationToken cancellationToken)
             => Task.FromResult<IReadOnlyList<ModelTransferSnapshot>>(paths
@@ -445,7 +453,7 @@ public class ModelLibraryTests
         public override Task RemoveAsync(ModelTransferHandle handle, CancellationToken cancellationToken)
         {
             Removed.Add(handle);
-            RemovedWhileFileWasThere = File.Exists(paths[int.Parse(handle.ToString()!["restored-".Length..], System.Globalization.CultureInfo.InvariantCulture)]);
+            FileWasThereWhenRemoved.Add(File.Exists(paths[int.Parse(handle.ToString()!["restored-".Length..], System.Globalization.CultureInfo.InvariantCulture)]));
             return Task.CompletedTask;
         }
     }

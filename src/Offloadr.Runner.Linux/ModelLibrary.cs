@@ -809,46 +809,13 @@ internal sealed class ModelLibrary : IModelDownloadStaging, IDownloadLinks, IDis
         => !string.IsNullOrWhiteSpace(path) && IsStrictlyBeneath(Normalize(path), _stagingDirectory);
 
     /// <summary>
-    /// Whether <paramref name="path"/> is a download in progress of this run or of an ended run of this runner,
-    /// as aria2 restores them from its saved state after a restart: those are given up before
-    /// <see cref="DiscardAll"/> clears their folders. A run still going, whose lease is held, keeps its own.
+    /// Whether <paramref name="path"/> is a download in progress of any run of this runner, as aria2 restores them
+    /// from its saved state after a restart: this aria2 gives them all up, before <see cref="DiscardAll"/> clears
+    /// the folders of ended runs. Giving one up stops only this aria2's transfer and deletes nothing, so a run
+    /// still going, sharing that saved state, keeps its own transfer and its files.
     /// </summary>
-    public bool IsStagingPathOfThisOrAnEndedRun(string? path)
-    {
-        if (string.IsNullOrWhiteSpace(path))
-        {
-            return false;
-        }
-
-        var normalized = Normalize(path);
-        if (IsStrictlyBeneath(normalized, _stagingDirectory))
-        {
-            return true;
-        }
-
-        if (!IsStrictlyBeneath(normalized, _runnerDirectory))
-        {
-            return false;
-        }
-
-        var run = Path.GetRelativePath(_runnerDirectory, normalized).Split(Path.DirectorySeparatorChar)[0];
-        if (run.EndsWith(LeaseSuffix, StringComparison.Ordinal) || !IsMissingOrRealDirectory(_runnerDirectory))
-        {
-            return false;
-        }
-
-        try
-        {
-            using var root = new LinuxSecureDirectoryRoot(Directory);
-            var result = root.TryLockFile(RelativeToFolder(Path.Combine(_runnerDirectory, run)) + LeaseSuffix, out var lease);
-            lease?.Dispose();
-            return result != SecureLockResult.Held;
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            return false;
-        }
-    }
+    public bool IsStagingPathOfThisRunner(string? path)
+        => !string.IsNullOrWhiteSpace(path) && IsStrictlyBeneath(Normalize(path), _runnerDirectory);
 
     /// <summary>Removes what an earlier run of this runner left half downloaded; other runners' stay.</summary>
     public void DiscardAll()

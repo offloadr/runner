@@ -109,7 +109,7 @@ internal sealed class ModelDownloadService : IAsyncDisposable
 
         var snapshots = await _transferBackend.ListAsync(cancellationToken).ConfigureAwait(false);
         foreach (var snapshot in snapshots.Where(snapshot => snapshot.Files.Any(file =>
-                     _staging?.IsStagingPath(file.Path) == true || _library?.IsStagingPathOfThisOrAnEndedRun(file.Path) == true)))
+                     _staging?.IsStagingPath(file.Path) == true || _library?.IsStagingPathOfThisRunner(file.Path) == true)))
         {
             try
             {
