@@ -1041,6 +1041,10 @@ public sealed class RunnerSupervisor : BackgroundService
                 return;
             }
 
+            // From here until its container runs, the image must stay: a removal of unused images waits, and
+            // one under way finishes first. A switch to an image downloaded earlier pulls nothing, so the pull
+            // alone would not hold it.
+            using var launching = await ImageGate.EnterUseAsync(cancellationToken).ConfigureAwait(false);
             ContainerEngineException? pullFailure = null;
             if (prepared is null)
             {
@@ -1049,7 +1053,6 @@ public sealed class RunnerSupervisor : BackgroundService
                 {
                     var progress = new PullProgressParser();
                     Update(view => view with { PullProgress = progress.Current });
-                    using var pulling = await ImageGate.EnterPullAsync(cancellationToken).ConfigureAwait(false);
                     await _engine.PullAsync(
                         template.Image,
                         line =>
@@ -1712,7 +1715,7 @@ public sealed class RunnerSupervisor : BackgroundService
         ContainerEngineException? pullFailure = null;
         try
         {
-            using var pulling = await ImageGate.EnterPullAsync(cancellationToken).ConfigureAwait(false);
+            using var pulling = await ImageGate.EnterUseAsync(cancellationToken).ConfigureAwait(false);
             await _engine.PullAsync(image, line => AppendLog("pull: " + line), cancellationToken).ConfigureAwait(false);
         }
         catch (ContainerEngineException ex)

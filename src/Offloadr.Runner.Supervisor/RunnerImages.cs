@@ -50,26 +50,27 @@ public enum ImageRemoval
 }
 
 /// <summary>
-/// Keeps removals of runner images and the supervisor's pulls of them apart: a pull can move a tag from
-/// one image to another, so no removal runs while one is under way. Pulls may overlap one another; a
-/// pull that starts during a removal waits for it, which takes moments.
+/// Keeps removals of runner images apart from the supervisor's uses of them: a pull, which can move a tag
+/// from one image to another, and a launch, whose image must still be there when its container is
+/// created. No removal runs while either is under way. Uses may overlap one another; one that starts
+/// during a removal waits for it, which takes moments.
 /// </summary>
 public sealed class RunnerImageGate
 {
     private readonly SemaphoreSlim _removal = new(1, 1);
-    private int _pulls;
+    private int _uses;
 
-    /// <summary>Marks a pull as under way until the result is disposed; waits for a removal in progress first.</summary>
-    internal async Task<IDisposable> EnterPullAsync(CancellationToken cancellationToken)
+    /// <summary>Marks a pull or launch as under way until the result is disposed; waits for a removal in progress first.</summary>
+    internal async Task<IDisposable> EnterUseAsync(CancellationToken cancellationToken)
     {
         await _removal.WaitAsync(cancellationToken).ConfigureAwait(false);
-        Interlocked.Increment(ref _pulls);
+        Interlocked.Increment(ref _uses);
         _removal.Release();
-        return new Exit(() => Interlocked.Decrement(ref _pulls));
+        return new Exit(() => Interlocked.Decrement(ref _uses));
     }
 
     /// <summary>
-    /// Starts a removal unless a pull is under way; null then. A pull can only check in before the removal
+    /// Starts a removal unless a pull or launch is under way; null then. A use can only check in before the removal
     /// takes the gate (and is counted) or after it leaves, so a removal never overlaps one.
     /// </summary>
     internal IDisposable? TryEnterRemoval()
@@ -79,7 +80,7 @@ public sealed class RunnerImageGate
             return null;
         }
 
-        if (Volatile.Read(ref _pulls) > 0)
+        if (Volatile.Read(ref _uses) > 0)
         {
             _removal.Release();
             return null;

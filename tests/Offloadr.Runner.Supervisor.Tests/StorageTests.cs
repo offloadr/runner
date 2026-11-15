@@ -218,7 +218,7 @@ public class RunnerImagesTests
         var gate = new RunnerImageGate();
         var engine = new ImageStore(Running, Forge);
         var images = new RunnerImages(() => RunningView, engine, new FakeSettingsStore(new RunnerSettings()), gate);
-        var pull = await gate.EnterPullAsync(CancellationToken.None);
+        var pull = await gate.EnterUseAsync(CancellationToken.None);
 
         var whilePulling = await images.RemoveAsync("sha256:bbb");
         pull.Dispose();
@@ -243,7 +243,7 @@ public class RunnerImagesTests
             // The pull asks to start while the removal talks to the engine.
             BeforeRemove = () =>
             {
-                pull ??= gate.EnterPullAsync(CancellationToken.None);
+                pull ??= gate.EnterUseAsync(CancellationToken.None);
                 startedDuringRemoval ??= pull.IsCompleted;
             },
         };
