@@ -14,7 +14,7 @@
 <MudPaper Outlined="true" Class="pa-5">
     <MudStack Spacing="4">
         <MudStack Spacing="1">
-            <MudTextField T="string" @bind-Value="_runnerKey" Label="Runner key" Variant="Variant.Outlined"
+            <MudTextField T="string" @bind-Value="_runnerKey" Immediate="true" Label="Runner key" Variant="Variant.Outlined"
                           InputType="@(_showKey ? InputType.Text : InputType.Password)"
                           Adornment="Adornment.End" AdornmentIcon="@(_showKey ? Icons.Material.Filled.VisibilityOff : Icons.Material.Filled.Visibility)"
                           AdornmentAriaLabel="Show or hide the key" OnAdornmentClick="@(() => _showKey = !_showKey)"
@@ -34,7 +34,7 @@
         </MudSelect>
 
         <MudStack Row="true" AlignItems="AlignItems.Start" Spacing="2">
-            <MudTextField T="string" @bind-Value="_modelsDirectory" Label="Models folder (optional)" Variant="Variant.Outlined" Clearable="true"
+            <MudTextField T="string" @bind-Value="_modelsDirectory" Immediate="true" Label="Models folder (optional)" Variant="Variant.Outlined" Clearable="true"
                           HelperText="Your model files. Offloadr uses the ones that match what a workflow needs, and saves the models it downloads here." />
             @if (Host.CanPickFolder)
             {
@@ -75,9 +75,9 @@
         <MudExpansionPanels Outlined="true" Elevation="0">
             <MudExpansionPanel Text="Advanced">
                 <MudStack Spacing="4">
-                    <MudTextField T="string" @bind-Value="_origin" Label="Offloadr address" Variant="Variant.Outlined"
+                    <MudTextField T="string" @bind-Value="_origin" Immediate="true" Label="Offloadr address" Variant="Variant.Outlined"
                                   HelperText="Change this only to use another Offloadr environment." />
-                    <MudTextField T="string" @bind-Value="_engineExecutable" Label="Docker or podman executable" Variant="Variant.Outlined" Clearable="true"
+                    <MudTextField T="string" @bind-Value="_engineExecutable" Immediate="true" Label="Docker or podman executable" Variant="Variant.Outlined" Clearable="true"
                                   HelperText="Leave empty to find Docker automatically." />
                 </MudStack>
             </MudExpansionPanel>
