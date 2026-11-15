@@ -250,12 +250,10 @@ public class RunnerImagesTests
         var images = new RunnerImages(() => RunningView, engine, new FakeSettingsStore(new RunnerSettings()), gate);
 
         Assert.That(await images.RemoveAsync("sha256:bbb"), Is.EqualTo(ImageRemoval.Removed));
-        Assert.Multiple(() =>
-        {
-            Assert.That(startedDuringRemoval, Is.False, "Not while the removal is under way.");
-            Assert.That(pull!.IsCompleted, Is.True, "It goes ahead once the removal is done.");
-        });
-        (await pull!).Dispose();
+        Assert.That(startedDuringRemoval, Is.False, "Not while the removal is under way.");
+
+        // It goes ahead once the removal is done; its continuation may run a moment later.
+        (await pull!.WaitAsync(TimeSpan.FromSeconds(10))).Dispose();
     }
 
     [Test]
