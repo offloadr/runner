@@ -119,6 +119,9 @@ public sealed record ImageInfo(string Id, string? RepoDigest, IReadOnlyList<stri
 
 public sealed record GpuAccessCheck(bool Succeeded, string Output);
 
+/// <summary>An image the engine holds. <paramref name="Size"/> counts layers it shares with other images too.</summary>
+public sealed record StoredImage(string Id, IReadOnlyList<string> RepoTags, IReadOnlyList<string> RepoDigests, long Size, DateTimeOffset? Created = null);
+
 /// <summary>
 /// The engine failed. <see cref="Kind"/> is what the engine's output (<paramref name="detail"/>) says
 /// about the cause, unless the thrower already knows it.
@@ -147,6 +150,9 @@ public interface IContainerEngine
     Task PullAsync(string image, Action<string> onProgress, CancellationToken cancellationToken);
 
     Task<ImageInfo?> InspectImageAsync(string image, CancellationToken cancellationToken);
+
+    /// <summary>Every image the engine holds, with the names and digests that point at it and its size.</summary>
+    Task<IReadOnlyList<StoredImage>> ListImagesAsync(CancellationToken cancellationToken);
 
     /// <summary>
     /// Removes <paramref name="reference"/> (a name, a digest reference or an ID), never by force: the engine

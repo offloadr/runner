@@ -930,6 +930,68 @@ public class RunnerSupervisorTests
     }
 
     [Test]
+    public async Task ImageRemoval_WaitsForTheBackgroundPullOfANewerImage()
+    {
+        _engine.StatusJson = Status(activeSessionId: "");
+        _engine.StoredImages.Add(new StoredImage("sha256:forge", ["ghcr.io/offloadr/runner-forge-neo:neo"], [], 1));
+        var supervisor = await StartSupervisorAsync(imageUpdateInterval: TimeSpan.FromMilliseconds(50));
+        supervisor.RequestStart();
+        await WaitForStateAsync(SupervisorState.Running);
+        var pulling = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _engine.OnPull = async _ =>
+        {
+            pulling.TrySetResult();
+            await release.Task;
+        };
+        var images = new RunnerImages(supervisor, _engine, _settings);
+
+        await pulling.Task.WaitAsync(WaitLimit);
+        var whilePulling = await images.RemoveAsync("sha256:forge");
+        var state = supervisor.View.State;
+        release.SetResult();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(state, Is.EqualTo(SupervisorState.Running), "The pull runs in the background.");
+            Assert.That(whilePulling, Is.EqualTo(ImageRemoval.Busy));
+            Assert.That(_engine.RemovalRequests, Is.Empty);
+        });
+    }
+
+    [Test]
+    public async Task ImageRemoval_WaitsForALaunchOfAnImageDownloadedEarlier()
+    {
+        // A switch waits for the session to end with its image already downloaded, and pulls nothing then.
+        _engine.StatusJson = Status(activeSessionId: "session-1");
+        var supervisor = await StartSupervisorAsync();
+        supervisor.RequestStart();
+        await WaitForStateAsync(SupervisorState.Running);
+        await WaitUntilAsync(() => supervisor.View.HasActiveSession);
+        await _settings.SaveAsync(_settings.Current with { SelectedEditorTemplate = "comfyui-master" });
+        await WaitForStateAsync(SupervisorState.RestartPending);
+        await WaitUntilAsync(() => _engine.Pulls.Contains("ghcr.io/offloadr/runner-comfyui:master"));
+        var pullsBefore = _engine.Pulls.Count;
+        var removalsDuringLaunch = new List<bool>();
+        _engine.BeforeRun = () =>
+        {
+            using var removal = supervisor.ImageGate.TryEnterRemoval();
+            removalsDuringLaunch.Add(removal is not null);
+        };
+
+        _engine.StatusJson = Status(activeSessionId: "");
+
+        await WaitUntilAsync(() => _engine.Runs.Count == 2 && supervisor.View.State == SupervisorState.Running);
+        Assert.Multiple(() =>
+        {
+            Assert.That(_engine.Pulls, Has.Count.EqualTo(pullsBefore), "The launch used the image downloaded earlier.");
+            Assert.That(removalsDuringLaunch, Is.EqualTo(new[] { false }), "No removal could run during the launch.");
+        });
+        using var afterwards = supervisor.ImageGate.TryEnterRemoval();
+        Assert.That(afterwards, Is.Not.Null, "The launch let go once its container ran.");
+    }
+
+    [Test]
     public async Task TagMovedDuringTheLaunch_IsRecordedAsTheImageThatRuns()
     {
         _engine.StatusJson = Status(activeSessionId: "");

@@ -1,0 +1,272 @@
+@page "/storage"
+@inherits SupervisorComponent
+@inject IRunnerSettingsStore SettingsStore
+@inject RunnerImages RunnerImages
+@inject IHostActions Host
+@inject NavigationManager Navigation
+@inject ISnackbar Snackbar
+@inject IDialogService Dialogs
+
+<PageTitle>Models and storage - Offloadr Runner</PageTitle>
+
+<MudText Typo="Typo.h5" HtmlTag="h1" Class="mb-4">Models and storage</MudText>
+
+<MudStack Spacing="4">
+    <MudPaper Outlined="true" Class="pa-5">
+        <MudStack Row="true" AlignItems="AlignItems.Center" Justify="Justify.SpaceBetween" Wrap="Wrap.Wrap" Spacing="2">
+            <MudText Typo="Typo.h6" HtmlTag="h2">Models folder</MudText>
+            @if (Folder is not null)
+            {
+                <MudStack Row="true" Spacing="1">
+                    @if (Host.CanOpenFolder)
+                    {
+                        <MudButton Size="Size.Small" Variant="Variant.Text" StartIcon="@Icons.Material.Filled.FolderOpen"
+                                   OnClick="@(() => Host.OpenFolderAsync(Folder))">Open folder</MudButton>
+                    }
+                    <MudButton Size="Size.Small" Variant="Variant.Text" StartIcon="@Icons.Material.Filled.Refresh"
+                               Disabled="_measuring" OnClick="MeasureAsync">Measure again</MudButton>
+                </MudStack>
+            }
+        </MudStack>
+        @if (Folder is null)
+        {
+            <MudText Typo="Typo.body2" Class="mud-text-secondary mt-2">
+                No models folder is chosen. Choose the folder with your model files in Settings, so the runner can use them.
+            </MudText>
+            <MudButton Size="Size.Small" Variant="Variant.Outlined" Color="Color.Primary" Class="mt-3"
+                       OnClick="@(() => Navigation.NavigateTo("settings"))">Open Settings</MudButton>
+        }
+        else
+        {
+            <MudSimpleTable Dense="true" Elevation="0" Class="mt-3 runner-facts">
+                <tbody>
+                    <tr><th scope="row">Folder</th><td class="runner-check-detail">@Folder</td></tr>
+                    <tr>
+                        <th scope="row">Holds</th>
+                        <td aria-live="polite">
+                            @if (_measuring)
+                            {
+                                <span>Measuring…</span>
+                            }
+                            else if (_usage is { } usage)
+                            {
+                                <span>@usage.Files.ToString("N0") @(usage.Files == 1 ? "file" : "files"), @ModelsFolderUsage.Format(usage.Bytes)</span>
+                            }
+                            else
+                            {
+                                <span>@(_usageProblem ?? "–")</span>
+                            }
+                        </td>
+                    </tr>
+                    @if (_usage is { UnfinishedBytes: > 0 } unfinished)
+                    {
+                        <tr>
+                            <th scope="row">Unfinished downloads</th>
+                            <td>@ModelsFolderUsage.Format(unfinished.UnfinishedBytes), in its @ModelsFolderUsage.StagingFolderName folder</td>
+                        </tr>
+                    }
+                    <tr>
+                        <th scope="row">Downloads</th>
+                        <td>@(SettingsStore.Current.DownloadModels ? "On: models a workflow needs are downloaded here" : "Off: the runner uses only the models already here")</td>
+                    </tr>
+                </tbody>
+            </MudSimpleTable>
+        }
+    </MudPaper>
+
+    <MudPaper Outlined="true" Class="pa-5">
+        <MudStack Row="true" AlignItems="AlignItems.Center" Justify="Justify.SpaceBetween" Wrap="Wrap.Wrap" Spacing="2">
+            <MudText Typo="Typo.h6" HtmlTag="h2">Runner images</MudText>
+            <MudButton Size="Size.Small" Variant="Variant.Text" StartIcon="@Icons.Material.Filled.Refresh"
+                       Disabled="@(_loadingImages || View.Engine?.Available != true)" OnClick="LoadImagesAsync">Refresh</MudButton>
+        </MudStack>
+        <MudText Typo="Typo.body2" Class="mud-text-secondary mt-2">
+            Docker keeps the runner image of every editor you have used. Remove the ones you no longer need; choosing that editor again downloads its image again.
+        </MudText>
+        @if (View.Engine?.Available != true)
+        {
+            <MudText Typo="Typo.body2" Class="mt-3">Docker is not available, so its images cannot be listed. See the Status page.</MudText>
+        }
+        else if (_imagesProblem is not null)
+        {
+            <MudAlert Severity="Severity.Warning" Dense="true" Class="mt-3">@_imagesProblem</MudAlert>
+        }
+        else if (_images is null)
+        {
+            <MudProgressLinear Indeterminate="true" Color="Color.Primary" Class="mt-3" aria-label="Listing the runner images" />
+        }
+        else if (_images.Count == 0)
+        {
+            <MudText Typo="Typo.body2" Class="mt-3">No runner images yet. The first start downloads one.</MudText>
+        }
+        else
+        {
+            <MudSimpleTable Dense="true" Elevation="0" Class="mt-3 runner-facts">
+                <thead>
+                    <tr><th scope="col">Image</th><th scope="col">Size</th><th scope="col">Use</th><th scope="col"><span class="runner-visually-hidden">Actions</span></th></tr>
+                </thead>
+                <tbody>
+                    @foreach (var image in _images)
+                    {
+                        <tr>
+                            <td class="runner-check-detail">@image.Name</td>
+                            <td>@ModelsFolderUsage.Format(image.Size)</td>
+                            <td>@image.UseText</td>
+                            <td>
+                                @if (image.CanRemove)
+                                {
+                                    <MudButton Size="Size.Small" Variant="Variant.Text" Color="Color.Error" Disabled="@(_removing is not null)"
+                                               OnClick="@(() => RemoveAsync(image))">@(_removing == image.Id ? "Removing…" : "Remove")</MudButton>
+                                }
+                            </td>
+                        </tr>
+                    }
+                </tbody>
+            </MudSimpleTable>
+            <MudText Typo="Typo.caption" Class="mud-text-secondary mt-2">
+                Images share layers, so removing one can free less than its size. The image the runner runs, and the one for your editor, are kept.
+            </MudText>
+        }
+    </MudPaper>
+</MudStack>
+
+@code {
+    private readonly CancellationTokenSource _closed = new();
+    private ModelsFolderUsage? _usage;
+    private string? _usageProblem;
+    private bool _measuring;
+    private IReadOnlyList<RunnerImage>? _images;
+    private string? _imagesProblem;
+    private bool _loadingImages;
+    private string? _removing;
+
+    private string? Folder => string.IsNullOrWhiteSpace(SettingsStore.Current.LocalModelsDirectory) ? null : SettingsStore.Current.LocalModelsDirectory;
+
+    protected override Task OnInitializedAsync() => Task.WhenAll(MeasureAsync(), LoadImagesAsync());
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        // Docker may answer only after the page opened, while the app still checks it at start.
+        if (_images is null && _imagesProblem is null && !_loadingImages && View.Engine?.Available == true)
+        {
+            await LoadImagesAsync();
+            StateHasChanged();
+        }
+    }
+
+    public override void Dispose()
+    {
+        // Cancelled, not disposed: a measurement or listing still running reads the token.
+        _closed.Cancel();
+        base.Dispose();
+    }
+
+    private async Task MeasureAsync()
+    {
+        if (Folder is not { } folder)
+        {
+            return;
+        }
+
+        _measuring = true;
+        _usageProblem = null;
+        try
+        {
+            var token = _closed.Token;
+            _usage = await Task.Run(() => ModelsFolderUsage.Measure(folder, token), token);
+        }
+        catch (OperationCanceledException)
+        {
+            // The page closed.
+        }
+        catch (DirectoryNotFoundException)
+        {
+            _usage = null;
+            _usageProblem = "The folder does not exist.";
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException)
+        {
+            _usage = null;
+            _usageProblem = $"Could not measure the folder: {ex.Message}";
+        }
+        finally
+        {
+            _measuring = false;
+        }
+    }
+
+    private async Task LoadImagesAsync()
+    {
+        if (View.Engine?.Available != true)
+        {
+            return;
+        }
+
+        _loadingImages = true;
+        _imagesProblem = null;
+        try
+        {
+            _images = await RunnerImages.ListAsync(_closed.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            // The page closed.
+        }
+        catch (Exception ex) when (ex is ContainerEngineException or Offloadr.Runner.Supervisor.Processes.ProcessStartException)
+        {
+            _imagesProblem = $"Could not list the runner images: {ex.Message}";
+        }
+        finally
+        {
+            _loadingImages = false;
+        }
+    }
+
+    private async Task RemoveAsync(RunnerImage image)
+    {
+        var confirmed = await Dialogs.ShowMessageBoxAsync(
+            "Remove this runner image?",
+            $"{image.Name} takes up to {ModelsFolderUsage.Format(image.Size)}. If you choose its editor again, the image is downloaded again.",
+            yesText: "Remove",
+            cancelText: "Keep it");
+        if (confirmed != true)
+        {
+            return;
+        }
+
+        _removing = image.Id;
+        try
+        {
+            var result = await RunnerImages.RemoveAsync(image.Id, _closed.Token);
+            switch (result)
+            {
+                case ImageRemoval.Removed:
+                    Snackbar.Add($"Removed {image.Name}.", Severity.Success);
+                    break;
+                case ImageRemoval.Kept:
+                    Snackbar.Add("Docker kept the image: a container or another name still uses it.", Severity.Warning);
+                    break;
+                case ImageRemoval.NotAllowed:
+                    Snackbar.Add("The runner or your editor uses this image now, so it was kept.", Severity.Info);
+                    break;
+                case ImageRemoval.Busy:
+                    Snackbar.Add("The runner is starting or stopping. Try again once it has settled.", Severity.Info);
+                    break;
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            return;
+        }
+        catch (Exception ex) when (ex is ContainerEngineException or Offloadr.Runner.Supervisor.Processes.ProcessStartException)
+        {
+            Snackbar.Add($"Could not remove the image: {ex.Message}", Severity.Error);
+        }
+        finally
+        {
+            _removing = null;
+        }
+
+        await LoadImagesAsync();
+    }
+}

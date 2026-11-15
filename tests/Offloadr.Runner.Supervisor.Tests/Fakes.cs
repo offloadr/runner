@@ -223,6 +223,17 @@ internal sealed class FakeContainerEngine : IContainerEngine
         }
     }
 
+    /// <summary>What ListImagesAsync returns.</summary>
+    public List<StoredImage> StoredImages { get; } = [];
+
+    public Task<IReadOnlyList<StoredImage>> ListImagesAsync(CancellationToken cancellationToken)
+    {
+        lock (_gate)
+        {
+            return Task.FromResult<IReadOnlyList<StoredImage>>([.. StoredImages]);
+        }
+    }
+
     public void AddImage(string image)
     {
         lock (_gate)
