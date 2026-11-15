@@ -22,3 +22,4 @@ The first public release.
 - With a writable second mount of the models folder (`RUNNER_MODEL_LIBRARY_DIR`), downloaded models are saved there instead of inside the container.
 - Forge Neo keeps its models in a cache shared by its sessions.
 - Image signatures (cosign) and build provenance attestations.
+- A runner Offloadr no longer speaks the protocol of stops and says so instead of retrying; the desktop app then downloads the image Offloadr names. Images also carry a `<channel>-p<protocol>` tag, and the bare channel tags move to a new protocol only when Offloadr has switched to it.

@@ -817,7 +817,8 @@ internal static partial class ServiceClientManager
         Func<SessionProcessManager.SessionPaths?, IEnumerable<ModelDownloadRequest>, bool, CancellationToken, Task>? localModelProjectionReconciler,
         TimeSpan localModelsScanInterval,
         RuntimeIdentityRegistry runtimeIdentities,
-        CancellationToken shutdown)
+        CancellationToken shutdown,
+        Action<RegisterRunnerResponse>? onProtocolRejected = null)
     {
         ArgumentNullException.ThrowIfNull(commandClient);
         ArgumentNullException.ThrowIfNull(sessionSink);
@@ -921,7 +922,8 @@ internal static partial class ServiceClientManager
                 minBackoff,
                 maxBackoff,
                 initialStatusApplied,
-                sessionManager.DescribeSealedStorage),
+                sessionManager.DescribeSealedStorage,
+                onProtocolRejected),
             localModels: token => localModelSnapshotProvider is null
                 ? Task.CompletedTask
                 : RunLocalModelSyncLoopAsync(
@@ -972,7 +974,7 @@ internal static partial class ServiceClientManager
             ]).ConfigureAwait(false);
     }
 
-    private static async Task RunRunnerStatusLoopAsync(
+    internal static async Task RunRunnerStatusLoopAsync(
         IRunnerSessionSink sessionSink,
         CancellationToken shutdown,
         string runnerId,
@@ -984,7 +986,8 @@ internal static partial class ServiceClientManager
         TimeSpan minBackoff,
         TimeSpan maxBackoff,
         TaskCompletionSource initialStatusApplied,
-        Func<RunnerSealedStorage>? describeSealedStorage = null)
+        Func<RunnerSealedStorage>? describeSealedStorage = null,
+        Action<RegisterRunnerResponse>? onProtocolRejected = null)
     {
         ArgumentNullException.ThrowIfNull(sessionSink);
 
@@ -1006,6 +1009,15 @@ internal static partial class ServiceClientManager
                     shutdown).ConfigureAwait(false);
 
                 RunnerLog.Info(nameof(ServiceClientManager), $"Status update accepted={response.Accepted} message='{response.Message}' next={response.RefreshSeconds}s");
+                if (RunnerProtocolVersion.IsProtocolRejection(response))
+                {
+                    // Retrying cannot help: this build and Offloadr no longer share a protocol.
+                    RunnerLog.Error(nameof(ServiceClientManager),
+                        $"Offloadr refused this runner's protocol {RunnerProtocolVersion.Current} (Offloadr speaks {response.ServerProtocolVersion}): {response.Message}");
+                    onProtocolRejected?.Invoke(response);
+                    return;
+                }
+
                 if (!response.Accepted)
                 {
                     throw new RunnerSessionRejectedException(response.Message);
@@ -1297,7 +1309,8 @@ internal static partial class ServiceClientManager
                     {
                         RunnerId = runnerId,
                         Version = version,
-                        InstanceId = instanceId
+                        InstanceId = instanceId,
+                        ProtocolVersion = RunnerProtocolVersion.Current,
                     },
                     cancellationToken: shutdown);
                 RunnerLog.Info(nameof(ServiceClientManager), "Runner commands stream (grpc) connected.");
@@ -3932,7 +3945,8 @@ internal static partial class ServiceClientManager
             ActiveSessionReported = true,
             ActiveSessionId = getActiveSessionId(),
             Version = version,
-            Resources = resources
+            Resources = resources,
+            ProtocolVersion = RunnerProtocolVersion.Current,
         };
         request.SupportedEditorTemplates.AddRange(supportedEditorTemplates);
         try

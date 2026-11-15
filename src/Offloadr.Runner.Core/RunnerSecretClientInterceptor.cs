@@ -74,6 +74,11 @@ internal sealed class RunnerSecretClientInterceptor(string runnerSecret) : Inter
             headers.Add(RunnerSecretHeader, _runnerSecret);
         }
 
+        if (!headers.Any(h => string.Equals(h.Key, RunnerProtocolVersion.HeaderName, StringComparison.OrdinalIgnoreCase)))
+        {
+            headers.Add(RunnerProtocolVersion.HeaderName, RunnerProtocolVersion.HeaderValue);
+        }
+
         return options.WithHeaders(headers);
     }
 }

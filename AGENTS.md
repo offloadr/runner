@@ -29,9 +29,9 @@ The Offloadr runner: the agent that executes GPU work for the Offloadr control p
 
 ## Protocol compatibility policy
 
-- The platform is pre-deployment. Coordinated protocol changes update both sides directly; do not add backward-compatibility shims or preserve superseded wire layouts.
+- One current protocol (`RunnerProtocol.RUNNER_PROTOCOL_CURRENT`). Coordinated protocol changes raise it and update both sides directly; an outdated runner is refused and told to update. Do not add backward-compatibility shims or preserve superseded wire layouts. See `docs/contracts-sync.md`.
 - The current Stop acknowledgement uses `command_id = 3`, string `instance_id = 4`, and lifecycle generation, runtime epoch and runtime instance in fields 5–7. The previous layout is intentionally unsupported.
-- Keep all seven shared definitions identical with the control plane and regenerate affected consumers as described in `docs/contracts-sync.md`.
+- Keep all six shared definitions identical with the control plane and regenerate affected consumers as described in `docs/contracts-sync.md`.
 
 ## Agent boundary
 

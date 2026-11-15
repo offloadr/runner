@@ -4,20 +4,29 @@
 
 | File | Contents |
 | --- | --- |
-| `runner/v1/runner_agent.proto` | `RunnerControlService`, `RunnerArtifactService`, `RunnerWorkspaceService` and their messages |
-| `runner/v1/allocator.proto` | runtime telemetry snapshot |
+| `runner/v1/runner_agent.proto` | `RunnerProtocol`, `RunnerControlService`, `RunnerArtifactService`, `RunnerWorkspaceService` and their messages, including the runtime telemetry snapshot |
 | `common/v1/{gpus,models,prompt,gpu_control}.proto` | shared enums and prompt relay messages |
 | `editor_runtime/v1/editor_proxy.proto` | editor artifact metadata and runtime request kinds |
 
 C# is generated at build time by `Grpc.Tools` in `src/Offloadr.Runner.Contracts`, so building needs only the .NET SDK. Lint with `buf lint contracts`.
 
+## Protocol version
+
+`RunnerProtocol.RUNNER_PROTOCOL_CURRENT` in `runner_agent.proto` is the one protocol this build speaks. The agent sends it in `RegisterRunnerRequest.protocol_version`, `CommandStreamRequest.protocol_version` and the `x-offloadr-runner-protocol` header of every call.
+
+The control plane accepts exactly its own version:
+
+- **Registration** answers any other version with `accepted = false`, a `RegistrationRejection` (`RUNNER_OUTDATED` or `SERVER_OUTDATED`), its own `server_protocol_version` and a message. Fields 1–3 of `RegisterRunnerResponse` never change, so every past runner can read the refusal.
+- **Every other call** without the current header is refused with `FAILED_PRECONDITION`. Only `RegisterRunner` and `GetRunnerLaunchPlan` are ungated.
+- **The agent** stops on a protocol rejection instead of retrying: it cleans up its sessions as for a shutdown and exits with code 3. The desktop supervisor then restarts it, which asks Offloadr's launch plan for the image to run and downloads it. Any other refusal is still retried.
+
 ## Changing the protocol
 
 The Offloadr control plane implements the server side of these services, so a contract change has to land on both sides:
 
-1. Change the `.proto` files here and the agent code that uses them in one pull request.
-2. Keep the seven shared protobuf definitions identical on both sides and regenerate every affected consumer. The platform is pre-deployment: change the current protocol directly, without legacy layouts or compatibility shims.
-3. Release the coordinated runner and control-plane changes together. Schema declarations alone do not mean the corresponding behavior is implemented.
+1. Change the `.proto` files here and the agent code that uses them in one pull request, and raise `RUNNER_PROTOCOL_CURRENT`.
+2. Keep the six shared protobuf definitions identical on both sides and regenerate every affected consumer. Change the current protocol directly, without legacy layouts or compatibility shims: an outdated runner is refused and updated, never served.
+3. Release the coordinated runner and control-plane changes together, in an announced window: a protocol change ends running sessions of runners that have not updated yet. [Image publishing](image-publishing.md#protocol-tags) explains how the images follow. Schema declarations alone do not mean the corresponding behavior is implemented.
 
 ## Prompt content availability
 
@@ -50,6 +59,10 @@ Missing or invalid relay identities are dropped. Coordinate the current producer
 and server together; there is no missing-field compatibility fallback. This
 identity neither authenticates a runner nor grants runtime activity authority.
 
+## Launch plan
+
+`RunnerControlService.GetRunnerLaunchPlan` returns, per editor template, the runner image on Offloadr's own protocol (`<channel>-p<N>`, or a digest the operator pinned), and the owner's open editor's template (empty when none is open, so the supervisor's own setting wins). It doesn't touch runner liveness and isn't protocol-gated, so an outdated supervisor still learns which image to run. When the control plane can't be reached, the supervisor falls back to its built-in list of the bare channel tags, which serve the promoted protocol.
+
 ## Pending on the control plane
 
 These declarations are shared, but the server behavior below remains pending. The sealed-transfer rows follow `docs/sealed-envelope.md`, which defines the envelope format. Runtime fences apply only when the control plane supplies them; the command nonce and runner process identity above are always required.
@@ -71,4 +84,3 @@ These declarations are shared, but the server behavior below remains pending. Th
 | `RunnerArtifactUploadMetadata.envelope` (15) | Opens the transfer with the output recipient private key and streams plaintext in memory into independent Vault-backed artifact encryption | Seals every upload of a session with an output recipient, with a fresh data key per upload and retry; omits `sha256` |
 | `AcknowledgeSessionStopRequest.unsaved_artifact_count` (8) | Preserves known losses across processes; complete zero means no unsaved artifacts reported | Counts the artifacts that failed or were still uploading when the session's data was removed |
 | `AcknowledgeSessionStopRequest.unsaved_artifacts_unknown` (9) | Preserves uncertainty while it is set, including when the count is zero | Set when the count is incomplete: the uploads did not stop in time, or an artifact folder could not be read |
-| `RunnerControlService.GetRunnerLaunchPlan` RPC | Returns the runner images per editor template and the owner's selected template, without touching runner liveness | The desktop supervisor uses it to choose the image; until it is implemented the supervisor falls back to its built-in list of published images |
