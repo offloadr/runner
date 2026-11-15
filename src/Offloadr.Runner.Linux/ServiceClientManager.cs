@@ -923,7 +923,13 @@ internal static partial class ServiceClientManager
                 maxBackoff,
                 initialStatusApplied,
                 sessionManager.DescribeSealedStorage,
-                onProtocolRejected),
+                response =>
+                {
+                    // Cancel this lifetime before the required status lane returns;
+                    // the host token's callback would only cancel it later.
+                    _ = lifetime.RequestShutdownAsync();
+                    onProtocolRejected?.Invoke(response);
+                }),
             localModels: token => localModelSnapshotProvider is null
                 ? Task.CompletedTask
                 : RunLocalModelSyncLoopAsync(
