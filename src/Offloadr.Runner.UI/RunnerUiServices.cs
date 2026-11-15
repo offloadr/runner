@@ -28,6 +28,12 @@ public interface IHostActions
     /// <summary>Whether the system uses a dark theme, when the host knows before the page renders; null otherwise.</summary>
     bool? PrefersDark => null;
 
+    /// <summary>Whether the host can save a file where the person chooses.</summary>
+    bool CanSaveFile => false;
+
+    /// <summary>Asks where to save a text file and saves it there; returns where, or null when the person cancels.</summary>
+    Task<string?> SaveTextFileAsync(string suggestedName, string text) => Task.FromResult<string?>(null);
+
     /// <summary>Closes the app to install a downloaded update and starts it again, leaving the runner running.</summary>
     Task RestartToUpdateAsync() => Task.CompletedTask;
 }

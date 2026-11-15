@@ -2,13 +2,25 @@
 @inherits SupervisorComponent
 @inject IJSRuntime JS
 @inject ISnackbar Snackbar
+@inject IHostActions Host
+@inject DiagnosticsExport Diagnostics
 
 <PageTitle>Logs - Offloadr Runner</PageTitle>
 
-<MudStack Row="true" AlignItems="AlignItems.Center" Justify="Justify.SpaceBetween" Class="mb-4">
+<MudStack Row="true" AlignItems="AlignItems.Center" Justify="Justify.SpaceBetween" Wrap="Wrap.Wrap" Class="mb-4">
     <MudText Typo="Typo.h5" HtmlTag="h1">Logs</MudText>
-    <MudButton Variant="Variant.Outlined" StartIcon="@Icons.Material.Filled.ContentCopy" OnClick="CopyAsync">Copy</MudButton>
+    <MudStack Row="true" Spacing="2">
+        <MudButton Variant="Variant.Outlined" StartIcon="@Icons.Material.Filled.ContentCopy" OnClick="CopyAsync">Copy</MudButton>
+        <MudButton Variant="Variant.Outlined" StartIcon="@Icons.Material.Filled.Description" Disabled="_saving" OnClick="SaveDiagnosticsAsync">
+            @(Host.CanSaveFile ? "Save diagnostics" : "Copy diagnostics")
+        </MudButton>
+    </MudStack>
 </MudStack>
+
+<MudText Typo="Typo.body2" Class="mud-text-secondary mb-4">
+    Diagnostics are a text file for Offloadr support: this log, the app's checks of Docker and the GPU, and your settings.
+    They never hold the runner key. Read the file before you send it, since the log can name your models and files.
+</MudText>
 
 <MudPaper Outlined="true" Class="pa-4">
     @if (Supervisor.LogLines.Count == 0)
@@ -22,6 +34,8 @@
 </MudPaper>
 
 @code {
+    private bool _saving;
+
     private async Task CopyAsync()
     {
         try
@@ -32,6 +46,34 @@
         catch (JSException ex)
         {
             Snackbar.Add($"Could not copy: {ex.Message}", Severity.Error);
+        }
+    }
+
+    private async Task SaveDiagnosticsAsync()
+    {
+        _saving = true;
+        try
+        {
+            var (name, text) = Diagnostics.Create();
+            if (!Host.CanSaveFile)
+            {
+                await JS.InvokeVoidAsync("navigator.clipboard.writeText", text);
+                Snackbar.Add("Copied the diagnostics. Read them before you send them.", Severity.Success);
+                return;
+            }
+
+            if (await Host.SaveTextFileAsync(name, text) is { } saved)
+            {
+                Snackbar.Add($"Saved the diagnostics to {saved}. Read the file before you send it.", Severity.Success);
+            }
+        }
+        catch (Exception ex) when (ex is JSException or IOException or UnauthorizedAccessException or System.Runtime.InteropServices.COMException)
+        {
+            Snackbar.Add($"Could not save the diagnostics: {ex.Message}", Severity.Error);
+        }
+        finally
+        {
+            _saving = false;
         }
     }
 }

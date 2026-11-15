@@ -35,6 +35,7 @@ public static class SupervisorServiceCollectionExtensions
         services.TryAddSingleton<ILaunchPlanProvider, ControlPlaneLaunchPlanProvider>();
         services.AddSingleton<RunnerSupervisor>();
         services.AddHostedService(provider => provider.GetRequiredService<RunnerSupervisor>());
+        services.AddSingleton<DiagnosticsExport>();
         return services;
     }
 
