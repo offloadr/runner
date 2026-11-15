@@ -36,6 +36,7 @@ public static class SupervisorServiceCollectionExtensions
         services.AddSingleton<RunnerSupervisor>();
         services.AddHostedService(provider => provider.GetRequiredService<RunnerSupervisor>());
         services.AddSingleton<DiagnosticsExport>();
+        services.AddSingleton<RunnerImages>();
         return services;
     }
 

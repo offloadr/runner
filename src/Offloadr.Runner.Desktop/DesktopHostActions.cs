@@ -40,6 +40,19 @@ public sealed class DesktopHostActions(MainPage page) : IHostActions
 
     public Task<string?> PickFolderAsync() => MainThread.InvokeOnMainThreadAsync(PlatformFiles.PickFolderAsync);
 
+    public bool CanOpenFolder => true;
+
+    public Task OpenFolderAsync(string path)
+    {
+        // Only a folder that exists, and as one argument: Explorer then shows it and runs nothing.
+        if (Path.IsPathFullyQualified(path) && Directory.Exists(path))
+        {
+            using var explorer = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("explorer.exe") { ArgumentList = { path }, UseShellExecute = false });
+        }
+
+        return Task.CompletedTask;
+    }
+
     public bool CanSaveFile => true;
 
     public Task<string?> SaveTextFileAsync(string suggestedName, string text)

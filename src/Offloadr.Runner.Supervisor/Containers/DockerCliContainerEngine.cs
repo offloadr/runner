@@ -149,6 +149,40 @@ public sealed class DockerCliContainerEngine(IProcessRunner processes, Func<stri
         return IsImageNotFound(result) ? null : throw new ContainerEngineException($"Could not look up {image}.", result.StandardError);
     }
 
+    /// <summary>How many images one <c>image inspect</c> looks up, keeping its command line well short of Windows' limit.</summary>
+    internal const int ImagesPerInspect = 100;
+
+    public async Task<IReadOnlyList<StoredImage>> ListImagesAsync(CancellationToken cancellationToken)
+    {
+        var engine = Require();
+        var listed = await RunQuickAsync(engine, ["image", "ls", "--quiet", "--no-trunc"], cancellationToken).ConfigureAwait(false);
+        if (!listed.Succeeded)
+        {
+            throw new ContainerEngineException("Could not list the images.", listed.StandardError);
+        }
+
+        var ids = listed.StandardOutput
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        var images = new List<StoredImage>();
+        foreach (var chunk in ids.Chunk(ImagesPerInspect))
+        {
+            var result = await RunQuickAsync(engine, ["image", "inspect", .. chunk], cancellationToken).ConfigureAwait(false);
+            var found = DockerCliJson.Images(result.StandardOutput);
+
+            // An image removed since the listing fails the command but leaves the others' JSON.
+            if (!result.Succeeded && !IsImageNotFound(result))
+            {
+                throw new ContainerEngineException("Could not look up the images.", result.StandardError);
+            }
+
+            images.AddRange(found);
+        }
+
+        return images;
+    }
+
     public async Task<bool> RemoveImageAsync(string reference, CancellationToken cancellationToken)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(reference);

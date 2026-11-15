@@ -299,6 +299,42 @@ internal static class DockerCliJson
         return new ImageInfo(String(image, "Id") ?? string.Empty, digest, tags);
     }
 
+    /// <summary>The images of <c>image inspect</c> with several images: names, digests and size in bytes.</summary>
+    public static IReadOnlyList<StoredImage> Images(string json)
+    {
+        using var document = Parse(json);
+        if (document?.RootElement is not { ValueKind: JsonValueKind.Array } root)
+        {
+            return [];
+        }
+
+        var images = new List<StoredImage>();
+        foreach (var image in root.EnumerateArray())
+        {
+            if (image.ValueKind != JsonValueKind.Object || String(image, "Id") is not { Length: > 0 } id)
+            {
+                continue;
+            }
+
+            var size = image.TryGetProperty("Size", out var sizeElement) && sizeElement.TryGetInt64(out var bytes) ? bytes : 0;
+            var created = String(image, "Created") is { } text && DateTimeOffset.TryParse(text, System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.AssumeUniversal, out var time)
+                ? time
+                : (DateTimeOffset?)null;
+            images.Add(new StoredImage(id, Strings(image, "RepoTags"), Strings(image, "RepoDigests"), size, created));
+        }
+
+        return images;
+    }
+
+    private static string[] Strings(JsonElement element, string name)
+        => element.TryGetProperty(name, out var values) && values.ValueKind == JsonValueKind.Array
+            ? values.EnumerateArray()
+                .Where(static value => value.ValueKind == JsonValueKind.String)
+                .Select(static value => value.GetString()!)
+                .Where(static value => value.Length > 0 && !value.EndsWith("<none>", StringComparison.Ordinal))
+                .ToArray()
+            : [];
+
     private static JsonDocument? Parse(string json)
     {
         if (string.IsNullOrWhiteSpace(json))

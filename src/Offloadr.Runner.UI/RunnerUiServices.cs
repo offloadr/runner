@@ -28,6 +28,12 @@ public interface IHostActions
     /// <summary>Whether the system uses a dark theme, when the host knows before the page renders; null otherwise.</summary>
     bool? PrefersDark => null;
 
+    /// <summary>Whether the host can show a folder in the file manager.</summary>
+    bool CanOpenFolder => false;
+
+    /// <summary>Shows <paramref name="path"/> in the file manager; does nothing for a folder that does not exist.</summary>
+    Task OpenFolderAsync(string path) => Task.CompletedTask;
+
     /// <summary>Whether the host can save a file where the person chooses.</summary>
     bool CanSaveFile => false;
 
