@@ -1,0 +1,29 @@
+# A personal runner with Docker Compose. Put a .env file beside this one:
+#
+#   RUNNER_SECRET=your-runner-key
+#   MODELS_DIR=/srv/models
+#
+# then run `docker compose up -d`. See docs/hosting.md for every setting.
+services:
+  runner:
+    image: ghcr.io/offloadr/runner-comfyui:latest
+    pull_policy: always
+    restart: unless-stopped
+    environment:
+      RUNNER_SECRET: ${RUNNER_SECRET:?Set RUNNER_SECRET in .env}
+      RUNNER_LOCAL_MODELS_DIR: /local
+      # Downloads are saved in the models folder, through its second, writable mount below.
+      RUNNER_MODEL_DOWNLOADS: "on"
+      RUNNER_MODEL_LIBRARY_DIR: /var/lib/offloadr-library/models
+    volumes:
+      # Sessions see the folder read-only.
+      - ${MODELS_DIR:?Set MODELS_DIR in .env}:/local:ro
+      # The same folder again, writable, for downloads. Its parent stays the container's own.
+      - ${MODELS_DIR}:/var/lib/offloadr-library/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

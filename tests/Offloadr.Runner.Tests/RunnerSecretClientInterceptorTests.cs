@@ -21,7 +21,7 @@ public class RunnerSecretClientInterceptorTests
 
         var context = new ClientInterceptorContext<RegisterRunnerRequest, RegisterRunnerResponse>(
             method,
-            "https://api.offloadr.app",
+            "https://control-plane.example",
             new CallOptions());
 
         var call = interceptor.AsyncUnaryCall(

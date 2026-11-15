@@ -1,12 +1,41 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+<svg width="150" height="150" viewBox="-2 -1 150 150" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="offloadr.studio icon">
   <defs>
-    <linearGradient id="ribbon" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#1753d7"/>
-      <stop offset="1" stop-color="#7a00e2"/>
+    <linearGradient id="frameGradient" x1="30" y1="18" x2="125" y2="126" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#C8CDD5" />
+      <stop offset="1" stop-color="#B6BDC8" />
     </linearGradient>
+    <linearGradient id="blueRibbon" x1="24" y1="110" x2="118" y2="38" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0B338B" />
+      <stop offset="0.48" stop-color="#1753D7" />
+      <stop offset="1" stop-color="#3F77ED" />
+    </linearGradient>
+    <linearGradient id="purpleRibbon" x1="34" y1="130" x2="126" y2="48" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#47019A" />
+      <stop offset="0.5" stop-color="#7A00E2" />
+      <stop offset="1" stop-color="#9C3FFF" />
+    </linearGradient>
+    <radialGradient id="dotGradient" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(111.5 24.5) rotate(126) scale(37)">
+      <stop offset="0" stop-color="#3F77ED" />
+      <stop offset="0.45" stop-color="#1753D7" />
+      <stop offset="1" stop-color="#7A00E2" />
+    </radialGradient>
+    <clipPath id="iconClip">
+      <rect x="18" y="18" width="113" height="116" rx="27" />
+    </clipPath>
+    <mask id="orbitMask" maskUnits="userSpaceOnUse" x="0" y="0" width="150" height="150">
+      <rect width="150" height="150" fill="white" />
+      <circle cx="112.5" cy="34.5" r="28" fill="black" />
+    </mask>
   </defs>
-  <rect x="4" y="4" width="56" height="56" rx="12" fill="url(#ribbon)"/>
-  <rect x="18" y="18" width="28" height="28" rx="4" fill="none" stroke="#ffffff" stroke-width="4"/>
-  <rect x="26" y="26" width="12" height="12" rx="2" fill="#ffffff"/>
-  <path d="M24 10v8M32 10v8M40 10v8M24 46v8M32 46v8M40 46v8M10 24h8M10 32h8M10 40h8M46 24h8M46 32h8M46 40h8" stroke="#ffffff" stroke-width="3" stroke-linecap="round"/>
+
+  <g mask="url(#orbitMask)">
+    <g clip-path="url(#iconClip)">
+      <path d="M18 92C50 86 78 71 98 54Q101 52 104 56Q104 58 102 60C84 85 60 101 23 111C20 105 18 98 18 92Z" fill="url(#blueRibbon)" />
+      <path d="M11 119C15 120 19 120 22 119C58 112 91 88 112 49L117 55C94 93 77 123 45 132C35 131 24 129 11 119Z" fill="url(#purpleRibbon)" />
+    </g>
+
+    <path d="M38 20H100" stroke="url(#frameGradient)" stroke-width="11" stroke-linecap="round" />
+    <path d="M38 20C27.507 20 19 28.507 19 39V109C19 119.493 27.507 128 38 128H108C118.493 128 127 119.493 127 109V55" stroke="url(#frameGradient)" stroke-width="11" stroke-linecap="round" stroke-linejoin="round" />
+  </g>
+  <circle cx="112.5" cy="34.5" r="20" fill="url(#dotGradient)" />
 </svg>

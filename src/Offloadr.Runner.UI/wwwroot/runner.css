@@ -39,9 +39,10 @@
     font-size: 0.85rem;
 }
 
-/* Blazor moves focus to the page heading after navigation. Keyboard users keep the ring that shows
-   where they are; it is hidden only when the browser judges it not needed, as after a mouse click. */
-h1:focus:not(:focus-visible) {
+/* Blazor moves focus to the page heading after navigation, so screen readers announce the new page and
+   Tab starts from there. A heading is not a control, so it gets no ring: before the first click or key
+   press the browser would otherwise draw one around the heading the app opens on. */
+.runner-shell h1:focus {
     outline: none;
 }
 
@@ -98,11 +99,6 @@ h1:focus:not(:focus-visible) {
     border-color: transparent;
 }
 
-.runner-setup {
-    max-width: 52rem;
-    margin: 0 auto;
-}
-
 /* Read by screen readers, not shown: the state an icon or colour stands for. */
 .runner-visually-hidden {
     position: absolute;
@@ -120,4 +116,9 @@ h1:focus:not(:focus-visible) {
     width: 48px;
     height: 48px;
     display: block;
+}
+
+/* Room for the scrollbar on every page, so content keeps its width between a short page and a long one. */
+html {
+    scrollbar-gutter: stable;
 }

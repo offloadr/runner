@@ -633,7 +633,7 @@ public partial class RunnerStartupValidatorTests
         string tempRoot,
         string ariaBinaryPath,
         string runnerSecret = "0123456789abcdef0123456789abcdef0123456789ab",
-        string offloadrApiUrl = "https://api.offloadr.app",
+        string offloadrApiUrl = "https://control-plane.example",
         string? localModelsDirectory = null,
         string? runnerId = null,
         string? seedVirtualEnvPath = null,
