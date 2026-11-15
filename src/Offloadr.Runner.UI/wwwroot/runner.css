@@ -115,3 +115,9 @@ h1:focus:not(:focus-visible) {
     white-space: nowrap;
     border: 0;
 }
+
+.runner-about-logo {
+    width: 48px;
+    height: 48px;
+    display: block;
+}

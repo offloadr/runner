@@ -1,9 +1,8 @@
 @page "/logs"
 @inherits SupervisorComponent
+@implements IAsyncDisposable
 @inject IJSRuntime JS
 @inject ISnackbar Snackbar
-@inject IHostActions Host
-@inject DiagnosticsExport Diagnostics
 
 <PageTitle>Logs - Offloadr Runner</PageTitle>
 
@@ -11,30 +10,60 @@
     <MudText Typo="Typo.h5" HtmlTag="h1">Logs</MudText>
     <MudStack Row="true" Spacing="2">
         <MudButton Variant="Variant.Outlined" StartIcon="@Icons.Material.Filled.ContentCopy" OnClick="CopyAsync">Copy</MudButton>
-        <MudButton Variant="Variant.Outlined" StartIcon="@Icons.Material.Filled.Description" Disabled="_saving" OnClick="SaveDiagnosticsAsync">
-            @(Host.CanSaveFile ? "Save diagnostics" : "Copy diagnostics")
-        </MudButton>
+        <SaveDiagnosticsButton />
     </MudStack>
 </MudStack>
 
 <MudText Typo="Typo.body2" Class="mud-text-secondary mb-4">
+    Image downloads and the runner's output since this app started. The log follows new lines while you are at the bottom; scroll up to stop it.
     Diagnostics are a text file for Offloadr support: this log, the app's checks of Docker and the GPU, and your settings.
     They never hold the runner key. Read the file before you send it, since the log can name your models and files.
 </MudText>
 
 <MudPaper Outlined="true" Class="pa-4">
-    @if (Supervisor.LogLines.Count == 0)
+    @{
+        // One snapshot per render: lines arrive on another thread, so reading the count twice could disagree.
+        var lines = Supervisor.LogLines;
+        _logRendered = lines.Count > 0;
+    }
+    @if (!_logRendered)
     {
         <MudText Class="mud-text-secondary">Image downloads and runner output appear here once the runner starts.</MudText>
     }
     else
     {
-        <pre class="runner-log runner-log-full">@string.Join('\n', Supervisor.LogLines)</pre>
+        <pre @ref="_log" class="runner-log runner-log-full" tabindex="0" aria-label="Runner log">@string.Join('\n', lines)</pre>
     }
 </MudPaper>
 
 @code {
-    private bool _saving;
+    private ElementReference _log;
+    private bool _logRendered;
+    private IJSObjectReference? _module;
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        // What this render drew, not the live count: a first line may have arrived since, with no log element yet.
+        if (!_logRendered)
+        {
+            return;
+        }
+
+        try
+        {
+            _module ??= await JS.InvokeAsync<IJSObjectReference>("import", "./_content/Offloadr.Runner.UI/logs.js");
+            // Does nothing for a log it already follows; picks up the log once its first line appears.
+            await _module.InvokeVoidAsync("follow", _log);
+        }
+        catch (JSDisconnectedException)
+        {
+            // The window closed.
+        }
+        catch (JSException)
+        {
+            // Following new lines is a convenience; the log still shows without it.
+        }
+    }
 
     private async Task CopyAsync()
     {
@@ -49,31 +78,20 @@
         }
     }
 
-    private async Task SaveDiagnosticsAsync()
+    public async ValueTask DisposeAsync()
     {
-        _saving = true;
-        try
+        // Blazor calls only DisposeAsync on a component that has both; the base's Dispose stops its updates.
+        Dispose();
+        if (_module is not null)
         {
-            var (name, text) = Diagnostics.Create();
-            if (!Host.CanSaveFile)
+            try
             {
-                await JS.InvokeVoidAsync("navigator.clipboard.writeText", text);
-                Snackbar.Add("Copied the diagnostics. Read them before you send them.", Severity.Success);
-                return;
+                await _module.DisposeAsync();
             }
-
-            if (await Host.SaveTextFileAsync(name, text) is { } saved)
+            catch (JSDisconnectedException)
             {
-                Snackbar.Add($"Saved the diagnostics to {saved}. Read the file before you send it.", Severity.Success);
+                // The window closed.
             }
-        }
-        catch (Exception ex) when (ex is JSException or IOException or UnauthorizedAccessException or System.Runtime.InteropServices.COMException)
-        {
-            Snackbar.Add($"Could not save the diagnostics: {ex.Message}", Severity.Error);
-        }
-        finally
-        {
-            _saving = false;
         }
     }
 }

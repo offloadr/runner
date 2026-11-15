@@ -42,7 +42,24 @@ public enum AppUpdateState
     Failed,
 }
 
-public sealed record AppUpdateStatus(AppUpdateState State, Version Current, Version? Available = null, int Percent = 0, string? Problem = null);
+public sealed record AppUpdateStatus(AppUpdateState State, Version Current, Version? Available = null, int Percent = 0, string? Problem = null)
+{
+    /// <summary>One sentence on where updates stand, for the About page.</summary>
+    public string Summary => State switch
+    {
+        AppUpdateState.NotInstalled => "This copy was not installed with the installer, so it does not update itself.",
+        AppUpdateState.Current => "This is the latest version.",
+        AppUpdateState.Checking => "Checking for updates…",
+        AppUpdateState.Downloading when Available is { } version => $"Downloading version {version.ToString(3)}… {Percent}%",
+        AppUpdateState.Ready when Available is { } version =>
+            $"Version {version.ToString(3)} is ready. It installs when you restart the app from the banner, or when you quit it.",
+        AppUpdateState.Failed => Problem ?? "Could not check for updates. The app tries again later.",
+        _ => "Looking for updates shortly.",
+    };
+
+    /// <summary>Whether a check can be asked for now: not while one runs, nor once a release waits to install.</summary>
+    public bool CanCheck => State is AppUpdateState.Current or AppUpdateState.Failed;
+}
 
 /// <summary>
 /// Keeps the installed app up to date: shortly after start and then daily it looks for a newer

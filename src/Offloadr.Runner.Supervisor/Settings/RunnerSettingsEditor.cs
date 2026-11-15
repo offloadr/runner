@@ -11,7 +11,25 @@ public sealed record SettingsForm(
     string? ContainerEngineExecutable,
     bool AutoStart,
     bool DownloadModels = false,
-    bool KeepAwakeDuringSessions = true);
+    bool KeepAwakeDuringSessions = true)
+{
+    /// <summary>
+    /// True when saving this form saves the same settings as <paramref name="other"/>: a field left blank
+    /// is the same as one never filled in, and surrounding spaces do not count.
+    /// </summary>
+    public bool SameAs(SettingsForm other) => Normalized() == other.Normalized();
+
+    private SettingsForm Normalized() => this with
+    {
+        RunnerKey = Text(RunnerKey),
+        SelectedEditorTemplate = Text(SelectedEditorTemplate),
+        LocalModelsDirectory = Text(LocalModelsDirectory),
+        OffloadrApiOrigin = Text(OffloadrApiOrigin) ?? RunnerSettings.DefaultOffloadrApiOrigin,
+        ContainerEngineExecutable = Text(ContainerEngineExecutable),
+    };
+
+    private static string? Text(string? value) => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+}
 
 /// <param name="Saved">False when the settings could not be written; <paramref name="Error"/> says why.</param>
 /// <param name="Problems">What is still wrong with saved settings; the runner does not start until it is fixed.</param>
