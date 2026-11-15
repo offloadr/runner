@@ -65,6 +65,9 @@ public enum FaultAction
     StartEngine,
     OpenSettings,
     SetUpGpu,
+
+    /// <summary>No NVIDIA GPU or driver was found on this computer.</summary>
+    InstallGpuDriver,
     FreeDiskSpace,
     CheckConnection,
 }

@@ -44,3 +44,74 @@
 h1:focus:not(:focus-visible) {
     outline: none;
 }
+
+.runner-check-body {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+.runner-details > summary {
+    cursor: pointer;
+    color: var(--color-text-muted);
+    font-size: 0.85rem;
+}
+
+.runner-details > summary:hover {
+    color: var(--color-text);
+}
+
+.runner-facts th {
+    font-weight: 500;
+    color: var(--color-text-muted);
+    white-space: nowrap;
+}
+
+.runner-facts td.runner-check-detail {
+    word-break: break-all;
+}
+
+/* Setup's numbered steps: blue while open, green once done, red when the step needs attention. */
+.runner-step-number {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    flex: 0 0 28px;
+    border-radius: var(--radius-pill);
+    font-weight: 650;
+    font-size: 0.9rem;
+    color: var(--color-action);
+    background: var(--surface-selected);
+    border: 1px solid var(--border-subtle);
+}
+
+.runner-step-number.done {
+    color: #ffffff;
+    background: var(--color-success);
+    border-color: transparent;
+}
+
+.runner-step-number.attention {
+    color: #ffffff;
+    background: var(--color-danger);
+    border-color: transparent;
+}
+
+.runner-setup {
+    max-width: 52rem;
+    margin: 0 auto;
+}
+
+/* Read by screen readers, not shown: the state an icon or colour stands for. */
+.runner-visually-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+}

@@ -1,0 +1,57 @@
+@* One line of the environment checklist: passed, failed, or not run yet, with its fix. *@
+<MudStack Row="true" AlignItems="AlignItems.Start" Spacing="2" Class="runner-check">
+    <MudIcon Icon="@Icon" Color="@IconColor" Size="Size.Small" Class="mt-1" aria-hidden="true" />
+    <MudStack Spacing="1" Class="runner-check-body">
+        <MudStack Row="true" AlignItems="AlignItems.Center" Justify="Justify.SpaceBetween" Wrap="Wrap.Wrap" Spacing="2">
+            <MudText Typo="Typo.body1">
+                @Check.Title<span class="runner-visually-hidden">: @StatusText</span>
+            </MudText>
+            @ChildContent
+        </MudStack>
+        <div class="runner-check-detail">@Check.Detail</div>
+        @if (Check.Ok == false && Check.Fix != FaultAction.None)
+        {
+            <div><FixButton Action="Check.Fix" OnOpenSettings="OnOpenSettings" /></div>
+        }
+        @if (!string.IsNullOrWhiteSpace(Check.Technical))
+        {
+            <details class="runner-details">
+                <summary>Details</summary>
+                <pre class="runner-log runner-fault-detail mt-1">@Check.Technical</pre>
+            </details>
+        }
+    </MudStack>
+</MudStack>
+
+@code {
+    [Parameter, EditorRequired]
+    public EnvironmentCheck Check { get; set; } = null!;
+
+    /// <summary>Extra controls beside the title, such as a button that runs the check.</summary>
+    [Parameter]
+    public RenderFragment? ChildContent { get; set; }
+
+    [Parameter]
+    public EventCallback OnOpenSettings { get; set; }
+
+    private string StatusText => Check.Ok switch
+    {
+        true => "passed",
+        false => "needs attention",
+        null => "not checked yet",
+    };
+
+    private string Icon => Check.Ok switch
+    {
+        true => Icons.Material.Filled.CheckCircle,
+        false => Icons.Material.Filled.Cancel,
+        null => Icons.Material.Outlined.Circle,
+    };
+
+    private Color IconColor => Check.Ok switch
+    {
+        true => Color.Success,
+        false => Color.Error,
+        null => Color.Default,
+    };
+}

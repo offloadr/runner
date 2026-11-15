@@ -52,6 +52,27 @@ public sealed record RunnerSettings
 
     public const string MissingKeyProblem = "Add your personal runner key. Create one under Settings in the Offloadr web app.";
 
+    /// <summary>What is wrong with the runner key, or null when it can be used.</summary>
+    public string? RunnerKeyProblem
+    {
+        get
+        {
+            if (!HasRunnerKey)
+            {
+                return MissingKeyProblem;
+            }
+
+            var key = RunnerKey!.Trim();
+            if (key.Any(char.IsWhiteSpace))
+            {
+                return "The runner key cannot contain spaces.";
+            }
+
+            // The agent refuses shorter keys at startup, so the container would only exit and restart.
+            return key.Length < MinimumRunnerKeyLength ? "The runner key is too short. Copy the whole key from the Offloadr web app." : null;
+        }
+    }
+
     /// <summary>Problems that prevent the runner from starting with these settings, in display order.</summary>
     public IReadOnlyList<string> Validate(Func<string, bool>? directoryExists = null)
     {
@@ -62,18 +83,9 @@ public sealed record RunnerSettings
             errors.Add("The Offloadr address must be an https:// origin, such as https://offloadr.studio.");
         }
 
-        if (!HasRunnerKey)
+        if (RunnerKeyProblem is { } keyProblem)
         {
-            errors.Add(MissingKeyProblem);
-        }
-        else if (RunnerKey!.Trim().Any(char.IsWhiteSpace))
-        {
-            errors.Add("The runner key cannot contain spaces.");
-        }
-        else if (RunnerKey.Trim().Length < MinimumRunnerKeyLength)
-        {
-            // The agent refuses shorter keys at startup, so the container would only exit and restart.
-            errors.Add("The runner key is too short. Copy the whole key from the Offloadr web app.");
+            errors.Add(keyProblem);
         }
 
         if (!string.IsNullOrWhiteSpace(LocalModelsDirectory) && LocalModelsDirectory.IndexOf(':', HasDrive(LocalModelsDirectory) ? 2 : 0) >= 0)

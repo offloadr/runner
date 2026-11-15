@@ -1,0 +1,35 @@
+@* Why the runner needs attention, what to do about it, and the engine's own words folded away. *@
+<MudAlert Severity="@(Waiting ? Severity.Warning : Severity.Error)" Class="@Class">
+    <MudStack Spacing="2">
+        <div>
+            <MudText Typo="Typo.subtitle2">@Fault.Title</MudText>
+            <MudText Typo="Typo.body2">@Fault.Message</MudText>
+        </div>
+        @if (Fault.Action != FaultAction.None)
+        {
+            <div><FixButton Action="Fault.Action" OnOpenSettings="OnOpenSettings" /></div>
+        }
+        @if (Fault.Detail is { } detail)
+        {
+            <details class="runner-details">
+                <summary>Details</summary>
+                <pre class="runner-log runner-fault-detail mt-1">@detail</pre>
+            </details>
+        }
+    </MudStack>
+</MudAlert>
+
+@code {
+    [Parameter, EditorRequired]
+    public SupervisorFault Fault { get; set; } = null!;
+
+    /// <summary>True while an automatic restart waits: a warning, not an error that stopped the runner.</summary>
+    [Parameter]
+    public bool Waiting { get; set; }
+
+    [Parameter]
+    public EventCallback OnOpenSettings { get; set; }
+
+    [Parameter]
+    public string? Class { get; set; }
+}

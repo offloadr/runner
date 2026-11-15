@@ -1,0 +1,209 @@
+@page "/setup"
+@inherits SupervisorComponent
+@inject RunnerSettingsEditor SettingsEditor
+@inject IRunnerSettingsStore SettingsStore
+@inject IHostActions Host
+@inject NavigationManager Navigation
+@inject ISnackbar Snackbar
+
+<PageTitle>Set up - Offloadr Runner</PageTitle>
+
+<MudStack Spacing="4" Class="runner-setup">
+    <div>
+        <MudText Typo="Typo.h5" HtmlTag="h1">Set up your GPU for Offloadr</MudText>
+        <MudText Typo="Typo.body1" Class="mud-text-secondary mt-1">
+            The runner lets the Offloadr editor in your browser use the NVIDIA GPU in this computer. It only makes outbound connections.
+        </MudText>
+    </div>
+
+    <MudPaper Outlined="true" Class="pa-5">
+        <SetupStepHeading Number="1" Title="Check this computer" Done="ComputerReady" />
+        <MudStack Spacing="3" Class="mt-3">
+            <CheckRow Check="EnvironmentChecks.Docker(View)" />
+            <CheckRow Check="EnvironmentChecks.HostGpu(View)" />
+            <div>
+                <MudButton Size="Size.Small" Variant="Variant.Text" StartIcon="@Icons.Material.Filled.Refresh"
+                           Disabled="@View.IsActive" OnClick="Supervisor.RequestRefresh">Check again</MudButton>
+            </div>
+        </MudStack>
+    </MudPaper>
+
+    <MudPaper Outlined="true" Class="pa-5">
+        <SetupStepHeading Number="2" Title="Add your runner key" Done="KeyEntered" />
+        <MudText Typo="Typo.body2" Class="mud-text-secondary mt-2">
+            In the Offloadr web app, open Settings and create a personal runner key, then paste it here. It is stored encrypted on this computer.
+        </MudText>
+        <MudStack Spacing="2" Class="mt-3">
+            <MudTextField T="string" @bind-Value="_runnerKey" @bind-Value:after="ClearProblems" Label="Runner key" Variant="Variant.Outlined"
+                          InputType="@(_showKey ? InputType.Text : InputType.Password)" Immediate="true" @ref="_keyField"
+                          Adornment="Adornment.End" AdornmentIcon="@(_showKey ? Icons.Material.Filled.VisibilityOff : Icons.Material.Filled.Visibility)"
+                          AdornmentAriaLabel="Show or hide the key" OnAdornmentClick="@(() => _showKey = !_showKey)" />
+            <div>
+                <MudButton Size="Size.Small" Variant="Variant.Text" EndIcon="@Icons.Material.Filled.OpenInNew"
+                           OnClick="OpenOffloadrAsync">Open Offloadr</MudButton>
+            </div>
+        </MudStack>
+    </MudPaper>
+
+    <MudPaper Outlined="true" Class="pa-5">
+        <SetupStepHeading Number="3" Title="Choose your models" Done="@null" />
+        <MudText Typo="Typo.body2" Class="mud-text-secondary mt-2">
+            Point the runner at the folder with your model files, and it uses the ones that match what a workflow needs. You can skip this and add a folder later in Settings.
+        </MudText>
+        <MudStack Spacing="3" Class="mt-3">
+            <MudStack Row="true" AlignItems="AlignItems.Start" Spacing="2">
+                <MudTextField T="string" @bind-Value="_modelsDirectory" @bind-Value:after="ModelsFolderChanged" Label="Models folder (optional)"
+                              Variant="Variant.Outlined" Clearable="true" />
+                @if (Host.CanPickFolder)
+                {
+                    <MudButton Variant="Variant.Outlined" Class="mt-2" OnClick="PickModelsFolderAsync">Browse</MudButton>
+                }
+            </MudStack>
+            <MudRadioGroup T="bool" @bind-Value="_downloadModels" @bind-Value:after="ClearProblems">
+                <MudStack Spacing="1">
+                    <MudRadio T="bool" Value="false" Color="Color.Primary">Use only the models I already have</MudRadio>
+                    <MudRadio T="bool" Value="true" Color="Color.Primary" Disabled="@string.IsNullOrWhiteSpace(_modelsDirectory)">
+                        Also download the models a workflow needs
+                    </MudRadio>
+                </MudStack>
+            </MudRadioGroup>
+            <MudText Typo="Typo.caption" Class="mud-text-secondary">
+                @if (string.IsNullOrWhiteSpace(_modelsDirectory))
+                {
+                    <text>Downloads need a models folder: they are saved there, where you can see them, delete them and use them in other apps.</text>
+                }
+                else
+                {
+                    <text>Downloaded models are saved in your models folder and are often several gigabytes each. You can change this later in Settings.</text>
+                }
+            </MudText>
+        </MudStack>
+    </MudPaper>
+
+    <MudPaper Outlined="true" Class="pa-5">
+        <SetupStepHeading Number="4" Title="Start the runner" Done="RunnerReady" />
+        <MudText Typo="Typo.body2" Class="mud-text-secondary mt-2">
+            The first start downloads the runner image for your editor, which is several gigabytes and can take a while.
+        </MudText>
+        <MudStack Spacing="3" Class="mt-3">
+            <MudSwitch T="bool" @bind-Value="_autoStart" Color="Color.Primary" Label="Start the runner whenever this app opens" />
+            @if (_problems.Count > 0)
+            {
+                <MudAlert Severity="Severity.Warning" Dense="true">
+                    @foreach (var problem in _problems)
+                    {
+                        <div>@problem</div>
+                    }
+                </MudAlert>
+            }
+            <StatusHero OnStart="SaveAndStartAsync" StartLabel="Save and start" IsPageHeading="false" OnOpenSettings="FocusKeyAsync" />
+            @if (View.State is SupervisorState.Running or SupervisorState.RestartPending)
+            {
+                <CheckRow Check="EnvironmentChecks.GpuInContainers(View)" />
+                <MudAlert Severity="Severity.Success">
+                    Your GPU is ready. Open the editor in Offloadr and it runs here; this app can stay in the notification area.
+                </MudAlert>
+                <div>
+                    <MudButton Variant="Variant.Filled" Color="Color.Primary" OnClick="@(() => Navigation.NavigateTo(""))">Done</MudButton>
+                </div>
+            }
+        </MudStack>
+    </MudPaper>
+
+    @if (!(View.State is SupervisorState.Running or SupervisorState.RestartPending))
+    {
+        <div>
+            <MudButton Variant="Variant.Text" OnClick="@(() => Navigation.NavigateTo(""))">Skip for now</MudButton>
+        </div>
+    }
+</MudStack>
+
+@code {
+    private string? _runnerKey;
+    private string? _modelsDirectory;
+    private bool _downloadModels;
+    private bool _autoStart;
+    private bool _showKey;
+    private MudTextField<string>? _keyField;
+    private IReadOnlyList<string> _problems = [];
+
+    private bool? ComputerReady => EnvironmentChecks.ComputerReady(View);
+
+    // Marked wrong only once Save and start found it wrong, not while the person is still typing.
+    private bool? KeyEntered => _problems.Count > 0 && new RunnerSettings { RunnerKey = _runnerKey }.RunnerKeyProblem is not null
+        ? false
+        : string.IsNullOrWhiteSpace(_runnerKey) ? null : true;
+
+    private bool? RunnerReady => View.State switch
+    {
+        SupervisorState.Running or SupervisorState.RestartPending => true,
+        SupervisorState.Faulted => false,
+        _ => _problems.Count > 0 ? false : null,
+    };
+
+    protected override void OnInitialized()
+    {
+        base.OnInitialized();
+        var form = SettingsEditor.Load();
+        _runnerKey = form.RunnerKey;
+        _modelsDirectory = form.LocalModelsDirectory;
+        _downloadModels = form.DownloadModels;
+        // Most people want their GPU available whenever the app runs; a first setup suggests it.
+        _autoStart = form.AutoStart || !SettingsStore.Current.HasRunnerKey;
+    }
+
+    private async Task SaveAndStartAsync()
+    {
+        var form = SettingsEditor.Load() with
+        {
+            RunnerKey = _runnerKey?.Trim(),
+            LocalModelsDirectory = string.IsNullOrWhiteSpace(_modelsDirectory) ? null : _modelsDirectory.Trim(),
+            DownloadModels = _downloadModels && !string.IsNullOrWhiteSpace(_modelsDirectory),
+            AutoStart = _autoStart,
+        };
+        var result = await SettingsEditor.SaveAsync(form);
+        _problems = result.Problems;
+        if (!result.Saved)
+        {
+            Snackbar.Add(result.Error ?? "Could not save the settings.", Severity.Error);
+            return;
+        }
+
+        if (_problems.Count == 0)
+        {
+            Supervisor.RequestStart();
+        }
+    }
+
+    private void ClearProblems() => _problems = [];
+
+    private void ModelsFolderChanged()
+    {
+        if (string.IsNullOrWhiteSpace(_modelsDirectory))
+        {
+            _downloadModels = false;
+        }
+
+        ClearProblems();
+    }
+
+    private async Task PickModelsFolderAsync()
+    {
+        var folder = await Host.PickFolderAsync();
+        if (!string.IsNullOrEmpty(folder))
+        {
+            _modelsDirectory = folder;
+            ClearProblems();
+        }
+    }
+
+    private async Task FocusKeyAsync()
+    {
+        if (_keyField is not null)
+        {
+            await _keyField.FocusAsync();
+        }
+    }
+
+    private Task OpenOffloadrAsync() => Host.OpenExternalAsync(SettingsStore.Current.OffloadrApiOrigin);
+}

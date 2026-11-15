@@ -1,0 +1,110 @@
+@inherits SupervisorComponent
+
+@* The runner's state at a glance: what it is doing, the one button that changes it, progress and problems. *@
+<MudStack Row="true" AlignItems="AlignItems.Center" Justify="Justify.SpaceBetween" Wrap="Wrap.Wrap" Spacing="3">
+    <MudStack Row="true" AlignItems="AlignItems.Center" Spacing="3">
+        <MudIcon Icon="@StateIcon" Color="@StateColor" Size="Size.Large" aria-hidden="true" />
+        <div>
+            <MudText Typo="@TitleTypo" HtmlTag="@TitleTag">@View.StateTitle</MudText>
+            <MudText Typo="Typo.body2" Class="mud-text-secondary" aria-live="polite">@Summary</MudText>
+        </div>
+    </MudStack>
+    @if (View.IsActive || View.State == SupervisorState.Stopping)
+    {
+        <MudButton Variant="Variant.Outlined" Color="Color.Error" StartIcon="@Icons.Material.Filled.Stop"
+                   Disabled="@(View.State == SupervisorState.Stopping)" OnClick="Supervisor.RequestStop">Stop runner</MudButton>
+    }
+    else
+    {
+        <MudButton Variant="Variant.Filled" Color="Color.Primary" StartIcon="@Icons.Material.Filled.PlayArrow"
+                   Disabled="Starting" OnClick="StartAsync">@StartLabel</MudButton>
+    }
+</MudStack>
+@if (View.Fault is { } fault)
+{
+    <FaultCard Fault="fault" Waiting="@(View.State != SupervisorState.Faulted)" OnOpenSettings="OnOpenSettings" Class="mt-4" />
+}
+@if (View.PullProgress is { Fraction: { } fraction } pull)
+{
+    <MudProgressLinear Value="@(fraction * 100)" Color="Color.Primary" Class="mt-4" aria-label="Image download" />
+    <MudText Typo="Typo.caption" Class="mud-text-secondary">@pull.Summary</MudText>
+}
+else if (View.State is SupervisorState.Pulling or SupervisorState.Checking or SupervisorState.ResolvingPlan or SupervisorState.Starting or SupervisorState.Stopping)
+{
+    <MudProgressLinear Indeterminate="true" Color="Color.Primary" Class="mt-4" aria-label="@View.StateTitle" />
+    @if (View.PullProgress is { } measuring)
+    {
+        <MudText Typo="Typo.caption" Class="mud-text-secondary">@measuring.Summary</MudText>
+    }
+}
+@if (View.HasActiveSession)
+{
+    <MudAlert Severity="Severity.Info" Dense="true" Class="mt-4">An editor session is using this runner. Stopping now interrupts it.</MudAlert>
+}
+@if (View.Plan?.Notice is { } notice && View.IsActive)
+{
+    <MudAlert Severity="Severity.Normal" Dense="true" Class="mt-4">@notice</MudAlert>
+}
+
+@code {
+    /// <summary>What Start does instead of starting the runner at once; Setup saves its answers first.</summary>
+    [Parameter]
+    public EventCallback OnStart { get; set; }
+
+    [Parameter]
+    public string StartLabel { get; set; } = "Start runner";
+
+    [Parameter]
+    public EventCallback OnOpenSettings { get; set; }
+
+    /// <summary>The page's own heading, or a heading inside one.</summary>
+    [Parameter]
+    public bool IsPageHeading { get; set; } = true;
+
+    private bool Starting { get; set; }
+
+    private Typo TitleTypo => IsPageHeading ? Typo.h5 : Typo.h6;
+
+    private string TitleTag => IsPageHeading ? "h1" : "h3";
+
+    // The card below says what is wrong and what to do.
+    private string Summary => View is { State: SupervisorState.Faulted, Fault: not null }
+        ? "The runner stopped. Fix the problem below, then start it again."
+        : View.Message;
+
+    private async Task StartAsync()
+    {
+        if (!OnStart.HasDelegate)
+        {
+            Supervisor.RequestStart();
+            return;
+        }
+
+        Starting = true;
+        try
+        {
+            await OnStart.InvokeAsync();
+        }
+        finally
+        {
+            Starting = false;
+        }
+    }
+
+    private string StateIcon => View.State switch
+    {
+        SupervisorState.Running or SupervisorState.RestartPending => Icons.Material.Filled.CheckCircle,
+        SupervisorState.Faulted => Icons.Material.Filled.Error,
+        SupervisorState.Stopped => Icons.Material.Filled.PauseCircle,
+        _ => Icons.Material.Filled.Autorenew,
+    };
+
+    private Color StateColor => View.State switch
+    {
+        SupervisorState.Running or SupervisorState.RestartPending => Color.Success,
+        SupervisorState.Faulted => Color.Error,
+        SupervisorState.WaitingToRestart => Color.Warning,
+        SupervisorState.Stopped => Color.Default,
+        _ => Color.Primary,
+    };
+}

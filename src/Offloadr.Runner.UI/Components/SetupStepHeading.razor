@@ -1,0 +1,27 @@
+@* A numbered step of Setup, marked once it is done. Done is null while there is nothing to say yet. *@
+<MudStack Row="true" AlignItems="AlignItems.Center" Spacing="2">
+    <span class="@($"runner-step-number{(Done == true ? " done" : Done == false ? " attention" : string.Empty)}")" aria-hidden="true">
+        @if (Done == true)
+        {
+            <MudIcon Icon="@Icons.Material.Filled.Check" Size="Size.Small" />
+        }
+        else
+        {
+            @Number
+        }
+    </span>
+    <MudText Typo="Typo.h6" HtmlTag="h2">
+        @Title<span class="runner-visually-hidden">@(Done == true ? ", done" : Done == false ? ", needs attention" : string.Empty)</span>
+    </MudText>
+</MudStack>
+
+@code {
+    [Parameter, EditorRequired]
+    public int Number { get; set; }
+
+    [Parameter, EditorRequired]
+    public string Title { get; set; } = string.Empty;
+
+    [Parameter]
+    public bool? Done { get; set; }
+}
