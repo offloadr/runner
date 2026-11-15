@@ -64,6 +64,11 @@
             </MudStack>
         }
 
+        <MudStack Spacing="0">
+            <MudSwitch T="bool" @bind-Value="_keepAwake" Color="Color.Primary" Label="Keep this computer awake while a session runs on it" />
+            <MudText Typo="Typo.caption" Class="mud-text-secondary ml-14">Sleep would cut the session off. The display can still turn off, and the computer sleeps again once the session ends.</MudText>
+        </MudStack>
+
         <MudExpansionPanels Outlined="true" Elevation="0">
             <MudExpansionPanel Text="Advanced">
                 <MudStack Spacing="4">
@@ -99,6 +104,7 @@
     private string? _engineExecutable;
     private bool _autoStart;
     private bool _downloadModels;
+    private bool _keepAwake = true;
     private bool _startAtSignIn;
     private bool _showKey;
     private bool _saving;
@@ -122,6 +128,7 @@
         _engineExecutable = form.ContainerEngineExecutable;
         _autoStart = form.AutoStart;
         _downloadModels = form.DownloadModels;
+        _keepAwake = form.KeepAwakeDuringSessions;
         _startAtSignIn = Host.CanStartAtSignIn && Host.StartsAtSignIn;
     }
 
@@ -130,7 +137,7 @@
         _saving = true;
         try
         {
-            var result = await SettingsEditor.SaveAsync(new SettingsForm(_runnerKey, _editorTemplate, _modelsDirectory, _origin, _engineExecutable, _autoStart, _downloadModels));
+            var result = await SettingsEditor.SaveAsync(new SettingsForm(_runnerKey, _editorTemplate, _modelsDirectory, _origin, _engineExecutable, _autoStart, _downloadModels, _keepAwake));
             _problems = result.Problems;
             if (!result.Saved)
             {

@@ -35,6 +35,9 @@ internal sealed class FakeContainerEngine : IContainerEngine
 
     public int Stops { get; private set; }
 
+    /// <summary>The grace period each stop gave the runner.</summary>
+    public List<TimeSpan> StopTimeouts { get; } = [];
+
     /// <summary>Thrown by ProbeAsync, for example while Docker is still starting.</summary>
     public Exception? ProbeFailure { get; set; }
 
@@ -481,6 +484,7 @@ internal sealed class FakeContainerEngine : IContainerEngine
             }
 
             Stops++;
+            StopTimeouts.Add(timeout);
             StopExecutables.Add(Executable());
             if (Find(container) is { } key && _containers.TryGetValue(key, out var found))
             {

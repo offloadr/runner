@@ -3,12 +3,12 @@ using Microsoft.AspNetCore.Components.WebView.Maui;
 
 namespace Offloadr.Runner.Desktop;
 
-public sealed class App(MainPage page, RunnerSupervisor supervisor, SingleInstanceLock instanceLock) : Application
+public sealed class App(MainPage page, RunnerSupervisor supervisor, SingleInstanceLock instanceLock, IRunnerSettingsStore settings, ILoggerFactory loggers) : Application
 {
     protected override Window CreateWindow(IActivationState? activationState)
     {
         var window = new Window(page) { Title = "Offloadr Runner", Width = 1100, Height = 860, MinimumWidth = 480, MinimumHeight = 560 };
-        window.HandlerChanged += (_, _) => PlatformWindow.Attach(window, page, supervisor, instanceLock);
+        window.HandlerChanged += (_, _) => PlatformWindow.Attach(window, page, supervisor, instanceLock, settings, loggers);
         return window;
     }
 }
@@ -190,6 +190,22 @@ public sealed class MainPage : ContentPage
             // It is still downloaded; quitting again tries again.
             _logger.LogError(ex, "Could not hand the update to the installer.");
         }
+    }
+
+    /// <summary>
+    /// Windows is shutting down, restarting or signing out: everything stops now, with no question
+    /// asked, and the runner container is removed. Nothing is installed: Windows may end the app any
+    /// moment, and a downloaded update is offered again at the next start.
+    /// </summary>
+    public async Task StopForWindowsSessionEndAsync()
+    {
+        if (CanClose)
+        {
+            return;
+        }
+
+        await _runtime.StopAsync();
+        CanClose = true;
     }
 
     /// <summary>Quitting stops the runner container; ask first when it is running, and say so when a session would be cut off.</summary>

@@ -58,6 +58,7 @@ public sealed class FileRunnerSettingsStore : IRunnerSettingsStore
             ContainerEngineExecutable = normalized.ContainerEngineExecutable,
             SelectedEditorTemplate = normalized.SelectedEditorTemplate,
             AutoStart = normalized.AutoStart,
+            KeepAwakeDuringSessions = normalized.KeepAwakeDuringSessions,
         };
 
         await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -122,6 +123,7 @@ public sealed class FileRunnerSettingsStore : IRunnerSettingsStore
             ContainerEngineExecutable = document.ContainerEngineExecutable,
             SelectedEditorTemplate = document.SelectedEditorTemplate,
             AutoStart = document.AutoStart,
+            KeepAwakeDuringSessions = document.KeepAwakeDuringSessions,
         });
     }
 
@@ -153,5 +155,8 @@ public sealed class FileRunnerSettingsStore : IRunnerSettingsStore
         public string? SelectedEditorTemplate { get; set; }
 
         public bool AutoStart { get; set; }
+
+        // On unless saved off: settings saved before the option existed keep the computer awake too.
+        public bool KeepAwakeDuringSessions { get; set; } = true;
     }
 }

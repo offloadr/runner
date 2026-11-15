@@ -42,6 +42,12 @@ public sealed class SupervisorOptions
     public TimeSpan StopTimeout { get; init; } = TimeSpan.FromSeconds(30);
 
     /// <summary>
+    /// The runner's stop grace period when Windows shuts down or the person signs out: Windows ends the app
+    /// within seconds, and Docker stops with it.
+    /// </summary>
+    public TimeSpan FastStopTimeout { get; init; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>
     /// After a Stop cancels `docker run`, how long the engine may still be creating the container the
     /// command asked for; the cleanup watches for it this long.
     /// </summary>
@@ -218,6 +224,9 @@ public sealed class RunnerSupervisor : BackgroundService
         AutoStart,
         Stop,
         Refresh,
+
+        /// <summary>The computer woke from sleep: the runner, Docker and the GPU are checked again at once.</summary>
+        Resumed,
     }
 
     private readonly record struct Request(Command Kind, long StopGeneration);
@@ -703,6 +712,9 @@ public sealed class RunnerSupervisor : BackgroundService
                 }
 
                 break;
+            case Command.Resumed:
+                await HandleResumedAsync(request.Value.StopGeneration, stoppingToken).ConfigureAwait(false);
+                break;
             case null:
                 if (View.State == SupervisorState.WaitingToRestart && _restartDueAt <= Now())
                 {
@@ -714,6 +726,35 @@ public sealed class RunnerSupervisor : BackgroundService
                     // switch the check decides on.
                     var stopGeneration = CurrentStopGeneration();
                     await WatchAsync(() => MonitorAsync(stopGeneration, stoppingToken)).ConfigureAwait(false);
+                }
+
+                break;
+        }
+    }
+
+    private async Task HandleResumedAsync(long stopGeneration, CancellationToken stoppingToken)
+    {
+        AppendLog("supervisor: the computer woke from sleep; checking the runner again.");
+        switch (View.State)
+        {
+            case SupervisorState.WaitingToRestart:
+                // Docker was likely asleep too: the retry runs now rather than when its backoff ends.
+                _restartDueAt = Now();
+                break;
+            case SupervisorState.Running or SupervisorState.RestartPending:
+                // The container may have gone with Docker; and after sleep the GPU can stop reaching
+                // containers until Docker restarts, which the check shows.
+                await WatchAsync(() => MonitorAsync(stopGeneration, stoppingToken)).ConfigureAwait(false);
+                if (View.State is SupervisorState.Running or SupervisorState.RestartPending)
+                {
+                    _ = CheckGpuAccessInBackgroundAsync(stoppingToken);
+                }
+
+                break;
+            default:
+                if (!View.IsActive)
+                {
+                    await ProbeEnvironmentAsync(stoppingToken).ConfigureAwait(false);
                 }
 
                 break;
@@ -1818,7 +1859,7 @@ public sealed class RunnerSupervisor : BackgroundService
 
             if (existing is not null && IsOwned(existing) && IsOurContainer(existing))
             {
-                await _engine.StopAsync(Target(existing), _options.StopTimeout, cancellationToken).ConfigureAwait(false);
+                await _engine.StopAsync(Target(existing), StopGrace, cancellationToken).ConfigureAwait(false);
                 await _engine.RemoveAsync(Target(existing), cancellationToken).ConfigureAwait(false);
             }
         }
@@ -1891,7 +1932,29 @@ public sealed class RunnerSupervisor : BackgroundService
            _time.GetElapsedTime(advanced) <= _options.StatusStaleAfter;
 
     /// <summary>Time to stop the runner on shutdown: its stop grace period plus the inspect and remove around it.</summary>
-    private TimeSpan ShutdownBudget => _options.StopTimeout + TimeSpan.FromSeconds(60);
+    private TimeSpan ShutdownBudget => StopGrace + TimeSpan.FromSeconds(Volatile.Read(ref _fastStop) ? 15 : 60);
+
+    /// <summary>How long the runner gets to stop: shorter once Windows is shutting down.</summary>
+    private TimeSpan StopGrace => Volatile.Read(ref _fastStop) ? _options.FastStopTimeout : _options.StopTimeout;
+
+    private bool _fastStop;
+
+    /// <summary>
+    /// Windows is shutting down, restarting or signing the person out: the coming stop gives the runner only
+    /// <see cref="SupervisorOptions.FastStopTimeout"/>, so the container (which holds the runner key in its
+    /// environment) is removed before Windows ends the app.
+    /// </summary>
+    public void UseFastStop() => Volatile.Write(ref _fastStop, true);
+
+    /// <summary>The computer is about to sleep. Noted in the log, so a session cut off then reads as such.</summary>
+    public void NotifySuspending() => AppendLog("supervisor: the computer is going to sleep.");
+
+    /// <summary>
+    /// The computer woke from sleep. Docker, the runner and its network connections may all have gone
+    /// meanwhile, and the GPU may no longer reach containers: all are checked again now, not when the next
+    /// check comes round.
+    /// </summary>
+    public void NotifyResumed() => Enqueue(Command.Resumed);
 
     /// <summary>
     /// Waits for shutdown to finish its own budget, whatever the host's shutdown timeout (30 seconds by

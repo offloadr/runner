@@ -111,6 +111,41 @@ public class FileRunnerSettingsStoreTests
     }
 
     [Test]
+    public async Task KeepAwakeDuringSessions_IsOnUnlessSavedOff_EvenInSettingsFromBeforeTheOption()
+    {
+        var paths = new SupervisorPaths(_root);
+        Directory.CreateDirectory(_root);
+        File.WriteAllText(paths.SettingsFile, """{"OffloadrApiOrigin":"https://offloadr.studio","AutoStart":true}""");
+        var store = new FileRunnerSettingsStore(paths, new ReversingSecretProtector(), NullLogger<FileRunnerSettingsStore>.Instance);
+        var older = store.Current.KeepAwakeDuringSessions;
+
+        await store.SaveAsync(store.Current with { KeepAwakeDuringSessions = false });
+        var reloaded = new FileRunnerSettingsStore(paths, new ReversingSecretProtector(), NullLogger<FileRunnerSettingsStore>.Instance).Current;
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(new RunnerSettings().KeepAwakeDuringSessions, Is.True);
+            Assert.That(older, Is.True);
+            Assert.That(reloaded.KeepAwakeDuringSessions, Is.False);
+        });
+    }
+
+    [Test]
+    public async Task SettingsEditor_KeepsTheKeepAwakeChoice()
+    {
+        var store = new FileRunnerSettingsStore(new SupervisorPaths(_root), new ReversingSecretProtector(), NullLogger<FileRunnerSettingsStore>.Instance);
+        var editor = new RunnerSettingsEditor(store);
+
+        await editor.SaveAsync(editor.Load() with { KeepAwakeDuringSessions = false });
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(store.Current.KeepAwakeDuringSessions, Is.False);
+            Assert.That(editor.Load().KeepAwakeDuringSessions, Is.False);
+        });
+    }
+
+    [Test]
     public void Load_DropsAKeyThatCanNoLongerBeDecrypted()
     {
         var paths = new SupervisorPaths(_root);
