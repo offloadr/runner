@@ -170,9 +170,10 @@ public sealed class RunnerImages
     {
         var at = reference.IndexOf('@', StringComparison.Ordinal);
 
-        // Docker lists a digest as repository@digest, without the tag a reference may also carry (repo:tag@digest).
+        // Docker lists a digest as repository@digest, without the tag a reference may also carry (repo:tag@digest),
+        // and reads a reference without a tag as :latest.
         return at >= 0
             ? image.RepoDigests.Contains(Repository(reference) + reference[at..], StringComparer.Ordinal)
-            : image.RepoTags.Contains(reference, StringComparer.Ordinal);
+            : image.RepoTags.Contains(Repository(reference) == reference ? reference + ":latest" : reference, StringComparer.Ordinal);
     }
 }

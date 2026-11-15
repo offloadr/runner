@@ -91,6 +91,26 @@ public class RunnerImagesTests
     }
 
     [Test]
+    public async Task Classify_KeepsTheImageOfATemplateWithoutATag()
+    {
+        // Docker reads a reference without a tag as :latest.
+        var tagless = new LaunchTemplate("comfyui-default", "comfyui", ComfyRepository, "ComfyUI");
+        var view = SupervisorView.Initial(DateTimeOffset.UtcNow) with
+        {
+            Plan = new LaunchPlan([tagless], "comfyui-default", TimeSpan.FromMinutes(5), LaunchPlanSource.ControlPlane),
+        };
+        var engine = new ImageStore(Running);
+        var images = new RunnerImages(() => view, engine, new FakeSettingsStore(new RunnerSettings()));
+
+        Assert.Multiple(async () =>
+        {
+            Assert.That(RunnerImages.Classify([Running], view, new RunnerSettings()).Single().Use, Is.EqualTo(RunnerImageUse.Chosen));
+            Assert.That(await images.RemoveAsync("sha256:aaa"), Is.EqualTo(ImageRemoval.NotAllowed));
+            Assert.That(engine.Removals, Is.Empty);
+        });
+    }
+
+    [Test]
     public void Classify_NamesOnlyTheRunnersTags_OfAnImageSomeoneTaggedToo()
     {
         var tagged = Forge with { RepoTags = [ForgeNeo, "my-forge:keep"] };
