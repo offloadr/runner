@@ -21,23 +21,30 @@
 </MudText>
 
 <MudPaper Outlined="true" Class="pa-4">
-    @if (Supervisor.LogLines.Count == 0)
+    @{
+        // One snapshot per render: lines arrive on another thread, so reading the count twice could disagree.
+        var lines = Supervisor.LogLines;
+        _logRendered = lines.Count > 0;
+    }
+    @if (!_logRendered)
     {
         <MudText Class="mud-text-secondary">Image downloads and runner output appear here once the runner starts.</MudText>
     }
     else
     {
-        <pre @ref="_log" class="runner-log runner-log-full" tabindex="0" aria-label="Runner log">@string.Join('\n', Supervisor.LogLines)</pre>
+        <pre @ref="_log" class="runner-log runner-log-full" tabindex="0" aria-label="Runner log">@string.Join('\n', lines)</pre>
     }
 </MudPaper>
 
 @code {
     private ElementReference _log;
+    private bool _logRendered;
     private IJSObjectReference? _module;
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
-        if (Supervisor.LogLines.Count == 0)
+        // What this render drew, not the live count: a first line may have arrived since, with no log element yet.
+        if (!_logRendered)
         {
             return;
         }
@@ -51,6 +58,10 @@
         catch (JSDisconnectedException)
         {
             // The window closed.
+        }
+        catch (JSException)
+        {
+            // Following new lines is a convenience; the log still shows without it.
         }
     }
 
