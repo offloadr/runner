@@ -99,7 +99,12 @@ public sealed class RunnerImages
 
         foreach (var tag in image.Tags)
         {
-            await _engine.RemoveImageAsync(tag, cancellationToken).ConfigureAwait(false);
+            // A pull since the listing may have moved the tag to another image, which is not the one asked
+            // for and stays. A digest reference cannot move, so those below need no such check.
+            if ((await _engine.InspectImageAsync(tag, cancellationToken).ConfigureAwait(false))?.Id == imageId)
+            {
+                await _engine.RemoveImageAsync(tag, cancellationToken).ConfigureAwait(false);
+            }
         }
 
         // An image left without a name keeps its digests, which the runner's repositories' go with. One
@@ -162,7 +167,12 @@ public sealed class RunnerImages
     }
 
     private static bool Names(StoredImage image, string reference)
-        => reference.Contains('@', StringComparison.Ordinal)
-            ? image.RepoDigests.Contains(reference, StringComparer.Ordinal)
+    {
+        var at = reference.IndexOf('@', StringComparison.Ordinal);
+
+        // Docker lists a digest as repository@digest, without the tag a reference may also carry (repo:tag@digest).
+        return at >= 0
+            ? image.RepoDigests.Contains(Repository(reference) + reference[at..], StringComparer.Ordinal)
             : image.RepoTags.Contains(reference, StringComparer.Ordinal);
+    }
 }

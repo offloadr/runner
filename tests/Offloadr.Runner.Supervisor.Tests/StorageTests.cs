@@ -71,6 +71,26 @@ public class RunnerImagesTests
     }
 
     [Test]
+    public async Task Classify_KeepsAnImagePinnedByTagAndDigest()
+    {
+        // Docker lists the digest without the tag the template's reference also names.
+        var pinned = new LaunchTemplate("comfyui-pinned", "comfyui", ComfyLatest + "@sha256:dc", "ComfyUI pinned");
+        var view = SupervisorView.Initial(DateTimeOffset.UtcNow) with
+        {
+            Plan = new LaunchPlan([pinned], "comfyui-pinned", TimeSpan.FromMinutes(5), LaunchPlanSource.ControlPlane),
+        };
+        var engine = new ImageStore(Older);
+        var images = new RunnerImages(() => view, engine, new FakeSettingsStore(new RunnerSettings()));
+
+        Assert.Multiple(async () =>
+        {
+            Assert.That(RunnerImages.Classify([Older], view, new RunnerSettings()).Single().Use, Is.EqualTo(RunnerImageUse.Chosen));
+            Assert.That(await images.RemoveAsync("sha256:ccc"), Is.EqualTo(ImageRemoval.NotAllowed));
+            Assert.That(engine.Removals, Is.Empty);
+        });
+    }
+
+    [Test]
     public void Classify_NamesOnlyTheRunnersTags_OfAnImageSomeoneTaggedToo()
     {
         var tagged = Forge with { RepoTags = [ForgeNeo, "my-forge:keep"] };
@@ -145,6 +165,29 @@ public class RunnerImagesTests
         {
             Assert.That(await images.RemoveAsync("sha256:bbb"), Is.EqualTo(ImageRemoval.Kept));
             Assert.That(engine.Removals, Is.EqualTo(new[] { ForgeNeo }), "Their name, and so the image, stays.");
+        });
+    }
+
+    [Test]
+    public async Task Remove_LeavesTheImageATagMovedToSinceTheListing()
+    {
+        // A pull of the tag after the listing points it at a new image; only the one asked for goes.
+        var engine = new ImageStore(Running, Forge) { LastTagKeepsDigests = true };
+        engine.AfterList = store =>
+        {
+            store.AfterList = null;
+            store.Retag(ForgeNeo, "sha256:new");
+        };
+        var images = new RunnerImages(() => RunningView, engine, new FakeSettingsStore(new RunnerSettings()));
+
+        var result = await images.RemoveAsync("sha256:bbb");
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(engine.Has("sha256:new"), Is.True, "The image the tag names now stays.");
+            Assert.That(engine.Removals, Has.None.EqualTo(ForgeNeo));
+            Assert.That(result, Is.EqualTo(ImageRemoval.Removed), "The image asked for went by its digest.");
+            Assert.That(engine.Has("sha256:bbb"), Is.False);
         });
     }
 
@@ -229,13 +272,33 @@ public class RunnerImagesTests
 
         public bool Has(string id) => _images.ContainsKey(id);
 
+        /// <summary>Runs after each listing, for example to move a tag the way a pull would.</summary>
+        public Action<ImageStore>? AfterList { get; set; }
+
+        /// <summary>Points <paramref name="tag"/> at a new image <paramref name="id"/>, as a pull of that tag does.</summary>
+        public void Retag(string tag, string id)
+        {
+            foreach (var image in _images.Values.Where(image => image.RepoTags.Contains(tag)).ToArray())
+            {
+                _images[image.Id] = image with { RepoTags = image.RepoTags.Where(name => name != tag).ToArray() };
+            }
+
+            _images[id] = new StoredImage(id, [tag], [], 1);
+        }
+
         public Task<IReadOnlyList<StoredImage>> ListImagesAsync(CancellationToken cancellationToken)
-            => Task.FromResult<IReadOnlyList<StoredImage>>([.. _images.Values]);
+        {
+            IReadOnlyList<StoredImage> listed = [.. _images.Values];
+            AfterList?.Invoke(this);
+            return Task.FromResult(listed);
+        }
 
         public Task<ImageInfo?> InspectImageAsync(string image, CancellationToken cancellationToken)
-            => Task.FromResult(_images.TryGetValue(image, out var found)
-                ? new ImageInfo(found.Id, found.RepoDigests.FirstOrDefault(), found.RepoTags)
-                : null);
+        {
+            var found = _images.Values.FirstOrDefault(candidate =>
+                candidate.Id == image || candidate.RepoTags.Contains(image) || candidate.RepoDigests.Contains(image));
+            return Task.FromResult(found is null ? null : new ImageInfo(found.Id, found.RepoDigests.FirstOrDefault(), found.RepoTags));
+        }
 
         public Task<bool> RemoveImageAsync(string reference, CancellationToken cancellationToken)
         {
