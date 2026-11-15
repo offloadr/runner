@@ -1,0 +1,52 @@
+@inject RunnerSupervisor Supervisor
+@inject IHostActions Host
+@inject NavigationManager Navigation
+
+@* The one thing that most likely fixes a problem: help outside the app, or a step inside it. *@
+@if (FaultHelp.For(Action) is { } help)
+{
+    <MudButton Size="Size.Small" Variant="Variant.Outlined" Color="Color.Primary"
+               EndIcon="@(help.Url is null ? null : Icons.Material.Filled.OpenInNew)"
+               OnClick="@(() => RunAsync(help))">@help.Label</MudButton>
+}
+
+@code {
+    [Parameter, EditorRequired]
+    public FaultAction Action { get; set; }
+
+    /// <summary>What Open Settings does instead of opening the Settings page; Setup, say, has the fields itself.</summary>
+    [Parameter]
+    public EventCallback OnOpenSettings { get; set; }
+
+    /// <summary>What Try again does instead of starting the runner at once; Setup saves what the page shows first.</summary>
+    [Parameter]
+    public EventCallback OnStart { get; set; }
+
+    private async Task RunAsync(FaultHelp help)
+    {
+        if (help.Url is { } url)
+        {
+            await Host.OpenExternalAsync(url);
+            return;
+        }
+
+        switch (Action)
+        {
+            case FaultAction.StartEngine:
+                Supervisor.RequestRefresh();
+                break;
+            case FaultAction.CheckConnection when OnStart.HasDelegate:
+                await OnStart.InvokeAsync();
+                break;
+            case FaultAction.CheckConnection:
+                Supervisor.RequestStart();
+                break;
+            case FaultAction.OpenSettings when OnOpenSettings.HasDelegate:
+                await OnOpenSettings.InvokeAsync();
+                break;
+            case FaultAction.OpenSettings:
+                Navigation.NavigateTo("settings");
+                break;
+        }
+    }
+}

@@ -54,6 +54,7 @@ public static class RunnerUiServices
     {
         services.AddMudServices(config => config.SnackbarConfiguration.PositionClass = Defaults.Classes.Position.BottomRight);
         services.TryAddScoped<IHostActions, BrowserHostActions>();
+        services.TryAddSingleton<Offloadr.Runner.Supervisor.SetupPrompt>();
         return services;
     }
 }
