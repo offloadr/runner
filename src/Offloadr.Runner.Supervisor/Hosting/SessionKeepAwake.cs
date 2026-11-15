@@ -13,7 +13,13 @@ public interface IKeepAwake
 /// would cut the session off. The display may still turn off, and the computer sleeps again once the
 /// session ends. Only changes reach the power request.
 /// </summary>
-public sealed class SessionKeepAwake(IKeepAwake keepAwake) : IDisposable
+/// <remarks>
+/// The supervisor and the settings store publish their current value before they raise Changed, on
+/// whichever thread made the change. <see cref="Refresh"/> reads both inside its lock rather than taking
+/// them from the notification, so a refresh delayed behind another can never apply an older value over
+/// a newer one: whichever runs last reads the latest of both.
+/// </remarks>
+public sealed class SessionKeepAwake(IKeepAwake keepAwake, Func<SupervisorView> view, Func<RunnerSettings> settings) : IDisposable
 {
     private readonly object _gate = new();
     private bool _awake;
@@ -22,13 +28,18 @@ public sealed class SessionKeepAwake(IKeepAwake keepAwake) : IDisposable
     public static bool ShouldStayAwake(SupervisorView view, RunnerSettings settings)
         => settings.KeepAwakeDuringSessions && view.HasActiveSession;
 
-    public void Apply(SupervisorView view, RunnerSettings settings) => Apply(ShouldStayAwake(view, settings));
-
-    public void Apply(bool awake)
+    /// <summary>Reads the current view and settings and keeps awake, or lets the computer sleep, to match.</summary>
+    public void Refresh()
     {
         lock (_gate)
         {
-            if (_disposed || awake == _awake)
+            if (_disposed)
+            {
+                return;
+            }
+
+            var awake = ShouldStayAwake(view(), settings());
+            if (awake == _awake)
             {
                 return;
             }

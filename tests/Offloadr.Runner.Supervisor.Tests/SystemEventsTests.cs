@@ -30,29 +30,80 @@ public class SessionKeepAwakeTests
     public void KeepsAwakeOnlyWhileASessionRuns_AndTheSettingAllowsIt()
     {
         var keepAwake = new RecordingKeepAwake();
-        using var session = new SessionKeepAwake(keepAwake);
+        var view = View("");
         var on = new Settings.RunnerSettings();
         var off = on with { KeepAwakeDuringSessions = false };
+        var settings = on;
+        using var session = new SessionKeepAwake(keepAwake, () => view, () => settings);
 
-        session.Apply(View(""), on);
-        session.Apply(View("session-1"), on);
-        session.Apply(View("session-1"), on);
-        session.Apply(View("session-1"), off);
-        session.Apply(View("session-1"), on);
-        session.Apply(View(""), on);
+        session.Refresh();
+        view = View("session-1");
+        session.Refresh();
+        session.Refresh();
+        settings = off;
+        session.Refresh();
+        settings = on;
+        session.Refresh();
+        view = View("");
+        session.Refresh();
 
         Assert.That(keepAwake.Calls, Is.EqualTo(new[] { true, false, true, false }), "Only changes reach the power request.");
+    }
+
+    [Test]
+    public async Task ARefreshHeldUpBehindANewerOne_CannotApplyAnOlderSetting()
+    {
+        // A refresh that read Keep awake off is held up while the setting is turned on and a second refresh
+        // runs. The second must still decide last, so the computer stays awake for the running session.
+        var keepAwake = new RecordingKeepAwake();
+        var view = View("session-1");
+        var settings = new Settings.RunnerSettings { KeepAwakeDuringSessions = false };
+        using var read = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        var holdNextRead = true;
+        Settings.RunnerSettings ReadSettings()
+        {
+            var current = Volatile.Read(ref settings);
+            if (Interlocked.Exchange(ref holdNextRead, false))
+            {
+                read.Set();
+                release.Wait(TimeSpan.FromSeconds(10));
+            }
+
+            return current;
+        }
+
+        using var session = new SessionKeepAwake(keepAwake, () => view, ReadSettings);
+        // Becomes awake first, so the held refresh's stale "off" would clear the request.
+        Volatile.Write(ref holdNextRead, false);
+        Volatile.Write(ref settings, settings with { KeepAwakeDuringSessions = true });
+        session.Refresh();
+        Volatile.Write(ref settings, settings with { KeepAwakeDuringSessions = false });
+        Volatile.Write(ref holdNextRead, true);
+
+        var older = Task.Run(session.Refresh);
+        Assert.That(read.Wait(TimeSpan.FromSeconds(10)), Is.True);
+        Volatile.Write(ref settings, settings with { KeepAwakeDuringSessions = true });
+        var newer = Task.Run(session.Refresh);
+        // Lets the newer refresh finish first if it can: one that does not wait for the held one would.
+        newer.Wait(TimeSpan.FromMilliseconds(300));
+        release.Set();
+        await Task.WhenAll(older, newer).WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.That(keepAwake.Calls[^1], Is.True, "The newer setting decides last.");
     }
 
     [Test]
     public void Dispose_LetsTheComputerSleepAgain_AndIgnoresWhatComesAfter()
     {
         var keepAwake = new RecordingKeepAwake();
-        var session = new SessionKeepAwake(keepAwake);
-        session.Apply(View("session-1"), new Settings.RunnerSettings());
+        var view = View("session-1");
+        var session = new SessionKeepAwake(keepAwake, () => view, () => new Settings.RunnerSettings());
+        session.Refresh();
 
         session.Dispose();
-        session.Apply(View("session-2"), new Settings.RunnerSettings());
+        view = View("session-2");
+        session.Refresh();
         session.Dispose();
 
         Assert.That(keepAwake.Calls, Is.EqualTo(new[] { true, false }));
@@ -60,8 +111,26 @@ public class SessionKeepAwakeTests
 
     private sealed class RecordingKeepAwake : IKeepAwake
     {
-        public List<bool> Calls { get; } = [];
+        private readonly object _gate = new();
+        private readonly List<bool> _calls = [];
 
-        public void Set(bool awake) => Calls.Add(awake);
+        public IReadOnlyList<bool> Calls
+        {
+            get
+            {
+                lock (_gate)
+                {
+                    return [.. _calls];
+                }
+            }
+        }
+
+        public void Set(bool awake)
+        {
+            lock (_gate)
+            {
+                _calls.Add(awake);
+            }
+        }
     }
 }

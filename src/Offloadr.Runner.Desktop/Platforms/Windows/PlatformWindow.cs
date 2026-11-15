@@ -151,11 +151,11 @@ internal static class PlatformWindow
             var logger = loggers.CreateLogger(typeof(WindowLifecycleHook));
             lifecycle = new WindowLifecycleHook(handle, supervisor, page.StopForWindowsSessionEndAsync, logger);
             keepAwake = new WindowsKeepAwake(logger);
-            var awake = new SessionKeepAwake(keepAwake);
+            var awake = new SessionKeepAwake(keepAwake, () => supervisor.View, () => settings.Current);
             sessionKeepAwake = awake;
-            awake.Apply(supervisor.View, settings.Current);
-            supervisor.Changed += () => awake.Apply(supervisor.View, settings.Current);
-            settings.Changed += current => awake.Apply(supervisor.View, current);
+            awake.Refresh();
+            supervisor.Changed += awake.Refresh;
+            settings.Changed += _ => awake.Refresh();
 
             // Changed is raised on several threads, so the posted update reads the view itself, on the UI
             // thread: whichever post runs last shows the current state. The check here only skips
