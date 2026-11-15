@@ -144,7 +144,8 @@ public static partial class DiagnosticsReport
         if (view.GpuAccess is { } access)
         {
             Line(text, "GPU inside a container", access.Succeeded ? "works" : "failed");
-            Block(text, "Check output", Shorten(access.Output, MaximumCheckOutput));
+            // Redacted whole before it is cut: a key or link split by the cut could no longer be recognised.
+            Block(text, "Check output", Shorten(Redact(access.Output, input), MaximumCheckOutput));
         }
 
         if (view.Plan is { } plan)
@@ -209,6 +210,11 @@ public static partial class DiagnosticsReport
     /// <summary>Removes what the report must never hold, wherever it appears: the last step before the report leaves the app.</summary>
     public static string Redact(string text, DiagnosticsInput input)
     {
+        // Link queries and bearer tokens first, while the text is as written: the placeholders below hold
+        // spaces, which would end a link or token early and leave the rest of it behind.
+        text = LinkQuery().Replace(text, match => match.Groups["link"].Value + RemovedQuery);
+        text = BearerToken().Replace(text, RemovedBearer);
+
         // Longest first, so a key that contains another is removed whole.
         var keys = input.OtherRunnerKeys.Append(input.Settings.RunnerKey)
             .Select(key => key?.Trim())
@@ -220,8 +226,6 @@ public static partial class DiagnosticsReport
             text = text.Replace(key!, RemovedKey, StringComparison.Ordinal);
         }
 
-        text = BearerToken().Replace(text, RemovedBearer);
-        text = LinkQuery().Replace(text, match => match.Groups["link"].Value + RemovedQuery);
         if (input.UserProfile?.TrimEnd('\\', '/') is { Length: > 3 } profile)
         {
             // With either slash, and only as a whole folder: /root is not /rootfs.
@@ -250,7 +254,9 @@ public static partial class DiagnosticsReport
     [GeneratedRegex(@"\bBearer\s+[^\s""',;]+", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
     private static partial Regex BearerToken();
 
-    [GeneratedRegex(@"(?<link>\b[a-z][a-z0-9+.-]*://[^\s?#""'<>]+)\?[^\s""'<>]*", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    // An apostrophe may be part of a link (alex's-model), so it does not end one; a link in single quotes
+    // then loses its closing quote with its query, which only removes more.
+    [GeneratedRegex(@"(?<link>\b[a-z][a-z0-9+.-]*://[^\s?#""<>]+)\?[^\s""<>]*", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
     private static partial Regex LinkQuery();
 
     private static void Section(StringBuilder text, string title)

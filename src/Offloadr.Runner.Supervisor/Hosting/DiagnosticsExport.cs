@@ -81,9 +81,25 @@ public sealed class DiagnosticsExport(RunnerSupervisor supervisor, IRunnerSettin
                 }
 
                 using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-                var buffer = new byte[(int)Math.Min(stream.Length, budget)];
+                var length = stream.Length;
+                var buffer = new byte[(int)Math.Min(length, budget)];
                 var read = stream.ReadAtLeast(buffer, buffer.Length, throwOnEndOfStream: false);
-                budget -= read;
+                if (read < length)
+                {
+                    // Cut short: only whole lines, so no line (or character) is left half.
+                    read = Array.LastIndexOf(buffer, (byte)'\n', Math.Max(read - 1, 0)) + 1;
+                    budget = 0;
+                    if (read == 0)
+                    {
+                        files.Add(new DiagnosticLogFile(name, null, "left out: the report already holds the newer logs"));
+                        continue;
+                    }
+                }
+                else
+                {
+                    budget -= read;
+                }
+
                 files.Add(new DiagnosticLogFile(name, Encoding.UTF8.GetString(buffer, 0, read)));
             }
             catch (FileNotFoundException)

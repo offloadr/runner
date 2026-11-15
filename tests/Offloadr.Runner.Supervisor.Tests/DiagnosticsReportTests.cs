@@ -136,6 +136,53 @@ public class DiagnosticsReportTests
         => Assert.That(DiagnosticsReport.Redact(line, Input() with { UserProfile = "/root/", UserName = null }), Is.EqualTo(expected));
 
     [Test]
+    public void Redact_RemovesTheWholeQueryOfALinkThatHoldsARunnerKey()
+    {
+        var redacted = DiagnosticsReport.Redact($"GET https://example.test/f?runner={Key}&sig=sensitive 403", Input());
+
+        Assert.That(redacted, Is.EqualTo("GET https://example.test/f?[removed] 403"));
+    }
+
+    [Test]
+    public void Redact_RemovesTheKeyFromALinksPath_AndItsQuery()
+    {
+        var redacted = DiagnosticsReport.Redact($"GET https://example.test/{Key}/f?sig=sensitive", Input());
+
+        Assert.That(redacted, Is.EqualTo("GET https://example.test/[runner key]/f?[removed]"));
+    }
+
+    [TestCase("GET https://cdn.example/alex's-model?Signature=sensitive 200", "GET https://cdn.example/alex's-model?[removed] 200")]
+    [TestCase("open 'https://cdn.example/f?Signature=sensitive'", "open 'https://cdn.example/f?[removed]")]
+    public void Redact_RemovesTheQueryOfALinkWithAnApostrophe(string line, string expected)
+        => Assert.That(DiagnosticsReport.Redact(line, Input()), Is.EqualTo(expected));
+
+    [Test]
+    public void Redact_CanRunTwice()
+    {
+        var once = DiagnosticsReport.Redact($"https://example.test/f?runner={Key} Bearer abc {@"C:\Users\alex\x"} /mnt/c/Users/alex", Input());
+
+        Assert.That(DiagnosticsReport.Redact(once, Input()), Is.EqualTo(once));
+    }
+
+    [Test]
+    public void Report_RedactsTheGpuCheckBeforeCuttingIt()
+    {
+        // The key crosses the end of the start that is kept, and a signed link's query the start of the end.
+        var half = DiagnosticsReport.MaximumCheckOutput / 2;
+        var output = new string('a', half - 10) + Key + new string('b', DiagnosticsReport.MaximumCheckOutput)
+            + " https://bucket.example/m?Signature=" + new string('S', half) + " done";
+        var report = DiagnosticsReport.Build(Input(SupervisorView.Initial(Now) with { GpuAccess = new GpuAccessCheck(false, output) }));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(report, Does.Not.Contain(Key[..10]), "No part of the key survives the cut.");
+            Assert.That(report, Does.Not.Contain("SSSSSSSS"), "Nor the signature.");
+            Assert.That(report, Does.Contain("https://bucket.example/m?[removed] done"));
+            Assert.That(report, Does.Contain("[…]"));
+        });
+    }
+
+    [Test]
     public void Report_KeepsTheStartAndTheEndOfALongGpuCheck()
     {
         var output = "first line\n" + new string('x', DiagnosticsReport.MaximumCheckOutput * 2) + "\nlast line";
@@ -207,9 +254,9 @@ public class DiagnosticsExportTests
     [Test]
     public void ReadDiagnosticLogs_KeepsTheNewestWhenTheyAreTooLarge()
     {
-        var large = new string('n', DiagnosticsExport.MaximumDiagnosticLogBytes - 10);
+        var large = new string('n', DiagnosticsExport.MaximumDiagnosticLogBytes - 25);
         File.WriteAllText(Path.Combine(_logs, "diagnostic-2026111509.log"), large);
-        File.WriteAllText(Path.Combine(_logs, "diagnostic-2026111508.log"), "older and cut short\n");
+        File.WriteAllText(Path.Combine(_logs, "diagnostic-2026111508.log"), "older line\nsecond line, cut\n");
         File.WriteAllText(Path.Combine(_logs, "diagnostic-2026111507.log"), "oldest\n");
 
         var files = DiagnosticsExport.ReadDiagnosticLogs(_logs);
@@ -219,8 +266,24 @@ public class DiagnosticsExportTests
             Assert.That(files.Select(file => file.Name), Is.EqualTo(new[] { "diagnostic-2026111507.log", "diagnostic-2026111508.log", "diagnostic-2026111509.log" }));
             Assert.That(files[0].Text, Is.Null);
             Assert.That(files[0].Error, Does.StartWith("left out"));
-            Assert.That(files[1].Text, Is.EqualTo("older and "));
+            Assert.That(files[1].Text, Is.EqualTo("older line\n"), "Only whole lines.");
             Assert.That(files[2].Text, Is.EqualTo(large));
+        });
+    }
+
+    [Test]
+    public void ReadDiagnosticLogs_LeavesOutALogWhoseFirstLineDoesNotFit()
+    {
+        File.WriteAllText(Path.Combine(_logs, "diagnostic-2026111509.log"), new string('n', DiagnosticsExport.MaximumDiagnosticLogBytes - 5));
+        File.WriteAllText(Path.Combine(_logs, "diagnostic-2026111508.log"), "a line longer than what is left\n");
+
+        var files = DiagnosticsExport.ReadDiagnosticLogs(_logs);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(files[0].Name, Is.EqualTo("diagnostic-2026111508.log"));
+            Assert.That(files[0].Text, Is.Null);
+            Assert.That(files[0].Error, Does.StartWith("left out"));
         });
     }
 
