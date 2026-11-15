@@ -82,7 +82,7 @@ public class RunnerImagesTests
         var engine = new ImageStore(Older);
         var images = new RunnerImages(() => view, engine, new FakeSettingsStore(new RunnerSettings()));
 
-        Assert.Multiple(async () =>
+        await Assert.MultipleAsync(async () =>
         {
             Assert.That(RunnerImages.Classify([Older], view, new RunnerSettings()).Single().Use, Is.EqualTo(RunnerImageUse.Chosen));
             Assert.That(await images.RemoveAsync("sha256:ccc"), Is.EqualTo(ImageRemoval.NotAllowed));
@@ -102,7 +102,7 @@ public class RunnerImagesTests
         var engine = new ImageStore(Running);
         var images = new RunnerImages(() => view, engine, new FakeSettingsStore(new RunnerSettings()));
 
-        Assert.Multiple(async () =>
+        await Assert.MultipleAsync(async () =>
         {
             Assert.That(RunnerImages.Classify([Running], view, new RunnerSettings()).Single().Use, Is.EqualTo(RunnerImageUse.Chosen));
             Assert.That(await images.RemoveAsync("sha256:aaa"), Is.EqualTo(ImageRemoval.NotAllowed));
@@ -154,7 +154,7 @@ public class RunnerImagesTests
         var engine = new ImageStore(Running, Older);
         var images = new RunnerImages(() => RunningView, engine, new FakeSettingsStore(new RunnerSettings()));
 
-        Assert.Multiple(async () =>
+        await Assert.MultipleAsync(async () =>
         {
             Assert.That(await images.RemoveAsync("sha256:ccc"), Is.EqualTo(ImageRemoval.Removed));
             Assert.That(engine.Removals, Is.EqualTo(new[] { ComfyRepository + "@sha256:dc" }));
@@ -168,7 +168,7 @@ public class RunnerImagesTests
         var engine = new ImageStore(Running, Forge) { LastTagKeepsDigests = true };
         var images = new RunnerImages(() => RunningView, engine, new FakeSettingsStore(new RunnerSettings()));
 
-        Assert.Multiple(async () =>
+        await Assert.MultipleAsync(async () =>
         {
             Assert.That(await images.RemoveAsync("sha256:bbb"), Is.EqualTo(ImageRemoval.Removed));
             Assert.That(engine.Removals, Is.EqualTo(new[] { ForgeNeo, "ghcr.io/offloadr/runner-forge-neo@sha256:db" }));
@@ -181,7 +181,7 @@ public class RunnerImagesTests
         var engine = new ImageStore(Running, Forge with { RepoTags = [ForgeNeo, "my-forge:keep"] }) { LastTagKeepsDigests = true };
         var images = new RunnerImages(() => RunningView, engine, new FakeSettingsStore(new RunnerSettings()));
 
-        Assert.Multiple(async () =>
+        await Assert.MultipleAsync(async () =>
         {
             Assert.That(await images.RemoveAsync("sha256:bbb"), Is.EqualTo(ImageRemoval.Kept));
             Assert.That(engine.Removals, Is.EqualTo(new[] { ForgeNeo }), "Their name, and so the image, stays.");
@@ -271,7 +271,7 @@ public class RunnerImagesTests
         var engine = new ImageStore(Running, Forge);
         var images = new RunnerImages(() => RunningView, engine, new FakeSettingsStore(new RunnerSettings { SelectedEditorTemplate = "forge-neo:neo" }));
 
-        Assert.Multiple(async () =>
+        await Assert.MultipleAsync(async () =>
         {
             Assert.That(await images.RemoveAsync("sha256:aaa"), Is.EqualTo(ImageRemoval.NotAllowed));
             Assert.That(engine.Removals, Is.Empty);
@@ -289,7 +289,7 @@ public class RunnerImagesTests
 
         await settings.SaveAsync(new RunnerSettings { SelectedEditorTemplate = "forge-neo:neo" });
 
-        Assert.Multiple(async () =>
+        await Assert.MultipleAsync(async () =>
         {
             Assert.That(await images.RemoveAsync("sha256:bbb"), Is.EqualTo(ImageRemoval.NotAllowed));
             Assert.That(engine.Removals, Is.Empty);
@@ -306,7 +306,7 @@ public class RunnerImagesTests
         var engine = new ImageStore(Running, Forge);
         var images = new RunnerImages(() => RunningView with { State = state }, engine, new FakeSettingsStore(new RunnerSettings()));
 
-        Assert.Multiple(async () =>
+        await Assert.MultipleAsync(async () =>
         {
             Assert.That(await images.RemoveAsync("sha256:bbb"), Is.EqualTo(ImageRemoval.Busy));
             Assert.That(engine.Removals, Is.Empty);
