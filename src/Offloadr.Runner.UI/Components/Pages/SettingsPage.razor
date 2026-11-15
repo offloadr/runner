@@ -201,16 +201,26 @@
             return;
         }
 
-        var discard = await Dialogs.ShowMessageBoxAsync(
+        // One dialog for every navigation asked for while it is open: a later one cancels the earlier,
+        // which then has nothing left to decide, and no second dialog stacks on the first.
+        var confirmation = _confirmation ??= Dialogs.ShowMessageBoxAsync(
             "Discard your changes?",
             "You changed settings without saving them. Leaving this page discards those changes.",
             yesText: "Discard",
             cancelText: "Keep editing");
-        if (discard != true)
+        var discard = await confirmation;
+        if (ReferenceEquals(_confirmation, confirmation))
+        {
+            _confirmation = null;
+        }
+
+        if (!context.CancellationToken.IsCancellationRequested && discard != true)
         {
             context.PreventNavigation();
         }
     }
+
+    private Task<bool?>? _confirmation;
 
     private Task OpenOffloadrAsync()
         => Host.OpenExternalAsync(string.IsNullOrWhiteSpace(_origin) ? RunnerSettings.DefaultOffloadrApiOrigin : _origin);
