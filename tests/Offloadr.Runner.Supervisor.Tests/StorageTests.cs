@@ -212,6 +212,53 @@ public class RunnerImagesTests
     }
 
     [Test]
+    public async Task Remove_WaitsWhileTheRunnerPullsAnImage()
+    {
+        // A pull of a newer image runs in the background while the runner runs, and can move a tag.
+        var gate = new RunnerImageGate();
+        var engine = new ImageStore(Running, Forge);
+        var images = new RunnerImages(() => RunningView, engine, new FakeSettingsStore(new RunnerSettings()), gate);
+        var pull = await gate.EnterPullAsync(CancellationToken.None);
+
+        var whilePulling = await images.RemoveAsync("sha256:bbb");
+        pull.Dispose();
+        var afterwards = await images.RemoveAsync("sha256:bbb");
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(whilePulling, Is.EqualTo(ImageRemoval.Busy));
+            Assert.That(afterwards, Is.EqualTo(ImageRemoval.Removed));
+            Assert.That(engine.Removals, Is.EqualTo(new[] { ForgeNeo }));
+        });
+    }
+
+    [Test]
+    public async Task APull_WaitsForARemovalUnderWay()
+    {
+        var gate = new RunnerImageGate();
+        Task<IDisposable>? pull = null;
+        bool? startedDuringRemoval = null;
+        var engine = new ImageStore(Running, Forge)
+        {
+            // The pull asks to start while the removal talks to the engine.
+            BeforeRemove = () =>
+            {
+                pull ??= gate.EnterPullAsync(CancellationToken.None);
+                startedDuringRemoval ??= pull.IsCompleted;
+            },
+        };
+        var images = new RunnerImages(() => RunningView, engine, new FakeSettingsStore(new RunnerSettings()), gate);
+
+        Assert.That(await images.RemoveAsync("sha256:bbb"), Is.EqualTo(ImageRemoval.Removed));
+        Assert.Multiple(() =>
+        {
+            Assert.That(startedDuringRemoval, Is.False, "Not while the removal is under way.");
+            Assert.That(pull!.IsCompleted, Is.True, "It goes ahead once the removal is done.");
+        });
+        (await pull!).Dispose();
+    }
+
+    [Test]
     public async Task Remove_ReportsAnImageTheEngineKept()
     {
         var engine = new ImageStore(Running, Forge) { KeepEverything = true };
@@ -320,8 +367,12 @@ public class RunnerImagesTests
             return Task.FromResult(found is null ? null : new ImageInfo(found.Id, found.RepoDigests.FirstOrDefault(), found.RepoTags));
         }
 
+        /// <summary>Runs as each removal reaches the engine.</summary>
+        public Action? BeforeRemove { get; init; }
+
         public Task<bool> RemoveImageAsync(string reference, CancellationToken cancellationToken)
         {
+            BeforeRemove?.Invoke();
             Removals.Add(reference);
             var image = _images.Values.FirstOrDefault(candidate => candidate.RepoTags.Contains(reference) || candidate.RepoDigests.Contains(reference));
             if (image is null || KeepEverything)

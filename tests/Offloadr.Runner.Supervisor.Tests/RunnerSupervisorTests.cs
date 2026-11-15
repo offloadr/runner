@@ -930,6 +930,36 @@ public class RunnerSupervisorTests
     }
 
     [Test]
+    public async Task ImageRemoval_WaitsForTheBackgroundPullOfANewerImage()
+    {
+        _engine.StatusJson = Status(activeSessionId: "");
+        _engine.StoredImages.Add(new StoredImage("sha256:forge", ["ghcr.io/offloadr/runner-forge-neo:neo"], [], 1));
+        var supervisor = await StartSupervisorAsync(imageUpdateInterval: TimeSpan.FromMilliseconds(50));
+        supervisor.RequestStart();
+        await WaitForStateAsync(SupervisorState.Running);
+        var pulling = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _engine.OnPull = async _ =>
+        {
+            pulling.TrySetResult();
+            await release.Task;
+        };
+        var images = new RunnerImages(supervisor, _engine, _settings);
+
+        await pulling.Task.WaitAsync(WaitLimit);
+        var whilePulling = await images.RemoveAsync("sha256:forge");
+        var state = supervisor.View.State;
+        release.SetResult();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(state, Is.EqualTo(SupervisorState.Running), "The pull runs in the background.");
+            Assert.That(whilePulling, Is.EqualTo(ImageRemoval.Busy));
+            Assert.That(_engine.RemovalRequests, Is.Empty);
+        });
+    }
+
+    [Test]
     public async Task TagMovedDuringTheLaunch_IsRecordedAsTheImageThatRuns()
     {
         _engine.StatusJson = Status(activeSessionId: "");

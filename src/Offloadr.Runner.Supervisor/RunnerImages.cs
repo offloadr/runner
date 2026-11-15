@@ -50,6 +50,53 @@ public enum ImageRemoval
 }
 
 /// <summary>
+/// Keeps removals of runner images and the supervisor's pulls of them apart: a pull can move a tag from
+/// one image to another, so no removal runs while one is under way. Pulls may overlap one another; a
+/// pull that starts during a removal waits for it, which takes moments.
+/// </summary>
+public sealed class RunnerImageGate
+{
+    private readonly SemaphoreSlim _removal = new(1, 1);
+    private int _pulls;
+
+    /// <summary>Marks a pull as under way until the result is disposed; waits for a removal in progress first.</summary>
+    internal async Task<IDisposable> EnterPullAsync(CancellationToken cancellationToken)
+    {
+        await _removal.WaitAsync(cancellationToken).ConfigureAwait(false);
+        Interlocked.Increment(ref _pulls);
+        _removal.Release();
+        return new Exit(() => Interlocked.Decrement(ref _pulls));
+    }
+
+    /// <summary>
+    /// Starts a removal unless a pull is under way; null then. A pull can only check in before the removal
+    /// takes the gate (and is counted) or after it leaves, so a removal never overlaps one.
+    /// </summary>
+    internal IDisposable? TryEnterRemoval()
+    {
+        if (!_removal.Wait(0))
+        {
+            return null;
+        }
+
+        if (Volatile.Read(ref _pulls) > 0)
+        {
+            _removal.Release();
+            return null;
+        }
+
+        return new Exit(() => _removal.Release());
+    }
+
+    private sealed class Exit(Action exit) : IDisposable
+    {
+        private Action? _exit = exit;
+
+        public void Dispose() => Interlocked.Exchange(ref _exit, null)?.Invoke();
+    }
+}
+
+/// <summary>
 /// The runner images Docker keeps on this computer, and removing the ones no runner uses. Only images of
 /// the runner's own repositories are listed, and only by their runner names or digests are they removed,
 /// never by force: Docker keeps an image a container uses, or one another name points at.
@@ -59,17 +106,19 @@ public sealed class RunnerImages
     private readonly Func<SupervisorView> _view;
     private readonly IContainerEngine _engine;
     private readonly IRunnerSettingsStore _settings;
+    private readonly RunnerImageGate _gate;
 
     public RunnerImages(RunnerSupervisor supervisor, IContainerEngine engine, IRunnerSettingsStore settings)
-        : this(() => supervisor.View, engine, settings)
+        : this(() => supervisor.View, engine, settings, supervisor.ImageGate)
     {
     }
 
-    internal RunnerImages(Func<SupervisorView> view, IContainerEngine engine, IRunnerSettingsStore settings)
+    internal RunnerImages(Func<SupervisorView> view, IContainerEngine engine, IRunnerSettingsStore settings, RunnerImageGate? gate = null)
     {
         _view = view;
         _engine = engine;
         _settings = settings;
+        _gate = gate ?? new RunnerImageGate();
     }
 
     public async Task<IReadOnlyList<RunnerImage>> ListAsync(CancellationToken cancellationToken = default)
@@ -82,6 +131,13 @@ public sealed class RunnerImages
             or SupervisorState.Starting or SupervisorState.Stopping)
         {
             // It may be about to use the image; the list is shown again once it settles.
+            return ImageRemoval.Busy;
+        }
+
+        // Not while the runner pulls an image (a newer one in the background, say), which can move a tag.
+        using var removal = _gate.TryEnterRemoval();
+        if (removal is null)
+        {
             return ImageRemoval.Busy;
         }
 

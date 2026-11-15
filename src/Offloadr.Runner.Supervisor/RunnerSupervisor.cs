@@ -235,6 +235,9 @@ public sealed class RunnerSupervisor : BackgroundService
 
     public IReadOnlyList<string> LogLines => _logs.Snapshot();
 
+    /// <summary>Keeps the runner's image pulls and the removal of unused runner images apart.</summary>
+    internal RunnerImageGate ImageGate { get; } = new();
+
     /// <summary>The key the running container was started with, which Settings may no longer hold; for redaction only.</summary>
     internal string? ActiveRunnerKey => Volatile.Read(ref _activeRunnerKey);
 
@@ -1046,6 +1049,7 @@ public sealed class RunnerSupervisor : BackgroundService
                 {
                     var progress = new PullProgressParser();
                     Update(view => view with { PullProgress = progress.Current });
+                    using var pulling = await ImageGate.EnterPullAsync(cancellationToken).ConfigureAwait(false);
                     await _engine.PullAsync(
                         template.Image,
                         line =>
@@ -1708,6 +1712,7 @@ public sealed class RunnerSupervisor : BackgroundService
         ContainerEngineException? pullFailure = null;
         try
         {
+            using var pulling = await ImageGate.EnterPullAsync(cancellationToken).ConfigureAwait(false);
             await _engine.PullAsync(image, line => AppendLog("pull: " + line), cancellationToken).ConfigureAwait(false);
         }
         catch (ContainerEngineException ex)
