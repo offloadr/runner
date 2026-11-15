@@ -99,16 +99,28 @@
     backdrop-filter: blur(18px) saturate(1.2);
 }
 
-.runner-logo {
-    width: 28px;
-    height: 28px;
+/* The offloadr.studio wordmark on the left, as on the site, and the app's name beside it. */
+.runner-brand {
+    height: 38px;
+    width: auto;
     display: block;
 }
 
-.runner-wordmark {
-    font-weight: 650;
+.runner-app-name {
+    margin-left: 14px;
+    padding-left: 14px;
+    border-left: 1px solid var(--border-default);
+    font-weight: 600;
     letter-spacing: -0.01em;
     color: var(--color-text-strong);
+    white-space: nowrap;
+}
+
+/* A narrow window has no room for it beside the menu. */
+@media (max-width: 640px) {
+    .runner-app-name {
+        display: none;
+    }
 }
 
 /* Cards: the site's 22 px glass card with a hairline and soft shadow. */

@@ -10,8 +10,9 @@
 
     <MudLayout>
         <MudAppBar Elevation="0" Dense="true">
-            <img src="_content/Offloadr.Runner.UI/icon.svg" alt="" class="runner-logo" />
-            <MudText Typo="Typo.h6" HtmlTag="span" Class="ml-2 runner-wordmark">Offloadr Runner</MudText>
+            <img src="@(_isDarkMode ? "_content/Offloadr.Runner.UI/wordmark-dark.svg" : "_content/Offloadr.Runner.UI/wordmark-light.svg")"
+                 alt="offloadr.studio" class="runner-brand" />
+            <MudText Typo="Typo.h6" HtmlTag="span" Class="runner-app-name">Personal Runner</MudText>
             <MudSpacer />
             <NavButton Href="/" Text="Status" />
             <NavButton Href="settings" Text="Settings" />
