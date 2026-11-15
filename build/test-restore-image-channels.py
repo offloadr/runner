@@ -73,6 +73,21 @@ else:
             "docker://ghcr.io/offloadr/runner-forge-neo:neo",
         ])
 
+    def test_also_restores_the_promoted_protocol_tags(self):
+        result, calls = self.run_restore(self.digests + ["3"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        copies = [call[-1] for call in calls if call[0] == "copy"]
+        self.assertEqual(copies[:2], [
+            "docker://ghcr.io/offloadr/runner-comfyui:latest",
+            "docker://ghcr.io/offloadr/runner-comfyui:latest-p3",
+        ])
+        self.assertEqual(len(copies), 8)
+
+    def test_rejects_an_invalid_protocol_before_registry_access(self):
+        result, calls = self.run_restore(self.digests + ["latest"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(calls, [])
+
     def test_registry_mismatch_stops_remaining_writes(self):
         result, calls = self.run_restore(WRONG_CHANNEL="1")
         self.assertNotEqual(result.returncode, 0)

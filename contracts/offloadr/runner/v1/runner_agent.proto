@@ -6,10 +6,36 @@ import "offloadr/common/v1/gpus.proto"; // GpuType
 import "offloadr/common/v1/models.proto"; // ModelCategory
 import "offloadr/common/v1/prompt.proto"; // Prompt relay helpers
 import "offloadr/common/v1/gpu_control.proto";
-import "offloadr/runner/v1/allocator.proto"; // RunnerRuntimeTelemetrySnapshot
 import "offloadr/editor_runtime/v1/editor_proxy.proto"; // Artifact messages
 import "google/protobuf/timestamp.proto"; // Timestamp for session stream events
 import "google/protobuf/wrappers.proto";
+
+// The wire contract this file describes. Every coordinated runner and control-plane
+// release that changes it raises CURRENT; the control plane refuses any other version,
+// so an outdated runner is told to update instead of misbehaving.
+enum RunnerProtocol {
+    RUNNER_PROTOCOL_UNSPECIFIED = 0;
+    RUNNER_PROTOCOL_CURRENT = 1;
+}
+
+message RunnerRuntimeTelemetrySnapshot {
+  google.protobuf.UInt32Value utilization_percent = 1;
+  google.protobuf.UInt64Value vram_used_bytes = 2;
+  google.protobuf.UInt64Value vram_total_bytes = 3;
+  google.protobuf.UInt32Value temperature_celsius = 4;
+  google.protobuf.Timestamp sampled_utc = 5;
+  google.protobuf.UInt32Value fan_percent = 6;
+  google.protobuf.DoubleValue power_usage_watts = 7;
+  google.protobuf.DoubleValue power_limit_watts = 8;
+  google.protobuf.DoubleValue power_min_limit_watts = 9;
+  google.protobuf.DoubleValue power_default_limit_watts = 10;
+  google.protobuf.DoubleValue power_max_limit_watts = 11;
+  google.protobuf.UInt64Value system_ram_used_bytes = 12;
+  google.protobuf.UInt64Value system_ram_total_bytes = 13;
+  google.protobuf.UInt64Value model_disk_available_bytes = 14;
+  google.protobuf.UInt64Value model_disk_total_bytes = 15;
+  string model_disk_path = 16;
+}
 
 // Basic hardware/resource snapshot sent during registration.
 message RunnerResources {
@@ -332,13 +358,24 @@ message RegisterRunnerRequest {
     bool active_session_reported = 6; // True when active_session_id is intentionally reported by the runner.
     repeated string supported_editor_templates = 7; // Canonical editor templates this runner can execute.
     RunnerSealedStorage sealed_storage = 8; // What this runner can offer sealed sessions.
+    uint32 protocol_version = 9; // RunnerProtocol.RUNNER_PROTOCOL_CURRENT of the runner's build.
 }
 
-// Response acknowledging registration.
+// Why registration was refused. Anything other than an outdated protocol is retried.
+enum RegistrationRejection {
+    REGISTRATION_REJECTION_UNSPECIFIED = 0;
+    REGISTRATION_REJECTION_RUNNER_OUTDATED = 1; // The runner speaks an older protocol: update it.
+    REGISTRATION_REJECTION_SERVER_OUTDATED = 2; // The runner is newer than this control plane.
+}
+
+// Response acknowledging registration. Fields 1-3 never change, so any past runner
+// can read why it was refused.
 message RegisterRunnerResponse {
-	bool accepted = 1;          // False if rejected (e.g., incompatible version).
-	string message = 2;         // Optional human-readable reason / guidance.
+	bool accepted = 1;          // False if rejected.
+	string message = 2;         // Human-readable reason / guidance.
 	int32 refresh_seconds = 3;  // When to re-register / heartbeat; 0 = default.
+	uint32 server_protocol_version = 4; // The control plane's RunnerProtocol.RUNNER_PROTOCOL_CURRENT.
+	RegistrationRejection rejection = 5;
 }
 
 // Unary ack request message for start-session.
@@ -595,6 +632,7 @@ message CommandStreamRequest {
     string runner_id = 1;
     string version = 2;
     string instance_id = 3;
+    uint32 protocol_version = 4;
 }
 
 message CommandStreamResponse {
@@ -627,21 +665,6 @@ message RunnerArtifactServiceListArtifactsRequest {
 
 message RunnerArtifactServiceListArtifactsResponse {
     repeated offloadr.editor_runtime.v1.EditorArtifactMetadata artifacts = 1;
-}
-
-message RunnerArtifactServiceGetDownloadUrlRequest {
-    string editor_sid = 1;
-    string filename = 2;
-    string type = 3;
-    string subfolder = 4;
-}
-
-message RunnerArtifactServiceGetDownloadUrlResponse {
-    string url = 1;
-    google.protobuf.StringValue content_type = 2;
-    google.protobuf.Int64Value size_bytes = 3;
-    google.protobuf.StringValue sha256 = 4;
-    google.protobuf.Timestamp created_utc = 5;
 }
 
 message RunnerReadStreamMetadata {
@@ -739,14 +762,6 @@ message RunnerArtifactServiceIssueUploadIdentityResponse {
     string upload_id = 1;
 }
 
-message RunnerArtifactServiceRegisterMetadataRequest {
-    RunnerArtifactUploadMetadata metadata = 1;
-}
-
-message RunnerArtifactServiceRegisterMetadataResponse {
-    offloadr.editor_runtime.v1.EditorArtifactMetadata artifact = 1;
-}
-
 message RunnerWorkspaceServiceReadWorkspaceFileRequest {
     string editor_sid = 1;
     WorkspaceRoot root = 2;
@@ -762,18 +777,6 @@ message RunnerWorkspaceServiceReadWorkspaceFileResponse {
     }
 }
 
-message RunnerWorkspaceServiceGetDownloadUrlRequest {
-    string editor_sid = 1;
-    WorkspaceRoot root = 2;
-    string relative_path = 3;
-}
-
-message RunnerWorkspaceServiceGetDownloadUrlResponse {
-    string url = 1;
-    google.protobuf.Int64Value size_bytes = 2;
-    google.protobuf.Timestamp modified_utc = 3;
-}
-
 message RunnerWorkspaceServiceReadWorkspaceSeedArchiveRequest {
     string editor_sid = 1;
     WorkspaceRoot root = 2;
@@ -786,15 +789,6 @@ message RunnerWorkspaceServiceReadWorkspaceSeedArchiveResponse {
         RunnerReadStreamMetadata metadata = 1;
         bytes chunk = 2;
     }
-}
-
-message RunnerWorkspaceServiceGetSeedArchiveUrlRequest {
-    string editor_sid = 1;
-    WorkspaceRoot root = 2;
-}
-
-message RunnerWorkspaceServiceGetSeedArchiveUrlResponse {
-    string url = 1;
 }
 
 message GetRunnerLaunchPlanRequest {
@@ -851,7 +845,6 @@ service RunnerArtifactService {
     rpc ListArtifacts(RunnerArtifactServiceListArtifactsRequest) returns (RunnerArtifactServiceListArtifactsResponse);
     rpc ReadArtifact(RunnerArtifactServiceReadArtifactRequest) returns (stream RunnerArtifactServiceReadArtifactResponse);
     rpc UploadArtifact(stream RunnerArtifactServiceUploadArtifactRequest) returns (RunnerArtifactServiceUploadArtifactResponse);
-    rpc RegisterMetadata(RunnerArtifactServiceRegisterMetadataRequest) returns (RunnerArtifactServiceRegisterMetadataResponse);
 }
 
 service RunnerWorkspaceService {

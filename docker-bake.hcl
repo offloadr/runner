@@ -15,13 +15,27 @@ variable "SOURCE_REVISION" {
   default = ""
 }
 
-# Each image gets its channel tag, plus <channel>-<commit> when SOURCE_REVISION is set.
+# RunnerProtocol.RUNNER_PROTOCOL_CURRENT of this source, and the protocol the bare channel tags
+# currently serve. CI sets both; a local build leaves them empty and gets the bare tag only.
+variable "PROTOCOL" {
+  default = ""
+}
+
+variable "PROMOTED_PROTOCOL" {
+  default = ""
+}
+
+# Each image gets <channel>-p<protocol>, which Offloadr's launch plan names, and <channel>-<commit>.
+# The bare channel tag (what `docker run …:latest` pulls) moves only while this build's protocol is
+# the promoted one, so a merged protocol change reaches no runner before Offloadr speaks it, while
+# an upstream editor refresh on the promoted protocol still publishes to every tag at once.
 function "tags_for" {
   params = [repository, channel]
-  result = SOURCE_REVISION == "" ? ["${REGISTRY}/${repository}:${channel}"] : [
-    "${REGISTRY}/${repository}:${channel}",
-    "${REGISTRY}/${repository}:${channel}-${substr(SOURCE_REVISION, 0, 12)}",
-  ]
+  result = concat(
+    PROTOCOL == "" || PROTOCOL == PROMOTED_PROTOCOL ? ["${REGISTRY}/${repository}:${channel}"] : [],
+    PROTOCOL == "" ? [] : ["${REGISTRY}/${repository}:${channel}-p${PROTOCOL}"],
+    SOURCE_REVISION == "" ? [] : ["${REGISTRY}/${repository}:${channel}-${substr(SOURCE_REVISION, 0, 12)}"],
+  )
 }
 
 group "default" {

@@ -1386,11 +1386,17 @@ public sealed class RunnerSupervisor : BackgroundService
             var delay = RegistrationPolicy.ComputeBackoff(_restartAttempt++, _options.RestartMinBackoff, _options.RestartMaxBackoff);
             _restartDueAt = now + delay;
             var exit = container?.ExitCode is { } code ? $" with exit code {code}" : string.Empty;
-            AppendLog($"supervisor: the runner stopped{exit}; restarting in {delay.TotalSeconds:0} s.");
+            // The restart asks Offloadr for its image again and downloads it, which is the update.
+            var outdated = container?.ExitCode == RunnerProtocolVersion.ProtocolRejectedExitCode;
+            AppendLog(outdated
+                ? $"supervisor: Offloadr needs a different runner version; fetching the image it names in {delay.TotalSeconds:0} s."
+                : $"supervisor: the runner stopped{exit}; restarting in {delay.TotalSeconds:0} s.");
             Update(view => view with
             {
                 State = SupervisorState.WaitingToRestart,
-                Message = $"The runner stopped{exit}. Restarting in {delay.TotalSeconds:0} seconds.",
+                Message = outdated
+                    ? $"Offloadr needs a different runner version. Updating in {delay.TotalSeconds:0} seconds."
+                    : $"The runner stopped{exit}. Restarting in {delay.TotalSeconds:0} seconds.",
                 Fault = null,
                 RunnerStatus = null,
                 Restarts = view.Restarts + 1,

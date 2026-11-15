@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# != 4 ]]; then
-  echo 'Usage: restore-image-channels.sh <comfyui-latest-digest> <comfyui-master-digest> <forge-neo-latest-digest> <forge-neo-neo-digest>' >&2
+if [[ $# != 4 && $# != 5 ]]; then
+  echo 'Usage: restore-image-channels.sh <comfyui-latest-digest> <comfyui-master-digest> <forge-neo-latest-digest> <forge-neo-neo-digest> [promoted-protocol]' >&2
   exit 1
 fi
 
@@ -12,7 +12,13 @@ refs=(
   ghcr.io/offloadr/runner-forge-neo:latest
   ghcr.io/offloadr/runner-forge-neo:neo
 )
-digests=("$@")
+digests=("${@:1:4}")
+# The promoted protocol's -p<N> tags move with the bare channels, so a rollback restores them too.
+protocol="${5:-}"
+if [[ -n "$protocol" && ! "$protocol" =~ ^[0-9]+$ ]]; then
+  echo "Invalid protocol: $protocol" >&2
+  exit 1
+fi
 
 # Validate every requested source before changing any channel.
 for i in "${!refs[@]}"; do
@@ -33,11 +39,17 @@ done
 
 for i in "${!refs[@]}"; do
   source="${refs[$i]%:*}@${digests[$i]}"
-  skopeo copy --all --preserve-digests "docker://$source" "docker://${refs[$i]}"
-  actual="$(skopeo inspect --format '{{.Digest}}' "docker://${refs[$i]}")"
-  if [[ "$actual" != "${digests[$i]}" ]]; then
-    echo "Restored channel digest mismatch for ${refs[$i]}: $actual" >&2
-    exit 1
+  targets=("${refs[$i]}")
+  if [[ -n "$protocol" ]]; then
+    targets+=("${refs[$i]}-p$protocol")
   fi
-  echo "Restored ${refs[$i]} to $actual"
+  for target in "${targets[@]}"; do
+    skopeo copy --all --preserve-digests "docker://$source" "docker://$target"
+    actual="$(skopeo inspect --format '{{.Digest}}' "docker://$target")"
+    if [[ "$actual" != "${digests[$i]}" ]]; then
+      echo "Restored channel digest mismatch for $target: $actual" >&2
+      exit 1
+    fi
+    echo "Restored $target to $actual"
+  done
 done

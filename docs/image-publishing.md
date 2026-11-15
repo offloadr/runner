@@ -9,6 +9,28 @@ registry verification confirms the build digests, channel and commit tags, the
 source/revision/license labels, the recorded editor image, and the signature and
 build provenance described below.
 
+## Protocol tags
+
+Every image carries three kinds of tag:
+
+| Tag | Moves when |
+| --- | --- |
+| `<channel>-p<N>` (`latest-p1`, `master-p1`, `neo-p1`) | Every publication of source whose `RUNNER_PROTOCOL_CURRENT` is `N`. Offloadr's launch plan names this tag, so a desktop runner always runs an image that speaks Offloadr's protocol. |
+| `<channel>` (`latest`, `master`, `neo`) | Only while `N` equals the repository variable `PROMOTED_RUNNER_PROTOCOL`. This is what `docker run …:latest` and the built-in launch plan pull. |
+| `<channel>-<commit>` | Every publication; never moved. For diagnosis and rollback sources. |
+
+An automatic dispatch after an upstream editor image moves (a new ComfyUI master, say) therefore needs no manual step: it rebuilds on the promoted protocol and moves both `<channel>-p<N>` and `<channel>`.
+
+A protocol change needs one deliberate step:
+
+1. Merge the runner change (protocol `N+1`) and publish it. Only the `-p<N+1>` and commit tags move; every runner keeps running `N`.
+2. Deploy the Offloadr release that speaks `N+1`. Its launch plan names `-p<N+1>`, and runners on `N` are refused and update.
+3. In the same window, set `PROMOTED_RUNNER_PROTOCOL` to `N+1` and publish all targets, so the bare channel tags move too.
+
+Between steps 1 and 3, an upstream refresh dispatch builds the source on `main`, which is `N+1`, so `-p<N>` is not refreshed. Keep that gap short.
+
+To roll back the promoted protocol, pass `protocol` to **Restore runner image channels**: it restores the recorded digests to both the bare channel tags and their `-p<protocol>` tags.
+
 ## Signatures and provenance
 
 Every published digest is signed with [cosign](https://docs.sigstore.dev/) using

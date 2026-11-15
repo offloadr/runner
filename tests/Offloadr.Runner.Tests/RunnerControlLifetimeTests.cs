@@ -446,6 +446,36 @@ public sealed class RunnerControlLifetimeTests
         }
     }
 
+    [Test]
+    public async Task RequiredLane_EndsCleanlyWhenItRequestsShutdownBeforeReturning()
+    {
+        // A protocol rejection ends the status lane this way; the agent then exits
+        // with the protocol code instead of a lane failure.
+        await using var lifetime = new RunnerControlLifetime(CancellationToken.None);
+        await Run(lifetime, status: token =>
+        {
+            _ = lifetime.RequestShutdownAsync();
+            return Task.CompletedTask;
+        }).WaitAsync(Timeout);
+
+        Assert.That(lifetime.Token.IsCancellationRequested, Is.True);
+    }
+
+    [Test]
+    public async Task RequiredLane_ThatReturnsWithoutShutdownIsAFailure()
+    {
+        var lifetime = new RunnerControlLifetime(CancellationToken.None);
+        try
+        {
+            var failure = await FailureAsync(Run(lifetime, status: _ => Task.CompletedTask));
+            Assert.That(failure, Is.TypeOf<InvalidOperationException>());
+        }
+        finally
+        {
+            await JoinAfterAssertionAsync(lifetime.DisposeAsync().AsTask());
+        }
+    }
+
     private static Task Run(RunnerControlLifetime lifetime, Action? attach = null,
         Func<CancellationToken, Task>? status = null, Func<CancellationToken, Task>? models = null,
         Func<CancellationToken, Task>? commands = null, Func<Task>? drainGpu = null,

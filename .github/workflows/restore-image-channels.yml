@@ -19,6 +19,11 @@ on:
         description: Recorded digest for runner-forge-neo:neo (sha256:...)
         required: true
         type: string
+      protocol:
+        description: Also restore these digests to <channel>-p<protocol> (the promoted protocol); empty restores the bare channels only
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -46,9 +51,10 @@ jobs:
           COMFYUI_MASTER: ${{ inputs.comfyui_master }}
           FORGE_NEO_LATEST: ${{ inputs.forge_neo_latest }}
           FORGE_NEO_NEO: ${{ inputs.forge_neo_neo }}
+          PROTOCOL: ${{ inputs.protocol }}
           REGISTRY_USER: ${{ github.actor }}
           REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           echo "$REGISTRY_TOKEN" | skopeo login ghcr.io --username "$REGISTRY_USER" --password-stdin
-          ./build/restore-image-channels.sh "$COMFYUI_LATEST" "$COMFYUI_MASTER" "$FORGE_NEO_LATEST" "$FORGE_NEO_NEO"
+          ./build/restore-image-channels.sh "$COMFYUI_LATEST" "$COMFYUI_MASTER" "$FORGE_NEO_LATEST" "$FORGE_NEO_NEO" ${PROTOCOL:+"$PROTOCOL"}

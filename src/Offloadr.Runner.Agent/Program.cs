@@ -95,6 +95,7 @@ static async Task<int> RunAgentAsync()
     }
 
     await using var shutdown = new RunnerAgentLifetime();
+    RegisterRunnerResponse? protocolRejected = null;
     using var shutdownSignals = new RunnerAgentShutdownSignals(shutdown);
     var runtimeIdentities = new RuntimeIdentityRegistry();
 
@@ -352,7 +353,13 @@ static async Task<int> RunAgentAsync()
             },
             options.LocalModelsScanInterval,
             runtimeIdentities,
-            cancellationToken),
+            cancellationToken,
+            response =>
+            {
+                // The whole agent stops; its sessions are cleaned up as for a shutdown.
+                protocolRejected = response;
+                _ = shutdown.RequestShutdownAsync();
+            }),
 
         runtimeTelemetry: runtimeTelemetryReporter.RunAsync,
         sealedStorageEviction: cancellationToken => new SealedStorageEvictor(
@@ -387,6 +394,12 @@ static async Task<int> RunAgentAsync()
                 throw;
             }
         });
+
+    if (protocolRejected is { } rejection)
+    {
+        RunnerLog.Error($"Runner agent exiting: Offloadr needs runner protocol {rejection.ServerProtocolVersion}, this build speaks {RunnerProtocolVersion.Current}. {rejection.Message}");
+        return RunnerProtocolVersion.ProtocolRejectedExitCode;
+    }
 
     RunnerLog.Info("Runner agent exiting.");
     return 0;

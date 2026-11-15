@@ -102,8 +102,30 @@ jobs:
         target: ${{ fromJSON(needs.plan.outputs.targets) }}
     env:
       SOURCE_REVISION: ${{ github.sha }}
+      # The protocol whose images the bare channel tags serve. Raise it, in the repository's
+      # Actions variables, together with the Offloadr deploy that speaks the new protocol.
+      PROMOTED_PROTOCOL: ${{ vars.PROMOTED_RUNNER_PROTOCOL }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Read the runner protocol
+        run: |
+          set -euo pipefail
+          protocol="$(sed -n 's/^ *RUNNER_PROTOCOL_CURRENT = \([0-9][0-9]*\);.*/\1/p' contracts/offloadr/runner/v1/runner_agent.proto)"
+          if [[ ! "$protocol" =~ ^[0-9]+$ ]]; then
+            echo "::error::Could not read RUNNER_PROTOCOL_CURRENT from runner_agent.proto."
+            exit 1
+          fi
+          if [[ ! "$PROMOTED_PROTOCOL" =~ ^[0-9]+$ ]]; then
+            echo "::error::Set the repository variable PROMOTED_RUNNER_PROTOCOL to the protocol the channel tags serve."
+            exit 1
+          fi
+          echo "PROTOCOL=$protocol" >> "$GITHUB_ENV"
+          if [ "$protocol" = "$PROMOTED_PROTOCOL" ]; then
+            echo "Protocol $protocol is promoted: the channel tags move with this build."
+          else
+            echo "::notice::Protocol $protocol is not the promoted $PROMOTED_PROTOCOL: only the -p$protocol and commit tags are published."
+          fi
 
       # The editor base images are around 12 GB; keep BuildKit state on the larger /mnt disk.
       - name: Put BuildKit state on /mnt
