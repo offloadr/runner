@@ -99,11 +99,6 @@
     border-color: transparent;
 }
 
-.runner-setup {
-    max-width: 52rem;
-    margin: 0 auto;
-}
-
 /* Read by screen readers, not shown: the state an icon or colour stands for. */
 .runner-visually-hidden {
     position: absolute;
@@ -121,4 +116,9 @@
     width: 48px;
     height: 48px;
     display: block;
+}
+
+/* Room for the scrollbar on every page, so content keeps its width between a short page and a long one. */
+html {
+    scrollbar-gutter: stable;
 }
