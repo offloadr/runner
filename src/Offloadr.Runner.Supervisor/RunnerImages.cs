@@ -128,14 +128,13 @@ public sealed class RunnerImages
     /// <summary>Removes the image with <paramref name="imageId"/> when it is still one no runner uses.</summary>
     public async Task<ImageRemoval> RemoveAsync(string imageId, CancellationToken cancellationToken = default)
     {
-        if (_view().State is SupervisorState.Checking or SupervisorState.ResolvingPlan or SupervisorState.Pulling
-            or SupervisorState.Starting or SupervisorState.Stopping)
+        if (Busy(_view()))
         {
             // It may be about to use the image; the list is shown again once it settles.
             return ImageRemoval.Busy;
         }
 
-        // Not while the runner pulls an image (a newer one in the background, say), which can move a tag.
+        // Not while the runner pulls or launches an image, which can move a tag or needs the image.
         using var removal = _gate.TryEnterRemoval();
         if (removal is null)
         {
@@ -143,25 +142,39 @@ public sealed class RunnerImages
         }
 
         // Looked at again, not taken from the page: the editor may have changed since it was drawn.
-        var image = (await ListAsync(cancellationToken).ConfigureAwait(false)).FirstOrDefault(candidate => candidate.Id == imageId);
-        if (image is null)
+        var stored = (await _engine.ListImagesAsync(cancellationToken).ConfigureAwait(false)).FirstOrDefault(candidate => candidate.Id == imageId);
+        if (stored is null)
         {
             return ImageRemoval.Removed;
         }
 
-        if (!image.CanRemove)
+        // And again before each step that removes something: an editor chosen meanwhile (a launch of it waits
+        // for this removal) keeps its image, and what was already removed stays removed.
+        ImageRemoval? Stop() => Busy(_view()) ? ImageRemoval.Busy
+            : Classify([stored], _view(), _settings.Current).FirstOrDefault() is { CanRemove: true } ? null
+            : ImageRemoval.NotAllowed;
+        if (Stop() is { } stop)
         {
-            return ImageRemoval.NotAllowed;
+            return stop;
         }
+
+        var image = Classify([stored], _view(), _settings.Current).Single();
 
         foreach (var tag in image.Tags)
         {
-            // A pull since the listing may have moved the tag to another image, which is not the one asked
-            // for and stays. A digest reference cannot move, so those below need no such check.
-            if ((await _engine.InspectImageAsync(tag, cancellationToken).ConfigureAwait(false))?.Id == imageId)
+            // A pull outside the app since the listing may have moved the tag to another image, which is not
+            // the one asked for and stays. A digest reference cannot move, so those below need no such check.
+            if ((await _engine.InspectImageAsync(tag, cancellationToken).ConfigureAwait(false))?.Id != imageId)
             {
-                await _engine.RemoveImageAsync(tag, cancellationToken).ConfigureAwait(false);
+                continue;
             }
+
+            if (Stop() is { } stopped)
+            {
+                return stopped;
+            }
+
+            await _engine.RemoveImageAsync(tag, cancellationToken).ConfigureAwait(false);
         }
 
         // An image left without a name keeps its digests, which the runner's repositories' go with. One
@@ -170,6 +183,11 @@ public sealed class RunnerImages
         {
             foreach (var digest in image.Digests)
             {
+                if (Stop() is { } stopped)
+                {
+                    return stopped;
+                }
+
                 await _engine.RemoveImageAsync(digest, cancellationToken).ConfigureAwait(false);
             }
         }
@@ -178,6 +196,10 @@ public sealed class RunnerImages
             ? ImageRemoval.Removed
             : ImageRemoval.Kept;
     }
+
+    private static bool Busy(SupervisorView view)
+        => view.State is SupervisorState.Checking or SupervisorState.ResolvingPlan or SupervisorState.Pulling
+            or SupervisorState.Starting or SupervisorState.Stopping;
 
     /// <summary>The runner images among <paramref name="images"/>: what each is for, the running and chosen ones first.</summary>
     internal static IReadOnlyList<RunnerImage> Classify(IEnumerable<StoredImage> images, SupervisorView view, RunnerSettings settings)

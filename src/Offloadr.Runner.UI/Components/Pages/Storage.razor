@@ -247,7 +247,7 @@
                     Snackbar.Add("Docker kept the image: a container or another name still uses it.", Severity.Warning);
                     break;
                 case ImageRemoval.NotAllowed:
-                    Snackbar.Add("The runner uses this image now, so it was kept.", Severity.Info);
+                    Snackbar.Add("The runner or your editor uses this image now, so it was kept.", Severity.Info);
                     break;
                 case ImageRemoval.Busy:
                     Snackbar.Add("The runner is starting or stopping. Try again once it has settled.", Severity.Info);

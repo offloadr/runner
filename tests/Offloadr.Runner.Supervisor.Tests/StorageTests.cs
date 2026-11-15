@@ -212,6 +212,49 @@ public class RunnerImagesTests
     }
 
     [Test]
+    public async Task Remove_StopsWhenItsEditorIsChosenWhileItRuns()
+    {
+        // The editor is switched to this image while the removal waits for Docker; the launch of it waits
+        // for the removal, so the removal must leave the image.
+        var settings = new FakeSettingsStore(new RunnerSettings());
+        var stopped = SupervisorView.Initial(DateTimeOffset.UtcNow);
+        var engine = new ImageStore(Running, Forge);
+        engine.BeforeInspect = reference =>
+        {
+            if (reference == ForgeNeo)
+            {
+                engine.BeforeInspect = null;
+                settings.SaveAsync(new RunnerSettings { SelectedEditorTemplate = "forge-neo:neo" }).GetAwaiter().GetResult();
+            }
+        };
+        var images = new RunnerImages(() => stopped, engine, settings);
+
+        var result = await images.RemoveAsync("sha256:bbb");
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(result, Is.EqualTo(ImageRemoval.NotAllowed));
+            Assert.That(engine.Removals, Is.Empty, "Nothing of the newly chosen image is removed.");
+            Assert.That(engine.Has("sha256:bbb"), Is.True);
+        });
+    }
+
+    [Test]
+    public async Task Remove_StopsWhenTheRunnerStartsWhileItRuns()
+    {
+        var view = SupervisorView.Initial(DateTimeOffset.UtcNow);
+        var engine = new ImageStore(Running, Forge);
+        engine.BeforeInspect = _ => view = view with { State = SupervisorState.ResolvingPlan };
+        var images = new RunnerImages(() => view, engine, new FakeSettingsStore(new RunnerSettings()));
+
+        await Assert.MultipleAsync(async () =>
+        {
+            Assert.That(await images.RemoveAsync("sha256:bbb"), Is.EqualTo(ImageRemoval.Busy));
+            Assert.That(engine.Removals, Is.Empty);
+        });
+    }
+
+    [Test]
     public async Task Remove_WaitsWhileTheRunnerPullsAnImage()
     {
         // A pull of a newer image runs in the background while the runner runs, and can move a tag.
@@ -358,8 +401,12 @@ public class RunnerImagesTests
             return Task.FromResult(listed);
         }
 
+        /// <summary>Runs as each lookup reaches the engine, while a removal waits for its answer.</summary>
+        public Action<string>? BeforeInspect { get; set; }
+
         public Task<ImageInfo?> InspectImageAsync(string image, CancellationToken cancellationToken)
         {
+            BeforeInspect?.Invoke(image);
             var found = _images.Values.FirstOrDefault(candidate =>
                 candidate.Id == image || candidate.RepoTags.Contains(image) || candidate.RepoDigests.Contains(image));
             return Task.FromResult(found is null ? null : new ImageInfo(found.Id, found.RepoDigests.FirstOrDefault(), found.RepoTags));
