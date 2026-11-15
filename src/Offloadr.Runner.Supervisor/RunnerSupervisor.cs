@@ -235,6 +235,9 @@ public sealed class RunnerSupervisor : BackgroundService
 
     public IReadOnlyList<string> LogLines => _logs.Snapshot();
 
+    /// <summary>The key the running container was started with, which Settings may no longer hold; for redaction only.</summary>
+    internal string? ActiveRunnerKey => Volatile.Read(ref _activeRunnerKey);
+
     /// <summary>Raised after <see cref="View"/> or <see cref="LogLines"/> changed, on a background thread.</summary>
     public event Action? Changed;
 

@@ -3072,6 +3072,33 @@ public class RunnerSupervisorTests
     }
 
     [Test]
+    public async Task Diagnostics_HideTheRunningContainersKey_AfterTheKeyChanges()
+    {
+        const string newKey = "another-runner-key-0123456789abcdefghijklmnop";
+        _engine.StatusJson = Status(activeSessionId: "session-1");
+        var supervisor = await StartSupervisorAsync();
+        supervisor.RequestStart();
+        await WaitForStateAsync(SupervisorState.Running);
+        await WaitUntilAsync(() => supervisor.View.HasActiveSession);
+        await _settings.SaveAsync(_settings.Current with { RunnerKey = newKey });
+        await WaitForStateAsync(SupervisorState.RestartPending);
+        var logs = Path.Combine(Path.GetTempPath(), "runner-diagnostics-" + Guid.NewGuid().ToString("n"));
+        var export = new Offloadr.Runner.Supervisor.Hosting.DiagnosticsExport(supervisor, _settings, new SupervisorPaths(logs), TimeProvider.System);
+
+        var input = export.Gather();
+        var (name, report) = export.Create();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(input.OtherRunnerKeys, Is.EqualTo(new[] { Key }));
+            Assert.That(Offloadr.Runner.Supervisor.Hosting.DiagnosticsReport.Redact($"old {Key} new {newKey}", input), Is.EqualTo("old [runner key] new [runner key]"));
+            Assert.That(report, Does.Not.Contain(Key).And.Not.Contain(newKey));
+            Assert.That(report, Does.Contain("State: Running, restart pending (RestartPending)"));
+            Assert.That(name, Does.StartWith("offloadr-runner-diagnostics-").And.EndWith(".txt"));
+        });
+    }
+
+    [Test]
     public async Task Monitoring_WhenDockerStopsAnswering_KeepsWatchingTheRunner()
     {
         var supervisor = await StartSupervisorAsync();

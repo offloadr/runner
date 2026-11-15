@@ -40,6 +40,11 @@ public sealed class DesktopHostActions(MainPage page) : IHostActions
 
     public Task<string?> PickFolderAsync() => MainThread.InvokeOnMainThreadAsync(PlatformFiles.PickFolderAsync);
 
+    public bool CanSaveFile => true;
+
+    public Task<string?> SaveTextFileAsync(string suggestedName, string text)
+        => MainThread.InvokeOnMainThreadAsync(() => PlatformFiles.SaveTextFileAsync(suggestedName, text));
+
     public Task RestartToUpdateAsync() => MainThread.InvokeOnMainThreadAsync(page.RestartToUpdateAsync);
 
     public async Task OpenExternalAsync(string url)

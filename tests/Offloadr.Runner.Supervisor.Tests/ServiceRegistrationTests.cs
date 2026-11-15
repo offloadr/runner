@@ -23,6 +23,7 @@ public class ServiceRegistrationTests
             Assert.That(provider.GetServices<IHostedService>().Single(), Is.SameAs(provider.GetRequiredService<RunnerSupervisor>()));
             Assert.That(provider.GetRequiredService<ILaunchPlanProvider>(), Is.InstanceOf<ControlPlaneLaunchPlanProvider>());
             Assert.That(provider.GetRequiredService<ILoggerFactory>(), Is.Not.Null);
+            Assert.That(provider.GetRequiredService<Offloadr.Runner.Supervisor.Hosting.DiagnosticsExport>(), Is.Not.Null);
         });
     }
 

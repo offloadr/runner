@@ -1,3 +1,4 @@
+using Windows.Storage;
 using Windows.Storage.Pickers;
 
 namespace Offloadr.Runner.Desktop;
@@ -241,5 +242,24 @@ internal static class PlatformFiles
         var native = (Microsoft.UI.Xaml.Window)Application.Current!.Windows[0].Handler!.PlatformView!;
         WinRT.Interop.InitializeWithWindow.Initialize(picker, WinRT.Interop.WindowNative.GetWindowHandle(native));
         return (await picker.PickSingleFolderAsync())?.Path;
+    }
+
+    public static async Task<string?> SaveTextFileAsync(string suggestedName, string text)
+    {
+        var picker = new FileSavePicker
+        {
+            SuggestedFileName = Path.GetFileNameWithoutExtension(suggestedName),
+            SuggestedStartLocation = PickerLocationId.DocumentsLibrary,
+        };
+        picker.FileTypeChoices.Add("Text file", [".txt"]);
+        var native = (Microsoft.UI.Xaml.Window)Application.Current!.Windows[0].Handler!.PlatformView!;
+        WinRT.Interop.InitializeWithWindow.Initialize(picker, WinRT.Interop.WindowNative.GetWindowHandle(native));
+        if (await picker.PickSaveFileAsync() is not { } file)
+        {
+            return null;
+        }
+
+        await FileIO.WriteTextAsync(file, text);
+        return file.Path;
     }
 }
