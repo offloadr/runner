@@ -6,12 +6,19 @@ It is primarily for personal runner installs. Hosted runners run the same images
 
 ## Runtime Requirements
 
-- Docker with Linux containers.
-- NVIDIA GPU with container GPU support (`--gpus all`).
-- Linux host or Windows host using Docker Desktop (PowerShell flow below).
-- A personal runner key from Settings (`Personal Runner Keys`).
+- An NVIDIA GPU with a current driver. AMD and Intel GPUs are not supported, and neither is macOS: Docker on a Mac cannot give a container a GPU.
+- Docker with Linux containers and GPU support (`--gpus all`):
+  - Linux: Docker Engine and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html), with Docker configured to use it (`sudo nvidia-ctk runtime configure --runtime=docker`, then restart Docker).
+  - Windows: [Docker Desktop](https://docs.docker.com/desktop/setup/install/windows-install/) with the WSL 2 backend. The desktop app in this repository runs the runner for you; the commands below are for running it yourself.
+- A personal runner key from Settings in the Offloadr web app (`Personal Runner Keys`).
 - The isolation mode requires root privileges inside the container because session setup uses `useradd`, `chown`, and `userdel`.
 - The published runner image defaults to root, so `--user root` is not required unless your runtime overrides the container user.
+
+Check that containers can reach the GPU before you start a runner; this prints your GPUs:
+
+```bash
+docker run --rm --gpus all ubuntu nvidia-smi -L
+```
 
 ## Offloadr API Connectivity
 
@@ -48,6 +55,37 @@ docker run --rm -it `
 ```
 
 For non-prod environments, add `-e OFFLOADR_API_GRPC=<environment-origin>`. These runners have no models: mount a models folder (see the examples under [Workspace Mirroring](#workspace-mirroring)) or turn on [model downloads](#model-downloads).
+
+### Docker Compose
+
+[compose.yaml](compose.yaml) keeps a runner running with a models folder, and saves the models it downloads there. Put it in a folder with a `.env` file beside it:
+
+```bash
+RUNNER_SECRET=replace-with-your-runner-key
+MODELS_DIR=/srv/models
+```
+
+Then start it, and read its log:
+
+```bash
+docker compose up -d
+```
+
+```bash
+docker compose logs -f runner
+```
+
+To use only the models already in the folder, set `RUNNER_MODEL_DOWNLOADS` to `off` in the file and drop the second models mount and `RUNNER_MODEL_LIBRARY_DIR`. For another editor, change the image (see the table in the [README](../README.md#docker-linux-or-the-command-line)).
+
+### Updating
+
+A runner started with `--pull always` gets the newest image of its tag each time it starts. With Compose, pull and recreate it between sessions:
+
+```bash
+docker compose pull && docker compose up -d
+```
+
+Docker keeps the image a newer one replaced; `docker image prune` removes it once no container uses it.
 
 ## Selecting one physical GPU
 
@@ -326,6 +364,22 @@ The image sets `RUNNER_STATUS_FILE=/run/offloadr/status.json`. The agent rewrite
 ```
 
 `sealed_storage.budget_bytes` is the smaller of the sealed root's free space and the container's memory headroom: its memory limit minus its working set (usage without reclaimable page cache, as `docker stats` counts it), and never more than the machine's `MemAvailable`. Without a usage figure only `MemAvailable` counts; without either the budget is unknown and sealed storage unavailable. A supervisor can read it with `docker exec <container> cat /run/offloadr/status.json`. An empty `active_session_id` means restarting the container will not interrupt a session. The file never leaves the container; unset `RUNNER_STATUS_FILE` to disable it.
+
+## Troubleshooting
+
+The desktop app shows most of these on its Status page, with what to do; its Save diagnostics button writes them, with its recent log, to a file for Offloadr support. From the command line, start with the runner's log (`docker logs <container>`, or `docker compose logs runner`).
+
+- **`could not select device driver "" with capabilities: [[gpu]]`**: Docker cannot give containers the GPU. On Linux, install the NVIDIA Container Toolkit, run `sudo nvidia-ctk runtime configure --runtime=docker` and restart Docker. On Windows, update the NVIDIA driver and make sure Docker Desktop uses the WSL 2 backend. `docker run --rm --gpus all ubuntu nvidia-smi -L` should then list your GPUs.
+- **The runner exits at once with a list of problems**: startup validation found settings it cannot run with, such as a missing or short `RUNNER_SECRET`, an `http://` Offloadr address, or a models folder that is not where `RUNNER_LOCAL_MODELS_DIR` says. Fix what the list names. With `RUNNER_SEALED_STORAGE=required` the console shows only `event=startup-validation-failed`; start it once without that setting to see the list. See [Startup Validation Behavior](#startup-validation-behavior).
+- **`pidfd_open` or `pidfd_send_signal` is unavailable or denied**: the kernel is too old, or a seccomp or container policy blocks these calls. Use a current kernel and Docker's default seccomp profile.
+- **The runner does not appear in Offloadr**: the log shows `Status update accepted=False` with Offloadr's reason, or `Runner status update failed` while it cannot reach Offloadr. Check that the key is a current personal runner key, copied whole, and that the host can make outbound HTTPS connections to `offloadr.studio`.
+- **The runner is online but your workspace does not use it**: a runner serves only the editor build of its image, so a `runner-comfyui:latest` runner does not serve `comfyui-master` or Forge Neo workspaces. Run the image for your workspace's editor (see [Startup-first Quick Start](#startup-first-quick-start)).
+- **A workflow says a model is missing**: with downloads off, the runner uses only the models in its local folder, and refuses a prompt that needs another with `model_downloads_disabled`. Add the model to the folder, or turn on [model downloads](#model-downloads). A file of a different size than Offloadr's catalog entry is not used in its place.
+- **The disk fills up**: runner images are several gigabytes each, and Docker keeps old ones. `docker image ls` lists them; `docker image rm` removes those you no longer use (the desktop app does this from its Storage page). Downloaded models take space in your models folder.
+
+## Removing the runner
+
+Stop and remove the container (`docker compose down`, or `docker rm -f <container>`), then its images (`docker image rm ghcr.io/offloadr/runner-comfyui:latest`, and so on). Your models folder is left as it is, including the models the runner downloaded into it; a `.offloadr-downloads` folder in it holds only unfinished downloads and can be deleted once no runner runs. Delete the runner key under Settings in the Offloadr web app if you no longer use it.
 
 ## Building the Images
 

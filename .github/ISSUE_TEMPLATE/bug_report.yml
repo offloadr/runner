@@ -1,0 +1,39 @@
+name: Bug report
+description: The runner or the desktop app does not work as it should.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Never paste a runner key, signed link or other secret here. Report security problems privately instead (see SECURITY.md).
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: dropdown
+    id: how
+    attributes:
+      label: How you run the runner
+      options:
+        - Desktop app (Windows)
+        - Docker on Linux
+        - Docker on Windows, without the desktop app
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: The desktop app's version (About page), or the runner image and tag you run, and your GPU.
+      placeholder: Desktop app 1.0.0, ghcr.io/offloadr/runner-comfyui:latest, RTX 4090
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics or log
+      description: |
+        Desktop app: attach the file from Save diagnostics on the Logs or About page; it never holds your runner key. Read it before you attach it.
+        Docker: paste the relevant part of `docker logs`.
