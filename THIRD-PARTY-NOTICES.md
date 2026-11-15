@@ -12,6 +12,18 @@ The runner source code in this repository is licensed under the GNU Affero Gener
 | Grpc.Net.Client, Grpc.Net.Common, Grpc.Core.Api, Grpc.Tools (build only) | Apache-2.0 |
 | Microsoft.Extensions.* and the .NET runtime (self-contained in the image) | MIT |
 
+## Desktop app (Windows)
+
+| Component | License |
+| --- | --- |
+| .NET runtime, .NET MAUI, ASP.NET Core (Blazor, Data Protection), System.Drawing.Common | MIT |
+| MudBlazor | MIT |
+| Velopack (installer and updates) | MIT |
+| Microsoft WebView2 SDK | BSD-3-Clause |
+| Windows App SDK | Microsoft Software License Terms |
+
+The Microsoft Edge WebView2 Runtime, Docker and the NVIDIA driver are not part of the app; they are installed separately, under their own terms.
+
 ## Runner container images
 
 Each image layers the agent, `aria2` and the model VFS shim (`liboffloadr_model_vfs.so`, built from `src/Offloadr.Runner.Linux/VfsShim/model_vfs.c`) on a public editor image. The complete build sources of every layer are public:

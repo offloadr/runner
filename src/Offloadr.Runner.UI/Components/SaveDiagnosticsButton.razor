@@ -1,0 +1,41 @@
+@inject IJSRuntime JS
+@inject ISnackbar Snackbar
+@inject IHostActions Host
+@inject DiagnosticsExport Diagnostics
+
+@* Saves the redacted diagnostics report where the person chooses, or copies it where the host cannot save. *@
+<MudButton Variant="Variant.Outlined" StartIcon="@Icons.Material.Filled.Description" Disabled="_saving" OnClick="SaveAsync">
+    @(Host.CanSaveFile ? "Save diagnostics" : "Copy diagnostics")
+</MudButton>
+
+@code {
+    private bool _saving;
+
+    private async Task SaveAsync()
+    {
+        _saving = true;
+        try
+        {
+            var (name, text) = Diagnostics.Create();
+            if (!Host.CanSaveFile)
+            {
+                await JS.InvokeVoidAsync("navigator.clipboard.writeText", text);
+                Snackbar.Add("Copied the diagnostics. Read them before you send them.", Severity.Success);
+                return;
+            }
+
+            if (await Host.SaveTextFileAsync(name, text) is { } saved)
+            {
+                Snackbar.Add($"Saved the diagnostics to {saved}. Read the file before you send it.", Severity.Success);
+            }
+        }
+        catch (Exception ex) when (ex is JSException or IOException or UnauthorizedAccessException or System.Runtime.InteropServices.COMException)
+        {
+            Snackbar.Add($"Could not save the diagnostics: {ex.Message}", Severity.Error);
+        }
+        finally
+        {
+            _saving = false;
+        }
+    }
+}

@@ -3,8 +3,11 @@
 @inject RunnerSettingsEditor SettingsEditor
 @inject IHostActions Host
 @inject ISnackbar Snackbar
+@inject IDialogService Dialogs
 
 <PageTitle>Settings - Offloadr Runner</PageTitle>
+
+<NavigationLock OnBeforeInternalNavigation="ConfirmLeavingAsync" />
 
 <MudText Typo="Typo.h5" HtmlTag="h1" Class="mb-4">Settings</MudText>
 
@@ -90,7 +93,11 @@
             </MudAlert>
         }
 
-        <MudStack Row="true" Justify="Justify.FlexEnd">
+        <MudStack Row="true" Justify="Justify.FlexEnd" AlignItems="AlignItems.Center" Spacing="3">
+            @if (HasChanges)
+            {
+                <MudText Typo="Typo.body2" Class="mud-text-secondary" aria-live="polite">Unsaved changes</MudText>
+            }
             <MudButton Variant="Variant.Filled" Color="Color.Primary" Disabled="_saving" OnClick="SaveAsync">Save</MudButton>
         </MudStack>
     </MudStack>
@@ -109,6 +116,14 @@
     private bool _showKey;
     private bool _saving;
     private IReadOnlyList<string> _problems = [];
+
+    // What the page last loaded or saved, to tell whether leaving would lose changes.
+    private SettingsForm _saved = null!;
+    private bool _savedStartAtSignIn;
+
+    private SettingsForm Form => new(_runnerKey, _editorTemplate, _modelsDirectory, _origin, _engineExecutable, _autoStart, _downloadModels, _keepAwake);
+
+    private bool HasChanges => !Form.SameAs(_saved) || _startAtSignIn != _savedStartAtSignIn;
 
     private IReadOnlyList<LaunchTemplate> Templates
         => View.Plan?.Source == LaunchPlanSource.ControlPlane ? View.Plan.Templates : BuiltInLaunchPlanCatalog.Templates;
@@ -130,6 +145,8 @@
         _downloadModels = form.DownloadModels;
         _keepAwake = form.KeepAwakeDuringSessions;
         _startAtSignIn = Host.CanStartAtSignIn && Host.StartsAtSignIn;
+        _saved = form;
+        _savedStartAtSignIn = _startAtSignIn;
     }
 
     private async Task SaveAsync()
@@ -137,7 +154,8 @@
         _saving = true;
         try
         {
-            var result = await SettingsEditor.SaveAsync(new SettingsForm(_runnerKey, _editorTemplate, _modelsDirectory, _origin, _engineExecutable, _autoStart, _downloadModels, _keepAwake));
+            var form = Form;
+            var result = await SettingsEditor.SaveAsync(form);
             _problems = result.Problems;
             if (!result.Saved)
             {
@@ -145,10 +163,13 @@
                 return;
             }
 
+            _saved = form;
             if (Host.CanStartAtSignIn && _startAtSignIn != Host.StartsAtSignIn)
             {
                 Host.SetStartAtSignIn(_startAtSignIn);
             }
+
+            _savedStartAtSignIn = _startAtSignIn;
 
             Snackbar.Add(
                 View.IsActive ? "Saved. The runner restarts with these settings when no session is using it." : "Saved.",
@@ -170,6 +191,24 @@
         if (!string.IsNullOrEmpty(folder))
         {
             _modelsDirectory = folder;
+        }
+    }
+
+    private async Task ConfirmLeavingAsync(LocationChangingContext context)
+    {
+        if (!HasChanges)
+        {
+            return;
+        }
+
+        var discard = await Dialogs.ShowMessageBoxAsync(
+            "Discard your changes?",
+            "You changed settings without saving them. Leaving this page discards those changes.",
+            yesText: "Discard",
+            cancelText: "Keep editing");
+        if (discard != true)
+        {
+            context.PreventNavigation();
         }
     }
 
