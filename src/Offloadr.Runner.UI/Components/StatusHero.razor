@@ -22,7 +22,8 @@
 </MudStack>
 @if (View.Fault is { } fault)
 {
-    <FaultCard Fault="fault" Waiting="@(View.State != SupervisorState.Faulted)" OnOpenSettings="OnOpenSettings" Class="mt-4" />
+    @* A retry is the same start as the button above: on Setup it saves the page's answers first. *@
+    <FaultCard Fault="fault" Waiting="@(View.State != SupervisorState.Faulted)" OnOpenSettings="OnOpenSettings" OnStart="StartAsync" Class="mt-4" />
 }
 @if (View.PullProgress is { Fraction: { } fraction } pull)
 {

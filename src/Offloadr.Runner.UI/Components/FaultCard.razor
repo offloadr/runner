@@ -7,7 +7,7 @@
         </div>
         @if (Fault.Action != FaultAction.None)
         {
-            <div><FixButton Action="Fault.Action" OnOpenSettings="OnOpenSettings" /></div>
+            <div><FixButton Action="Fault.Action" OnOpenSettings="OnOpenSettings" OnStart="OnStart" /></div>
         }
         @if (Fault.Detail is { } detail)
         {
@@ -29,6 +29,10 @@
 
     [Parameter]
     public EventCallback OnOpenSettings { get; set; }
+
+    /// <summary>How a retry starts the runner: the page's own start, so it runs with what the page shows.</summary>
+    [Parameter]
+    public EventCallback OnStart { get; set; }
 
     [Parameter]
     public string? Class { get; set; }

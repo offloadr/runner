@@ -18,6 +18,10 @@
     [Parameter]
     public EventCallback OnOpenSettings { get; set; }
 
+    /// <summary>What Try again does instead of starting the runner at once; Setup saves what the page shows first.</summary>
+    [Parameter]
+    public EventCallback OnStart { get; set; }
+
     private async Task RunAsync(FaultHelp help)
     {
         if (help.Url is { } url)
@@ -30,6 +34,9 @@
         {
             case FaultAction.StartEngine:
                 Supervisor.RequestRefresh();
+                break;
+            case FaultAction.CheckConnection when OnStart.HasDelegate:
+                await OnStart.InvokeAsync();
                 break;
             case FaultAction.CheckConnection:
                 Supervisor.RequestStart();
