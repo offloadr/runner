@@ -14,9 +14,9 @@ public partial class ServiceClientManagerTests
         var command = WithPromptIdentity(new()
         {
             SessionId = PromptSessionId,
-            SubmissionId = PromptSubmissionId,
+            HandoffId = PromptHandoffId,
             EditorSid = "editor-1",
-            PromptJson = "{}"
+            Request = new() { Body = "{}" }
         });
         CancellationTokenRegistration registration = default;
         Task? stop = null;
@@ -40,7 +40,7 @@ public partial class ServiceClientManagerTests
                 _ => { }, physical, demand,
                 isPromptQueued: (_, _) => Task.FromResult<bool?>(false),
                 nativeBody: "{\"prompt_id\":\"native-prompt-1\"}",
-                holdPromptDemand: settling => work.HoldDemand(command.CommandId, settling))), Is.True);
+                holdPromptDemand: settling => work.HoldDemand(command.HandoffId, settling))), Is.True);
             await callbackRan.Task.WaitAsync(TimeSpan.FromSeconds(5));
             stop = work.CancelAndWaitAsync(_ => true);
             await Task.Delay(50);

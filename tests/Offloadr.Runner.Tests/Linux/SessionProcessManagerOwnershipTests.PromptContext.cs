@@ -112,30 +112,32 @@ public partial class SessionProcessManagerOwnershipTests
     {
         await using var fixture = await PromptRuntimeFixture.CreateAsync();
         var command = fixture.Command();
-        if (mismatch == "generation") command.Target.GpuGeneration++;
-        else if (mismatch == "epoch") command.Target.RuntimeEpoch++;
-        else command.Target.RuntimeInstanceId = Guid.NewGuid().ToString("n");
+        Assert.That(fixture.Manager.IsPromptRuntimeCurrent(command), Is.True);
+        if (mismatch == "generation") command.LifecycleGeneration++;
+        else if (mismatch == "epoch") command.RuntimeEpoch++;
+        else command.RuntimeInstanceId = Guid.NewGuid().ToString("n");
+        Assert.That(fixture.Manager.IsPromptRuntimeCurrent(command), Is.False, "The pre-grant fence refuses it.");
         Assert.ThrowsAsync<InvalidOperationException>(() => fixture.Manager.SubmitEditorActionAsync(command, CancellationToken.None));
         Assert.That(fixture.Http.Requests, Is.Empty);
     }
 
-    [TestCase("target-session")]
-    [TestCase("target-instance")]
-    [TestCase("command-session")]
+    [TestCase("handoff")]
+    [TestCase("instance")]
+    [TestCase("session")]
+    [TestCase("generation")]
     public async Task MalformedIdentityIsRejectedAsValidationFailureBeforeHttp(string malformed)
     {
         await using var fixture = await PromptRuntimeFixture.CreateAsync();
         var command = fixture.Command();
-        if (malformed == "target-session") command.Target.RunnerSessionId = "not-a-uuid";
-        else if (malformed == "target-instance") command.Target.RuntimeInstanceId = "not-a-uuid";
-        else command.SessionId = "not-a-uuid";
+        if (malformed == "handoff") command.HandoffId = "not-a-uuid";
+        else if (malformed == "instance") command.RuntimeInstanceId = "not-a-uuid";
+        else if (malformed == "session") command.SessionId = "not-a-uuid";
+        else command.LifecycleGeneration = 0;
 
         var failure = Assert.CatchAsync(() => fixture.Manager.SubmitEditorActionAsync(command, CancellationToken.None));
-        var recoveryFailure = Assert.CatchAsync(() => fixture.Manager.RecoverPromptAsync(
-            command, "runner-1", (_, _) => Task.CompletedTask, CancellationToken.None));
 
         Assert.That(failure, Is.InstanceOf<InvalidOperationException>().Or.InstanceOf<ArgumentException>());
-        Assert.That(recoveryFailure, Is.InstanceOf<InvalidOperationException>().Or.InstanceOf<ArgumentException>());
+        Assert.That(fixture.Manager.IsPromptRuntimeCurrent(command), Is.False);
         Assert.That(fixture.Http.Requests, Is.Empty);
     }
 
@@ -144,9 +146,9 @@ public partial class SessionProcessManagerOwnershipTests
     {
         await using var fixture = await PromptRuntimeFixture.CreateAsync("forge-neo");
         var command = fixture.Command();
-        command.HttpPath = "queue/join";
-        command.PromptJson = "{";
-        command.ArtifactReferences.Add(new Offloadr.Common.V1.PromptArtifactReference
+        command.Request.Path = "queue/join";
+        command.Request.Body = "{";
+        command.ArtifactReferences.Add(new PromptArtifact
         {
             Placeholder = "offloadr://forge-artifact/input",
             Filename = "input.png",
@@ -193,8 +195,8 @@ public partial class SessionProcessManagerOwnershipTests
     {
         await using var fixture = await PromptRuntimeFixture.CreateAsync("forge-neo");
         var command = fixture.Command();
-        command.HttpPath = "queue/join";
-        command.PreflightRequests.Add(new Offloadr.Common.V1.PromptHttpRequest { Method = "POST", Path = "api/preflight", Body = "{}" });
+        command.Request.Path = "queue/join";
+        command.PreflightRequests.Add(new PromptRequest { Method = "POST", Path = "api/preflight", Body = "{}" });
         fixture.Http.Respond = (_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.ServiceUnavailable));
         var nativeAttempts = 0;
         Assert.ThrowsAsync<InvalidOperationException>(() => fixture.Manager.SubmitEditorActionAsync(
@@ -224,6 +226,8 @@ public partial class SessionProcessManagerOwnershipTests
         fixture.Start.RuntimeInstanceId = Guid.NewGuid().ToString("n");
         await fixture.Manager.StartSessionAsync(fixture.Start, CancellationToken.None);
         fixture.Http.Respond = (_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent([0xff, 0x01]) });
+        Assert.That(fixture.Manager.IsPromptRuntimeCurrent(original), Is.False);
+        Assert.That(fixture.Manager.IsPromptRuntimeCurrent(fixture.Command()), Is.True);
         Assert.ThrowsAsync<InvalidOperationException>(() => fixture.Manager.SubmitEditorActionAsync(original, CancellationToken.None));
         var result = await fixture.Manager.SubmitEditorActionAsync(fixture.Command(), CancellationToken.None);
         Assert.That(fixture.Http.Requests, Has.Count.EqualTo(2));
@@ -408,47 +412,13 @@ public partial class SessionProcessManagerOwnershipTests
     }
 
     [Test]
-    public async Task ComfyRecoveryOnlyReadsHistoryAndQueueAndRetainsExactTarget()
-    {
-        await using var fixture = await PromptRuntimeFixture.CreateAsync();
-        var command = fixture.Command();
-        command.RecoveryOnly = true;
-        command.NativeIdentifiers = new() { PromptId = Guid.NewGuid().ToString("D") };
-        var evidence = new List<ReportPromptEvidenceRequest>();
-        await fixture.Manager.RecoverPromptAsync(command, command.Target.RunnerId,
-            (request, _) => { evidence.Add(request); return Task.CompletedTask; }, CancellationToken.None);
-        Assert.That(fixture.Http.Requests.Select(request => request.Method), Is.EqualTo(new[] { "GET", "GET" }));
-        Assert.That(fixture.Http.Requests.Select(request => request.Path), Is.EqualTo(new[] { "/api/history/" + command.NativeIdentifiers.PromptId, "/api/queue" }));
-        Assert.That(evidence, Has.Count.EqualTo(2));
-        Assert.That(evidence.All(item => item.Target.Equals(command.Target) && item.CommandId == command.CommandId), Is.True);
-    }
-
-    [Test]
     public async Task NativeForgeObserverDoesNotPollAGenerationsProgressThroughItsSharedStream()
     {
         await using var fixture = await PromptRuntimeFixture.CreateAsync("forge-neo");
         var command = fixture.Command();
-        command.HttpMethod = "GET";
-        command.HttpPath = "queue/data";
-        command.HttpQuery = "session_hash=captured-session";
-        command.PromptJson = string.Empty;
-        command.NativeIdentifiers = new() { SessionHash = "captured-session" };
+        command.Request = new() { Method = "GET", Path = "queue/data", Query = "session_hash=captured-session" };
         await fixture.Manager.SubmitEditorActionAsync(command, (_, _, _) => Task.CompletedTask, CancellationToken.None);
         Assert.That(fixture.Http.Requests.Select(request => request.Path), Is.EqualTo(new[] { "/queue/data" }));
-    }
-
-    [Test]
-    public async Task ForgeObserverRecoveryCannotOpenAnotherConsumingStream()
-    {
-        await using var fixture = await PromptRuntimeFixture.CreateAsync("forge-neo");
-        var command = fixture.Command();
-        command.HttpMethod = "GET";
-        command.HttpPath = "queue/data";
-        command.NativeIdentifiers = new() { SessionHash = "captured-session" };
-        command.RecoveryOnly = true;
-        await fixture.Manager.RecoverPromptAsync(command, command.Target.RunnerId,
-            (_, _) => throw new AssertionException("No native observation could have been produced"), CancellationToken.None);
-        Assert.That(fixture.Http.Requests, Is.Empty);
     }
 
     private sealed class PromptRuntimeFixture(string root, SessionProcessManager manager, PromptHttpHandler http, StartSessionCommand start) : IAsyncDisposable
@@ -459,30 +429,15 @@ public partial class SessionProcessManagerOwnershipTests
 
         public SubmitPromptCommand Command() => new()
         {
-            CommandId = Guid.NewGuid().ToString("n"),
-            SubmissionId = Guid.NewGuid().ToString("n"),
+            HandoffId = Guid.NewGuid().ToString("n"),
             SessionId = Start.SessionId,
             EditorSid = "editor",
             Owner = "alice",
             EditorRuntimeKind = Start.EditorRuntimeKind,
-            HttpMethod = "POST",
-            HttpPath = "api/prompt",
-            PromptJson = "{}",
-            ContentType = "application/json",
-            Target = new()
-            {
-                EditorLifecycleId = "cpu",
-                EditorGeneration = 1,
-                CpuRuntimeGeneration = 1,
-                CpuRuntimeInstanceId = Guid.NewGuid().ToString("n"),
-                GpuLifecycleId = "gpu",
-                GpuGeneration = Start.LifecycleGeneration,
-                AllocationId = "allocation",
-                RuntimeEpoch = Start.RuntimeEpoch,
-                RuntimeInstanceId = Start.RuntimeInstanceId,
-                RunnerId = "11111111111141118111111111111111",
-                RunnerSessionId = Start.SessionId,
-            },
+            LifecycleGeneration = Start.LifecycleGeneration,
+            RuntimeEpoch = Start.RuntimeEpoch,
+            RuntimeInstanceId = Start.RuntimeInstanceId,
+            Request = new() { Method = "POST", Path = "api/prompt", Body = "{}", ContentType = "application/json" },
         };
 
         public static async Task<PromptRuntimeFixture> CreateAsync(string kind = "comfyui", Func<Task>? cleanup = null)

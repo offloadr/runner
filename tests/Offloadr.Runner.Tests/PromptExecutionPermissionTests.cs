@@ -1,4 +1,4 @@
-using Google.Protobuf.WellKnownTypes;
+using Grpc.Core;
 using Offloadr.Common.V1;
 using Offloadr.Runner.V1;
 
@@ -6,191 +6,306 @@ namespace Offloadr.Runner.Tests;
 
 public sealed class PromptExecutionPermissionTests
 {
-    [Test]
-    public async Task DuplicateDeliveryAfterLostAcknowledgementOnlyObservesOriginalWork()
+    private const string RunnerId = "11111111111141118111111111111111";
+    private const string InstanceId = "runner-process-1";
+
+    [TestCase(PromptGrantOutcome.AlreadyGranted)]
+    [TestCase(PromptGrantOutcome.MissingOrExpired)]
+    [TestCase(PromptGrantOutcome.TargetNotCurrent)]
+    [TestCase(PromptGrantOutcome.AccountUnavailable)]
+    [TestCase(PromptGrantOutcome.Unspecified)]
+    public async Task AHandoffThatIsNotGrantedRunsNothingAndIsNotAcknowledged(PromptGrantOutcome outcome)
     {
         var command = Command();
         var grants = 0;
-        var invocations = 0;
-        var observations = 0;
-        var acknowledgements = new List<AcknowledgePromptResultRequest>();
-        Task<GrantPromptExecutionResponse> Grant(GrantPromptExecutionRequest request, CancellationToken token)
+        var granted = false;
+        await Execute(command,
+            (_, _) => { grants++; return Task.FromResult(new GrantPromptExecutionResponse { Outcome = outcome }); },
+            (_, _) => throw new AssertionException("A handoff that was not granted invoked the runtime"),
+            acknowledge: (_, _) => throw new AssertionException("A handoff that was not granted was acknowledged"),
+            captureRefresh: _ => throw new AssertionException("A handoff that was not granted prepared artifacts"),
+            prepareDownloads: (_, _, _) => throw new AssertionException("A handoff that was not granted prepared downloads"),
+            ensureBridge: (_, _, _, _) => throw new AssertionException("A handoff that was not granted opened a bridge"),
+            onGranted: () => granted = true);
+        Assert.Multiple(() =>
         {
-            Assert.That(request.Target, Is.EqualTo(command.Target));
-            Assert.That(request.CommandId, Is.EqualTo(command.CommandId));
-            return Task.FromResult(Permission(command, ++grants == 1));
-        }
-        for (var delivery = 0; delivery < 2; delivery++)
-            await Execute(command, Grant, (_, _) => { invocations++; return Task.FromResult(new SessionProcessManager.PromptSubmissionResult(true, 200, [0xff, 0x00, 0x80], "observed")); },
-                (_, _) => { observations++; return Task.CompletedTask; },
-                (ack, _) => { acknowledgements.Add(ack.Clone()); throw new IOException("ack response lost"); });
-        Assert.That(invocations, Is.EqualTo(1));
-        Assert.That(observations, Is.EqualTo(1));
-        Assert.That(acknowledgements, Has.Count.EqualTo(1));
-        Assert.That(acknowledgements[0].Target, Is.EqualTo(command.Target));
-        Assert.That(acknowledgements[0].Result.NativeResponse.Body.ToByteArray(), Is.EqualTo(new byte[] { 0xff, 0x00, 0x80 }));
+            Assert.That(grants, Is.EqualTo(1), "A refused grant is not retried.");
+            Assert.That(granted, Is.False);
+        });
+    }
+
+    [TestCase(StatusCode.FailedPrecondition)]
+    [TestCase(StatusCode.PermissionDenied)]
+    [TestCase(StatusCode.InvalidArgument)]
+    public async Task ANonRetryableGrantErrorDropsTheDeliveryWithoutAcknowledgement(StatusCode status)
+    {
+        var command = Command();
+        var grants = 0;
+        await Execute(command,
+            (_, _) => { grants++; throw new RpcException(new(status, "refused")); },
+            (_, _) => throw new AssertionException("A refused grant invoked the runtime"),
+            acknowledge: (_, _) => throw new AssertionException("A refused grant was acknowledged"));
+        Assert.That(grants, Is.EqualTo(1));
     }
 
     [Test]
-    public async Task RecoveryDeliveryNeverAsksForAnotherExecutionPermission()
+    public async Task AGrantedNativeResponseIsAcknowledgedExactlyOnce()
     {
         var command = Command();
-        command.RecoveryOnly = true;
-        var observations = 0;
+        var grantRequests = new List<GrantPromptExecutionRequest>();
+        var acknowledgements = new List<AcknowledgePromptResultRequest>();
+        var invocations = 0;
+        var granted = 0;
         await Execute(command,
-            (_, _) => throw new AssertionException("Recovery must not ask for execution"),
-            (_, _) => throw new AssertionException("Recovery must not invoke a generation"),
-            (captured, _) => { Assert.That(captured.Target, Is.EqualTo(command.Target)); observations++; return Task.CompletedTask; },
-            (_, _) => throw new AssertionException("Observation cannot invent an original acknowledgement"));
-        Assert.That(observations, Is.EqualTo(1));
+            (request, _) => { grantRequests.Add(request.Clone()); return Granted(); },
+            (_, _) =>
+            {
+                invocations++;
+                return Task.FromResult(new SessionProcessManager.PromptSubmissionResult(true, 200, [0xff, 0x00, 0x80], "observed", "application/json"));
+            },
+            acknowledge: (ack, _) => { acknowledgements.Add(ack.Clone()); return Task.CompletedTask; },
+            onGranted: () => granted++);
+        Assert.Multiple(() =>
+        {
+            Assert.That(invocations, Is.EqualTo(1));
+            Assert.That(granted, Is.EqualTo(1));
+            Assert.That(grantRequests.Single(), Is.EqualTo(new GrantPromptExecutionRequest
+            {
+                RunnerId = RunnerId,
+                SessionId = command.SessionId,
+                HandoffId = command.HandoffId,
+                InstanceId = InstanceId,
+                LifecycleGeneration = command.LifecycleGeneration,
+                RuntimeEpoch = command.RuntimeEpoch,
+                RuntimeInstanceId = command.RuntimeInstanceId,
+            }));
+            var ack = acknowledgements.Single();
+            Assert.That(ack.RunnerId, Is.EqualTo(RunnerId));
+            Assert.That(ack.SessionId, Is.EqualTo(command.SessionId));
+            Assert.That(ack.HandoffId, Is.EqualTo(command.HandoffId));
+            Assert.That(ack.InstanceId, Is.EqualTo(InstanceId));
+            Assert.That(ack.Outcome, Is.EqualTo(PromptResultOutcome.NativeResponse));
+            Assert.That(ack.StatusCode, Is.EqualTo(200));
+            Assert.That(ack.Body.ToByteArray(), Is.EqualTo(new byte[] { 0xff, 0x00, 0x80 }));
+            Assert.That(ack.ContentType, Is.EqualTo("application/json"));
+            Assert.That(ack.BodyOmitted, Is.False);
+            Assert.That(ack.DiagnosticCode, Is.Empty);
+        });
     }
 
-    [TestCase(false)]
-    [TestCase(true)]
-    public void UnspecifiedReceiptContentReportsAProtocolErrorWithoutNativeEffects(bool mayExecute)
+    [TestCase(StatusCode.Unavailable)]
+    [TestCase(StatusCode.DeadlineExceeded)]
+    public async Task ALostGrantReplyIsRetriedAndTheHandoffRunsOnce(StatusCode lostReply)
     {
         var command = Command();
-        var permission = Permission(command, mayExecute);
-        permission.Submission.ContentAvailability = PromptContentAvailability.Unspecified;
-        var error = Assert.ThrowsAsync<InvalidOperationException>(() => Execute(command,
-            (_, _) => Task.FromResult(permission),
-            (_, _) => throw new AssertionException("Unspecified content invoked the runtime"),
-            (_, _) => throw new AssertionException("Unspecified content probed the runtime"),
-            (_, _) => throw new AssertionException("Unspecified content invented an acknowledgement"),
-            captureRefresh: _ => throw new AssertionException("Unspecified content prepared artifacts")));
-        Assert.That(error!.Message, Does.Contain("content availability"));
+        var grantRequests = new List<GrantPromptExecutionRequest>();
+        var acknowledgements = new List<AcknowledgePromptResultRequest>();
+        var invocations = 0;
+        await Execute(command,
+            (request, _) =>
+            {
+                grantRequests.Add(request.Clone());
+                // The platform committed the first grant, but its reply was lost.
+                if (grantRequests.Count == 1) throw new RpcException(new(lostReply, "grant reply lost"));
+                return Granted();
+            },
+            (_, _) =>
+            {
+                invocations++;
+                return Task.FromResult(new SessionProcessManager.PromptSubmissionResult(true, 200, "{}"u8.ToArray(), "observed"));
+            },
+            acknowledge: (ack, _) => { acknowledgements.Add(ack.Clone()); return Task.CompletedTask; });
+        Assert.Multiple(() =>
+        {
+            Assert.That(grantRequests, Has.Count.EqualTo(2));
+            Assert.That(grantRequests[1], Is.EqualTo(grantRequests[0]), "The retry is the same grant.");
+            Assert.That(invocations, Is.EqualTo(1));
+            Assert.That(acknowledgements, Has.Count.EqualTo(1));
+            Assert.That(acknowledgements[0].Outcome, Is.EqualTo(PromptResultOutcome.NativeResponse));
+        });
     }
 
-    [TestCase(PromptContentAvailability.Expired, false)]
-    [TestCase(PromptContentAvailability.Expired, true)]
-    [TestCase(PromptContentAvailability.Unspecified, false)]
-    [TestCase(PromptContentAvailability.Unspecified, true)]
-    public async Task UnavailableReceiptCannotReachNativeWorkEvenWithContradictoryPermission(
-        PromptContentAvailability availability, bool mayExecute)
+    [Test]
+    public async Task AHandoffForARuntimeThatIsNotCurrentIsNeverGranted()
     {
         var command = Command();
-        var permission = Permission(command, mayExecute);
-        permission.Submission.ContentAvailability = availability;
-        Task Attempt() => Execute(command, (_, _) => Task.FromResult(permission),
-            (_, _) => throw new AssertionException("Unavailable content invoked the runtime"),
-            (_, _) => throw new AssertionException("Unavailable content probed the runtime"),
-            (_, _) => throw new AssertionException("Unavailable content invented an acknowledgement"),
-            captureRefresh: _ => throw new AssertionException("Unavailable content prepared artifacts"));
-        if (availability == PromptContentAvailability.Unspecified)
-            Assert.ThrowsAsync<InvalidOperationException>(Attempt);
-        else
-            await Attempt();
+        SubmitPromptCommand? checkedCommand = null;
+        await Execute(command,
+            (_, _) => throw new AssertionException("A handoff for another runtime asked for a grant"),
+            (_, _) => throw new AssertionException("A handoff for another runtime invoked the runtime"),
+            acknowledge: (_, _) => throw new AssertionException("A handoff for another runtime was acknowledged"),
+            isRuntimeCurrent: candidate => { checkedCommand = candidate; return false; });
+        Assert.That(checkedCommand, Is.SameAs(command));
     }
 
+    [TestCase("handoff")]
+    [TestCase("session")]
     [TestCase("generation")]
-    [TestCase("runner")]
-    [TestCase("command")]
-    public void MissingOrMismatchedIdentityCannotReachPermission(string field)
+    [TestCase("epoch")]
+    [TestCase("instance")]
+    public void AMissingOrMalformedIdentityCannotReachTheGrant(string field)
     {
         var command = Command();
-        if (field == "generation") command.Target.GpuGeneration = 0;
-        else if (field == "runner") command.Target.RunnerId = Guid.NewGuid().ToString("n");
-        else command.CommandId = "";
+        if (field == "handoff") command.HandoffId = "";
+        else if (field == "session") command.SessionId = "not-a-session";
+        else if (field == "generation") command.LifecycleGeneration = 0;
+        else if (field == "epoch") command.RuntimeEpoch = 0;
+        else command.RuntimeInstanceId = Guid.Empty.ToString("n");
         Assert.ThrowsAsync<ArgumentException>(() => Execute(command,
-            (_, _) => throw new AssertionException("Invalid identity reached permission"),
+            (_, _) => throw new AssertionException("Invalid identity reached the grant"),
             (_, _) => throw new AssertionException("Invalid identity invoked the runtime")));
     }
 
-    [TestCase(false)]
-    [TestCase(true)]
-    public void WrongReceiptOrMissingCommittedPermissionCannotInvokeRuntime(bool differentTarget)
-    {
-        var command = Command();
-        var permission = Permission(command, true);
-        if (differentTarget) permission.Submission.Target.RuntimeEpoch++;
-        else permission.Submission.ExecutionPermissionUtc = null;
-        Assert.ThrowsAsync<InvalidOperationException>(() => Execute(command, (_, _) => Task.FromResult(permission),
-            (_, _) => throw new AssertionException("Mismatched permission invoked the runtime")));
-    }
-
     [Test]
-    public async Task LostNativeResultRemainsUnknownWithoutInventingHttpFailure()
+    public async Task ALostNativeResultIsAcknowledgedUnknown()
     {
         var command = Command();
-        AcknowledgePromptResultRequest? observed = null;
-        await Execute(command, (_, _) => Task.FromResult(Permission(command, true)),
+        var acknowledgements = new List<AcknowledgePromptResultRequest>();
+        await Execute(command, (_, _) => Granted(),
             (_, _) => throw new IOException("runtime connection lost after write"),
-            acknowledge: (ack, _) => { observed = ack; return Task.CompletedTask; });
-        Assert.That(observed!.Result.Outcome, Is.EqualTo(PromptInvocationOutcome.Unknown));
-        Assert.That(observed.Result.NativeResponse, Is.Null);
-        Assert.That(observed.Result.Message, Does.Not.Contain("connection lost after write"));
+            acknowledge: (ack, _) => { acknowledgements.Add(ack.Clone()); return Task.CompletedTask; });
+        var observed = acknowledgements.Single();
+        Assert.Multiple(() =>
+        {
+            Assert.That(observed.Outcome, Is.EqualTo(PromptResultOutcome.Unknown));
+            Assert.That(observed.DiagnosticCode, Is.EqualTo("prompt_native_result_unknown"));
+            Assert.That(observed.StatusCode, Is.Zero);
+            Assert.That(observed.Body.IsEmpty, Is.True);
+        });
     }
 
     [Test]
-    public async Task CancellationAfterGrantBeforeNativeCallIsProvenNotExecuted()
+    public async Task CancellationAfterTheGrantBeforeTheNativeCallIsAcknowledgedNotExecuted()
     {
         var command = Command();
         using var cancellation = new CancellationTokenSource();
-        AcknowledgePromptResultRequest? observed = null;
-        await Execute(command, (_, _) => { cancellation.Cancel(); return Task.FromResult(Permission(command, true)); },
+        var acknowledgements = new List<AcknowledgePromptResultRequest>();
+        await Execute(command, (_, _) => { cancellation.Cancel(); return Granted(); },
             (_, _) => throw new AssertionException("Cancelled preparation invoked the runtime"),
-            acknowledge: (ack, token) => { Assert.That(token.IsCancellationRequested, Is.False); observed = ack; return Task.CompletedTask; },
+            acknowledge: (ack, token) => { Assert.That(token.IsCancellationRequested, Is.False); acknowledgements.Add(ack.Clone()); return Task.CompletedTask; },
             cancellationToken: cancellation.Token);
-        Assert.That(observed!.Result.Outcome, Is.EqualTo(PromptInvocationOutcome.NotExecuted));
-        Assert.That(observed.Result.NativeResponse, Is.Null);
+        Assert.Multiple(() =>
+        {
+            Assert.That(acknowledgements.Single().Outcome, Is.EqualTo(PromptResultOutcome.NotExecuted));
+            Assert.That(acknowledgements.Single().DiagnosticCode, Is.EqualTo("prompt_preparation_incomplete"));
+        });
     }
 
     [Test]
-    public async Task MissingArtifactUploaderAfterPermissionAcknowledgesNotExecuted()
+    public async Task CancellationWhileWaitingForTheGrantSendsNoAcknowledgement()
+    {
+        var command = Command();
+        using var cancellation = new CancellationTokenSource();
+        var grants = 0;
+        await Execute(command,
+            async (_, token) =>
+            {
+                grants++;
+                cancellation.Cancel();
+                await Task.Delay(Timeout.Infinite, token);
+                throw new AssertionException("The cancelled grant returned.");
+            },
+            (_, _) => throw new AssertionException("A cancelled grant invoked the runtime"),
+            acknowledge: (_, _) => throw new AssertionException("No grant was received, so nothing is acknowledged"),
+            cancellationToken: cancellation.Token);
+        Assert.That(grants, Is.EqualTo(1));
+    }
+
+    [Test]
+    public async Task AMissingArtifactUploaderAfterTheGrantIsAcknowledgedNotExecuted()
     {
         var command = Command();
         AcknowledgePromptResultRequest? acknowledged = null;
-        await Execute(command, (_, _) => Task.FromResult(Permission(command, true)),
+        await Execute(command, (_, _) => Granted(),
             (_, _) => throw new AssertionException("Missing uploader invoked the runtime"),
             acknowledge: (ack, _) => { acknowledged = ack.Clone(); return Task.CompletedTask; },
             captureRefresh: _ => throw new InvalidOperationException("The captured artifact uploader is not active."));
-        Assert.That(acknowledged!.CommandId, Is.EqualTo(command.CommandId));
-        Assert.That(acknowledged.Target, Is.EqualTo(command.Target));
-        Assert.That(acknowledged.Result.Outcome, Is.EqualTo(PromptInvocationOutcome.NotExecuted));
-        Assert.That(acknowledged.Result.DiagnosticCode, Is.EqualTo("prompt_preparation_incomplete"));
+        Assert.Multiple(() =>
+        {
+            Assert.That(acknowledged!.HandoffId, Is.EqualTo(command.HandoffId));
+            Assert.That(acknowledged.Outcome, Is.EqualTo(PromptResultOutcome.NotExecuted));
+            Assert.That(acknowledged.DiagnosticCode, Is.EqualTo("prompt_preparation_incomplete"));
+        });
     }
 
     [Test]
-    public async Task FailedLocalForgePreparationBeforeNativeIoAcknowledgesNotExecuted()
+    public async Task FailedLocalForgePreparationBeforeNativeIoIsAcknowledgedNotExecuted()
     {
         var command = Command();
         command.EditorRuntimeKind = "forge-neo";
-        command.HttpPath = "queue/join";
+        command.Request.Path = "queue/join";
         AcknowledgePromptResultRequest? acknowledged = null;
-        await Execute(command, (_, _) => Task.FromResult(Permission(command, true)),
+        await Execute(command, (_, _) => Granted(),
             (_, _) => throw new System.Text.Json.JsonException("local Forge request preparation failed"),
             acknowledge: (ack, _) => { acknowledged = ack.Clone(); return Task.CompletedTask; },
             nativeRequestAttempted: false);
-        Assert.That(acknowledged!.Result.Outcome, Is.EqualTo(PromptInvocationOutcome.NotExecuted));
-        Assert.That(acknowledged.Result.DiagnosticCode, Is.EqualTo("prompt_preparation_incomplete"));
+        Assert.That(acknowledged!.Outcome, Is.EqualTo(PromptResultOutcome.NotExecuted));
+        Assert.That(acknowledged.DiagnosticCode, Is.EqualTo("prompt_preparation_incomplete"));
     }
 
     [Test]
-    public async Task NativeErrorStatusIsRetainedAsObservedResponse()
+    public async Task ANativeErrorStatusIsAcknowledgedAsTheNativeResponse()
     {
         var command = Command();
         AcknowledgePromptResultRequest? observed = null;
-        await Execute(command, (_, _) => Task.FromResult(Permission(command, true)),
+        await Execute(command, (_, _) => Granted(),
             (_, _) => Task.FromResult(new SessionProcessManager.PromptSubmissionResult(false, 503, [1, 2, 3], "not generation evidence", "application/octet-stream")),
             acknowledge: (ack, _) => { observed = ack; return Task.CompletedTask; });
-        Assert.That(observed!.Result.Outcome, Is.EqualTo(PromptInvocationOutcome.NativeResponse));
-        Assert.That(observed.Result.NativeResponse.StatusCode, Is.EqualTo(503));
-        Assert.That(observed.Result.NativeResponse.Body.ToByteArray(), Is.EqualTo(new byte[] { 1, 2, 3 }));
-        Assert.That(observed.Result.NativeResponse.ContentType, Is.EqualTo("application/octet-stream"));
+        Assert.That(observed!.Outcome, Is.EqualTo(PromptResultOutcome.NativeResponse));
+        Assert.That(observed.StatusCode, Is.EqualTo(503));
+        Assert.That(observed.Body.ToByteArray(), Is.EqualTo(new byte[] { 1, 2, 3 }));
+        Assert.That(observed.ContentType, Is.EqualTo("application/octet-stream"));
     }
 
     [Test]
-    public async Task OmittedNativeBodyKeepsExactStatusAndExplicitDiagnostic()
+    public async Task AnOmittedNativeBodyKeepsTheExactStatusAndSaysSo()
     {
         var command = Command();
         AcknowledgePromptResultRequest? observed = null;
-        await Execute(command, (_, _) => Task.FromResult(Permission(command, true)),
+        await Execute(command, (_, _) => Granted(),
             (_, _) => Task.FromResult(new SessionProcessManager.PromptSubmissionResult(true, 200, [], "Prompt submitted", "application/json", BodyOmitted: true)),
             acknowledge: (ack, _) => { observed = ack; return Task.CompletedTask; });
-        Assert.That(observed!.Result.Outcome, Is.EqualTo(PromptInvocationOutcome.NativeResponse));
-        Assert.That(observed.Result.NativeResponse.StatusCode, Is.EqualTo(200));
-        Assert.That(observed.Result.NativeResponse.Body.IsEmpty, Is.True);
-        Assert.That(observed.Result.DiagnosticCode, Is.EqualTo(PromptProtocolCodes.NativeResponseBodyOmitted));
+        Assert.Multiple(() =>
+        {
+            Assert.That(observed!.Outcome, Is.EqualTo(PromptResultOutcome.NativeResponse));
+            Assert.That(observed.StatusCode, Is.EqualTo(200));
+            Assert.That(observed.Body.IsEmpty, Is.True);
+            Assert.That(observed.BodyOmitted, Is.True);
+            Assert.That(observed.DiagnosticCode, Is.EqualTo(PromptProtocolCodes.NativeResponseBodyOmitted));
+        });
+    }
+
+    [Test]
+    public async Task TheBridgeUsesTheClientNamedByTheCommandAndMapsTheReturnedPromptId()
+    {
+        var command = Command();
+        command.ClientId = "client-7";
+        command.Request.Body = "{\"client_id\":\"body-client\"}";
+        string? bridgedClient = null;
+        (string Client, string PromptId, string HandoffId)? mapped = null;
+        await Execute(command, (_, _) => Granted(),
+            (_, _) => Task.FromResult(new SessionProcessManager.PromptSubmissionResult(true, 200,
+                "{\"prompt_id\":\"8d6f9c8e-6f1f-4a4b-9c55-6b2f1d3c4e5f\",\"number\":3}"u8.ToArray(), "Prompt submitted")),
+            ensureBridge: (_, _, clientId, _) => { bridgedClient = clientId; return Task.CompletedTask; },
+            mapPrompt: (_, clientId, promptId, handoffId) => mapped = (clientId, promptId, handoffId));
+        Assert.Multiple(() =>
+        {
+            Assert.That(bridgedClient, Is.EqualTo("client-7"));
+            Assert.That(mapped, Is.EqualTo(("client-7", "8d6f9c8e-6f1f-4a4b-9c55-6b2f1d3c4e5f", command.HandoffId)));
+        });
+    }
+
+    [Test]
+    public async Task ARejectedPromptMapsNoPromptId()
+    {
+        var command = Command();
+        command.ClientId = "client-7";
+        var mapped = false;
+        await Execute(command, (_, _) => Granted(),
+            (_, _) => Task.FromResult(new SessionProcessManager.PromptSubmissionResult(false, 400,
+                "{\"prompt_id\":\"8d6f9c8e-6f1f-4a4b-9c55-6b2f1d3c4e5f\"}"u8.ToArray(), "rejected")),
+            mapPrompt: (_, _, _, _) => mapped = true);
+        Assert.That(mapped, Is.False);
     }
 
     [Test]
@@ -200,18 +315,18 @@ public sealed class PromptExecutionPermissionTests
         var interrupt = new RelayEditorRuntimeRequestCommand
         {
             SessionId = command.SessionId,
-            LifecycleGeneration = command.Target.GpuGeneration,
-            RuntimeEpoch = command.Target.RuntimeEpoch,
-            RuntimeInstanceId = command.Target.RuntimeInstanceId,
+            LifecycleGeneration = command.LifecycleGeneration,
+            RuntimeEpoch = command.RuntimeEpoch,
+            RuntimeInstanceId = command.RuntimeInstanceId,
         };
         Assert.That(ServiceClientManager.TargetsPromptRuntime(interrupt, PromptWorkIdentity.Capture(command, false)), Is.True);
-        command.Target.RuntimeEpoch++;
-        command.Target.RuntimeInstanceId = Guid.NewGuid().ToString("n");
+        command.RuntimeEpoch++;
+        command.RuntimeInstanceId = Guid.NewGuid().ToString("n");
         Assert.That(ServiceClientManager.TargetsPromptRuntime(interrupt, PromptWorkIdentity.Capture(command, false)), Is.False);
     }
 
     [Test]
-    public async Task APromptNeedingADownloadWhileDownloadsAreOffIsRefusedWithTheReason()
+    public async Task APromptNeedingADownloadWhileDownloadsAreOffIsAcknowledgedNotExecutedWithTheReason()
     {
         var command = Command();
         command.Downloads.Add(new ModelDownloadRequest
@@ -222,77 +337,55 @@ public sealed class PromptExecutionPermissionTests
             SourceUrl = "https://models.example.test/flux-dev.safetensors",
         });
         AcknowledgePromptResultRequest? acknowledged = null;
-        await Execute(command, (_, _) => Task.FromResult(Permission(command, true)),
+        await Execute(command, (_, _) => Granted(),
             (_, _) => throw new AssertionException("A refused prompt invoked the runtime"),
             acknowledge: (ack, _) => { acknowledged = ack.Clone(); return Task.CompletedTask; },
             prepareDownloads: (downloads, _, _) => throw new ModelDownloadsDisabledException(downloads.Select(download => download.Filename).ToArray()));
 
         Assert.Multiple(() =>
         {
-            Assert.That(acknowledged!.Result.Outcome, Is.EqualTo(PromptInvocationOutcome.NotExecuted));
-            Assert.That(acknowledged.Result.DiagnosticCode, Is.EqualTo("model_downloads_disabled"));
-            Assert.That(acknowledged.Result.Message, Does.Contain("flux-dev.safetensors").And.Contain("turned off"));
+            Assert.That(acknowledged!.Outcome, Is.EqualTo(PromptResultOutcome.NotExecuted));
+            Assert.That(acknowledged.DiagnosticCode, Is.EqualTo("model_downloads_disabled"));
         });
     }
 
     private static SubmitPromptCommand Command() => new()
     {
-        CommandId = Guid.NewGuid().ToString("n"),
-        SubmissionId = Guid.NewGuid().ToString("n"),
+        HandoffId = Guid.NewGuid().ToString("n"),
         SessionId = "22222222222242228222222222222222",
         EditorSid = "editor-1",
         Owner = "alice",
         EditorRuntimeKind = "comfyui",
-        HttpMethod = "POST",
-        HttpPath = "api/prompt",
-        PromptJson = "{}",
-        Target = new()
-        {
-            EditorLifecycleId = "cpu-1",
-            EditorGeneration = 1,
-            CpuRuntimeGeneration = 1,
-            CpuRuntimeInstanceId = "33333333333343338333333333333333",
-            GpuLifecycleId = "gpu-1",
-            GpuGeneration = 1,
-            AllocationId = "allocation-1",
-            RuntimeEpoch = 1,
-            RuntimeInstanceId = "44444444444444448444444444444444",
-            RunnerId = "11111111111141118111111111111111",
-            RunnerSessionId = "22222222222242228222222222222222",
-        },
+        LifecycleGeneration = 1,
+        RuntimeEpoch = 1,
+        RuntimeInstanceId = "44444444444444448444444444444444",
+        Request = new() { Method = "POST", Path = "api/prompt", Body = "{}" },
     };
 
-    private static GrantPromptExecutionResponse Permission(SubmitPromptCommand command, bool mayExecute) => new()
-    {
-        MayExecute = mayExecute,
-        Submission = new()
-        {
-            SubmissionId = command.SubmissionId,
-            Target = command.Target.Clone(),
-            ContentAvailability = PromptContentAvailability.Available,
-            ExecutionPermissionUtc = Timestamp.FromDateTime(DateTime.UtcNow)
-        },
-    };
+    private static Task<GrantPromptExecutionResponse> Granted()
+        => Task.FromResult(new GrantPromptExecutionResponse { Outcome = PromptGrantOutcome.Granted });
 
     private static Task Execute(SubmitPromptCommand command,
         Func<GrantPromptExecutionRequest, CancellationToken, Task<GrantPromptExecutionResponse>> grant,
         Func<SubmitPromptCommand, CancellationToken, Task<SessionProcessManager.PromptSubmissionResult>> invoke,
-        Func<SubmitPromptCommand, CancellationToken, Task>? observe = null,
         Func<AcknowledgePromptResultRequest, CancellationToken, Task>? acknowledge = null,
         CancellationToken cancellationToken = default,
         Func<string, Func<Task>>? captureRefresh = null,
         bool nativeRequestAttempted = true,
-        Func<IEnumerable<ModelDownloadRequest>, CancellationToken, bool, Task<Task>>? prepareDownloads = null)
+        Func<IEnumerable<ModelDownloadRequest>, CancellationToken, bool, Task<Task>>? prepareDownloads = null,
+        Func<SubmitPromptCommand, bool>? isRuntimeCurrent = null,
+        Func<string, string, string, CancellationToken, Task>? ensureBridge = null,
+        Action<string, string, string, string>? mapPrompt = null,
+        Action? onGranted = null)
         => ServiceClientManager.HandleSubmitEditorActionAsync(
             acknowledge ?? ((_, _) => Task.CompletedTask), (_, _) => Task.CompletedTask,
-            command, "11111111111141118111111111111111", grant, (_, _) => Task.CompletedTask,
-            observe ?? ((_, _) => throw new AssertionException("Unexpected recovery")),
-            (_, _, _, _) => Task.CompletedTask, (_, _, _) => { }, _ => { },
+            command, RunnerId, InstanceId, isRuntimeCurrent ?? (_ => true), grant,
+            ensureBridge ?? ((_, _, _, _) => Task.CompletedTask), _ => { },
             (_, _, _, _) => Task.CompletedTask, (_, _, _, _, _) => Task.CompletedTask,
             captureRefresh ?? (_ => () => Task.CompletedTask), (_, _) => { }, prepareDownloads ?? ((_, _, _) => Task.FromResult(Task.CompletedTask)),
             (captured, _, onNativeRequestAttempt, token) =>
             {
                 if (nativeRequestAttempted) onNativeRequestAttempt();
                 return invoke(captured, token);
-            }, (_, _, _, _) => { }, cancellationToken);
+            }, mapPrompt ?? ((_, _, _, _) => { }), cancellationToken, onGranted: onGranted);
 }

@@ -22,7 +22,7 @@ public sealed partial class PromptCommandWorkSetTests
                 Assert.That(command.TryGetTarget(out _), Is.False, "Settling model demand must release the completed command.");
                 Assert.That(body.TryGetTarget(out _), Is.False, "Settling model demand must release the prompt body.");
             });
-            work.WithdrawDemand(identity => identity.CommandId == "held-body");
+            work.WithdrawDemand(identity => identity.HandoffId == "held-body");
             Assert.That(demand.IsCancellationRequested, Is.True, "Identity still permits terminal withdrawal.");
         }
         finally
@@ -39,13 +39,13 @@ public sealed partial class PromptCommandWorkSetTests
         WeakReference<SubmitPromptCommand>? command = null;
         WeakReference<string>? body = null;
         CancellationToken demand = default;
-        Assert.That(work.Start(new() { CommandId = "held-body", SessionId = "synthetic-session", PromptJson = new string('x', 65536) }, false,
+        Assert.That(work.Start(new() { HandoffId = "held-body", SessionId = "synthetic-session", Request = new() { Body = new string('x', 65536) } }, false,
             (captured, _, token) =>
             {
                 command = new(captured);
-                body = new(captured.PromptJson);
+                body = new(captured.Request.Body);
                 demand = token;
-                work.HoldDemand(captured.CommandId, settling);
+                work.HoldDemand(captured.HandoffId, settling);
                 return Task.CompletedTask;
             }), Is.True);
         return (command!, body!, demand);
@@ -63,25 +63,26 @@ public sealed partial class PromptCommandWorkSetTests
             {
                 var command = new SubmitPromptCommand
                 {
-                    CommandId = "command-" + epoch,
+                    HandoffId = "handoff-" + epoch,
                     SessionId = "session",
-                    SubmissionId = "submission-" + epoch,
-                    Target = new() { GpuGeneration = 1, RuntimeEpoch = epoch, RuntimeInstanceId = instance },
+                    LifecycleGeneration = 1,
+                    RuntimeEpoch = epoch,
+                    RuntimeInstanceId = instance,
                 };
                 Assert.That(work.Start(command, false, (captured, _, demand) =>
                 {
                     tokens[epoch] = demand;
-                    work.HoldDemand(captured.CommandId, Task.Delay(Timeout.Infinite, demand).ContinueWith(_ => { }));
+                    work.HoldDemand(captured.HandoffId, Task.Delay(Timeout.Infinite, demand).ContinueWith(_ => { }));
                     return Task.CompletedTask;
                 }), Is.True);
-                command.Target.RuntimeEpoch = 99;
+                command.RuntimeEpoch = 99;
             }
 
             await work.CancelAndWaitAsync(identity => identity.SessionId == "session"
-                && identity.Runtime is { RuntimeEpoch: 1 }).WaitAsync(TimeSpan.FromSeconds(2));
+                && identity.Runtime.RuntimeEpoch == 1).WaitAsync(TimeSpan.FromSeconds(2));
             Assert.That(tokens[1].IsCancellationRequested, Is.True);
             Assert.That(tokens[2].IsCancellationRequested, Is.False);
-            work.WithdrawDemand(identity => identity.SubmissionId == "submission-2");
+            work.WithdrawDemand(identity => identity.HandoffId == "handoff-2");
             Assert.That(tokens[2].IsCancellationRequested, Is.True);
         }
         finally
@@ -96,7 +97,7 @@ public sealed partial class PromptCommandWorkSetTests
         var work = new PromptCommandWorkSet(CancellationToken.None);
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var command = new SubmitPromptCommand { CommandId = Guid.NewGuid().ToString("n"), SessionId = "original" };
+        var command = new SubmitPromptCommand { HandoffId = Guid.NewGuid().ToString("n"), SessionId = "original" };
         var calls = 0;
         string? capturedSession = null;
         Assert.That(work.Start(command, false, async (captured, _) =>
@@ -117,12 +118,12 @@ public sealed partial class PromptCommandWorkSetTests
 
     [TestCase("withdraw")]
     [TestCase("stop")]
-    public async Task HeldDemandLetsRecoveryRunAndStaysWithdrawable(string withdrawal)
+    public async Task HeldDemandRefusesARedeliveryAndStaysWithdrawable(string withdrawal)
     {
-        // An accepted prompt keeps only its model demand after its command ends, so a
-        // recovery delivery of the same command must start instead of being refused.
+        // An accepted prompt keeps only its model demand after its command ends; a
+        // redelivery of the same handoff still starts nothing.
         var work = new PromptCommandWorkSet(CancellationToken.None);
-        var command = new SubmitPromptCommand { CommandId = "accepted", SessionId = "session" };
+        var command = new SubmitPromptCommand { HandoffId = "accepted", SessionId = "session" };
         CancellationToken demandToken = default;
         var settled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var commandEnded = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -130,23 +131,17 @@ public sealed partial class PromptCommandWorkSetTests
         {
             demandToken = demand;
             var settling = Task.Delay(Timeout.Infinite, demand).ContinueWith(_ => settled.SetResult());
-            work.HoldDemand(captured.CommandId, settling);
+            work.HoldDemand(captured.HandoffId, settling);
             commandEnded.SetResult();
             return Task.CompletedTask;
         }), Is.True);
         await commandEnded.Task.WaitAsync(TimeSpan.FromSeconds(2));
 
-        var recovered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        await WaitUntilStartedAsync(() => work.Start(command, false, (_, _) =>
-        {
-            recovered.TrySetResult();
-            return Task.CompletedTask;
-        }));
-        await recovered.Task.WaitAsync(TimeSpan.FromSeconds(2));
-        Assert.That(demandToken.IsCancellationRequested, Is.False, "Recovery leaves the held demand in place.");
+        Assert.That(work.Start(command, false, (_, _) => throw new AssertionException("A redelivery ran while demand was held.")), Is.False);
+        Assert.That(demandToken.IsCancellationRequested, Is.False);
 
         if (withdrawal == "withdraw")
-            work.WithdrawDemand(prompt => prompt.CommandId == "accepted");
+            work.WithdrawDemand(prompt => prompt.HandoffId == "accepted");
         else
             await work.CancelAndWaitAsync(prompt => prompt.SessionId == "session").WaitAsync(TimeSpan.FromSeconds(2));
 
@@ -154,15 +149,73 @@ public sealed partial class PromptCommandWorkSetTests
         await settled.Task.WaitAsync(TimeSpan.FromSeconds(2));
     }
 
-    private static async Task WaitUntilStartedAsync(Func<bool> start)
+    [Test]
+    public async Task AGrantedHandoffIsNotRunAgainUntilItExpires()
     {
-        // The original work leaves the active set just after its body returns.
-        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(2);
-        while (!start())
+        // A retried grant from this process is answered GRANTED again, so the process
+        // itself must refuse a late redelivery of a handoff it already ran.
+        var clock = new ManualClock(DateTimeOffset.UtcNow);
+        var work = new PromptCommandWorkSet(CancellationToken.None, clock);
+        var command = new SubmitPromptCommand
         {
-            if (DateTime.UtcNow >= deadline) Assert.Fail("The recovery delivery was refused as a duplicate.");
-            await Task.Delay(10);
+            HandoffId = "granted",
+            SessionId = "session",
+            ExpiresUtc = Google.Protobuf.WellKnownTypes.Timestamp.FromDateTimeOffset(clock.GetUtcNow() + TimeSpan.FromMinutes(2)),
+        };
+        var calls = 0;
+        Assert.That(work.Start(command, false, (captured, _) =>
+        {
+            calls++;
+            work.MarkGranted(captured.HandoffId);
+            return Task.CompletedTask;
+        }), Is.True);
+        await work.JoinCurrentOperationsAsync().WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.That(work.Start(command, false, (_, _) => { calls++; return Task.CompletedTask; }), Is.False);
+
+        clock.Advance(TimeSpan.FromMinutes(3));
+        Assert.That(work.Start(command, false, (_, _) => { calls++; return Task.CompletedTask; }), Is.True,
+            "An expired handoff is forgotten; the platform refuses its grant.");
+        await work.CancelAndWaitAsync(_ => true);
+        Assert.That(calls, Is.EqualTo(2));
+    }
+
+    [Test]
+    public async Task AHandoffThatWasNeverGrantedCanBeDeliveredAgain()
+    {
+        var work = new PromptCommandWorkSet(CancellationToken.None);
+        var command = new SubmitPromptCommand { HandoffId = "dropped", SessionId = "session" };
+        var calls = 0;
+        Assert.That(work.Start(command, false, (_, _) => { calls++; return Task.CompletedTask; }), Is.True);
+        await work.JoinCurrentOperationsAsync().WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.That(work.Start(command, false, (_, _) => { calls++; return Task.CompletedTask; }), Is.True);
+        await work.CancelAndWaitAsync(_ => true);
+        Assert.That(calls, Is.EqualTo(2));
+    }
+
+    [Test]
+    public async Task GrantedHandoffMemoryIsBounded()
+    {
+        var work = new PromptCommandWorkSet(CancellationToken.None);
+        for (var index = 0; index <= PromptCommandWorkSet.MaxRetiredHandoffs; index++)
+        {
+            Assert.That(work.Start(new() { HandoffId = "handoff-" + index, SessionId = "session" }, false, (captured, _) =>
+            {
+                work.MarkGranted(captured.HandoffId);
+                return Task.CompletedTask;
+            }), Is.True);
         }
+        await work.JoinCurrentOperationsAsync().WaitAsync(TimeSpan.FromSeconds(5));
+        var refused = Enumerable.Range(0, PromptCommandWorkSet.MaxRetiredHandoffs + 1)
+            .Count(index => !work.Start(new() { HandoffId = "handoff-" + index, SessionId = "session" }, false, (_, _) => Task.CompletedTask));
+        Assert.That(refused, Is.EqualTo(PromptCommandWorkSet.MaxRetiredHandoffs));
+        await work.CancelAndWaitAsync(_ => true);
+    }
+
+    private sealed class ManualClock(DateTimeOffset now) : TimeProvider
+    {
+        private DateTimeOffset _now = now;
+        public override DateTimeOffset GetUtcNow() => _now;
+        public void Advance(TimeSpan by) => _now += by;
     }
 
     [Test]
@@ -172,7 +225,7 @@ public sealed partial class PromptCommandWorkSetTests
         var tokens = new Dictionary<string, (CancellationToken Physical, CancellationToken Demand)>();
         var entered = new CountdownEvent(2);
         foreach (var name in new[] { "queued", "finished" })
-            Assert.That(work.Start(new() { CommandId = name, SessionId = "session" }, false, async (_, physical, demand) =>
+            Assert.That(work.Start(new() { HandoffId = name, SessionId = "session" }, false, async (_, physical, demand) =>
             {
                 lock (tokens) tokens[name] = (physical, demand);
                 entered.Signal();
@@ -190,7 +243,7 @@ public sealed partial class PromptCommandWorkSetTests
         });
 
         // The interrupted prompt's terminal event withdraws only its own demand.
-        work.WithdrawDemand(command => command.CommandId == "finished");
+        work.WithdrawDemand(command => command.HandoffId == "finished");
         Assert.Multiple(() =>
         {
             Assert.That(tokens["finished"].Demand.IsCancellationRequested, Is.True);
@@ -210,7 +263,7 @@ public sealed partial class PromptCommandWorkSetTests
         var entered = new CountdownEvent(2);
         var cancelled = new CountdownEvent(2);
         foreach (var name in new[] { "generation", "stream-reader" })
-            Assert.That(work.Start(new() { CommandId = name, SessionId = "old" }, false, async (_, token) =>
+            Assert.That(work.Start(new() { HandoffId = name, SessionId = "old" }, false, async (_, token) =>
             {
                 entered.Signal();
                 try { await Task.Delay(Timeout.Infinite, token); }
@@ -231,7 +284,7 @@ public sealed partial class PromptCommandWorkSetTests
         var work = new PromptCommandWorkSet(CancellationToken.None);
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         CancellationToken captured = default;
-        work.Start(new() { CommandId = "current", SessionId = "new" }, false, async (_, token) => { captured = token; await release.Task; });
+        work.Start(new() { HandoffId = "current", SessionId = "new" }, false, async (_, token) => { captured = token; await release.Task; });
         await work.CancelAndWaitAsync(command => command.SessionId == "old");
         Assert.That(captured.IsCancellationRequested, Is.False);
         release.SetResult();

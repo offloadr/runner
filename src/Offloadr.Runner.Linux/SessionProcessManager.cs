@@ -791,38 +791,34 @@ internal sealed partial class SessionProcessManager : IAsyncDisposable
         using var runtimeCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, context.Cancellation.Token);
         cancellationToken = runtimeCancellation.Token;
 
-        var method = string.IsNullOrWhiteSpace(command.HttpMethod)
+        var nativeRequest = command.Request ?? new PromptRequest();
+        var method = string.IsNullOrWhiteSpace(nativeRequest.Method)
             ? HttpMethod.Post
-            : new HttpMethod(command.HttpMethod.Trim().ToUpperInvariant());
-        var path = string.IsNullOrWhiteSpace(command.HttpPath)
+            : new HttpMethod(nativeRequest.Method.Trim().ToUpperInvariant());
+        var path = string.IsNullOrWhiteSpace(nativeRequest.Path)
             ? "api/prompt"
-            : command.HttpPath.Trim().TrimStart('/');
-        if (string.Equals(command.EditorRuntimeKind, "comfyui", StringComparison.OrdinalIgnoreCase) &&
-            string.IsNullOrWhiteSpace(command.HttpPath))
-        {
-            path = "api/prompt";
-        }
+            : nativeRequest.Path.Trim().TrimStart('/');
 
-        var promptJson = command.PromptJson ?? "{}";
+        var promptJson = nativeRequest.Body ?? "{}";
         if (IsForgeRuntime(command) &&
             string.Equals(method.Method, HttpMethod.Post.Method, StringComparison.OrdinalIgnoreCase) &&
             PathMatchesRoute(path, "queue/join"))
         {
-            promptJson = PrepareForgePromptJson(command, context);
+            promptJson = PrepareForgePromptJson(promptJson, command, context);
             await ReplayForgePreflightsAsync(command, context, cancellationToken, onNativeRequestAttempt).ConfigureAwait(false);
             promptJson = await NormalizeForgeQueueJoinDataArityAsync(promptJson, command, context, cancellationToken).ConfigureAwait(false);
         }
 
         var builder = new UriBuilder("http", _readyHost, _comfyPort, path);
-        if (!string.IsNullOrWhiteSpace(command.HttpQuery))
+        if (!string.IsNullOrWhiteSpace(nativeRequest.Query))
         {
-            builder.Query = command.HttpQuery.TrimStart('?');
+            builder.Query = nativeRequest.Query.TrimStart('?');
         }
 
         using var request = new HttpRequestMessage(method, builder.Uri);
         if (!HttpMethodsWithoutBody.Contains(method.Method))
         {
-            var contentType = string.IsNullOrWhiteSpace(command.ContentType) ? "application/json" : command.ContentType.Trim();
+            var contentType = string.IsNullOrWhiteSpace(nativeRequest.ContentType) ? "application/json" : nativeRequest.ContentType.Trim();
             var content = new StringContent(promptJson, Encoding.UTF8);
             if (System.Net.Http.Headers.MediaTypeHeaderValue.TryParse(contentType, out var parsedContentType))
             {
@@ -938,12 +934,12 @@ internal sealed partial class SessionProcessManager : IAsyncDisposable
             response.Content.Headers.ContentType?.ToString() ?? string.Empty);
     }
 
-    private string PrepareForgePromptJson(SubmitPromptCommand command, SessionContext context)
-        => PrepareForgePromptJson(command.PromptJson ?? "{}", command.ArtifactReferences, context.Paths);
+    private static string PrepareForgePromptJson(string promptJson, SubmitPromptCommand command, SessionContext context)
+        => PrepareForgePromptJson(promptJson, command.ArtifactReferences, context.Paths);
 
     internal static string PrepareForgePromptJson(
         string promptJson,
-        IEnumerable<PromptArtifactReference> artifactReferences,
+        IEnumerable<PromptArtifact> artifactReferences,
         SessionPaths paths)
     {
         var replacements = new Dictionary<string, string>(StringComparer.Ordinal);
@@ -1238,7 +1234,7 @@ internal sealed partial class SessionProcessManager : IAsyncDisposable
             : null;
     }
 
-    private static (string Root, string RelativePath, string FullPath) ResolvePromptArtifactPath(SessionPaths paths, PromptArtifactReference reference)
+    private static (string Root, string RelativePath, string FullPath) ResolvePromptArtifactPath(SessionPaths paths, PromptArtifact reference)
     {
         var root = string.Equals(reference.Type, "output", StringComparison.OrdinalIgnoreCase)
             ? paths.OutputDirectory
@@ -1262,13 +1258,6 @@ internal sealed partial class SessionProcessManager : IAsyncDisposable
     private static bool PathMatchesRoute(string path, string route)
         => path.Equals(route, StringComparison.OrdinalIgnoreCase)
            || path.StartsWith($"{route}/", StringComparison.OrdinalIgnoreCase);
-
-    internal static string BuildForgeProgressRequestJson(string taskId)
-        => new JsonObject
-        {
-            ["id_task"] = taskId,
-            ["id_live_preview"] = -1
-        }.ToJsonString();
 
     private static async Task StreamResponseChunksAsync(
         HttpContent content,

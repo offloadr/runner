@@ -41,7 +41,7 @@ public class GrpcChannelConnectionTests
             await context.Request.Body.CopyToAsync(Stream.Null, context.RequestAborted);
             context.Response.ContentType = "application/grpc";
             context.Response.DeclareTrailer("grpc-status");
-            var message = new GrantPromptExecutionResponse { MayExecute = false }.ToByteArray();
+            var message = new GrantPromptExecutionResponse { Outcome = PromptGrantOutcome.MissingOrExpired }.ToByteArray();
             var frame = new byte[5 + message.Length];
             BinaryPrimitives.WriteInt32BigEndian(frame.AsSpan(1, 4), message.Length);
             message.CopyTo(frame, 5);
@@ -56,7 +56,7 @@ public class GrpcChannelConnectionTests
             using var call = client.GrantPromptExecutionAsync(new GrantPromptExecutionRequest(),
                 deadline: DateTime.UtcNow.AddSeconds(10), cancellationToken: timeout.Token);
             var response = await call.ResponseAsync;
-            Assert.That(response.MayExecute, Is.False);
+            Assert.That(response.Outcome, Is.EqualTo(PromptGrantOutcome.MissingOrExpired));
             Assert.That(connections, Is.EqualTo(1));
             Assert.That(closed.Task.IsCompleted, Is.False, "The completed RPC must leave a live pooled connection for the disposal check.");
 

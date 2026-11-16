@@ -4,7 +4,6 @@ package offloadr.runner.v1;
 
 import "offloadr/common/v1/gpus.proto"; // GpuType
 import "offloadr/common/v1/models.proto"; // ModelCategory
-import "offloadr/common/v1/prompt.proto"; // Prompt relay helpers
 import "offloadr/common/v1/gpu_control.proto";
 import "offloadr/editor_runtime/v1/editor_proxy.proto"; // Artifact messages
 import "google/protobuf/timestamp.proto"; // Timestamp for session stream events
@@ -15,7 +14,7 @@ import "google/protobuf/wrappers.proto";
 // so an outdated runner is told to update instead of misbehaving.
 enum RunnerProtocol {
     RUNNER_PROTOCOL_UNSPECIFIED = 0;
-    RUNNER_PROTOCOL_CURRENT = 1;
+    RUNNER_PROTOCOL_CURRENT = 2;
 }
 
 message RunnerRuntimeTelemetrySnapshot {
@@ -168,28 +167,45 @@ message LaunchEditorRuntimeCommand {
     SessionSealing sealing = 18;
 }
 
+// One HTTP request to the editor runtime, as the browser sent it.
+message PromptRequest {
+    string method = 1;
+    string path = 2;
+    string query = 3;
+    string body = 4;
+    string content_type = 5;
+}
+
+// A placeholder in the request body that names an input file prepared on the platform.
+message PromptArtifact {
+    string placeholder = 1;
+    string filename = 2;
+    string type = 3;
+    string subfolder = 4;
+}
+
+// A generation or editor request handed to the runner. The handoff exists on the platform
+// until expires_utc; the runner runs it at most once, and only after GrantPromptExecution
+// answers GRANTED. Redelivery of the same handoff_id is normal until then.
 message SubmitPromptCommand {
-    string session_id = 1;
-    string submission_id = 2;
+    string handoff_id = 1;
+    string session_id = 2;
     string editor_sid = 3;
-    string prompt_json = 4;
-    string owner = 5;
-    repeated ModelDownloadRequest downloads = 6;
-    string editor_runtime_kind = 7;
-    string http_method = 8;
-    string http_path = 9;
-    string http_query = 10;
-    string content_type = 11;
-    repeated offloadr.common.v1.PromptHttpRequest preflight_requests = 12;
-    repeated offloadr.common.v1.PromptArtifactReference artifact_references = 13;
+    string owner = 4;
+    string editor_runtime_kind = 5;
+    // The runtime the handoff was accepted for; the runner refuses it for any other.
+    uint64 lifecycle_generation = 6;
+    uint64 runtime_epoch = 7;
+    string runtime_instance_id = 8;
+    PromptRequest request = 9;
+    // Editor state requests replayed, in order, before the request itself.
+    repeated PromptRequest preflight_requests = 10;
+    repeated PromptArtifact artifact_references = 11;
+    repeated ModelDownloadRequest downloads = 12;
+    // The ComfyUI client the browser identified in the request; empty for other editors.
+    string client_id = 13;
     bytes websocket_client_message = 14;
-    offloadr.common.v1.PromptExecutionTarget target = 15;
-    string command_id = 16;
-    // A new recovery delivery still refers to this original immutable command.
-    // It cannot acquire another execution permission or invoke native mutations.
-    uint64 recovery_revision = 17;
-    bool recovery_only = 18;
-    offloadr.common.v1.PromptNativeIdentifiers native_identifiers = 19;
+    google.protobuf.Timestamp expires_utc = 15;
 }
 
 message RelayEditorRuntimeRequestCommand {
@@ -449,40 +465,59 @@ message AcknowledgeSessionStopRequest {
     RunnerCleanupDisposition cleanup_disposition = 10;
 }
 
+enum PromptResultOutcome {
+    PROMPT_RESULT_OUTCOME_UNSPECIFIED = 0;
+    // The editor runtime answered; status_code, body and content_type are its response.
+    PROMPT_RESULT_OUTCOME_NATIVE_RESPONSE = 1;
+    // Nothing reached the editor runtime.
+    PROMPT_RESULT_OUTCOME_NOT_EXECUTED = 2;
+    // The editor runtime was called, but its answer is not known.
+    PROMPT_RESULT_OUTCOME_UNKNOWN = 3;
+}
+
+// Sent once per granted handoff, by the runner instance that holds the grant. Resending the
+// same result is accepted as already applied; a different result is refused.
 message AcknowledgePromptResultRequest {
     string runner_id = 1;
     string session_id = 2;
-    string submission_id = 3;
-    string command_id = 4;
-    offloadr.common.v1.PromptExecutionTarget target = 5;
-    offloadr.common.v1.PromptInvocationResult result = 6;
+    string handoff_id = 3;
+    string instance_id = 4;
+    PromptResultOutcome outcome = 5;
+    int32 status_code = 6;
+    bytes body = 7;
+    string content_type = 8;
+    // The editor answered, but the body was larger than the runner relays.
+    bool body_omitted = 9;
+    string diagnostic_code = 10;
 }
 
 message GrantPromptExecutionRequest {
     string runner_id = 1;
     string session_id = 2;
-    string submission_id = 3;
-    string command_id = 4;
-    offloadr.common.v1.PromptExecutionTarget target = 5;
+    string handoff_id = 3;
+    string instance_id = 4;
+    uint64 lifecycle_generation = 5;
+    uint64 runtime_epoch = 6;
+    string runtime_instance_id = 7;
+}
+
+enum PromptGrantOutcome {
+    PROMPT_GRANT_OUTCOME_UNSPECIFIED = 0;
+    // Run it now. A retry from the same instance gets GRANTED again, so a lost reply is safe.
+    PROMPT_GRANT_OUTCOME_GRANTED = 1;
+    // Another runner instance holds the grant. Do not run it and do not acknowledge it.
+    PROMPT_GRANT_OUTCOME_ALREADY_GRANTED = 2;
+    // The handoff expired, was retired or never existed. Do not run it.
+    PROMPT_GRANT_OUTCOME_MISSING_OR_EXPIRED = 3;
+    // The runtime it was accepted for is no longer current. Do not run it.
+    PROMPT_GRANT_OUTCOME_TARGET_NOT_CURRENT = 4;
+    // The owner's account can no longer start work. Do not run it.
+    PROMPT_GRANT_OUTCOME_ACCOUNT_UNAVAILABLE = 5;
 }
 
 message GrantPromptExecutionResponse {
-    // True only for the first committed grant. Even an exact retry after a
-    // lost response is recovery-only and must not invoke the native runtime.
-    bool may_execute = 1;
-    offloadr.common.v1.PromptSubmissionSnapshot submission = 2;
+    PromptGrantOutcome outcome = 1;
 }
-
-message ReportPromptEvidenceRequest {
-    string runner_id = 1;
-    string session_id = 2;
-    string submission_id = 3;
-    string command_id = 4;
-    offloadr.common.v1.PromptExecutionTarget target = 5;
-    offloadr.common.v1.PromptExecutionEvidence evidence = 6;
-}
-
-message ReportPromptEvidenceResponse {}
 
 message SetGpuPowerLimitCommand {
     string command_id = 1;
@@ -526,7 +561,7 @@ message SessionStreamEvent {
     string session_id = 2;
     string editor_sid = 3;
     string client_id = 4;
-    string submission_id = 5;
+    string handoff_id = 5;
     string prompt_id = 6;
     string event_type = 7;
     SessionStreamFrameType frame_type = 8;
@@ -817,7 +852,6 @@ service RunnerControlService {
     rpc AcknowledgeSessionStop(AcknowledgeSessionStopRequest) returns (AcknowledgeSessionStopResponse);
     rpc AcknowledgePromptResult(AcknowledgePromptResultRequest) returns (AcknowledgePromptResultResponse);
     rpc GrantPromptExecution(GrantPromptExecutionRequest) returns (GrantPromptExecutionResponse);
-    rpc ReportPromptEvidence(ReportPromptEvidenceRequest) returns (ReportPromptEvidenceResponse);
     rpc AcknowledgeGpuPowerLimit(AcknowledgeGpuPowerLimitRequest) returns (AcknowledgeGpuPowerLimitResponse);
     rpc GrantGpuPowerExecution(GrantGpuPowerExecutionRequest) returns (GrantGpuPowerExecutionResponse);
     rpc AcknowledgeEditorRuntimeRequest(AcknowledgeEditorRuntimeRequestRequest) returns (AcknowledgeEditorRuntimeRequestResponse);

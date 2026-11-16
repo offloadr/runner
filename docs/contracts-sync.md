@@ -5,8 +5,10 @@
 | File | Contents |
 | --- | --- |
 | `runner/v1/runner_agent.proto` | `RunnerProtocol`, `RunnerControlService`, `RunnerArtifactService`, `RunnerWorkspaceService` and their messages, including the runtime telemetry snapshot |
-| `common/v1/{gpus,models,prompt,gpu_control}.proto` | shared enums and prompt relay messages |
-| `editor_runtime/v1/editor_proxy.proto` | editor artifact metadata and runtime request kinds |
+| `common/v1/{gpus,models,gpu_control}.proto` | shared enums and GPU control messages |
+| `editor_runtime/v1/editor_proxy.proto` | editor artifact metadata, runtime request kinds and the editor bridge types |
+
+These five files are identical on both sides. The control plane's `common/v1/prompt.proto` describes its own prompt records and is not part of the runner protocol.
 
 C# is generated at build time by `Grpc.Tools` in `src/Offloadr.Runner.Contracts`, so building needs only the .NET SDK. Lint with `buf lint contracts`.
 
@@ -25,25 +27,17 @@ The control plane accepts exactly its own version:
 The Offloadr control plane implements the server side of these services, so a contract change has to land on both sides:
 
 1. Change the `.proto` files here and the agent code that uses them in one pull request, and raise `RUNNER_PROTOCOL_CURRENT`.
-2. Keep the six shared protobuf definitions identical on both sides and regenerate every affected consumer. Change the current protocol directly, without legacy layouts or compatibility shims: an outdated runner is refused and updated, never served.
+2. Keep the five shared protobuf definitions identical on both sides and regenerate every affected consumer. Change the current protocol directly, without legacy layouts or compatibility shims: an outdated runner is refused and updated, never served.
 3. Release the coordinated runner and control-plane changes together, in an announced window: a protocol change ends running sessions of runners that have not updated yet. [Image publishing](image-publishing.md#protocol-tags) explains how the images follow. Schema declarations alone do not mean the corresponding behavior is implemented.
 
-## Prompt content availability
+## Prompt handoff
 
-A prompt execution permission must state its recovery-content availability.
-`Available` permits only the matching committed execution or recovery path;
-`Expired` permits no native action or invented acknowledgement. `Unspecified`
-and unknown values fail with a protocol error. Server and runner implementations
-must be coordinated; no missing-field fallback grants execution.
+Protocol 2 hands a prompt to the runner as a transient `SubmitPromptCommand`, identified by `handoff_id` and fenced by the runtime it was accepted for (`lifecycle_generation`, `runtime_epoch`, `runtime_instance_id`). The control plane keeps the handoff until `expires_utc` and may redeliver it until it is granted.
 
-## Progress recovery projection
-
-`FindForgeEditorActionsRequest.progress_only` selects a bounded progress read.
-Its response uses `ForgeProgressRecovery`, with status facts, database read timing,
-the selected native progress evidence and its original expiry. This projection
-omits full invocation and SSE bodies. It does not grant execution, renew retention
-or turn HTTP acceptance into generation completion. The runner declares the shared
-schema; these editor-facing reads are served by the control plane.
+- The runner asks `GrantPromptExecution` with its registered process `instance_id` (the one on `CommandStreamRequest`) and the handoff's runtime, and runs the handoff only on `GRANTED`. A retry from the same process after a lost reply is answered `GRANTED` again, so the runner retries transient grant failures with the same request and never runs a handoff twice in one process.
+- `ALREADY_GRANTED`, `MISSING_OR_EXPIRED`, `TARGET_NOT_CURRENT`, `ACCOUNT_UNAVAILABLE` or a refused grant: the runner drops the delivery without native I/O and without an acknowledgement.
+- After `GRANTED` the runner sends exactly one `AcknowledgePromptResult`: `NATIVE_RESPONSE` with the editor's status, body and content type (`body_omitted` with diagnostic `prompt_native_response_body_omitted` when the body exceeded what it relays), `NOT_EXECUTED` when nothing reached the editor (`prompt_preparation_incomplete`, `model_downloads_disabled`), or `UNKNOWN` once native I/O started (`prompt_native_result_unknown`). Resending the same result after a lost reply is accepted; the control plane answers `FAILED_PRECONDITION` for a handoff that expired, which the runner does not retry.
+- Nothing is recovered or replayed: there is no evidence report and no recovery delivery. ComfyUI's prompt id comes from its own response; the platform injects none. Session events carry the `handoff_id` they belong to.
 
 ## Current Stop identity
 

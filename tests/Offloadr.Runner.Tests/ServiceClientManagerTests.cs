@@ -7,42 +7,20 @@ using Offloadr.Runner.V1;
 public partial class ServiceClientManagerTests
 {
     private const string PromptRunnerId = "11111111111141118111111111111111";
+    private const string PromptInstanceId = "runner-process-1";
     private const string PromptSessionId = "22222222222242228222222222222222";
-    private const string PromptSubmissionId = "44444444444444448444444444444444";
+    private const string PromptHandoffId = "44444444444444448444444444444444";
 
     private static SubmitPromptCommand WithPromptIdentity(SubmitPromptCommand prompt)
     {
-        prompt.CommandId = "55555555555545558555555555555555";
-        prompt.NativeIdentifiers = new() { SessionHash = "session-hash" };
-        prompt.Target = new()
-        {
-            EditorLifecycleId = "cpu-1",
-            EditorGeneration = 1,
-            CpuRuntimeGeneration = 1,
-            CpuRuntimeInstanceId = "66666666666646668666666666666666",
-            GpuLifecycleId = "gpu-1",
-            GpuGeneration = 1,
-            AllocationId = "allocation-1",
-            RuntimeEpoch = 1,
-            RuntimeInstanceId = "77777777777747778777777777777777",
-            RunnerId = PromptRunnerId,
-            RunnerSessionId = PromptSessionId,
-        };
+        prompt.LifecycleGeneration = 1;
+        prompt.RuntimeEpoch = 1;
+        prompt.RuntimeInstanceId = "77777777777747778777777777777777";
         return prompt;
     }
 
     private static Task<GrantPromptExecutionResponse> GrantPromptForTestAsync(GrantPromptExecutionRequest request, CancellationToken token)
-        => Task.FromResult(new GrantPromptExecutionResponse
-        {
-            MayExecute = true,
-            Submission = new()
-            {
-                SubmissionId = request.SubmissionId,
-                Target = request.Target.Clone(),
-                ContentAvailability = Offloadr.Common.V1.PromptContentAvailability.Available,
-                ExecutionPermissionUtc = Google.Protobuf.WellKnownTypes.Timestamp.FromDateTime(DateTime.UtcNow)
-            },
-        });
+        => Task.FromResult(new GrantPromptExecutionResponse { Outcome = PromptGrantOutcome.Granted });
 
     [Test]
     public async Task AcknowledgeTransientRequestWithRetryAsync_RetriesUnavailableRpc()
@@ -98,21 +76,23 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
-    public async Task AcknowledgeRuntimeCommandWithRetryAsync_BoundsRetainedEvidenceAttempts()
+    public async Task AcknowledgeRuntimeCommandWithRetryAsync_DropsAPromptAckForAMissingHandoff()
     {
+        // The platform answers FailedPrecondition once a handoff expired; retrying it forever
+        // would hold the acknowledgement lane for nothing.
         var attempts = 0;
         var acknowledged = await ServiceClientManager.AcknowledgeRuntimeCommandWithRetryAsync(
             (_, _) =>
             {
                 attempts++;
-                throw new RpcException(new(StatusCode.Unavailable, "evidence path down"));
+                throw new RpcException(new(StatusCode.FailedPrecondition, "handoff expired"));
             },
-            new ReportPromptEvidenceRequest(), "command-1", CancellationToken.None,
-            TimeSpan.FromMilliseconds(1), TimeSpan.FromMilliseconds(1), maxAttempts: 3);
+            new AcknowledgePromptResultRequest { HandoffId = PromptHandoffId }, PromptHandoffId, CancellationToken.None,
+            TimeSpan.FromMilliseconds(1), TimeSpan.FromMilliseconds(1));
         Assert.Multiple(() =>
         {
             Assert.That(acknowledged, Is.False);
-            Assert.That(attempts, Is.EqualTo(3));
+            Assert.That(attempts, Is.EqualTo(1));
         });
     }
 
@@ -228,8 +208,7 @@ public partial class ServiceClientManagerTests
         var command = new SubmitPromptCommand
         {
             EditorRuntimeKind = runtimeKind,
-            HttpMethod = method,
-            HttpPath = path
+            Request = new() { Method = method, Path = path }
         };
 
         Assert.That(ServiceClientManager.ShouldPrepareGenerationDependencies(command), Is.EqualTo(expected));
@@ -1240,20 +1219,19 @@ public partial class ServiceClientManagerTests
         var prompt = new Offloadr.Runner.V1.SubmitPromptCommand
         {
             SessionId = PromptSessionId,
-            SubmissionId = PromptSubmissionId,
+            HandoffId = PromptHandoffId,
             EditorSid = "editor-1",
-            PromptJson = "{}"
+            Request = new() { Body = "{}" }
         };
         return ServiceClientManager.HandleSubmitEditorActionAsync(
             (ack, _) => { acknowledged(ack); return Task.CompletedTask; },
             (_, _) => Task.CompletedTask,
             WithPromptIdentity(prompt),
             PromptRunnerId,
+            PromptInstanceId,
+            _ => true,
             GrantPromptForTestAsync,
-            (_, _) => Task.CompletedTask,
-            (_, _) => Task.CompletedTask,
             (_, _, _, _) => Task.CompletedTask,
-            (_, _, _) => { },
             _ => { },
             (_, _, _, _) => Task.CompletedTask,
             (_, _, _, _, _) => Task.CompletedTask,
@@ -1299,7 +1277,7 @@ public partial class ServiceClientManagerTests
 
         Assert.Multiple(() =>
         {
-            Assert.That(capturedAck?.Result.NativeResponse.StatusCode, Is.EqualTo(400));
+            Assert.That(capturedAck?.StatusCode, Is.EqualTo(400));
             Assert.That(demandToken.IsCancellationRequested, Is.True);
             Assert.That(cts.IsCancellationRequested, Is.False);
         });
@@ -1323,7 +1301,7 @@ public partial class ServiceClientManagerTests
         // The native result is acknowledged before hydration; demand stays published.
         Assert.Multiple(() =>
         {
-            Assert.That(capturedAck!.Result.NativeResponse.StatusCode, Is.EqualTo(200));
+            Assert.That(capturedAck!.StatusCode, Is.EqualTo(200));
             Assert.That(handled.IsCompleted, Is.False);
             Assert.That(demandToken.IsCancellationRequested, Is.False);
         });
@@ -1367,8 +1345,8 @@ public partial class ServiceClientManagerTests
     [Test]
     public async Task HandleSubmitEditorActionAsync_HandsOverAcceptedDemandAndEndsTheCommand()
     {
-        // The command ends with its acknowledgement so a recovery delivery of it is
-        // not refused; the accepted prompt's demand settles separately.
+        // The command ends with its acknowledgement and releases its body; the accepted
+        // prompt's demand settles separately.
         var demandToken = CancellationToken.None;
         Task? held = null;
         Offloadr.Runner.V1.AcknowledgePromptResultRequest? capturedAck = null;
@@ -1385,7 +1363,7 @@ public partial class ServiceClientManagerTests
 
         Assert.Multiple(() =>
         {
-            Assert.That(capturedAck!.Result.NativeResponse.StatusCode, Is.EqualTo(200));
+            Assert.That(capturedAck!.StatusCode, Is.EqualTo(200));
             Assert.That(held, Is.Not.Null);
             Assert.That(held!.IsCompleted, Is.False);
             Assert.That(demandToken.IsCancellationRequested, Is.False);
@@ -1443,7 +1421,7 @@ public partial class ServiceClientManagerTests
 
         Assert.Multiple(() =>
         {
-            Assert.That(capturedAck!.Result.NativeResponse.StatusCode, Is.EqualTo(200));
+            Assert.That(capturedAck!.StatusCode, Is.EqualTo(200));
             Assert.That(physical.IsCancellationRequested, Is.True);
             Assert.That(demandToken.IsCancellationRequested, Is.False);
             Assert.That(handled.IsCompleted, Is.False);
@@ -1645,34 +1623,30 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
-    public void IsFinishedPrompt_MatchesNativePromptOrMappedSubmissionOnTheSameRuntime()
+    public void IsFinishedPrompt_MatchesTheMappedHandoffOnTheSameRuntime()
     {
         var prompt = WithPromptIdentity(new Offloadr.Runner.V1.SubmitPromptCommand
         {
             SessionId = PromptSessionId,
-            SubmissionId = PromptSubmissionId,
+            HandoffId = PromptHandoffId,
             EditorSid = "editor-1",
-            PromptJson = "{}"
         });
         var runtime = new Offloadr.Runner.Core.RuntimeIdentity(
-            prompt.Target.GpuGeneration, prompt.Target.RuntimeEpoch, prompt.Target.RuntimeInstanceId);
-        var nativePromptId = prompt.NativeIdentifiers.PromptId = Guid.NewGuid().ToString("D");
+            prompt.LifecycleGeneration, prompt.RuntimeEpoch, prompt.RuntimeInstanceId);
+        var nativePromptId = Guid.NewGuid().ToString("D");
         ComfySessionEventRelay.PromptTerminalEvent Finished(
-            string promptId, string? submissionId = null, Offloadr.Runner.Core.RuntimeIdentity? on = null)
-            => new(PromptSessionId, on ?? runtime, promptId, submissionId);
+            string? handoffId, Offloadr.Runner.Core.RuntimeIdentity? on = null)
+            => new(PromptSessionId, on ?? runtime, nativePromptId, handoffId);
 
         Assert.Multiple(() =>
         {
-            // An evicted evidence identity leaves no submission id; the native prompt id still matches.
-            Assert.That(ServiceClientManager.IsFinishedPrompt(PromptWorkIdentity.Capture(prompt, false), Finished(nativePromptId)), Is.True);
-            Assert.That(ServiceClientManager.IsFinishedPrompt(PromptWorkIdentity.Capture(prompt, false), Finished("other-prompt", PromptSubmissionId)), Is.True);
-            Assert.That(ServiceClientManager.IsFinishedPrompt(PromptWorkIdentity.Capture(prompt, false), Finished("other-prompt")), Is.False);
-            Assert.That(ServiceClientManager.IsFinishedPrompt(
-                PromptWorkIdentity.Capture(WithPromptIdentity(new() { SessionId = PromptSessionId, SubmissionId = PromptSubmissionId }), false),
-                Finished(string.Empty)), Is.False, "A prompt without a native id never matches an empty one.");
+            Assert.That(ServiceClientManager.IsFinishedPrompt(PromptWorkIdentity.Capture(prompt, false), Finished(PromptHandoffId)), Is.True);
+            // An unmapped prompt names no handoff; its queue probe ends the demand instead.
+            Assert.That(ServiceClientManager.IsFinishedPrompt(PromptWorkIdentity.Capture(prompt, false), Finished(null)), Is.False);
+            Assert.That(ServiceClientManager.IsFinishedPrompt(PromptWorkIdentity.Capture(prompt, false), Finished(Guid.NewGuid().ToString("n"))), Is.False);
             Assert.That(ServiceClientManager.IsFinishedPrompt(
                 PromptWorkIdentity.Capture(prompt, false),
-                Finished(nativePromptId, on: runtime with { RuntimeEpoch = runtime.RuntimeEpoch + 1 })), Is.False);
+                Finished(PromptHandoffId, on: runtime with { RuntimeEpoch = runtime.RuntimeEpoch + 1 })), Is.False);
         });
     }
 
@@ -1700,7 +1674,7 @@ public partial class ServiceClientManagerTests
 
         Assert.Multiple(() =>
         {
-            Assert.That(capturedAck?.Result.Outcome, Is.EqualTo(Offloadr.Common.V1.PromptInvocationOutcome.NotExecuted));
+            Assert.That(capturedAck?.Outcome, Is.EqualTo(PromptResultOutcome.NotExecuted));
             Assert.That(demandToken.IsCancellationRequested, Is.True);
             Assert.That(managedWaiter.IsCanceled, Is.True);
         });
@@ -1712,16 +1686,16 @@ public partial class ServiceClientManagerTests
         var prompt = new Offloadr.Runner.V1.SubmitPromptCommand
         {
             SessionId = PromptSessionId,
-            SubmissionId = PromptSubmissionId,
+            HandoffId = PromptHandoffId,
             EditorSid = "editor-1",
-            PromptJson = "{\"client_id\":\"client-1\"}"
+            ClientId = "client-1",
+            Request = new() { Body = "{}" }
         };
         Offloadr.Runner.V1.AcknowledgePromptResultRequest? capturedAck = null;
         var capturedAckCancellationToken = CancellationToken.None;
         string? activeDownloadSession = null;
         var submitCalls = 0;
-        var registered = 0;
-        var unregistered = 0;
+        var bridged = 0;
 
         using var cts = new CancellationTokenSource();
 
@@ -1735,11 +1709,10 @@ public partial class ServiceClientManagerTests
             (_, _) => Task.CompletedTask,
             WithPromptIdentity(prompt),
             PromptRunnerId,
+            PromptInstanceId,
+            _ => true,
             GrantPromptForTestAsync,
-            (_, _) => Task.CompletedTask,
-            (_, _) => Task.CompletedTask,
-            (_, _, _, _) => Task.CompletedTask,
-            (_, _, _) => registered++,
+            (_, _, _, _) => { bridged++; return Task.CompletedTask; },
             value => activeDownloadSession = value,
             (_, _, _, _) => Task.CompletedTask,
             (_, _, _, _, _) => Task.CompletedTask,
@@ -1752,29 +1725,27 @@ public partial class ServiceClientManagerTests
                 return Task.FromResult(new SessionProcessManager.PromptSubmissionResult(true, 200, System.Text.Encoding.UTF8.GetBytes("{\"prompt_id\":\"p1\"}"), "Prompt submitted"));
             },
             (_, _, _, _) => { },
-                        cts.Token,
-            unregisterUninvokedSubmission: (_, _, _) => unregistered++);
+                        cts.Token);
 
         Assert.That(activeDownloadSession, Is.EqualTo(PromptSessionId));
         Assert.That(submitCalls, Is.EqualTo(0));
-        Assert.That(registered, Is.EqualTo(1));
-        Assert.That(unregistered, Is.EqualTo(1));
+        Assert.That(bridged, Is.EqualTo(1));
         Assert.That(capturedAck, Is.Not.Null);
-        Assert.That(capturedAck!.Result.Outcome, Is.EqualTo(Offloadr.Common.V1.PromptInvocationOutcome.NotExecuted));
-        Assert.That(capturedAck.Result.NativeResponse, Is.Null);
+        Assert.That(capturedAck!.Outcome, Is.EqualTo(PromptResultOutcome.NotExecuted));
+        Assert.That(capturedAck.Body.IsEmpty, Is.True);
         Assert.That(capturedAckCancellationToken.IsCancellationRequested, Is.False);
         Assert.That(capturedAckCancellationToken.CanBeCanceled, Is.False);
     }
 
     [Test]
-    public async Task HandleSubmitEditorActionAsync_LostPermissionResponseCannotInvokeRuntimeOrInventResult()
+    public async Task HandleSubmitEditorActionAsync_CancelledGrantCannotInvokeRuntimeOrSendAResult()
     {
         var prompt = new Offloadr.Runner.V1.SubmitPromptCommand
         {
             SessionId = PromptSessionId,
-            SubmissionId = PromptSubmissionId,
+            HandoffId = PromptHandoffId,
             EditorSid = "editor-1",
-            PromptJson = "{}"
+            Request = new() { Body = "{}" }
         };
 
         Offloadr.Runner.V1.AcknowledgePromptResultRequest? capturedAck = null;
@@ -1790,23 +1761,22 @@ public partial class ServiceClientManagerTests
             (_, _) => Task.CompletedTask,
             WithPromptIdentity(prompt),
             PromptRunnerId,
+            PromptInstanceId,
+            _ => true,
             (_, _) =>
             {
                 grantCalls++;
                 cts.Cancel();
                 throw new IOException("grant response lost");
             },
-            (_, _) => Task.CompletedTask,
-            (_, _) => Task.CompletedTask,
             (_, _, _, _) => Task.CompletedTask,
-            (_, _, _) => { },
             _ => { },
             (_, _, _, _) => Task.CompletedTask,
             (_, _, _, _, _) => Task.CompletedTask,
             _ => () => Task.CompletedTask,
             (_, _) => { },
             (_, token, _) => Task.FromCanceled<Task>(token),
-            (_, _, _, _) => throw new AssertionException("No permission response can authorize native execution"),
+            (_, _, _, _) => throw new AssertionException("No grant was received, so the runtime cannot be called"),
             (_, _, _, _) => { },
                         cts.Token);
 
@@ -1814,46 +1784,35 @@ public partial class ServiceClientManagerTests
         Assert.That(grantCalls, Is.EqualTo(1));
     }
 
-    [TestCase(false)]
-    [TestCase(true)]
-    public async Task HandleSubmitEditorActionAsync_RetriesSameGrantAndNeverRepeatsNativeAfterLostCommittedResponse(bool grantWasCommitted)
+    [TestCase(PromptGrantOutcome.Granted)]
+    [TestCase(PromptGrantOutcome.AlreadyGranted)]
+    [TestCase(PromptGrantOutcome.MissingOrExpired)]
+    public async Task HandleSubmitEditorActionAsync_RetriesTheSameGrantAfterALostReplyAndRunsOnlyWhenGranted(PromptGrantOutcome retried)
     {
         var prompt = WithPromptIdentity(new SubmitPromptCommand
         {
             SessionId = PromptSessionId,
-            SubmissionId = PromptSubmissionId,
+            HandoffId = PromptHandoffId,
             EditorSid = "editor-1",
-            PromptJson = "{}"
+            Request = new() { Body = "{}" }
         });
         var grants = 0;
-        var recoveries = 0;
+        var acknowledgements = 0;
         var nativeCalls = 0;
         await ServiceClientManager.HandleSubmitEditorActionAsync(
-            (_, _) => Task.CompletedTask,
+            (_, _) => { acknowledgements++; return Task.CompletedTask; },
             (_, _) => Task.CompletedTask,
             prompt,
             PromptRunnerId,
+            PromptInstanceId,
+            _ => true,
             (request, token) =>
             {
                 grants++;
                 if (grants == 1) throw new RpcException(new(StatusCode.Unavailable, "response lost"));
-                if (!grantWasCommitted) return GrantPromptForTestAsync(request, token);
-                return Task.FromResult(new GrantPromptExecutionResponse
-                {
-                    MayExecute = false,
-                    Submission = new()
-                    {
-                        SubmissionId = request.SubmissionId,
-                        Target = request.Target.Clone(),
-                        ContentAvailability = Offloadr.Common.V1.PromptContentAvailability.Available,
-                        ExecutionPermissionUtc = Google.Protobuf.WellKnownTypes.Timestamp.FromDateTime(DateTime.UtcNow)
-                    }
-                });
+                return Task.FromResult(new GrantPromptExecutionResponse { Outcome = retried });
             },
-            (_, _) => Task.CompletedTask,
-            (_, _) => { recoveries++; return Task.CompletedTask; },
             (_, _, _, _) => Task.CompletedTask,
-            (_, _, _) => { },
             _ => { },
             (_, _, _, _) => Task.CompletedTask,
             (_, _, _, _, _) => Task.CompletedTask,
@@ -1867,11 +1826,12 @@ public partial class ServiceClientManagerTests
             },
             (_, _, _, _) => { },
             CancellationToken.None);
+        var granted = retried == PromptGrantOutcome.Granted;
         Assert.Multiple(() =>
         {
             Assert.That(grants, Is.EqualTo(2));
-            Assert.That(recoveries, Is.EqualTo(grantWasCommitted ? 1 : 0));
-            Assert.That(nativeCalls, Is.EqualTo(grantWasCommitted ? 0 : 1));
+            Assert.That(nativeCalls, Is.EqualTo(granted ? 1 : 0));
+            Assert.That(acknowledgements, Is.EqualTo(granted ? 1 : 0));
         });
     }
 
@@ -1895,9 +1855,9 @@ public partial class ServiceClientManagerTests
         var prompt = new Offloadr.Runner.V1.SubmitPromptCommand
         {
             SessionId = PromptSessionId,
-            SubmissionId = PromptSubmissionId,
+            HandoffId = PromptHandoffId,
             EditorSid = "editor-1",
-            PromptJson = "{}"
+            Request = new() { Body = "{}" }
         };
         prompt.Downloads.Add(localDownload);
         prompt.Downloads.Add(remoteDownload);
@@ -1912,11 +1872,10 @@ public partial class ServiceClientManagerTests
             (_, _) => Task.CompletedTask,
             WithPromptIdentity(prompt),
             PromptRunnerId,
+            PromptInstanceId,
+            _ => true,
             GrantPromptForTestAsync,
-            (_, _) => Task.CompletedTask,
-            (_, _) => Task.CompletedTask,
             (_, _, _, _) => Task.CompletedTask,
-            (_, _, _) => { },
             _ => { },
             (_, _, _, _) => Task.CompletedTask,
             (_, _, _, _, _) => Task.CompletedTask,
@@ -2043,14 +2002,15 @@ public partial class ServiceClientManagerTests
         var prompt = new Offloadr.Runner.V1.SubmitPromptCommand
         {
             SessionId = PromptSessionId,
-            SubmissionId = PromptSubmissionId,
+            HandoffId = PromptHandoffId,
             EditorSid = "editor-1",
-            PromptJson = "{\"client_id\":\"client-1\"}"
+            ClientId = "client-1",
+            Request = new() { Body = "{}" }
         };
         Offloadr.Runner.V1.AcknowledgePromptResultRequest? capturedAck = null;
-        string? registeredSubmissionClient = null;
+        string? bridgedClient = null;
         string? mappedPromptId = null;
-        string? mappedSubmissionId = null;
+        string? mappedHandoffId = null;
         string? activeDownloadSession = null;
         var refreshCalls = 0;
 
@@ -2065,11 +2025,10 @@ public partial class ServiceClientManagerTests
                 (_, _) => Task.CompletedTask,
                 WithPromptIdentity(prompt),
                 PromptRunnerId,
+            PromptInstanceId,
+            _ => true,
             GrantPromptForTestAsync,
-            (_, _) => Task.CompletedTask,
-            (_, _) => Task.CompletedTask,
-                (_, _, _, _) => Task.CompletedTask,
-                (_, clientId, _) => registeredSubmissionClient = clientId,
+                (_, _, clientId, _) => { bridgedClient = clientId; return Task.CompletedTask; },
                 value => activeDownloadSession = value,
                 (_, _, _, _) => Task.CompletedTask,
                 (_, _, _, _, _) => Task.CompletedTask,
@@ -2081,23 +2040,23 @@ public partial class ServiceClientManagerTests
                 (_, _) => { },
                 (_, _, _) => Task.FromResult(Task.CompletedTask),
                 (_, _, _, _) => Task.FromResult(new SessionProcessManager.PromptSubmissionResult(true, 200, System.Text.Encoding.UTF8.GetBytes("{\"prompt_id\":\"prompt-1\"}"), "Prompt submitted")),
-                (_, _, promptId, submissionId) =>
+                (_, _, promptId, handoffId) =>
                 {
                     mappedPromptId = promptId;
-                    mappedSubmissionId = submissionId;
+                    mappedHandoffId = handoffId;
                 },
                             CancellationToken.None);
 
             await Task.Delay(100).ConfigureAwait(false);
 
             Assert.That(activeDownloadSession, Is.EqualTo(PromptSessionId));
-            Assert.That(registeredSubmissionClient, Is.EqualTo("client-1"));
+            Assert.That(bridgedClient, Is.EqualTo("client-1"));
             Assert.That(mappedPromptId, Is.EqualTo("prompt-1"));
-            Assert.That(mappedSubmissionId, Is.EqualTo(PromptSubmissionId));
+            Assert.That(mappedHandoffId, Is.EqualTo(PromptHandoffId));
             Assert.That(refreshCalls, Is.GreaterThanOrEqualTo(1));
             Assert.That(capturedAck, Is.Not.Null);
-            Assert.That(capturedAck!.Result.Outcome, Is.EqualTo(Offloadr.Common.V1.PromptInvocationOutcome.NativeResponse));
-            Assert.That(capturedAck.Result.NativeResponse.StatusCode, Is.EqualTo(200));
+            Assert.That(capturedAck!.Outcome, Is.EqualTo(PromptResultOutcome.NativeResponse));
+            Assert.That(capturedAck.StatusCode, Is.EqualTo(200));
         }
         finally
         {
@@ -2111,19 +2070,18 @@ public partial class ServiceClientManagerTests
         var prompt = new Offloadr.Runner.V1.SubmitPromptCommand
         {
             SessionId = PromptSessionId,
-            SubmissionId = PromptSubmissionId,
+            HandoffId = PromptHandoffId,
             EditorSid = "editor-1",
             EditorRuntimeKind = "forge-neo",
-            HttpMethod = "GET",
-            HttpPath = "queue/data",
-            PromptJson = "{}"
+            Request = new() { Method = "GET", Path = "queue/data", Body = "{}" }
         };
 
         Offloadr.Runner.V1.ReportSessionEventsRequest? capturedEvents = null;
         var sinkWasProvided = false;
+        var acknowledgements = new List<AcknowledgePromptResultRequest>();
 
         await ServiceClientManager.HandleSubmitEditorActionAsync(
-            (_, _) => Task.CompletedTask,
+            (ack, _) => { acknowledgements.Add(ack.Clone()); return Task.CompletedTask; },
             (events, _) =>
             {
                 capturedEvents = events;
@@ -2131,11 +2089,10 @@ public partial class ServiceClientManagerTests
             },
             WithPromptIdentity(prompt),
             PromptRunnerId,
+            PromptInstanceId,
+            _ => true,
             GrantPromptForTestAsync,
-            (_, _) => Task.CompletedTask,
-            (_, _) => Task.CompletedTask,
             (_, _, _, _) => Task.CompletedTask,
-            (_, _, _) => { },
             _ => { },
             (_, _, _, _) => Task.CompletedTask,
             (_, _, _, _, _) => Task.CompletedTask,
@@ -2160,102 +2117,63 @@ public partial class ServiceClientManagerTests
         Assert.That(streamEvent.RunnerId, Is.EqualTo(PromptRunnerId));
         Assert.That(streamEvent.SessionId, Is.EqualTo(PromptSessionId));
         Assert.That(streamEvent.EditorSid, Is.EqualTo("editor-1"));
-        Assert.That(streamEvent.ClientId, Is.EqualTo($"http-relay:{PromptSubmissionId}"));
-        Assert.That(streamEvent.SubmissionId, Is.EqualTo(PromptSubmissionId));
+        Assert.That(streamEvent.ClientId, Is.EqualTo($"http-relay:{PromptHandoffId}"));
+        Assert.That(streamEvent.HandoffId, Is.EqualTo(PromptHandoffId));
+        Assert.That(streamEvent.LifecycleGeneration, Is.EqualTo(prompt.LifecycleGeneration));
+        Assert.That(streamEvent.RuntimeEpoch, Is.EqualTo(prompt.RuntimeEpoch));
+        Assert.That(streamEvent.RuntimeInstanceId, Is.EqualTo(prompt.RuntimeInstanceId));
         Assert.That(streamEvent.EventType, Is.EqualTo("http.response.chunk"));
         Assert.That(streamEvent.FrameType, Is.EqualTo(Offloadr.Runner.V1.SessionStreamFrameType.Binary));
         Assert.That(streamEvent.Payload.ToStringUtf8(), Is.EqualTo("data: ping\n\n"));
+        // The stream ended normally, so its acknowledgement is the native response.
+        var acknowledgement = acknowledgements.Single();
+        Assert.That(acknowledgement.Outcome, Is.EqualTo(PromptResultOutcome.NativeResponse));
+        Assert.That(acknowledgement.StatusCode, Is.EqualTo(200));
+        Assert.That(acknowledgement.ContentType, Is.EqualTo("text/event-stream"));
     }
 
-    [Test]
-    public async Task ForgeTerminalEvidenceSurvivesLiveFanoutFailure()
+    [TestCase(true)]
+    [TestCase(false)]
+    public async Task HandleSubmitEditorActionAsync_ForForgeQueueData_ABrokenStreamIsAcknowledgedUnknown(bool liveRelayFails)
     {
-        var prompt = WithPromptIdentity(new()
+        var prompt = WithPromptIdentity(new Offloadr.Runner.V1.SubmitPromptCommand
         {
             SessionId = PromptSessionId,
-            SubmissionId = PromptSubmissionId,
+            HandoffId = PromptHandoffId,
             EditorSid = "editor-1",
             EditorRuntimeKind = "forge-neo",
-            HttpMethod = "GET",
-            HttpPath = "queue/data",
-            PromptJson = "{}",
+            Request = new() { Method = "GET", Path = "queue/data" }
         });
-        var retained = new TaskCompletionSource<ReportPromptEvidenceRequest>(TaskCreationOptions.RunContinuationsAsynchronously);
-        AcknowledgePromptResultRequest? original = null;
+        var acknowledgements = new List<AcknowledgePromptResultRequest>();
+        var chunks = 0;
+
         await ServiceClientManager.HandleSubmitEditorActionAsync(
-            (ack, _) => { original = ack; return Task.CompletedTask; },
-            (_, _) => throw new IOException("stream fanout unavailable"),
-            prompt, PromptRunnerId, GrantPromptForTestAsync,
-            (evidence, _) => { retained.TrySetResult(evidence); return Task.CompletedTask; },
-            (_, _) => throw new AssertionException("Unexpected recovery"),
-            (_, _, _, _) => Task.CompletedTask, (_, _, _) => { }, _ => { },
-            (_, _, _, _) => Task.CompletedTask, (_, _, _, _, _) => Task.CompletedTask,
-            _ => () => Task.CompletedTask, (_, _) => { }, (_, _, _) => Task.FromResult(Task.CompletedTask),
-            async (_, stream, _, token) =>
+            (ack, _) => { acknowledgements.Add(ack.Clone()); return Task.CompletedTask; },
+            (_, _) =>
             {
-                await stream!(ServiceClientManager.HttpResponseChunkEventType,
-                    System.Text.Encoding.UTF8.GetBytes("data: {\"msg\":\"process_completed\",\"event_id\":\"event-1\",\"success\":true}\n\n"), token);
-                return new SessionProcessManager.PromptSubmissionResult(true, 200, [], "observed", "text/event-stream");
-            }, (_, _, _, _) => { }, CancellationToken.None);
-        var reported = await retained.Task.WaitAsync(TimeSpan.FromSeconds(3));
-        Assert.That(reported.Target, Is.EqualTo(prompt.Target));
-        Assert.That(reported.CommandId, Is.EqualTo(prompt.CommandId));
-        Assert.That(reported.Evidence.NativeIdentifiers.SessionHash, Is.EqualTo(prompt.NativeIdentifiers.SessionHash));
-        Assert.That(original!.Result.Outcome, Is.EqualTo(Offloadr.Common.V1.PromptInvocationOutcome.NativeResponse));
-    }
-
-    [Test]
-    public async Task ForgeTerminalEvidenceRpcCannotBlockNativeLiveChunkOrStop()
-    {
-        var prompt = WithPromptIdentity(new()
-        {
-            SessionId = PromptSessionId,
-            SubmissionId = PromptSubmissionId,
-            EditorSid = "editor-1",
-            EditorRuntimeKind = "forge-neo",
-            HttpMethod = "GET",
-            HttpPath = "queue/data",
-            PromptJson = "{}",
-        });
-        var evidenceStarted = new TaskCompletionSource<ReportPromptEvidenceRequest>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var releaseEvidence = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var evidenceDelivered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var liveChunk = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        using var physical = new CancellationTokenSource();
-        var nativeCalls = 0;
-        AcknowledgePromptResultRequest? acknowledgement = null;
-        var handling = ServiceClientManager.HandleSubmitEditorActionAsync(
-            (result, _) => { acknowledgement = result; return Task.CompletedTask; },
-            (_, _) => { liveChunk.TrySetResult(); return Task.CompletedTask; },
-            prompt, PromptRunnerId, GrantPromptForTestAsync,
-            async (evidence, _) =>
-            {
-                evidenceStarted.TrySetResult(evidence);
-                await releaseEvidence.Task.ConfigureAwait(false);
-                evidenceDelivered.TrySetResult();
+                chunks++;
+                // Losing the live fan-out never ends the native reader.
+                return liveRelayFails ? throw new IOException("stream fan-out unavailable") : Task.CompletedTask;
             },
-            (_, _) => throw new AssertionException("Unexpected recovery"),
-            (_, _, _, _) => Task.CompletedTask, (_, _, _) => { }, _ => { },
+            prompt, PromptRunnerId, PromptInstanceId, _ => true, GrantPromptForTestAsync,
+            (_, _, _, _) => Task.CompletedTask, _ => { },
             (_, _, _, _) => Task.CompletedTask, (_, _, _, _, _) => Task.CompletedTask,
             _ => () => Task.CompletedTask, (_, _) => { }, (_, _, _) => Task.FromResult(Task.CompletedTask),
             async (_, stream, onNativeRequestAttempt, token) =>
             {
                 onNativeRequestAttempt();
-                nativeCalls++;
                 await stream!(ServiceClientManager.HttpResponseChunkEventType,
-                    System.Text.Encoding.UTF8.GetBytes("data: {\"msg\":\"process_completed\",\"event_id\":\"event-1\",\"success\":true}\n\n"), token);
-                await Task.Delay(Timeout.InfiniteTimeSpan, token);
-                throw new AssertionException("The cancelled native reader must not complete successfully.");
-            }, (_, _, _, _) => { }, physical.Token);
-        var captured = await evidenceStarted.Task.WaitAsync(TimeSpan.FromSeconds(3));
-        await liveChunk.Task.WaitAsync(TimeSpan.FromSeconds(3));
-        physical.Cancel();
-        await handling.WaitAsync(TimeSpan.FromSeconds(3));
-        releaseEvidence.TrySetResult();
-        await evidenceDelivered.Task.WaitAsync(TimeSpan.FromSeconds(3));
-        Assert.That(captured.Evidence.NativeIdentifiers.SessionHash, Is.EqualTo(prompt.NativeIdentifiers.SessionHash));
-        Assert.That(nativeCalls, Is.EqualTo(1));
-        Assert.That(acknowledgement?.Result.Outcome, Is.EqualTo(Offloadr.Common.V1.PromptInvocationOutcome.Unknown));
+                    System.Text.Encoding.UTF8.GetBytes("data: {\"msg\":\"progress\"}\n\n"), token);
+                throw new IOException("upstream stream broke");
+            }, (_, _, _, _) => { }, CancellationToken.None);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(chunks, Is.EqualTo(1));
+            Assert.That(acknowledgements, Has.Count.EqualTo(1));
+            Assert.That(acknowledgements[0].Outcome, Is.EqualTo(PromptResultOutcome.Unknown));
+            Assert.That(acknowledgements[0].DiagnosticCode, Is.EqualTo("prompt_native_result_unknown"));
+        });
     }
 
     [Test]
@@ -2264,15 +2182,13 @@ public partial class ServiceClientManagerTests
         var prompt = new Offloadr.Runner.V1.SubmitPromptCommand
         {
             SessionId = PromptSessionId,
-            SubmissionId = PromptSubmissionId,
+            HandoffId = PromptHandoffId,
             EditorSid = "editor-1",
             Owner = "alice",
             EditorRuntimeKind = "forge-neo",
-            HttpMethod = "POST",
-            HttpPath = "queue/join",
-            PromptJson = "{}"
+            Request = new() { Method = "POST", Path = "queue/join", Body = "{}" }
         };
-        prompt.ArtifactReferences.Add(new Offloadr.Common.V1.PromptArtifactReference
+        prompt.ArtifactReferences.Add(new Offloadr.Runner.V1.PromptArtifact
         {
             Placeholder = "offloadr://forge-artifact/submission-1/0",
             Filename = "0000-input.png",
@@ -2287,11 +2203,10 @@ public partial class ServiceClientManagerTests
             (_, _) => Task.CompletedTask,
             WithPromptIdentity(prompt),
             PromptRunnerId,
+            PromptInstanceId,
+            _ => true,
             GrantPromptForTestAsync,
-            (_, _) => Task.CompletedTask,
-            (_, _) => Task.CompletedTask,
             (_, _, _, _) => Task.CompletedTask,
-            (_, _, _) => { },
             _ => { },
             (_, _, _, _) => Task.CompletedTask,
             (_, _, _, artifacts, _) =>
@@ -2320,13 +2235,11 @@ public partial class ServiceClientManagerTests
         var prompt = new Offloadr.Runner.V1.SubmitPromptCommand
         {
             SessionId = PromptSessionId,
-            SubmissionId = PromptSubmissionId,
+            HandoffId = PromptHandoffId,
             EditorSid = "editor-1",
             Owner = "alice",
             EditorRuntimeKind = "comfyui",
-            HttpMethod = "POST",
-            HttpPath = "api/prompt",
-            PromptJson = "{}"
+            Request = new() { Method = "POST", Path = "api/prompt", Body = "{}" }
         };
         var order = new List<string>();
 
@@ -2335,11 +2248,10 @@ public partial class ServiceClientManagerTests
             (_, _) => Task.CompletedTask,
             WithPromptIdentity(prompt),
             PromptRunnerId,
+            PromptInstanceId,
+            _ => true,
             GrantPromptForTestAsync,
-            (_, _) => Task.CompletedTask,
-            (_, _) => Task.CompletedTask,
             (_, _, _, _) => Task.CompletedTask,
-            (_, _, _) => { },
             _ => { },
             (_, _, _, _) =>
             {
@@ -2371,13 +2283,11 @@ public partial class ServiceClientManagerTests
         var prompt = new SubmitPromptCommand
         {
             SessionId = PromptSessionId,
-            SubmissionId = PromptSubmissionId,
+            HandoffId = PromptHandoffId,
             EditorSid = "editor-1",
             Owner = "alice",
             EditorRuntimeKind = "comfyui",
-            HttpMethod = "POST",
-            HttpPath = "api/interrupt",
-            PromptJson = "{}"
+            Request = new() { Method = "POST", Path = "api/interrupt", Body = "{}" }
         };
         var preparationCalls = 0;
         var submitCalls = 0;
@@ -2387,11 +2297,10 @@ public partial class ServiceClientManagerTests
             (_, _) => Task.CompletedTask,
             WithPromptIdentity(prompt),
             PromptRunnerId,
+            PromptInstanceId,
+            _ => true,
             GrantPromptForTestAsync,
-            (_, _) => Task.CompletedTask,
-            (_, _) => Task.CompletedTask,
             (_, _, _, _) => Task.CompletedTask,
-            (_, _, _) => { },
             _ => preparationCalls++,
             (_, _, _, _) => { preparationCalls++; return Task.CompletedTask; },
             (_, _, _, _, _) => { preparationCalls++; return Task.CompletedTask; },
@@ -2426,7 +2335,7 @@ public partial class ServiceClientManagerTests
         var body = """{"data":[{"path":"offloadr://forge-artifact/submission-1/0","url":"offloadr://forge-artifact/submission-1/0"}]}""";
         var references = new[]
         {
-            new Offloadr.Common.V1.PromptArtifactReference
+            new Offloadr.Runner.V1.PromptArtifact
             {
                 Placeholder = "offloadr://forge-artifact/submission-1/0",
                 Filename = "0000-input.png",
@@ -2464,14 +2373,14 @@ public partial class ServiceClientManagerTests
                 """;
             var references = new[]
             {
-                new Offloadr.Common.V1.PromptArtifactReference
+                new Offloadr.Runner.V1.PromptArtifact
                 {
                     Placeholder = "offloadr://forge-artifact/submission-1/1",
                     Filename = "one.png",
                     Type = "temp",
                     Subfolder = "forge-queue/submission-1"
                 },
-                new Offloadr.Common.V1.PromptArtifactReference
+                new Offloadr.Runner.V1.PromptArtifact
                 {
                     Placeholder = "offloadr://forge-artifact/submission-1/10",
                     Filename = "ten.png",
@@ -2570,19 +2479,6 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
-    public void BuildForgeProgressRequestJson_UsesForgeIdLivePreviewShape()
-    {
-        var body = SessionProcessManager.BuildForgeProgressRequestJson("task(progress-1)");
-
-        Assert.Multiple(() =>
-        {
-            Assert.That(body, Does.Contain("\"id_task\":\"task(progress-1)\""));
-            Assert.That(body, Does.Contain("\"id_live_preview\":-1"));
-            Assert.That(body, Does.Not.Contain("\"live_preview\""));
-        });
-    }
-
-    [Test]
     public async Task HandleSubmitEditorActionAsync_RunsDelayedArtifactRefreshSweeps()
     {
         var originalDelays = ServiceClientManager.PromptArtifactRefreshDelays;
@@ -2596,9 +2492,10 @@ public partial class ServiceClientManagerTests
         var prompt = new Offloadr.Runner.V1.SubmitPromptCommand
         {
             SessionId = PromptSessionId,
-            SubmissionId = PromptSubmissionId,
+            HandoffId = PromptHandoffId,
             EditorSid = "editor-1",
-            PromptJson = "{\"client_id\":\"client-1\"}"
+            ClientId = "client-1",
+            Request = new() { Body = "{}" }
         };
 
         var refreshCalls = 0;
@@ -2610,11 +2507,10 @@ public partial class ServiceClientManagerTests
                 (_, _) => Task.CompletedTask,
                 WithPromptIdentity(prompt),
                 PromptRunnerId,
+            PromptInstanceId,
+            _ => true,
             GrantPromptForTestAsync,
-            (_, _) => Task.CompletedTask,
-            (_, _) => Task.CompletedTask,
                 (_, _, _, _) => Task.CompletedTask,
-                (_, _, _) => { },
                 _ => { },
                 (_, _, _, _) => Task.CompletedTask,
                 (_, _, _, _, _) => Task.CompletedTask,
@@ -2648,13 +2544,11 @@ public partial class ServiceClientManagerTests
         var prompt = new Offloadr.Runner.V1.SubmitPromptCommand
         {
             SessionId = PromptSessionId,
-            SubmissionId = PromptSubmissionId,
+            HandoffId = PromptHandoffId,
             EditorSid = "editor-1",
             Owner = "alice",
             EditorRuntimeKind = "forge-neo",
-            HttpMethod = "POST",
-            HttpPath = "internal/progress",
-            PromptJson = """{"id_task":"task(progress-1)","id_live_preview":-1}"""
+            Request = new() { Method = "POST", Path = "internal/progress", Body = """{"id_task":"task(progress-1)","id_live_preview":-1}""" }
         };
 
         var refreshCalls = 0;
@@ -2666,11 +2560,10 @@ public partial class ServiceClientManagerTests
                 (_, _) => Task.CompletedTask,
                 WithPromptIdentity(prompt),
                 PromptRunnerId,
+            PromptInstanceId,
+            _ => true,
             GrantPromptForTestAsync,
-            (_, _) => Task.CompletedTask,
-            (_, _) => Task.CompletedTask,
                 (_, _, _, _) => Task.CompletedTask,
-                (_, _, _) => { },
                 _ => { },
                 (_, _, _, _) => Task.CompletedTask,
                 (_, _, _, _, _) => Task.CompletedTask,
@@ -2708,9 +2601,10 @@ public partial class ServiceClientManagerTests
         var prompt = new Offloadr.Runner.V1.SubmitPromptCommand
         {
             SessionId = PromptSessionId,
-            SubmissionId = PromptSubmissionId,
+            HandoffId = PromptHandoffId,
             EditorSid = "editor-1",
-            PromptJson = "{\"client_id\":\"client-1\"}"
+            ClientId = "client-1",
+            Request = new() { Body = "{}" }
         };
         Offloadr.Runner.V1.AcknowledgePromptResultRequest? capturedAck = null;
 
@@ -2725,11 +2619,10 @@ public partial class ServiceClientManagerTests
                 (_, _) => Task.CompletedTask,
                 WithPromptIdentity(prompt),
                 PromptRunnerId,
+            PromptInstanceId,
+            _ => true,
             GrantPromptForTestAsync,
-            (_, _) => Task.CompletedTask,
-            (_, _) => Task.CompletedTask,
                 (_, _, _, _) => Task.CompletedTask,
-                (_, _, _) => { },
                 _ => { },
                 (_, _, _, _) => Task.CompletedTask,
                 (_, _, _, _, _) => Task.CompletedTask,
@@ -2741,8 +2634,8 @@ public partial class ServiceClientManagerTests
                             CancellationToken.None);
 
             Assert.That(capturedAck, Is.Not.Null);
-            Assert.That(capturedAck!.Result.Outcome, Is.EqualTo(Offloadr.Common.V1.PromptInvocationOutcome.NativeResponse));
-            Assert.That(capturedAck.Result.NativeResponse.StatusCode, Is.EqualTo(200));
+            Assert.That(capturedAck!.Outcome, Is.EqualTo(PromptResultOutcome.NativeResponse));
+            Assert.That(capturedAck.StatusCode, Is.EqualTo(200));
         }
         finally
         {
@@ -2758,9 +2651,10 @@ public partial class ServiceClientManagerTests
         var prompt = new Offloadr.Runner.V1.SubmitPromptCommand
         {
             SessionId = PromptSessionId,
-            SubmissionId = PromptSubmissionId,
+            HandoffId = PromptHandoffId,
             EditorSid = "editor-1",
-            PromptJson = "{\"client_id\":\"client-1\"}"
+            ClientId = "client-1",
+            Request = new() { Body = "{}" }
         };
         Offloadr.Runner.V1.AcknowledgePromptResultRequest? capturedAck = null;
         var refreshStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -2777,11 +2671,10 @@ public partial class ServiceClientManagerTests
                 (_, _) => Task.CompletedTask,
                 WithPromptIdentity(prompt),
                 PromptRunnerId,
+            PromptInstanceId,
+            _ => true,
             GrantPromptForTestAsync,
-            (_, _) => Task.CompletedTask,
-            (_, _) => Task.CompletedTask,
                 (_, _, _, _) => Task.CompletedTask,
-                (_, _, _) => { },
                 _ => { },
                 (_, _, _, _) => Task.CompletedTask,
                 (_, _, _, _, _) => Task.CompletedTask,
@@ -2800,8 +2693,8 @@ public partial class ServiceClientManagerTests
             Assert.That(completed, Is.SameAs(handleTask), "prompt handling should not wait for artifact refresh");
 
             Assert.That(capturedAck, Is.Not.Null);
-            Assert.That(capturedAck!.Result.Outcome, Is.EqualTo(Offloadr.Common.V1.PromptInvocationOutcome.NativeResponse));
-            Assert.That(capturedAck.Result.NativeResponse.StatusCode, Is.EqualTo(200));
+            Assert.That(capturedAck!.Outcome, Is.EqualTo(PromptResultOutcome.NativeResponse));
+            Assert.That(capturedAck.StatusCode, Is.EqualTo(200));
 
             await refreshStarted.Task.ConfigureAwait(false);
             releaseRefresh.TrySetResult();

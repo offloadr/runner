@@ -1,4 +1,3 @@
-using Offloadr.Common.V1;
 using Offloadr.Runner.V1;
 using System.Runtime.ExceptionServices;
 
@@ -36,7 +35,7 @@ public partial class ServiceClientManagerTests
             Assert.Multiple(() =>
             {
                 Assert.That(handled.IsCompleted, Is.False, "Preparation returned no demand, but its callback is still owned.");
-                Assert.That(ack?.Result.Outcome, Is.EqualTo(PromptInvocationOutcome.NotExecuted));
+                Assert.That(ack?.Outcome, Is.EqualTo(PromptResultOutcome.NotExecuted));
                 Assert.That(nativeRequests, Is.Zero);
             });
             releaseCallback.SetResult();
@@ -97,7 +96,7 @@ public partial class ServiceClientManagerTests
             Assert.Multiple(() =>
             {
                 Assert.That(handled.IsCompleted, Is.False, "Factory completion cannot bypass its held withdrawal callback.");
-                Assert.That(ack!.Result.Outcome, Is.EqualTo(PromptInvocationOutcome.NotExecuted));
+                Assert.That(ack!.Outcome, Is.EqualTo(PromptResultOutcome.NotExecuted));
                 Assert.That(nativeRequests, Is.Zero);
             });
             releaseCallback.SetResult();
@@ -123,7 +122,7 @@ public partial class ServiceClientManagerTests
         var originalDemand = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var probeEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var originalProbe = new TaskCompletionSource<bool?>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var command = WithPromptIdentity(new() { SessionId = PromptSessionId, SubmissionId = PromptSubmissionId });
+        var command = WithPromptIdentity(new() { SessionId = PromptSessionId, HandoffId = PromptHandoffId });
         CancellationToken probeToken = default;
         Task? stop = null;
         Exception? bodyFailure = null;
@@ -138,7 +137,7 @@ public partial class ServiceClientManagerTests
                     probeEntered.TrySetResult();
                     return originalProbe.Task;
                 }, nativeBody: "{\"prompt_id\":\"native-prompt-1\"}",
-                holdPromptDemand: settling => work.HoldDemand(command.CommandId, settling))), Is.True);
+                holdPromptDemand: settling => work.HoldDemand(command.HandoffId, settling))), Is.True);
             await probeEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
             originalDemand.SetResult();
             stop = work.CancelAndWaitAsync(_ => true);

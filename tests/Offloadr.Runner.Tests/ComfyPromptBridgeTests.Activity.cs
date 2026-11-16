@@ -6,7 +6,7 @@ using Offloadr.Runner.V1;
 
 namespace Offloadr.Runner.Tests;
 
-public sealed partial class ComfyPromptEvidenceTests
+public sealed partial class ComfyPromptBridgeTests
 {
     [TestCase(false)]
     [TestCase(true)]
@@ -21,13 +21,13 @@ public sealed partial class ComfyPromptEvidenceTests
         listener.Start();
         var command = Command();
         var observed = new TaskCompletionSource<(string Session, RuntimeIdentity Runtime)>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var sink = new EvidenceSink((_, _) => Task.CompletedTask);
+        var sink = new BridgeSink();
         await using var relay = new ComfySessionEventRelay(
             (session, runtime) => observed.TrySetResult((session, runtime)),
-            command.Target.RunnerId, "127.0.0.1", port, "test-process", _ => new SessionSealingStatus(), (_, _) => true);
+            RunnerId, "127.0.0.1", port, "test-process", _ => new SessionSealingStatus(), (_, _) => true);
         relay.AttachSink(sink);
-        await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "activity-client", command.Target.GpuGeneration,
-            command.Target.RuntimeEpoch, command.Target.RuntimeInstanceId, [], CancellationToken.None);
+        await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "activity-client", command.LifecycleGeneration,
+            command.RuntimeEpoch, command.RuntimeInstanceId, [], CancellationToken.None);
         var context = await listener.GetContextAsync().WaitAsync(TimeSpan.FromSeconds(3));
         using var socket = (await context.AcceptWebSocketAsync(null)).WebSocket;
         await sink.Authority.Activations.Reader.ReadAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(3));
@@ -39,8 +39,8 @@ public sealed partial class ComfyPromptEvidenceTests
             Assert.Multiple(() =>
             {
                 Assert.That(activity.Session, Is.EqualTo(command.SessionId));
-                Assert.That(activity.Runtime, Is.EqualTo(new RuntimeIdentity(command.Target.GpuGeneration,
-                    command.Target.RuntimeEpoch, command.Target.RuntimeInstanceId).Normalized()));
+                Assert.That(activity.Runtime, Is.EqualTo(new RuntimeIdentity(command.LifecycleGeneration,
+                    command.RuntimeEpoch, command.RuntimeInstanceId).Normalized()));
             });
         }
         finally

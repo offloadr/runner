@@ -49,10 +49,10 @@ public sealed partial class PromptCommandWorkSetTests
         var reference = new WeakReference(content);
         var failure = new InvalidOperationException("fixture settling failure");
         failure.Data["synthetic-payload"] = content;
-        Assert.That(work.Start(new SubmitPromptCommand { CommandId = "faulted-demand", SessionId = "session" }, false,
+        Assert.That(work.Start(new SubmitPromptCommand { HandoffId = "faulted-demand", SessionId = "session" }, false,
             (command, _, _) =>
             {
-                work.HoldDemand(command.CommandId, settling.Task);
+                work.HoldDemand(command.HandoffId, settling.Task);
                 return Task.CompletedTask;
             }), Is.True);
         settling.SetException(failure);
@@ -70,7 +70,7 @@ public sealed partial class PromptCommandWorkSetTests
         var callbackCalls = 0;
         try
         {
-            Assert.That(work.Start(new() { CommandId = "held-callback", SessionId = "session" }, false, (_, token) =>
+            Assert.That(work.Start(new() { HandoffId = "held-callback", SessionId = "session" }, false, (_, token) =>
             {
                 registration = token.Register(() =>
                 {
@@ -109,17 +109,17 @@ public sealed partial class PromptCommandWorkSetTests
         var release = Gate();
         try
         {
-            Assert.That(work.Start(new() { CommandId = "original", SessionId = "closing" }, false,
+            Assert.That(work.Start(new() { HandoffId = "original", SessionId = "closing" }, false,
                 (_, _) => release.Task), Is.True);
             var stop = work.CancelAndWaitAsync(identity => identity.SessionId == "closing");
-            Assert.That(work.Start(new() { CommandId = "late", SessionId = "closing" }, false,
+            Assert.That(work.Start(new() { HandoffId = "late", SessionId = "closing" }, false,
                 (_, _) => Task.CompletedTask), Is.False);
-            Assert.That(work.Start(new() { CommandId = "other", SessionId = "unrelated" }, false,
+            Assert.That(work.Start(new() { HandoffId = "other", SessionId = "unrelated" }, false,
                 (_, _) => Task.CompletedTask), Is.True);
             Assert.That(stop.IsCompleted, Is.False);
             release.SetResult();
             await stop.WaitAsync(TimeSpan.FromSeconds(5));
-            Assert.That(work.Start(new() { CommandId = "replacement", SessionId = "closing" }, false,
+            Assert.That(work.Start(new() { HandoffId = "replacement", SessionId = "closing" }, false,
                 (_, _) => Task.CompletedTask), Is.True);
         }
         finally
@@ -136,47 +136,10 @@ public sealed partial class PromptCommandWorkSetTests
         var work = new PromptCommandWorkSet(shutdown.Token);
         await shutdown.CancelAsync();
         var calls = 0;
-        Assert.That(work.Start(new() { CommandId = "late", SessionId = "session" }, false,
+        Assert.That(work.Start(new() { HandoffId = "late", SessionId = "session" }, false,
             (_, _) => { calls++; return Task.CompletedTask; }), Is.False);
         await work.CancelAndWaitAsync(_ => true);
         Assert.That(calls, Is.Zero);
-    }
-
-    [Test]
-    public async Task Stop_JoinsDemandReplacedByARecoveryDelivery()
-    {
-        var work = new PromptCommandWorkSet(CancellationToken.None);
-        var oldSettling = Gate();
-        var newSettling = Gate();
-        CancellationToken oldDemand = default;
-        try
-        {
-            Assert.That(work.Start(new() { CommandId = "recovered", SessionId = "session" }, false,
-                (command, _, demand) =>
-                {
-                    oldDemand = demand;
-                    work.HoldDemand(command.CommandId, oldSettling.Task);
-                    return Task.CompletedTask;
-                }), Is.True);
-            Assert.That(work.Start(new() { CommandId = "recovered", SessionId = "session" }, false,
-                (command, _, _) =>
-                {
-                    work.HoldDemand(command.CommandId, newSettling.Task);
-                    return Task.CompletedTask;
-                }), Is.True);
-            Assert.That(oldDemand.IsCancellationRequested, Is.True);
-            var stop = work.CancelAndWaitAsync(_ => true);
-            newSettling.SetResult();
-            await Task.Delay(50);
-            Assert.That(stop.IsCompleted, Is.False, "The old original settling task still belongs to this session.");
-            oldSettling.SetResult();
-            await stop.WaitAsync(TimeSpan.FromSeconds(5));
-        }
-        finally
-        {
-            oldSettling.TrySetResult(); newSettling.TrySetResult();
-            await work.CancelAndWaitAsync(_ => true);
-        }
     }
 
     [Test]
@@ -187,10 +150,10 @@ public sealed partial class PromptCommandWorkSetTests
         var settling = Gate();
         try
         {
-            Assert.That(work.Start(new() { CommandId = "handoff", SessionId = "session" }, false,
+            Assert.That(work.Start(new() { HandoffId = "handoff", SessionId = "session" }, false,
                 (command, _, _) =>
                 {
-                    work.HoldDemand(command.CommandId, settling.Task);
+                    work.HoldDemand(command.HandoffId, settling.Task);
                     return execution.Task;
                 }), Is.True);
             var stop = work.CancelAndWaitAsync(_ => true);
@@ -250,11 +213,11 @@ public sealed partial class PromptCommandWorkSetTests
         WeakReference? command = null;
         WeakReference? body = null;
         CancellationTokenRegistration registration = default;
-        Assert.That(work.Start(new SubmitPromptCommand { CommandId = "payload", SessionId = "session", PromptJson = new string('x', 65536) }, false,
+        Assert.That(work.Start(new SubmitPromptCommand { HandoffId = "payload", SessionId = "session", Request = new() { Body = new string('x', 65536) } }, false,
             (captured, token) =>
             {
                 command = new(captured);
-                body = new(captured.PromptJson);
+                body = new(captured.Request.Body);
                 registration = token.Register(() =>
                 {
                     entered.SetResult();
@@ -282,9 +245,9 @@ public sealed partial class PromptCommandWorkSetTests
         var secondToken = CancellationToken.None;
         try
         {
-            Assert.That(work.Start(new() { CommandId = "first", SessionId = "original" }, false,
+            Assert.That(work.Start(new() { HandoffId = "first", SessionId = "original" }, false,
                 (_, token) => firstOriginal = FirstAsync(token)), Is.True);
-            Assert.That(work.Start(new() { CommandId = "second", SessionId = "original" }, false,
+            Assert.That(work.Start(new() { HandoffId = "second", SessionId = "original" }, false,
                 (_, token) =>
                 {
                     secondToken = token;

@@ -1475,16 +1475,11 @@ public partial class ServiceClientManagerTests
             var completed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             var prompt = new SubmitPromptCommand
             {
-                CommandId = Guid.NewGuid().ToString("n"),
+                HandoffId = Guid.NewGuid().ToString("n"),
                 SessionId = CommandSessionId,
-                Target = new()
-                {
-                    GpuGeneration = generation,
-                    RuntimeEpoch = epoch,
-                    RuntimeInstanceId = instance,
-                    RunnerId = CommandRunnerId,
-                    RunnerSessionId = CommandSessionId,
-                },
+                LifecycleGeneration = generation,
+                RuntimeEpoch = epoch,
+                RuntimeInstanceId = instance,
             };
             WorkState.Prompts.Start(prompt, false, async (_, token) =>
             {
@@ -1644,7 +1639,6 @@ public partial class ServiceClientManagerTests
         public Task AckGpuPowerLimitAsync(AcknowledgeGpuPowerLimitRequest request, CancellationToken cancellationToken) => Task.CompletedTask;
         public Task<GrantPromptExecutionResponse> GrantPromptExecutionAsync(GrantPromptExecutionRequest request, CancellationToken cancellationToken)
             => throw new NotSupportedException();
-        public Task ReportPromptEvidenceAsync(ReportPromptEvidenceRequest request, CancellationToken cancellationToken) => Task.CompletedTask;
         public Task AckSubmitEditorActionAsync(AcknowledgePromptResultRequest request, CancellationToken cancellationToken) => Task.CompletedTask;
         public Task ReportModelDownloadAsync(ReportModelDownloadRequest request, CancellationToken cancellationToken) => Task.CompletedTask;
         public Task ReportSessionEventsAsync(ReportSessionEventsRequest request, CancellationToken cancellationToken) => Task.CompletedTask;
