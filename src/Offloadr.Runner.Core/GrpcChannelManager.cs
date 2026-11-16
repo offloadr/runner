@@ -1,3 +1,4 @@
+using Grpc.Core;
 using Grpc.Net.Client;
 using Grpc.Core.Interceptors;
 using Offloadr.Runner.V1;
@@ -34,7 +35,15 @@ public static class GrpcChannelManager
             : "(unparsable url)";
 
     public static RunnerControlService.RunnerControlServiceClient CreateAuthenticatedControlClient(GrpcChannel channel, string runnerSecret)
-        => new(channel.Intercept(new RunnerSecretClientInterceptor(runnerSecret)));
+        => new(CreateAuthenticatedInvoker(channel.CreateCallInvoker(), runnerSecret));
+
+    /// <summary>
+    /// Every call to the control plane carries the runner secret and the protocol header; the
+    /// control plane refuses any call without the current protocol, except registration and the
+    /// launch plan. Build each client on an invoker from here, never on a bare channel.
+    /// </summary>
+    public static CallInvoker CreateAuthenticatedInvoker(CallInvoker invoker, string runnerSecret)
+        => invoker.Intercept(new RunnerSecretClientInterceptor(runnerSecret));
 
     public static GrpcChannel CreateChannel(
         string offloadrApiUrl,
