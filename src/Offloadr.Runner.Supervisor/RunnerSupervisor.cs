@@ -2094,6 +2094,13 @@ public sealed class RunnerSupervisor : BackgroundService
             ["OFFLOADR_API_GRPC"] = settings.OffloadrApiOrigin,
             ["RUNNER_MODEL_DOWNLOADS"] = settings.DownloadModels ? "on" : "off",
         };
+        // Each family's, under its own name: the image reads only the one for its editor. Blank ones are left
+        // out, so a runner started before they existed keeps its fingerprint.
+        foreach (var (runtimeKind, text) in settings.EditorArguments)
+        {
+            environment[EditorArguments.EnvironmentVariable(runtimeKind)] = text;
+        }
+
         var volumes = new List<VolumeMount>();
         if (!string.IsNullOrWhiteSpace(settings.LocalModelsDirectory))
         {

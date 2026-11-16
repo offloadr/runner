@@ -79,6 +79,12 @@
                                   HelperText="Change this only to use another Offloadr environment." />
                     <MudTextField T="string" @bind-Value="_engineExecutable" Immediate="true" Label="Docker or podman executable" Variant="Variant.Outlined" Clearable="true"
                                   HelperText="Leave empty to find Docker automatically." />
+                    <MudTextField T="string" @bind-Value="_comfyUiArguments" Immediate="true" Label="Extra ComfyUI arguments" Variant="Variant.Outlined" Clearable="true"
+                                  Error="@(ComfyUiArgumentsProblem is not null)" ErrorText="@ComfyUiArgumentsProblem"
+                                  HelperText="Added to ComfyUI's command line, such as --lowvram --preview-method auto. The runner sets the network, folder and GPU flags itself." />
+                    <MudTextField T="string" @bind-Value="_forgeNeoArguments" Immediate="true" Label="Extra Forge Neo arguments" Variant="Variant.Outlined" Clearable="true"
+                                  Error="@(ForgeNeoArgumentsProblem is not null)" ErrorText="@ForgeNeoArgumentsProblem"
+                                  HelperText="Added to Forge Neo's command line, such as --use-ck-attention. The runner sets the network, folder and GPU flags itself." />
                 </MudStack>
             </MudExpansionPanel>
         </MudExpansionPanels>
@@ -109,6 +115,8 @@
     private string? _modelsDirectory;
     private string? _origin;
     private string? _engineExecutable;
+    private string? _comfyUiArguments;
+    private string? _forgeNeoArguments;
     private bool _autoStart;
     private bool _downloadModels;
     private bool _keepAwake = true;
@@ -121,7 +129,11 @@
     private SettingsForm _saved = null!;
     private bool _savedStartAtSignIn;
 
-    private SettingsForm Form => new(_runnerKey, _editorTemplate, _modelsDirectory, _origin, _engineExecutable, _autoStart, _downloadModels, _keepAwake);
+    private SettingsForm Form => new(_runnerKey, _editorTemplate, _modelsDirectory, _origin, _engineExecutable, _autoStart, _downloadModels, _keepAwake, _comfyUiArguments, _forgeNeoArguments);
+
+    private string? ComfyUiArgumentsProblem => RunnerSettings.EditorArgumentsProblem(RunnerSettings.ComfyUiRuntimeKind, _comfyUiArguments);
+
+    private string? ForgeNeoArgumentsProblem => RunnerSettings.EditorArgumentsProblem(RunnerSettings.ForgeNeoRuntimeKind, _forgeNeoArguments);
 
     private bool HasChanges => !Form.SameAs(_saved) || _startAtSignIn != _savedStartAtSignIn;
 
@@ -144,6 +156,8 @@
         _autoStart = form.AutoStart;
         _downloadModels = form.DownloadModels;
         _keepAwake = form.KeepAwakeDuringSessions;
+        _comfyUiArguments = form.ComfyUiArguments;
+        _forgeNeoArguments = form.ForgeNeoArguments;
         _startAtSignIn = Host.CanStartAtSignIn && Host.StartsAtSignIn;
         _saved = form;
         _savedStartAtSignIn = _startAtSignIn;

@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Text;
 using System.Text.RegularExpressions;
+using Offloadr.Runner.Core;
 using Offloadr.Runner.Supervisor.Settings;
 
 namespace Offloadr.Runner.Supervisor.Hosting;
@@ -169,6 +170,8 @@ public static partial class DiagnosticsReport
         Line(text, "Editor in Settings", settings.SelectedEditorTemplate);
         Line(text, "Start the runner when the app opens", YesNo(settings.AutoStart));
         Line(text, "Keep awake during sessions", YesNo(settings.KeepAwakeDuringSessions));
+        Line(text, "Extra ComfyUI arguments", Flags(settings.ComfyUiArguments));
+        Line(text, "Extra Forge Neo arguments", Flags(settings.ForgeNeoArguments));
         var problems = settings.Validate(_ => true);
         foreach (var problem in problems)
         {
@@ -293,6 +296,19 @@ public static partial class DiagnosticsReport
             : string.Concat(text.AsSpan(0, maximum / 2), "\n[…]\n", text.AsSpan(text.Length - maximum / 2));
 
     private static string YesNo(bool value) => value ? "yes" : "no";
+
+    // Flags only, as the agent logs them: a value can hold anything.
+    private static string Flags(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return "none";
+        }
+
+        return EditorArguments.TrySplit(text, out var arguments, out _)
+            ? EditorArguments.Describe(arguments)
+            : "set, but cannot be read";
+    }
 
     private static string Time(DateTimeOffset time) => time.UtcDateTime.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + " UTC";
 }

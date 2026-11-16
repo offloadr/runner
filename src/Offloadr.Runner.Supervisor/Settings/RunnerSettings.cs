@@ -39,6 +39,34 @@ public sealed record RunnerSettings
     /// </summary>
     public bool KeepAwakeDuringSessions { get; init; } = true;
 
+    /// <summary>Extra arguments for ComfyUI, as typed: a shell-style line such as <c>--lowvram</c>.</summary>
+    public string? ComfyUiArguments { get; init; }
+
+    /// <summary>Extra arguments for Forge Neo, as typed.</summary>
+    public string? ForgeNeoArguments { get; init; }
+
+    public const string ComfyUiRuntimeKind = "comfyui";
+    public const string ForgeNeoRuntimeKind = "forge-neo";
+
+    /// <summary>
+    /// The extra arguments for each editor family, by runtime kind, leaving out blank ones. The runner
+    /// image of a family reads only its own, so the agent checks them again.
+    /// </summary>
+    public IEnumerable<(string RuntimeKind, string Text)> EditorArguments
+    {
+        get
+        {
+            if (!string.IsNullOrWhiteSpace(ComfyUiArguments)) yield return (ComfyUiRuntimeKind, ComfyUiArguments.Trim());
+            if (!string.IsNullOrWhiteSpace(ForgeNeoArguments)) yield return (ForgeNeoRuntimeKind, ForgeNeoArguments.Trim());
+        }
+    }
+
+    /// <summary>Why <paramref name="text"/> cannot be the extra arguments for <paramref name="runtimeKind"/>, or null.</summary>
+    public static string? EditorArgumentsProblem(string runtimeKind, string? text)
+        => !Core.EditorArguments.TrySplit(text, out var arguments, out var error)
+            ? error
+            : Core.EditorArguments.Problem(runtimeKind, arguments);
+
     public bool HasRunnerKey => !string.IsNullOrWhiteSpace(RunnerKey);
 
     /// <summary>True when the Offloadr address is an https origin, the only kind the runner key may be sent to.</summary>
@@ -108,6 +136,16 @@ public sealed record RunnerSettings
         if (DownloadModels && string.IsNullOrWhiteSpace(LocalModelsDirectory))
         {
             errors.Add(DownloadsNeedFolderProblem);
+        }
+
+        if (EditorArgumentsProblem(ComfyUiRuntimeKind, ComfyUiArguments) is { } comfyUiProblem)
+        {
+            errors.Add($"Extra ComfyUI arguments: {comfyUiProblem}");
+        }
+
+        if (EditorArgumentsProblem(ForgeNeoRuntimeKind, ForgeNeoArguments) is { } forgeNeoProblem)
+        {
+            errors.Add($"Extra Forge Neo arguments: {forgeNeoProblem}");
         }
 
         return errors;

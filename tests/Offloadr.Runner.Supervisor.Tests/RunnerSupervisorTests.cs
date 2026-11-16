@@ -173,6 +173,73 @@ public class RunnerSupervisorTests
     }
 
     [Test]
+    public async Task Start_PassesEachEditorFamilysArgumentsUnderItsOwnName()
+    {
+        _settings = new FakeSettingsStore(new RunnerSettings
+        {
+            RunnerKey = Key,
+            ComfyUiArguments = "  --lowvram --preview-method auto ",
+            ForgeNeoArguments = "--use-ck-attention",
+        });
+        var supervisor = await StartSupervisorAsync();
+
+        supervisor.RequestStart();
+        await WaitForStateAsync(SupervisorState.Running);
+
+        var environment = _engine.Runs.Single().Environment;
+        Assert.Multiple(() =>
+        {
+            Assert.That(environment["RUNNER_EDITOR_ARGS_COMFYUI"], Is.EqualTo("--lowvram --preview-method auto"));
+            Assert.That(environment["RUNNER_EDITOR_ARGS_FORGE_NEO"], Is.EqualTo("--use-ck-attention"));
+        });
+    }
+
+    [Test]
+    public async Task Start_WithoutEditorArguments_SetsNoArgumentVariables()
+    {
+        _settings = new FakeSettingsStore(new RunnerSettings { RunnerKey = Key, ComfyUiArguments = "   " });
+        var supervisor = await StartSupervisorAsync();
+
+        supervisor.RequestStart();
+        await WaitForStateAsync(SupervisorState.Running);
+
+        Assert.That(_engine.Runs.Single().Environment.Keys, Has.None.StartsWith("RUNNER_EDITOR_ARGS_"));
+    }
+
+    [Test]
+    public async Task ChangingEditorArguments_RecreatesTheRunner()
+    {
+        _settings = new FakeSettingsStore(new RunnerSettings { RunnerKey = Key });
+        _engine.StatusJson = Status(activeSessionId: "");
+        var supervisor = await StartSupervisorAsync();
+        supervisor.RequestStart();
+        await WaitForStateAsync(SupervisorState.Running);
+        await WaitUntilAsync(() => supervisor.View.RunnerStatus is not null);
+
+        await _settings.SaveAsync(_settings.Current with { ComfyUiArguments = "--lowvram" });
+        await WaitUntilAsync(() => _engine.Runs.Count == 2);
+
+        Assert.That(_engine.Runs[1].Environment["RUNNER_EDITOR_ARGS_COMFYUI"], Is.EqualTo("--lowvram"));
+    }
+
+    [Test]
+    public async Task Start_WithARefusedEditorArgument_DoesNotRunTheRunner()
+    {
+        _settings = new FakeSettingsStore(new RunnerSettings { RunnerKey = Key, ForgeNeoArguments = "--share" });
+        var supervisor = await StartSupervisorAsync();
+
+        supervisor.RequestStart();
+        await WaitUntilAsync(() => supervisor.View.State != SupervisorState.Stopped);
+        await Task.Delay(100);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(_engine.Runs, Is.Empty);
+            Assert.That(supervisor.View.Message, Does.Contain("Extra Forge Neo arguments: --share"));
+        });
+    }
+
+    [Test]
     public async Task Start_WithoutARunnerKey_Faults()
     {
         _settings = new FakeSettingsStore(new RunnerSettings());

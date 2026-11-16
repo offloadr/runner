@@ -11,7 +11,9 @@ public sealed record SettingsForm(
     string? ContainerEngineExecutable,
     bool AutoStart,
     bool DownloadModels = false,
-    bool KeepAwakeDuringSessions = true)
+    bool KeepAwakeDuringSessions = true,
+    string? ComfyUiArguments = null,
+    string? ForgeNeoArguments = null)
 {
     /// <summary>
     /// True when saving this form saves the same settings as <paramref name="other"/>: a field left blank
@@ -26,6 +28,8 @@ public sealed record SettingsForm(
         LocalModelsDirectory = Text(LocalModelsDirectory),
         OffloadrApiOrigin = Text(OffloadrApiOrigin) ?? RunnerSettings.DefaultOffloadrApiOrigin,
         ContainerEngineExecutable = Text(ContainerEngineExecutable),
+        ComfyUiArguments = Text(ComfyUiArguments),
+        ForgeNeoArguments = Text(ForgeNeoArguments),
     };
 
     private static string? Text(string? value) => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
@@ -53,7 +57,9 @@ public sealed class RunnerSettingsEditor(IRunnerSettingsStore store)
             settings.ContainerEngineExecutable,
             settings.AutoStart,
             settings.DownloadModels,
-            settings.KeepAwakeDuringSessions);
+            settings.KeepAwakeDuringSessions,
+            settings.ComfyUiArguments,
+            settings.ForgeNeoArguments);
     }
 
     /// <summary>Saves the form. Settings with problems are saved too, so nothing typed is lost; the problems are returned.</summary>
@@ -69,6 +75,8 @@ public sealed class RunnerSettingsEditor(IRunnerSettingsStore store)
             AutoStart = form.AutoStart,
             DownloadModels = form.DownloadModels,
             KeepAwakeDuringSessions = form.KeepAwakeDuringSessions,
+            ComfyUiArguments = form.ComfyUiArguments,
+            ForgeNeoArguments = form.ForgeNeoArguments,
         };
 
         try
