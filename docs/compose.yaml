@@ -15,6 +15,8 @@ services:
       # Downloads are saved in the models folder, through its second, writable mount below.
       RUNNER_MODEL_DOWNLOADS: "on"
       RUNNER_MODEL_LIBRARY_DIR: /var/lib/offloadr-library/models
+      # Extra ComfyUI arguments, if you want any (docs/hosting.md, Editor arguments).
+      # RUNNER_EDITOR_ARGS_COMFYUI: --lowvram
     volumes:
       # Sessions see the folder read-only.
       - ${MODELS_DIR:?Set MODELS_DIR in .env}:/local:ro

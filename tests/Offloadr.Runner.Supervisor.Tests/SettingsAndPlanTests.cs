@@ -131,6 +131,53 @@ public class FileRunnerSettingsStoreTests
     }
 
     [Test]
+    public async Task EditorArguments_AreSavedPerFamilyAndTrimmed()
+    {
+        var paths = new SupervisorPaths(_root);
+        var store = new FileRunnerSettingsStore(paths, new ReversingSecretProtector(), NullLogger<FileRunnerSettingsStore>.Instance);
+        var editor = new RunnerSettingsEditor(store);
+
+        await editor.SaveAsync(editor.Load() with { ComfyUiArguments = " --lowvram ", ForgeNeoArguments = "   " });
+        var reloaded = new FileRunnerSettingsStore(paths, new ReversingSecretProtector(), NullLogger<FileRunnerSettingsStore>.Instance).Current;
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(reloaded.ComfyUiArguments, Is.EqualTo("--lowvram"));
+            Assert.That(reloaded.ForgeNeoArguments, Is.Null);
+            Assert.That(editor.Load().ComfyUiArguments, Is.EqualTo("--lowvram"));
+            Assert.That(reloaded.EditorArguments, Is.EqualTo(new[] { ("comfyui", "--lowvram") }));
+        });
+    }
+
+    [Test]
+    public void SettingsForm_TreatsBlankAndSpacedArgumentsAsUnchanged()
+    {
+        var saved = new SettingsForm("key", "comfyui-latest", null, null, null, false, ComfyUiArguments: "--lowvram");
+
+        Assert.Multiple(() =>
+        {
+            Assert.That((saved with { ComfyUiArguments = " --lowvram ", ForgeNeoArguments = "" }).SameAs(saved), Is.True);
+            Assert.That((saved with { ForgeNeoArguments = "--sage" }).SameAs(saved), Is.False);
+        });
+    }
+
+    [TestCase("--lowvram", null, null)]
+    [TestCase("--port 9000", null, "Extra ComfyUI arguments: --port is one the runner sets")]
+    [TestCase(null, "--theme 'dark", "Extra Forge Neo arguments: A single quote")]
+    [TestCase(null, "--cuda-device 1", "Extra Forge Neo arguments: --cuda-device chooses the GPU")]
+    public void Validate_ChecksEachFamilysArgumentsWithItsOwnFlags(string? comfyUi, string? forgeNeo, string? expected)
+    {
+        var problems = new RunnerSettings
+        {
+            RunnerKey = new string('k', RunnerSettings.MinimumRunnerKeyLength),
+            ComfyUiArguments = comfyUi,
+            ForgeNeoArguments = forgeNeo,
+        }.Validate();
+
+        Assert.That(problems, expected is null ? Is.Empty : Has.One.StartsWith(expected));
+    }
+
+    [Test]
     public async Task SettingsEditor_KeepsTheKeepAwakeChoice()
     {
         var store = new FileRunnerSettingsStore(new SupervisorPaths(_root), new ReversingSecretProtector(), NullLogger<FileRunnerSettingsStore>.Instance);

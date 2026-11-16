@@ -59,6 +59,8 @@ public sealed class FileRunnerSettingsStore : IRunnerSettingsStore
             SelectedEditorTemplate = normalized.SelectedEditorTemplate,
             AutoStart = normalized.AutoStart,
             KeepAwakeDuringSessions = normalized.KeepAwakeDuringSessions,
+            ComfyUiArguments = normalized.ComfyUiArguments,
+            ForgeNeoArguments = normalized.ForgeNeoArguments,
         };
 
         await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -124,6 +126,8 @@ public sealed class FileRunnerSettingsStore : IRunnerSettingsStore
             SelectedEditorTemplate = document.SelectedEditorTemplate,
             AutoStart = document.AutoStart,
             KeepAwakeDuringSessions = document.KeepAwakeDuringSessions,
+            ComfyUiArguments = document.ComfyUiArguments,
+            ForgeNeoArguments = document.ForgeNeoArguments,
         });
     }
 
@@ -136,6 +140,8 @@ public sealed class FileRunnerSettingsStore : IRunnerSettingsStore
         LocalModelsDirectory = Blank(settings.LocalModelsDirectory),
         ContainerEngineExecutable = Blank(settings.ContainerEngineExecutable),
         SelectedEditorTemplate = Blank(settings.SelectedEditorTemplate),
+        ComfyUiArguments = Blank(settings.ComfyUiArguments),
+        ForgeNeoArguments = Blank(settings.ForgeNeoArguments),
     };
 
     private static string? Blank(string? value) => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
@@ -158,5 +164,9 @@ public sealed class FileRunnerSettingsStore : IRunnerSettingsStore
 
         // On unless saved off: settings saved before the option existed keep the computer awake too.
         public bool KeepAwakeDuringSessions { get; set; } = true;
+
+        public string? ComfyUiArguments { get; set; }
+
+        public string? ForgeNeoArguments { get; set; }
     }
 }

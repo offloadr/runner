@@ -8,7 +8,7 @@ using Offloadr.Runner.Agent;
 
 try
 {
-    return await RunAgentAsync();
+    return await RunAgentAsync(args);
 }
 catch (Exception error)
 {
@@ -22,9 +22,10 @@ catch (Exception error)
     return 1;
 }
 
-static async Task<int> RunAgentAsync()
+static async Task<int> RunAgentAsync(string[] commandLine)
 {
-    var options = RunnerAgentOptions.FromEnvironment();
+    // Arguments after the image name are the owner's extra arguments for the editor.
+    var options = RunnerAgentOptions.FromEnvironment(commandLine: commandLine);
     using var statusChannel = GrpcChannelManager.CreateChannel(options.OffloadrApiUrl, options.TraceGrpcHttp);
     using var commandChannel = GrpcChannelManager.CreateChannel(options.OffloadrApiUrl, options.TraceGrpcHttp);
     using var sessionEventChannel = GrpcChannelManager.CreateChannel(options.OffloadrApiUrl, options.TraceGrpcHttp);
@@ -69,6 +70,11 @@ static async Task<int> RunAgentAsync()
     RunnerLog.Info(options.ModelDownloads.Enabled
         ? "Model downloads are on: models this runner lacks are downloaded when a session needs them."
         : "Model downloads are off (RUNNER_MODEL_DOWNLOADS): sessions use only the models in the local models folder.");
+    if (options.Session.EditorArguments.Count > 0)
+    {
+        // Flags only: a value can hold anything.
+        RunnerLog.Info($"Extra editor arguments: {EditorArguments.Describe(options.Session.EditorArguments)}");
+    }
     var sealedStorageStatus = sealedStorageProbe.Probe(options.Session.Sealing);
     RunnerLog.Info(
         $"Sealed storage mode={sealedStorageStatus.Mode} root='{sealedStorageStatus.Root}' available={sealedStorageStatus.Available} " +

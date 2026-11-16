@@ -112,6 +112,40 @@ GPU selection is not a security isolation boundary. The host runtime determines
 which devices the container can access, and untrusted child code can change its
 own CUDA environment. Continue to use appropriate host/container isolation.
 
+Inside the session the selected GPU is the only one, so editor flags that choose
+a device (`--cuda-device`, `--gpu-device-id` and the like) are refused; see
+[Editor arguments](#editor-arguments).
+
+## Editor arguments
+
+Arguments after the image name are added to the editor's command line, after
+the runner's own:
+
+```bash
+docker run --rm -it --gpus all -e RUNNER_SECRET=<your-runner-key> \
+  ghcr.io/offloadr/runner-forge-neo:latest --use-ck-attention
+```
+
+Each image runs one editor, so its arguments are that editor's: ComfyUI's for
+the `runner-comfyui` images, Forge Neo's for `runner-forge-neo`. They can also be
+set in a variable for each editor family, `RUNNER_EDITOR_ARGS_COMFYUI` and
+`RUNNER_EDITOR_ARGS_FORGE_NEO`, which suits Compose: a runner reads only its own
+editor's variable, and adds the arguments after the image name after it. The
+variable is split like a shell line, so quote a value with spaces:
+`RUNNER_EDITOR_ARGS_COMFYUI=--lowvram --preview-method auto`. The desktop app
+has the same two fields under Settings, Advanced.
+
+The runner refuses, and does not start with, the flags it sets or relies on:
+
+- the address, port and TLS flags (`--listen`, `--port`, `--tls-keyfile`, `--tls-certfile`), and Forge Neo's `--api`, `--share`, `--ngrok`, `--subpath`, authentication and CORS flags;
+- flags that move the editor's files or the folder it serves its pages from, such as `--base-directory`, `--output-directory`, `--front-end-root`, `--data-dir` or `--model-ref`, and any flag ending in `-dir`, `-directory`, `-path` or `-file`;
+- flags that choose the GPU, such as `--cuda-device` or `--gpu-device-id`: set `OFFLOADR_GPU_UUID` instead (see [Selecting one physical GPU](#selecting-one-physical-gpu));
+- flags that open a browser, stop the editor from a web request or end it at once, such as `--help`;
+- short options such as `-h`: write the long flag.
+
+An abbreviation of a refused flag is refused too, since the editors accept
+abbreviations. The startup log lists the extra flags without their values.
+
 ## Key Environment Variables
 
 - Required for startup
@@ -120,6 +154,8 @@ own CUDA environment. Continue to use appropriate host/container isolation.
   - `OFFLOADR_API_GRPC` (optional; defaults to `https://offloadr.studio`; use a public HTTPS gRPC endpoint)
 - Optional physical GPU selection
   - `OFFLOADR_GPU_UUID` (complete `GPU-...` UUID; binds resources, telemetry, power and child CUDA visibility)
+- Optional editor arguments (see [Editor arguments](#editor-arguments))
+  - `RUNNER_EDITOR_ARGS_COMFYUI`, `RUNNER_EDITOR_ARGS_FORGE_NEO` (extra arguments for that editor family, split like a shell line; a refused flag fails startup)
 - Optional identity/retry tuning
   - `RUNNER_ID` (optional UUID override; primarily for Offloadr-managed hosted runners)
   - `REG_MIN_BACKOFF_SEC`
@@ -314,7 +350,7 @@ For a personal runner, add `--shm-size` to `docker run` together with `-e RUNNER
 
 ## Startup Validation Behavior
 
-Runner startup fails fast with a clear aggregated error list when prerequisites are missing or invalid (for example: bad URLs, non-writable directories, missing `aria2c`, missing `COMFY_ENTRYPOINT`, missing `RUNNER_SEED_VENV_PATH`, missing `RUNNER_UV_BINARY`, or missing user-management binaries). With metadata-only console logs the list is not printed: the console shows only `event=startup-validation-failed`.
+Runner startup fails fast with a clear aggregated error list when prerequisites are missing or invalid (for example: bad URLs, non-writable directories, missing `aria2c`, missing `COMFY_ENTRYPOINT`, missing `RUNNER_SEED_VENV_PATH`, missing `RUNNER_UV_BINARY`, or missing user-management binaries, or a refused editor argument). With metadata-only console logs the list is not printed: the console shows only `event=startup-validation-failed`.
 
 ## Console Logs
 

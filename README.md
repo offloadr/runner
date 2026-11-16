@@ -45,7 +45,7 @@ To uninstall, use Installed apps in Windows Settings. That removes the app and i
 docker run --rm -it --pull always --gpus all -e RUNNER_SECRET=<your-runner-key> ghcr.io/offloadr/runner-comfyui:latest
 ```
 
-A runner uses only the models in a folder you give it unless you add `-e RUNNER_MODEL_DOWNLOADS=on`, which lets it download the ones a workflow needs. Models are often several gigabytes each; mount your models folder writable as well and the runner saves them there (see [docs/hosting.md](docs/hosting.md#saving-downloads-in-the-models-folder)). [docs/compose.yaml](docs/compose.yaml) runs the runner with Docker Compose, with a models folder and downloads.
+A runner uses only the models in a folder you give it unless you add `-e RUNNER_MODEL_DOWNLOADS=on`, which lets it download the ones a workflow needs. Models are often several gigabytes each; mount your models folder writable as well and the runner saves them there (see [docs/hosting.md](docs/hosting.md#saving-downloads-in-the-models-folder)). [docs/compose.yaml](docs/compose.yaml) runs the runner with Docker Compose, with a models folder and downloads. Arguments after the image name go to the editor, such as `--use-ck-attention` (see [Editor arguments](docs/hosting.md#editor-arguments)).
 
 | Image | Editor |
 | --- | --- |

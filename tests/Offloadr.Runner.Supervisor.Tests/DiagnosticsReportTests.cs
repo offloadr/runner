@@ -78,6 +78,23 @@ public class DiagnosticsReportTests
     }
 
     [Test]
+    public void Report_ListsTheFlagsOfTheEditorArgumentsButNotTheirValues()
+    {
+        var report = DiagnosticsReport.Build(Input(settings: new RunnerSettings
+        {
+            RunnerKey = Key,
+            ComfyUiArguments = "--preview-method secret-value --lowvram",
+        }));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(report, Does.Contain("Extra ComfyUI arguments: --preview-method --lowvram"));
+            Assert.That(report, Does.Contain("Extra Forge Neo arguments: none"));
+            Assert.That(report, Does.Not.Contain("secret-value"));
+        });
+    }
+
+    [Test]
     public void Report_NeverHoldsEitherRunnerKey_WhereverItAppears()
     {
         var view = SupervisorView.Initial(Now) with

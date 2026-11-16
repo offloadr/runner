@@ -100,6 +100,11 @@ public sealed class RunnerStartupValidator
         ValidateBinary(options.Session.UvBinaryPath, "RUNNER_UV_BINARY", errors);
         ValidateSealedStorage(options.Session.Sealing, errors);
         ValidateConsoleLogs(options.ConsoleLogs, errors);
+        if (options.Session.EditorArgumentsProblem is { } editorArgumentsProblem)
+        {
+            errors.Add($"Editor arguments: {editorArgumentsProblem}");
+        }
+
         if (options.ModelDownloads.InvalidValue is { } invalidDownloads)
         {
             errors.Add($"RUNNER_MODEL_DOWNLOADS must be on or off, not '{invalidDownloads}'.");

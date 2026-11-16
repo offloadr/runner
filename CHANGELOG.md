@@ -15,11 +15,13 @@ The first public release.
 - Logs follow new lines; Save diagnostics writes a redacted report for support, never holding the runner key.
 - Keeps the computer awake while a session runs, checks the runner again after sleep, and stops it within seconds when Windows shuts down.
 - Settings asks before leaving with unsaved changes. About shows the version, update status, licences and source code.
+- Extra arguments for ComfyUI and for Forge Neo under Settings, Advanced.
 
 ### Runner images
 
 - Model downloads are off unless asked for (`RUNNER_MODEL_DOWNLOADS=on`); without them a runner uses only its local models folder.
 - With a writable second mount of the models folder (`RUNNER_MODEL_LIBRARY_DIR`), downloaded models are saved there instead of inside the container.
 - Forge Neo keeps its models in a cache shared by its sessions.
+- Extra editor arguments: after the image name, or in `RUNNER_EDITOR_ARGS_COMFYUI` and `RUNNER_EDITOR_ARGS_FORGE_NEO`. Flags the runner sets or relies on are refused at startup.
 - Image signatures (cosign) and build provenance attestations.
 - A runner Offloadr no longer speaks the protocol of stops and says so instead of retrying; the desktop app then downloads the image Offloadr names. Images also carry a `<channel>-p<protocol>` tag, and the bare channel tags move to a new protocol only when Offloadr has switched to it.
