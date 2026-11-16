@@ -218,6 +218,29 @@ public partial class RunnerStartupValidatorTests
     }
 
     [Test]
+    public void ValidateOrThrow_RefusesEditorArgumentsWithAProblem()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            Assert.Ignore("Runner startup validation is Linux-specific.");
+        }
+
+        var tempRoot = Path.Combine(Path.GetTempPath(), $"runner-validator-{Guid.NewGuid():N}");
+        try
+        {
+            var options = BuildOptions(tempRoot, "/bin/sh", editorArgumentsProblem: "--port is one the runner sets");
+
+            var ex = Assert.Throws<InvalidOperationException>(
+                () => new RunnerStartupValidator(new NoopIsolationStrategy()).ValidateOrThrow(options));
+            Assert.That(ex!.Message, Does.Contain("Editor arguments: --port is one the runner sets"));
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+        }
+    }
+
+    [Test]
     public void ValidateOrThrow_RequiredSealedStorageNeedsAMemoryBackedRoot()
     {
         if (!OperatingSystem.IsLinux())
@@ -642,7 +665,8 @@ public partial class RunnerStartupValidatorTests
         SealedStorageOptions? sealing = null,
         ConsoleLogOptions? consoleLogs = null,
         ModelDownloadOptions? modelDownloads = null,
-        string? modelLibraryDirectory = null)
+        string? modelLibraryDirectory = null,
+        string? editorArgumentsProblem = null)
     {
         var sessionRoot = Path.Combine(tempRoot, "sessions");
         var workingDirectory = Path.Combine(tempRoot, "comfy");
@@ -688,7 +712,8 @@ public partial class RunnerStartupValidatorTests
                 ShutdownGracePeriod = TimeSpan.FromSeconds(20),
                 ReadyTimeout = TimeSpan.FromSeconds(120),
                 ReadyHost = "127.0.0.1",
-                Sealing = sealing ?? new SealedStorageOptions()
+                Sealing = sealing ?? new SealedStorageOptions(),
+                EditorArgumentsProblem = editorArgumentsProblem
             },
             Aria2 = Aria2Settings.FromEnvironment(name => name switch
             {

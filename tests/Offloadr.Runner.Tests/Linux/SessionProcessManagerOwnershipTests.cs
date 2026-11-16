@@ -507,6 +507,27 @@ public partial class SessionProcessManagerOwnershipTests
             }));
     }
 
+    [TestCase("forge-neo")]
+    [TestCase("comfyui")]
+    public void BuildRuntimeArguments_AddsTheEditorArgumentsAfterTheRunnersOwn(string runtimeKind)
+    {
+        var paths = new SessionProcessManager.SessionPaths
+        {
+            HomeDirectory = "/sessions/session-a",
+            ModelsDirectory = "/sessions/session-a/models"
+        };
+        var own = SessionProcessManager.BuildRuntimeArguments(runtimeKind, 7860, paths, "/sessions/session-a/models");
+
+        var args = SessionProcessManager.BuildRuntimeArguments(
+            runtimeKind,
+            7860,
+            paths,
+            "/sessions/session-a/models",
+            ["--use-ck-attention", "--reserve-vram", "2"]);
+
+        Assert.That(args, Is.EqualTo(own.Concat(["--use-ck-attention", "--reserve-vram", "2"])));
+    }
+
     [Test]
     public async Task StartSessionAsync_SeparatesComfyTempFromProcessScratch()
     {

@@ -44,6 +44,7 @@ internal sealed partial class SessionProcessManager : IAsyncDisposable
     private readonly ConcurrentDictionary<string, PreparedSessionIdentity> _pendingTeardowns = new(StringComparer.Ordinal);
     private readonly string _sessionRoot;
     private readonly string _entryPointPath;
+    private readonly IReadOnlyList<string> _editorArguments;
     private readonly string _workingDirectory;
     private readonly string _bundledCustomNodesSeedPath;
     private readonly string _bundledInputSeedPath;
@@ -121,6 +122,7 @@ internal sealed partial class SessionProcessManager : IAsyncDisposable
         _activitySink = activitySink ?? throw new ArgumentNullException(nameof(activitySink));
         _sessionRoot = options.SessionRoot;
         _entryPointPath = options.EntryPointPath;
+        _editorArguments = options.EditorArguments;
         _workingDirectory = options.WorkingDirectory;
         _bundledCustomNodesSeedPath = options.BundledCustomNodesSeedPath;
         _bundledInputSeedPath = options.BundledInputSeedPath;
@@ -1769,13 +1771,24 @@ internal sealed partial class SessionProcessManager : IAsyncDisposable
 
     private void AddRuntimeArguments(ProcessStartInfo psi, SessionPaths paths)
     {
-        foreach (var arg in BuildRuntimeArguments(_runtimeKind, _comfyPort, paths, ResolveProjectedModelsRoot(paths)))
+        foreach (var arg in BuildRuntimeArguments(_runtimeKind, _comfyPort, paths, ResolveProjectedModelsRoot(paths), _editorArguments))
         {
             psi.ArgumentList.Add(arg);
         }
     }
 
+    /// <param name="editorArguments">
+    /// The owner's extra arguments. They follow the runner's own, which they cannot repeat: startup refuses them.
+    /// </param>
     internal static IReadOnlyList<string> BuildRuntimeArguments(
+        string runtimeKind,
+        int port,
+        SessionPaths paths,
+        string projectedModelsRoot,
+        IReadOnlyList<string>? editorArguments = null)
+        => [.. BuildOwnRuntimeArguments(runtimeKind, port, paths, projectedModelsRoot), .. editorArguments ?? []];
+
+    private static List<string> BuildOwnRuntimeArguments(
         string runtimeKind,
         int port,
         SessionPaths paths,

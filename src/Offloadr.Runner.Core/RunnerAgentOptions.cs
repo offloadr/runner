@@ -43,9 +43,29 @@ public sealed class SessionProcessOptions
     public required string ReadyHost { get; init; }
     public SealedStorageOptions Sealing { get; init; } = new();
 
-    public static SessionProcessOptions FromEnvironment(Func<string, string?>? env = null)
+    /// <summary>
+    /// Extra arguments for the editor, after the runner's own: those in the runtime kind's variable
+    /// (<c>RUNNER_EDITOR_ARGS_COMFYUI</c> or <c>RUNNER_EDITOR_ARGS_FORGE_NEO</c>), then those given to the container
+    /// after the image name. See <see cref="Core.EditorArguments"/>.
+    /// </summary>
+    public IReadOnlyList<string> EditorArguments { get; init; } = [];
+
+    /// <summary>Why <see cref="EditorArguments"/> cannot be used, or null; startup fails with it.</summary>
+    public string? EditorArgumentsProblem { get; init; }
+
+    public static SessionProcessOptions FromEnvironment(Func<string, string?>? env = null, IReadOnlyList<string>? commandLine = null)
     {
         env ??= Environment.GetEnvironmentVariable;
+        var runtimeKind = GetTrimmedOrDefault(env("EDITOR_RUNTIME"), DefaultRuntimeKind).ToLowerInvariant();
+        var editorArgumentsVariable = Core.EditorArguments.EnvironmentVariable(runtimeKind);
+        string? editorArgumentsProblem = null;
+        if (!Core.EditorArguments.TrySplit(env(editorArgumentsVariable), out var fromEnvironment, out var splitError))
+        {
+            editorArgumentsProblem = $"{editorArgumentsVariable}: {splitError}";
+        }
+
+        IReadOnlyList<string> editorArguments = [.. fromEnvironment, .. commandLine ?? []];
+        editorArgumentsProblem ??= Core.EditorArguments.Problem(runtimeKind, editorArguments);
 
         var shutdownSeconds = ParseInt(env, "COMFY_SHUTDOWN_TIMEOUT_SEC", DefaultShutdownSeconds, 5, 120);
         var readySeconds = ParseInt(env, "COMFY_READY_TIMEOUT_SEC", DefaultReadyTimeoutSeconds, 5, 600);
@@ -59,14 +79,16 @@ public sealed class SessionProcessOptions
             BundledInputSeedPath = GetTrimmedOrDefault(env("COMFY_INPUT_SEED_PATH"), DefaultBundledInputSeedPath),
             SeedVirtualEnvPath = GetTrimmedOrDefault(env("RUNNER_SEED_VENV_PATH"), DefaultSeedVirtualEnvPath),
             UvBinaryPath = GetTrimmedOrDefault(env("RUNNER_UV_BINARY"), DefaultUvBinaryPath),
-            RuntimeKind = GetTrimmedOrDefault(env("EDITOR_RUNTIME"), DefaultRuntimeKind).ToLowerInvariant(),
+            RuntimeKind = runtimeKind,
             ModelCacheDirectory = GetTrimmedOrDefault(env("RUNNER_MODEL_CACHE_DIR"), DefaultModelCacheDirectory),
             ReadyPath = GetTrimmedOrDefault(env("EDITOR_READY_PATH"), DefaultReadyPath),
             ComfyPort = ParseInt(env, "COMFY_PORT", DefaultPort, 1, 65535),
             ShutdownGracePeriod = TimeSpan.FromSeconds(shutdownSeconds),
             ReadyTimeout = TimeSpan.FromSeconds(readySeconds),
             ReadyHost = GetTrimmedOrDefault(env("COMFY_READY_HOST"), "127.0.0.1"),
-            Sealing = SealedStorageOptions.FromEnvironment(env)
+            Sealing = SealedStorageOptions.FromEnvironment(env),
+            EditorArguments = editorArguments,
+            EditorArgumentsProblem = editorArgumentsProblem,
         };
     }
 
@@ -125,7 +147,8 @@ public sealed class RunnerAgentOptions
 
     public static RunnerAgentOptions FromEnvironment(
         Func<string, string?>? env = null,
-        Func<string, bool>? directoryExists = null)
+        Func<string, bool>? directoryExists = null,
+        IReadOnlyList<string>? commandLine = null)
     {
         env ??= Environment.GetEnvironmentVariable;
         directoryExists ??= Directory.Exists;
@@ -151,7 +174,7 @@ public sealed class RunnerAgentOptions
             }
         }
 
-        var session = SessionProcessOptions.FromEnvironment(env);
+        var session = SessionProcessOptions.FromEnvironment(env, commandLine);
         return new RunnerAgentOptions
         {
             RunnerSecret = runnerSecret,
