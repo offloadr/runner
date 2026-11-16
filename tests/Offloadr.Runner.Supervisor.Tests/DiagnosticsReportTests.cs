@@ -66,7 +66,7 @@ public class DiagnosticsReportTests
             Assert.That(report, Does.Contain("Session running: yes"));
             Assert.That(report, Does.Not.Contain("session-9"), "Whether a session runs is enough.");
             Assert.That(report, Does.Contain("Server version: 28.1.0"));
-            Assert.That(report, Does.Contain("GPU: NVIDIA GeForce RTX 4090, 24564 MiB"));
+            Assert.That(report, Does.Contain("GPU: NVIDIA GeForce RTX 4090, 24564 MiB, no UUID"));
             Assert.That(report, Does.Contain("GPU inside a container: failed"));
             Assert.That(report, Does.Contain("Runner key: set"));
             Assert.That(report, Does.Contain(@"Models folder: %USERPROFILE%\models"));
@@ -91,6 +91,19 @@ public class DiagnosticsReportTests
             Assert.That(report, Does.Contain("Extra ComfyUI arguments: --preview-method --lowvram"));
             Assert.That(report, Does.Contain("Extra Forge Neo arguments: none"));
             Assert.That(report, Does.Not.Contain("secret-value"));
+        });
+    }
+
+    [Test]
+    public void Report_SaysWhichGpuIsChosen()
+    {
+        var all = DiagnosticsReport.Build(Input(settings: new RunnerSettings { RunnerKey = Key }));
+        var one = DiagnosticsReport.Build(Input(settings: new RunnerSettings { RunnerKey = Key, GpuUuid = "GPU-aaaaaaaa-1111-2222-3333-444444444444" }));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(all, Does.Contain("GPU in Settings: all"));
+            Assert.That(one, Does.Contain("GPU in Settings: GPU-aaaaaaaa-1111-2222-3333-444444444444"));
         });
     }
 

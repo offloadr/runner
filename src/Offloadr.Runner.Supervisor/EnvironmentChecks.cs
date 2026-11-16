@@ -1,3 +1,4 @@
+using Offloadr.Runner.Supervisor.Hardware;
 using Offloadr.Runner.Supervisor.Settings;
 
 namespace Offloadr.Runner.Supervisor;
@@ -32,7 +33,8 @@ public static class EnvironmentChecks
             : new EnvironmentCheck("Docker", false, $"{fault.Title}. {fault.Message}", fault.Action, fault.Detail);
     }
 
-    public static EnvironmentCheck HostGpu(SupervisorView view) => view.HostGpus switch
+    /// <param name="chosenGpu">The UUID of the GPU chosen in Settings (<see cref="RunnerSettings.SelectedGpuUuid"/>); null for every GPU.</param>
+    public static EnvironmentCheck HostGpu(SupervisorView view, string? chosenGpu = null) => view.HostGpus switch
     {
         null => new EnvironmentCheck("NVIDIA GPU", null, "Checking…"),
         { Gpus.Count: 0 } report => new EnvironmentCheck(
@@ -41,11 +43,27 @@ public static class EnvironmentChecks
             "No NVIDIA GPU was found. The runner needs one, with a current NVIDIA driver.",
             FaultAction.InstallGpuDriver,
             report.Error),
+        var report when chosenGpu is not null && report.Gpus.FirstOrDefault(gpu => Same(gpu.Uuid, chosenGpu)) is { } chosen => new EnvironmentCheck(
+            "NVIDIA GPU",
+            true,
+            $"{Describe(chosen)}, the GPU chosen in Settings."),
+        // Only a driver that names its GPUs can show the chosen one is gone; the runner never falls back to another.
+        var report when chosenGpu is not null && report.Gpus.Any(gpu => gpu.Uuid is not null) => new EnvironmentCheck(
+            "NVIDIA GPU",
+            false,
+            "The GPU chosen in Settings is not on this computer now, so the runner has no GPU to use. Choose another one under Advanced in Settings.",
+            FaultAction.OpenSettings,
+            chosenGpu),
         var report => new EnvironmentCheck(
             "NVIDIA GPU",
             true,
-            string.Join(", ", report.Gpus.Select(gpu => $"{gpu.Name} ({gpu.MemoryMiB / 1024.0:0.#} GB)"))),
+            string.Join(", ", report.Gpus.Select(Describe))),
     };
+
+    /// <summary>A GPU as the app names it: its name and memory, such as <c>NVIDIA GeForce RTX 4090 (24 GB)</c>.</summary>
+    public static string Describe(HostGpu gpu) => $"{gpu.Name} ({gpu.MemoryMiB / 1024.0:0.#} GB)";
+
+    private static bool Same(string? uuid, string chosen) => string.Equals(uuid, chosen, StringComparison.OrdinalIgnoreCase);
 
     public static EnvironmentCheck GpuInContainers(SupervisorView view) => view.GpuAccess switch
     {

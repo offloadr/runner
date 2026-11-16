@@ -223,6 +223,68 @@ public class RunnerSupervisorTests
     }
 
     [Test]
+    public async Task Start_WithAChosenGpu_BindsTheRunnerToItInNvidiaSpelling()
+    {
+        _settings = new FakeSettingsStore(new RunnerSettings { RunnerKey = Key, GpuUuid = " GPU-AAAAAAAA-1111-2222-3333-444444444444 " });
+        var supervisor = await StartSupervisorAsync();
+
+        supervisor.RequestStart();
+        await WaitForStateAsync(SupervisorState.Running);
+
+        var run = _engine.Runs.Single();
+        Assert.Multiple(() =>
+        {
+            Assert.That(run.Environment["OFFLOADR_GPU_UUID"], Is.EqualTo("GPU-aaaaaaaa-1111-2222-3333-444444444444"));
+            Assert.That(run.Gpus, Is.True);
+        });
+    }
+
+    [Test]
+    public async Task Start_WithoutAChosenGpu_LeavesEveryGpuVisible()
+    {
+        _settings = new FakeSettingsStore(new RunnerSettings { RunnerKey = Key, GpuUuid = "  " });
+        var supervisor = await StartSupervisorAsync();
+
+        supervisor.RequestStart();
+        await WaitForStateAsync(SupervisorState.Running);
+
+        Assert.That(_engine.Runs.Single().Environment.Keys, Has.No.Member("OFFLOADR_GPU_UUID"));
+    }
+
+    [Test]
+    public async Task ChoosingAnotherGpu_RecreatesTheRunner()
+    {
+        _settings = new FakeSettingsStore(new RunnerSettings { RunnerKey = Key, GpuUuid = "GPU-00000000-1111-2222-3333-444444444444" });
+        _engine.StatusJson = Status(activeSessionId: "");
+        var supervisor = await StartSupervisorAsync();
+        supervisor.RequestStart();
+        await WaitForStateAsync(SupervisorState.Running);
+        await WaitUntilAsync(() => supervisor.View.RunnerStatus is not null);
+
+        await _settings.SaveAsync(_settings.Current with { GpuUuid = "GPU-aaaaaaaa-1111-2222-3333-444444444444" });
+        await WaitUntilAsync(() => _engine.Runs.Count == 2);
+
+        Assert.That(_engine.Runs[1].Environment["OFFLOADR_GPU_UUID"], Is.EqualTo("GPU-aaaaaaaa-1111-2222-3333-444444444444"));
+    }
+
+    [Test]
+    public async Task Start_WithAnIncompleteGpuUuid_DoesNotRunTheRunner()
+    {
+        _settings = new FakeSettingsStore(new RunnerSettings { RunnerKey = Key, GpuUuid = "GPU-0000" });
+        var supervisor = await StartSupervisorAsync();
+
+        supervisor.RequestStart();
+        await WaitUntilAsync(() => supervisor.View.State != SupervisorState.Stopped);
+        await Task.Delay(100);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(_engine.Runs, Is.Empty);
+            Assert.That(supervisor.View.Message, Does.Contain("'GPU-0000' is not a complete NVIDIA GPU UUID"));
+        });
+    }
+
+    [Test]
     public async Task Start_WithARefusedEditorArgument_DoesNotRunTheRunner()
     {
         _settings = new FakeSettingsStore(new RunnerSettings { RunnerKey = Key, ForgeNeoArguments = "--share" });

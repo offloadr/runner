@@ -2107,6 +2107,14 @@ public sealed class RunnerSupervisor : BackgroundService
             environment[EditorArguments.EnvironmentVariable(runtimeKind)] = text;
         }
 
+        // The container still gets `--gpus all`: under WSL the driver can list every GPU whatever Docker
+        // was asked for, so the agent itself binds its queries, power commands and the editor's CUDA
+        // visibility to this one. Left out when none is chosen, like the arguments above.
+        if (settings.SelectedGpuUuid is { } gpu)
+        {
+            environment[NvidiaGpuUuid.EnvironmentVariable] = gpu;
+        }
+
         var volumes = new List<VolumeMount>();
         if (!string.IsNullOrWhiteSpace(settings.LocalModelsDirectory))
         {

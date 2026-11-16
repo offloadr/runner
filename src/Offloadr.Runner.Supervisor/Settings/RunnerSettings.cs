@@ -1,3 +1,5 @@
+using Offloadr.Runner.Core;
+
 namespace Offloadr.Runner.Supervisor.Settings;
 
 /// <summary>What the person running the desktop app configures. Immutable; replace it to change it.</summary>
@@ -44,6 +46,15 @@ public sealed record RunnerSettings
 
     /// <summary>Extra arguments for Forge Neo, as typed.</summary>
     public string? ForgeNeoArguments { get; init; }
+
+    /// <summary>
+    /// The one NVIDIA GPU the runner and its editor use, by UUID. Empty, the default, leaves every GPU
+    /// visible; only a computer with more than one has anything to choose.
+    /// </summary>
+    public string? GpuUuid { get; init; }
+
+    /// <summary>The chosen GPU's UUID in <c>nvidia-smi</c>'s spelling; null when none is chosen or it is not a complete UUID.</summary>
+    public string? SelectedGpuUuid => NvidiaGpuUuid.TryNormalize(GpuUuid, out var uuid) ? uuid : null;
 
     public const string ComfyUiRuntimeKind = "comfyui";
     public const string ForgeNeoRuntimeKind = "forge-neo";
@@ -136,6 +147,11 @@ public sealed record RunnerSettings
         if (DownloadModels && string.IsNullOrWhiteSpace(LocalModelsDirectory))
         {
             errors.Add(DownloadsNeedFolderProblem);
+        }
+
+        if (!string.IsNullOrWhiteSpace(GpuUuid) && SelectedGpuUuid is null)
+        {
+            errors.Add($"The GPU '{GpuUuid.Trim()}' is not a complete NVIDIA GPU UUID. Choose the GPU again under Advanced.");
         }
 
         if (EditorArgumentsProblem(ComfyUiRuntimeKind, ComfyUiArguments) is { } comfyUiProblem)

@@ -13,7 +13,8 @@ public sealed record SettingsForm(
     bool DownloadModels = false,
     bool KeepAwakeDuringSessions = true,
     string? ComfyUiArguments = null,
-    string? ForgeNeoArguments = null)
+    string? ForgeNeoArguments = null,
+    string? GpuUuid = null)
 {
     /// <summary>
     /// True when saving this form saves the same settings as <paramref name="other"/>: a field left blank
@@ -30,6 +31,7 @@ public sealed record SettingsForm(
         ContainerEngineExecutable = Text(ContainerEngineExecutable),
         ComfyUiArguments = Text(ComfyUiArguments),
         ForgeNeoArguments = Text(ForgeNeoArguments),
+        GpuUuid = Text(GpuUuid),
     };
 
     private static string? Text(string? value) => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
@@ -59,7 +61,8 @@ public sealed class RunnerSettingsEditor(IRunnerSettingsStore store)
             settings.DownloadModels,
             settings.KeepAwakeDuringSessions,
             settings.ComfyUiArguments,
-            settings.ForgeNeoArguments);
+            settings.ForgeNeoArguments,
+            settings.GpuUuid);
     }
 
     /// <summary>Saves the form. Settings with problems are saved too, so nothing typed is lost; the problems are returned.</summary>
@@ -77,6 +80,7 @@ public sealed class RunnerSettingsEditor(IRunnerSettingsStore store)
             KeepAwakeDuringSessions = form.KeepAwakeDuringSessions,
             ComfyUiArguments = form.ComfyUiArguments,
             ForgeNeoArguments = form.ForgeNeoArguments,
+            GpuUuid = form.GpuUuid,
         };
 
         try

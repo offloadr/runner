@@ -95,6 +95,47 @@ public class EnvironmentChecksTests
         });
     }
 
+    private const string FirstUuid = "GPU-00000000-1111-2222-3333-444444444444";
+    private const string SecondUuid = "GPU-aaaaaaaa-1111-2222-3333-444444444444";
+
+    private static readonly HostGpuReport TwoGpus = new(
+        [new HostGpu("NVIDIA GeForce RTX 4090", 24564, FirstUuid), new HostGpu("NVIDIA RTX A6000", 49140, SecondUuid)], null);
+
+    [Test]
+    public void HostGpu_Chosen_NamesOnlyTheChosenOne()
+    {
+        var check = EnvironmentChecks.HostGpu(Unchecked with { HostGpus = TwoGpus }, SecondUuid);
+
+        Assert.That(check, Is.EqualTo(new EnvironmentCheck("NVIDIA GPU", true, "NVIDIA RTX A6000 (48 GB), the GPU chosen in Settings.")));
+    }
+
+    [Test]
+    public void HostGpu_ChosenButGone_FailsAndPointsToSettings()
+    {
+        const string gone = "GPU-bbbbbbbb-1111-2222-3333-444444444444";
+        var check = EnvironmentChecks.HostGpu(Unchecked with { HostGpus = TwoGpus }, gone);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(check.Ok, Is.False);
+            Assert.That(check.Detail, Does.StartWith("The GPU chosen in Settings is not on this computer now"));
+            Assert.That(check.Fix, Is.EqualTo(FaultAction.OpenSettings));
+            Assert.That(check.Technical, Is.EqualTo(gone));
+        });
+    }
+
+    [Test]
+    public void HostGpu_Chosen_WhenTheDriverNamesNoGpu_ListsThemAll()
+    {
+        var check = EnvironmentChecks.HostGpu(Unchecked with { HostGpus = OneGpu }, FirstUuid);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(check.Ok, Is.True);
+            Assert.That(check.Detail, Does.StartWith("NVIDIA GeForce RTX 4090 (24"));
+        });
+    }
+
     [Test]
     public void GpuInContainers_CountsTheGpus_AndOffersTheGuideWhenItFails()
     {

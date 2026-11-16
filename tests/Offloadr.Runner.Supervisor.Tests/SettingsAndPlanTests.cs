@@ -150,6 +150,44 @@ public class FileRunnerSettingsStoreTests
     }
 
     [Test]
+    public async Task GpuChoice_IsSavedTrimmed_AndBlankMeansEveryGpu()
+    {
+        var paths = new SupervisorPaths(_root);
+        var store = new FileRunnerSettingsStore(paths, new ReversingSecretProtector(), NullLogger<FileRunnerSettingsStore>.Instance);
+        var editor = new RunnerSettingsEditor(store);
+
+        await editor.SaveAsync(editor.Load() with { GpuUuid = " GPU-aaaaaaaa-1111-2222-3333-444444444444 " });
+        var chosen = new FileRunnerSettingsStore(paths, new ReversingSecretProtector(), NullLogger<FileRunnerSettingsStore>.Instance).Current;
+        await editor.SaveAsync(editor.Load() with { GpuUuid = "  " });
+        var cleared = new FileRunnerSettingsStore(paths, new ReversingSecretProtector(), NullLogger<FileRunnerSettingsStore>.Instance).Current;
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(chosen.GpuUuid, Is.EqualTo("GPU-aaaaaaaa-1111-2222-3333-444444444444"));
+            Assert.That(chosen.SelectedGpuUuid, Is.EqualTo("GPU-aaaaaaaa-1111-2222-3333-444444444444"));
+            Assert.That(cleared.GpuUuid, Is.Null);
+            Assert.That(cleared.SelectedGpuUuid, Is.Null);
+            Assert.That(new SettingsForm("key", "comfyui-latest", null, null, null, false, GpuUuid: " ").SameAs(
+                new SettingsForm("key", "comfyui-latest", null, null, null, false)), Is.True);
+        });
+    }
+
+    [TestCase(null, null)]
+    [TestCase("GPU-AAAAAAAA-1111-2222-3333-444444444444", null)]
+    [TestCase("GPU-0000", "The GPU 'GPU-0000' is not a complete NVIDIA GPU UUID")]
+    [TestCase("00000000-1111-2222-3333-444444444444", "The GPU '00000000-1111-2222-3333-444444444444' is not a complete NVIDIA GPU UUID")]
+    public void Validate_AcceptsOnlyACompleteGpuUuid(string? gpu, string? expected)
+    {
+        var problems = new RunnerSettings
+        {
+            RunnerKey = new string('k', RunnerSettings.MinimumRunnerKeyLength),
+            GpuUuid = gpu,
+        }.Validate();
+
+        Assert.That(problems, expected is null ? Is.Empty : Has.One.StartsWith(expected));
+    }
+
+    [Test]
     public void SettingsForm_TreatsBlankAndSpacedArgumentsAsUnchanged()
     {
         var saved = new SettingsForm("key", "comfyui-latest", null, null, null, false, ComfyUiArguments: "--lowvram");
@@ -242,15 +280,25 @@ public class LaunchPlanTests
 public class HostGpuProbeTests
 {
     [Test]
-    public void Parse_ReadsNameAndMemory()
+    public void Parse_ReadsUuidNameAndMemory()
     {
-        var gpus = NvidiaSmiHostGpuProbe.Parse("NVIDIA GeForce RTX 4090, 24564\nNVIDIA RTX A6000, 49140\n\ngarbage\n");
+        var gpus = NvidiaSmiHostGpuProbe.Parse(
+            "GPU-00000000-1111-2222-3333-444444444444, NVIDIA GeForce RTX 4090, 24564\n" +
+            "GPU-AAAAAAAA-1111-2222-3333-444444444444, NVIDIA RTX A6000, 49140\n\ngarbage\nNVIDIA RTX 3090, 24576\n");
 
         Assert.That(gpus, Is.EqualTo(new[]
         {
-            new HostGpu("NVIDIA GeForce RTX 4090", 24564),
-            new HostGpu("NVIDIA RTX A6000", 49140),
+            new HostGpu("NVIDIA GeForce RTX 4090", 24564, "GPU-00000000-1111-2222-3333-444444444444"),
+            new HostGpu("NVIDIA RTX A6000", 49140, "GPU-aaaaaaaa-1111-2222-3333-444444444444"),
         }));
+    }
+
+    [Test]
+    public void Parse_ListsAGpuWithoutAUuidButCannotChooseIt()
+    {
+        var gpus = NvidiaSmiHostGpuProbe.Parse("[N/A], NVIDIA GeForce RTX 4090, 24564\n");
+
+        Assert.That(gpus, Is.EqualTo(new[] { new HostGpu("NVIDIA GeForce RTX 4090", 24564) }));
     }
 }
 

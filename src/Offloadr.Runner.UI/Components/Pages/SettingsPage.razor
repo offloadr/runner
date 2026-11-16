@@ -79,6 +79,22 @@
                                   HelperText="Change this only to use another Offloadr environment." />
                     <MudTextField T="string" @bind-Value="_engineExecutable" Immediate="true" Label="Docker or podman executable" Variant="Variant.Outlined" Clearable="true"
                                   HelperText="Leave empty to find Docker automatically." />
+                    @if (ShowsGpuChoice)
+                    {
+                        <MudSelect T="string" @bind-Value="GpuChoice" Label="GPU" Variant="Variant.Outlined"
+                                   Error="@SavedGpuMissing" ErrorText="This GPU is not on this computer now. Choose another one, or All GPUs."
+                                   HelperText="@GpuHelp">
+                            <MudSelectItem Value="@AllGpus">All GPUs</MudSelectItem>
+                            @foreach (var gpu in ChoosableGpus)
+                            {
+                                <MudSelectItem Value="@gpu.Uuid">@GpuLabel(gpu)</MudSelectItem>
+                            }
+                            @if (SavedGpu is null && !string.IsNullOrWhiteSpace(_gpuUuid))
+                            {
+                                <MudSelectItem Value="@_gpuUuid">@(SavedGpuMissing ? $"Not found: {_gpuUuid}" : _gpuUuid)</MudSelectItem>
+                            }
+                        </MudSelect>
+                    }
                     <MudTextField T="string" @bind-Value="_comfyUiArguments" Immediate="true" Label="Extra ComfyUI arguments" Variant="Variant.Outlined" Clearable="true"
                                   Error="@(ComfyUiArgumentsProblem is not null)" ErrorText="@ComfyUiArgumentsProblem"
                                   HelperText="Added to ComfyUI's command line, such as --lowvram --preview-method auto. The runner sets the network, folder and GPU flags itself." />
@@ -129,7 +145,39 @@
     private SettingsForm _saved = null!;
     private bool _savedStartAtSignIn;
 
-    private SettingsForm Form => new(_runnerKey, _editorTemplate, _modelsDirectory, _origin, _engineExecutable, _autoStart, _downloadModels, _keepAwake, _comfyUiArguments, _forgeNeoArguments);
+    private SettingsForm Form => new(_runnerKey, _editorTemplate, _modelsDirectory, _origin, _engineExecutable, _autoStart, _downloadModels, _keepAwake, _comfyUiArguments, _forgeNeoArguments, _gpuUuid);
+
+    // Stands for no choice in the select, which then saves a blank GPU.
+    private const string AllGpus = "all";
+
+    private string? _gpuUuid;
+
+    private string GpuChoice
+    {
+        get => string.IsNullOrWhiteSpace(_gpuUuid) ? AllGpus : _gpuUuid;
+        set => _gpuUuid = value == AllGpus ? null : value;
+    }
+
+    /// <summary>The GPUs this computer has that can be chosen: those whose driver gives a UUID.</summary>
+    private IReadOnlyList<HostGpu> ChoosableGpus => View.HostGpus?.Gpus.Where(gpu => gpu.Uuid is not null).ToList() ?? [];
+
+    // Most computers have one NVIDIA GPU, with nothing to choose; a GPU chosen before stays visible to change it.
+    private bool ShowsGpuChoice => ChoosableGpus.Count > 1 || !string.IsNullOrWhiteSpace(_gpuUuid);
+
+    private HostGpu? SavedGpu => ChoosableGpus.FirstOrDefault(gpu => string.Equals(gpu.Uuid, _gpuUuid?.Trim(), StringComparison.OrdinalIgnoreCase));
+
+    private bool SavedGpuMissing => !string.IsNullOrWhiteSpace(_gpuUuid) && ChoosableGpus.Count > 0 && SavedGpu is null;
+
+    private string GpuHelp => string.IsNullOrWhiteSpace(_gpuUuid)
+        ? "The runner can see every NVIDIA GPU, and editors use the first. Choose one to keep the others free for other work."
+        : "The runner and its editor use only this GPU.";
+
+    // Two GPUs of the same model are told apart by the start of their UUIDs.
+    private string GpuLabel(HostGpu gpu)
+    {
+        var label = EnvironmentChecks.Describe(gpu);
+        return ChoosableGpus.Count(other => EnvironmentChecks.Describe(other) == label) > 1 ? $"{label}, {gpu.Uuid![..12]}" : label;
+    }
 
     private string? ComfyUiArgumentsProblem => RunnerSettings.EditorArgumentsProblem(RunnerSettings.ComfyUiRuntimeKind, _comfyUiArguments);
 
@@ -158,6 +206,7 @@
         _keepAwake = form.KeepAwakeDuringSessions;
         _comfyUiArguments = form.ComfyUiArguments;
         _forgeNeoArguments = form.ForgeNeoArguments;
+        _gpuUuid = form.GpuUuid;
         _startAtSignIn = Host.CanStartAtSignIn && Host.StartsAtSignIn;
         _saved = form;
         _savedStartAtSignIn = _startAtSignIn;
