@@ -19,6 +19,9 @@ public static class EditorArguments
     // ComfyUI, Forge Neo and their entrypoints all set these, or the runner reaches the editor through them.
     private static readonly string[] SharedReserved = ["--listen", "--port", "--tls-keyfile", "--tls-certfile"];
 
+    // Both parsers add --help; with it the editor prints its usage and exits.
+    private static readonly string[] SharedExit = ["--help"];
+
     private static readonly Dictionary<string, Family> Families = new(StringComparer.OrdinalIgnoreCase)
     {
         ["comfyui"] = new(
@@ -29,10 +32,12 @@ public static class EditorArguments
                 "--base-directory", "--input-directory", "--output-directory", "--temp-directory",
                 "--user-directory", "--models-directory", "--previews-directory", "--extra-model-paths-config",
                 "--disabled-nodes-config", "--database-url", "--multi-user", "--enable-cors-header",
-                "--auto-launch", "--disable-auto-launch", "--windows-standalone-build", "--quick-test-for-ci",
-                "--list-feature-flags",
+                // The folder the editor serves its web pages from, with every other file in it.
+                "--front-end-root",
+                "--auto-launch", "--disable-auto-launch", "--windows-standalone-build",
             ],
-            Gpu: ["--cuda-device", "--default-device", "--oneapi-device-selector", "--directml"]),
+            Gpu: ["--cuda-device", "--default-device", "--oneapi-device-selector", "--directml"],
+            Exit: [.. SharedExit, "--quick-test-for-ci", "--list-feature-flags"]),
         ["forge-neo"] = new(
             "Forge Neo",
             Reserved:
@@ -45,10 +50,10 @@ public static class EditorArguments
                 "--gradio-allowed-path", "--gradio-auth", "--gradio-auth-path", "--api-auth", "--server-name",
                 "--subpath", "--share", "--ngrok", "--ngrok-options", "--ngrok-region", "--cors-allow-origins",
                 "--cors-allow-origins-regex", "--autolaunch", "--add-stop-route", "--api-server-stop",
-                "--dump-sysinfo",
             ],
             // --cuda-device is ComfyUI's, but people bring it over, and Forge Neo would stop on it.
-            Gpu: ["--gpu-device-id", "--device-id", "--cuda-device", "--directml"]),
+            Gpu: ["--gpu-device-id", "--device-id", "--cuda-device", "--directml"],
+            Exit: [.. SharedExit, "--dump-sysinfo"]),
     };
 
     // A flag a later editor release adds for a file or folder is refused before it is reviewed.
@@ -171,6 +176,14 @@ public static class EditorArguments
 
         foreach (var argument in arguments)
         {
+            // The editors' only short options are -h, which prints help and exits, and Forge Neo's -f,
+            // which skips a safety check; argparse also reads them inside a group such as -fh. A negative
+            // number is a value, not an option.
+            if (argument.Length >= 2 && argument[0] == '-' && char.IsAsciiLetter(argument[1]))
+            {
+                return $"{argument}: short options are not taken; write the long flag, such as --lowvram.";
+            }
+
             if (!argument.StartsWith("--", StringComparison.Ordinal) || argument.Length <= 2)
             {
                 continue;
@@ -185,6 +198,11 @@ public static class EditorArguments
             if (Match(family.Reserved, flag) is { } reserved)
             {
                 return $"{Spelled(flag, reserved)} is one the runner sets or depends on, so it cannot be added.";
+            }
+
+            if (Match(family.Exit, flag) is { } exit)
+            {
+                return $"{Spelled(flag, exit)} makes the editor print something and exit, so no session could start.";
             }
 
             if (PathSuffixes.Any(suffix => flag.EndsWith(suffix, StringComparison.Ordinal)))
@@ -211,5 +229,5 @@ public static class EditorArguments
     private static string Spelled(string flag, string refused)
         => string.Equals(flag, refused, StringComparison.Ordinal) ? flag : $"{flag} (short for {refused})";
 
-    private sealed record Family(string Name, string[] Reserved, string[] Gpu);
+    private sealed record Family(string Name, string[] Reserved, string[] Gpu, string[] Exit);
 }

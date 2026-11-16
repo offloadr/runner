@@ -87,6 +87,48 @@ public class EditorArgumentsTests
         Assert.That(EditorArguments.Problem(runtimeKind, arguments), Does.StartWith(expected));
     }
 
+    [TestCase("--front-end-root /srv")]
+    [TestCase("--front-end-root=/srv")]
+    [TestCase("--front-end-ro /srv")]
+    public void Problem_RefusesComfyUisWebPageFolder(string text)
+    {
+        Assert.That(EditorArguments.TrySplit(text, out var arguments, out _), Is.True);
+
+        Assert.That(EditorArguments.Problem("comfyui", arguments), Does.Contain("--front-end-root").And.Contain("is one the runner sets"));
+    }
+
+    [Test]
+    public void Problem_AcceptsComfyUisFrontEndVersion()
+        => Assert.That(EditorArguments.Problem("comfyui", ["--front-end-version", "Comfy-Org/ComfyUI_frontend@latest"]), Is.Null);
+
+    [TestCase("comfyui", "--help", "--help makes the editor print something and exit")]
+    [TestCase("forge-neo", "--help", "--help makes the editor print something and exit")]
+    [TestCase("comfyui", "--lowvram --hel", "--hel (short for --help) makes the editor")]
+    [TestCase("comfyui", "--quick-test-for-ci", "--quick-test-for-ci makes the editor")]
+    [TestCase("comfyui", "--list-feature-flags", "--list-feature-flags makes the editor")]
+    [TestCase("forge-neo", "--dump-sysinfo", "--dump-sysinfo makes the editor")]
+    public void Problem_RefusesFlagsThatEndTheEditorAtOnce(string runtimeKind, string text, string expected)
+    {
+        Assert.That(EditorArguments.TrySplit(text, out var arguments, out _), Is.True);
+
+        Assert.That(EditorArguments.Problem(runtimeKind, arguments), Does.StartWith(expected));
+    }
+
+    [TestCase("comfyui", "-h")]
+    [TestCase("forge-neo", "-h")]
+    [TestCase("forge-neo", "-f")]
+    [TestCase("forge-neo", "--lowvram -fh")]
+    public void Problem_RefusesShortOptions(string runtimeKind, string text)
+    {
+        Assert.That(EditorArguments.TrySplit(text, out var arguments, out _), Is.True);
+
+        Assert.That(EditorArguments.Problem(runtimeKind, arguments), Does.Contain("short options are not taken"));
+    }
+
+    [Test]
+    public void Problem_TakesANegativeNumberAsAValue()
+        => Assert.That(EditorArguments.Problem("comfyui", ["--preview-size", "-1"]), Is.Null);
+
     [TestCase("comfyui", "--lis 0.0.0.0", "--lis (short for --listen)")]
     [TestCase("comfyui", "--output-dir /tmp", "--output-dir (short for --output-directory)")]
     [TestCase("forge-neo", "--sha", "--sha (short for --share)")]

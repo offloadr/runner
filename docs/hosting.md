@@ -138,9 +138,10 @@ has the same two fields under Settings, Advanced.
 The runner refuses, and does not start with, the flags it sets or relies on:
 
 - the address, port and TLS flags (`--listen`, `--port`, `--tls-keyfile`, `--tls-certfile`), and Forge Neo's `--api`, `--share`, `--ngrok`, `--subpath`, authentication and CORS flags;
-- flags that move the editor's files, such as `--base-directory`, `--output-directory`, `--data-dir` or `--model-ref`, and any flag ending in `-dir`, `-directory`, `-path` or `-file`;
+- flags that move the editor's files or the folder it serves its pages from, such as `--base-directory`, `--output-directory`, `--front-end-root`, `--data-dir` or `--model-ref`, and any flag ending in `-dir`, `-directory`, `-path` or `-file`;
 - flags that choose the GPU, such as `--cuda-device` or `--gpu-device-id`: set `OFFLOADR_GPU_UUID` instead (see [Selecting one physical GPU](#selecting-one-physical-gpu));
-- flags that open a browser, stop the editor from a web request or end it at once.
+- flags that open a browser, stop the editor from a web request or end it at once, such as `--help`;
+- short options such as `-h`: write the long flag.
 
 An abbreviation of a refused flag is refused too, since the editors accept
 abbreviations. The startup log lists the extra flags without their values.
