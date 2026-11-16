@@ -16,6 +16,7 @@ The first public release.
 - Keeps the computer awake while a session runs, checks the runner again after sleep, and stops it within seconds when Windows shuts down.
 - Settings asks before leaving with unsaved changes. About shows the version, update status, licences and source code.
 - Extra arguments for ComfyUI and for Forge Neo under Settings, Advanced.
+- On a computer with more than one NVIDIA GPU, Settings, Advanced chooses the one the runner uses.
 
 ### Runner images
 

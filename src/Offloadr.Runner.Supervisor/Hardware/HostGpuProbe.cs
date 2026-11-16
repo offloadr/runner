@@ -1,9 +1,11 @@
 using System.Globalization;
+using Offloadr.Runner.Core;
 using Offloadr.Runner.Supervisor.Processes;
 
 namespace Offloadr.Runner.Supervisor.Hardware;
 
-public sealed record HostGpu(string Name, long MemoryMiB);
+/// <param name="Uuid">The UUID that names this GPU, in <c>nvidia-smi</c>'s spelling; null when the driver did not give one.</param>
+public sealed record HostGpu(string Name, long MemoryMiB, string? Uuid = null);
 
 public sealed record HostGpuReport(IReadOnlyList<HostGpu> Gpus, string? Error)
 {
@@ -25,7 +27,7 @@ public sealed class NvidiaSmiHostGpuProbe(IProcessRunner processes) : IHostGpuPr
         try
         {
             var result = await processes.RunAsync(
-                new ProcessSpec("nvidia-smi", ["--query-gpu=name,memory.total", "--format=csv,noheader,nounits"]),
+                new ProcessSpec("nvidia-smi", ["--query-gpu=uuid,name,memory.total", "--format=csv,noheader,nounits"]),
                 timeout.Token).ConfigureAwait(false);
             if (!result.Succeeded)
             {
@@ -50,16 +52,20 @@ public sealed class NvidiaSmiHostGpuProbe(IProcessRunner processes) : IHostGpuPr
         var gpus = new List<HostGpu>();
         foreach (var line in csv.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {
-            var separator = line.LastIndexOf(',');
-            if (separator <= 0)
+            // uuid, name, memory: the name is what lies between the first comma and the last.
+            var first = line.IndexOf(',');
+            var last = line.LastIndexOf(',');
+            if (first <= 0 || last <= first)
             {
                 continue;
             }
 
-            var name = line[..separator].Trim();
-            if (long.TryParse(line[(separator + 1)..].Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var memory))
+            var name = line[(first + 1)..last].Trim();
+            if (name.Length > 0 &&
+                long.TryParse(line[(last + 1)..].Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var memory))
             {
-                gpus.Add(new HostGpu(name, memory));
+                // A driver that cannot name the GPU prints "[N/A]": the GPU is listed, but cannot be chosen.
+                gpus.Add(new HostGpu(name, memory, NvidiaGpuUuid.TryNormalize(line[..first], out var uuid) ? uuid : null));
             }
         }
 

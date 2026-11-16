@@ -14,7 +14,7 @@ public static class EditorArguments
     /// <summary>The longest argument text accepted, in characters.</summary>
     public const int MaxLength = 4096;
 
-    private const string GpuHint = "to use one GPU, set OFFLOADR_GPU_UUID to its UUID instead.";
+    private const string GpuHint = "to use one GPU, choose it with the GPU setting in the desktop app, or set OFFLOADR_GPU_UUID to its UUID.";
 
     // ComfyUI, Forge Neo and their entrypoints all set these, or the runner reaches the editor through them.
     private static readonly string[] SharedReserved = ["--listen", "--port", "--tls-keyfile", "--tls-certfile"];

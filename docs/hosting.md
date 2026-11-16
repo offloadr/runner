@@ -93,6 +93,8 @@ Set `OFFLOADR_GPU_UUID` to a complete UUID reported by
 `nvidia-smi --query-gpu=uuid,name --format=csv,noheader`. For example, add
 `-e OFFLOADR_GPU_UUID=GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` to the Docker
 command, replacing the placeholder with the selected device's UUID.
+In the desktop app, choose the GPU under Settings, Advanced; the choice appears
+when the app finds more than one NVIDIA GPU, and sets `OFFLOADR_GPU_UUID` for you.
 
 The runner queries resources and telemetry for that UUID, applies power commands
 to that device, and sets the child editor's `CUDA_VISIBLE_DEVICES` to the same

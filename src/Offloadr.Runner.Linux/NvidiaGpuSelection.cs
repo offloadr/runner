@@ -3,7 +3,7 @@ namespace Offloadr.Runner.Linux;
 /// <summary>Binds native GPU operations and child CUDA visibility to one physical device.</summary>
 internal sealed class NvidiaGpuSelection
 {
-    internal const string EnvironmentVariable = "OFFLOADR_GPU_UUID";
+    internal const string EnvironmentVariable = NvidiaGpuUuid.EnvironmentVariable;
 
     private NvidiaGpuSelection(string? uuid) => Uuid = uuid;
 
@@ -16,14 +16,11 @@ internal sealed class NvidiaGpuSelection
     internal static NvidiaGpuSelection FromValues(string? uuid, string? cudaVisibleDevices)
     {
         if (string.IsNullOrWhiteSpace(uuid)) return new(null);
-        uuid = uuid.Trim();
-        if (!uuid.StartsWith("GPU-", StringComparison.OrdinalIgnoreCase)
-            || !Guid.TryParseExact(uuid[4..], "D", out var identifier))
+        if (!NvidiaGpuUuid.TryNormalize(uuid, out var selected))
         {
             throw new ArgumentException("OFFLOADR_GPU_UUID must be a complete NVIDIA GPU UUID.");
         }
 
-        var selected = "GPU-" + identifier.ToString("D");
         // A CUDA ordinal can identify a different physical device under WSL or
         // a container remapping. Never silently override an explicit CUDA mask.
         if (cudaVisibleDevices is not null

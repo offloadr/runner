@@ -30,7 +30,7 @@
                 </MudStack>
                 <MudStack Spacing="3" Class="mt-3">
                     <CheckRow Check="EnvironmentChecks.Docker(View)" />
-                    <CheckRow Check="EnvironmentChecks.HostGpu(View)" />
+                    <CheckRow Check="EnvironmentChecks.HostGpu(View, SettingsStore.Current.SelectedGpuUuid)" />
                     <CheckRow Check="EnvironmentChecks.GpuInContainers(View)">
                         <MudButton Size="Size.Small" Variant="Variant.Text" Disabled="@(_checkingGpu || View.Engine?.Available != true)"
                                    OnClick="CheckGpuAsync">@(_checkingGpu ? "Checking…" : "Check")</MudButton>

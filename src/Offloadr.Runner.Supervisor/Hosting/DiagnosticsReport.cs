@@ -127,7 +127,7 @@ public static partial class DiagnosticsReport
         {
             foreach (var gpu in gpus.Gpus)
             {
-                Line(text, "GPU", $"{gpu.Name}, {gpu.MemoryMiB.ToString(CultureInfo.InvariantCulture)} MiB");
+                Line(text, "GPU", $"{gpu.Name}, {gpu.MemoryMiB.ToString(CultureInfo.InvariantCulture)} MiB, {gpu.Uuid ?? "no UUID"}");
             }
 
             if (gpus.Gpus.Count == 0)
@@ -170,6 +170,7 @@ public static partial class DiagnosticsReport
         Line(text, "Editor in Settings", settings.SelectedEditorTemplate);
         Line(text, "Start the runner when the app opens", YesNo(settings.AutoStart));
         Line(text, "Keep awake during sessions", YesNo(settings.KeepAwakeDuringSessions));
+        Line(text, "GPU in Settings", string.IsNullOrWhiteSpace(settings.GpuUuid) ? "all" : settings.GpuUuid.Trim());
         Line(text, "Extra ComfyUI arguments", Flags(settings.ComfyUiArguments));
         Line(text, "Extra Forge Neo arguments", Flags(settings.ForgeNeoArguments));
         var problems = settings.Validate(_ => true);

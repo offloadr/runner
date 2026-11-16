@@ -61,6 +61,7 @@ public sealed class FileRunnerSettingsStore : IRunnerSettingsStore
             KeepAwakeDuringSessions = normalized.KeepAwakeDuringSessions,
             ComfyUiArguments = normalized.ComfyUiArguments,
             ForgeNeoArguments = normalized.ForgeNeoArguments,
+            GpuUuid = normalized.GpuUuid,
         };
 
         await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -128,6 +129,7 @@ public sealed class FileRunnerSettingsStore : IRunnerSettingsStore
             KeepAwakeDuringSessions = document.KeepAwakeDuringSessions,
             ComfyUiArguments = document.ComfyUiArguments,
             ForgeNeoArguments = document.ForgeNeoArguments,
+            GpuUuid = document.GpuUuid,
         });
     }
 
@@ -142,6 +144,7 @@ public sealed class FileRunnerSettingsStore : IRunnerSettingsStore
         SelectedEditorTemplate = Blank(settings.SelectedEditorTemplate),
         ComfyUiArguments = Blank(settings.ComfyUiArguments),
         ForgeNeoArguments = Blank(settings.ForgeNeoArguments),
+        GpuUuid = Blank(settings.GpuUuid),
     };
 
     private static string? Blank(string? value) => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
@@ -168,5 +171,7 @@ public sealed class FileRunnerSettingsStore : IRunnerSettingsStore
         public string? ComfyUiArguments { get; set; }
 
         public string? ForgeNeoArguments { get; set; }
+
+        public string? GpuUuid { get; set; }
     }
 }
