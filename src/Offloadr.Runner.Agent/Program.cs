@@ -190,8 +190,9 @@ static async Task<int> RunAgentAsync(string[] commandLine)
         options.OffloadrApiUrl,
         options.TraceGrpcHttp);
 
-    var artifactCatalogClient = new RunnerArtifactService.RunnerArtifactServiceClient(artifactGrpcChannel);
-    var workspaceCatalogClient = new RunnerWorkspaceService.RunnerWorkspaceServiceClient(artifactGrpcChannel);
+    var artifactInvoker = GrpcChannelManager.CreateAuthenticatedInvoker(artifactGrpcChannel.CreateCallInvoker(), options.RunnerSecret);
+    var artifactCatalogClient = new RunnerArtifactService.RunnerArtifactServiceClient(artifactInvoker);
+    var workspaceCatalogClient = new RunnerWorkspaceService.RunnerWorkspaceServiceClient(artifactInvoker);
     await using var artifactUploadService = new ArtifactUploadService(
         options.RunnerSecret,
         artifactCatalogClient,
