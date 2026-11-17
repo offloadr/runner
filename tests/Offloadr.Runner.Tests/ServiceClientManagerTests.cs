@@ -1753,6 +1753,7 @@ public partial class ServiceClientManagerTests
         Offloadr.Runner.V1.AcknowledgePromptResultRequest? capturedAck = null;
         var grantCalls = 0;
         var remembered = 0;
+        var settling = new List<Task>();
         using var cts = new CancellationTokenSource();
 
         await ServiceClientManager.HandleSubmitEditorActionAsync(
@@ -1783,7 +1784,9 @@ public partial class ServiceClientManagerTests
             (_, _, _, _) => { },
             cts.Token,
             onGranted: () => remembered++,
-            grantSettleTimeout: TimeSpan.FromMilliseconds(600));
+            grantSettleTimeout: TimeSpan.FromMilliseconds(600),
+            settleInBackground: settle => settling.Add(settle()));
+        await Task.WhenAll(settling).WaitAsync(TimeSpan.FromSeconds(10));
 
         Assert.That(capturedAck, Is.Null);
         Assert.That(grantCalls, Is.GreaterThan(1), "A lost grant reply is retried after the interrupt.");

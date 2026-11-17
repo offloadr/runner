@@ -281,6 +281,33 @@ public sealed class PromptExecutionPermissionTests
         Assert.That(granted, Is.Zero);
     }
 
+    [Test]
+    public async Task StopDoesNotWaitForAPendingGrant()
+    {
+        // Stop runs inline in the command loop, so a grant still settling must not hold it.
+        var work = new PromptCommandWorkSet(CancellationToken.None);
+        var command = Command();
+        var background = new List<Task>();
+        var acknowledgements = new List<AcknowledgePromptResultRequest>();
+        var grantSent = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var answer = new TaskCompletionSource<GrantPromptExecutionResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Assert.That(work.Start(command, false, (captured, physical) => Execute(captured,
+            async (_, _) => { grantSent.TrySetResult(); return await answer.Task; },
+            (_, _) => throw new AssertionException("A stopped handoff invoked the runtime"),
+            acknowledge: (ack, _) => { lock (acknowledgements) acknowledgements.Add(ack.Clone()); return Task.CompletedTask; },
+            cancellationToken: physical,
+            onGranted: () => work.MarkGranted(captured.HandoffId),
+            settleInBackground: settle => background.Add(settle()))), Is.True);
+        await grantSent.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        await work.CancelAndWaitAsync(prompt => prompt.SessionId == command.SessionId).WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.That(work.Start(command, false, (_, _) => throw new AssertionException("A redelivery ran while its grant settled.")), Is.False);
+
+        answer.SetResult(new() { Outcome = PromptGrantOutcome.Granted });
+        await Task.WhenAll(background).WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.That(acknowledgements.Select(ack => ack.Outcome), Is.EqualTo(new[] { PromptResultOutcome.NotExecuted }));
+    }
+
     [TestCase("answered")]
     [TestCase("unsettled")]
     public async Task AHandoffInterruptedDuringItsGrantIsNotRunByARedelivery(string grantAnswer)
@@ -478,7 +505,8 @@ public sealed class PromptExecutionPermissionTests
     private static Task<GrantPromptExecutionResponse> Granted()
         => Task.FromResult(new GrantPromptExecutionResponse { Outcome = PromptGrantOutcome.Granted });
 
-    private static Task Execute(SubmitPromptCommand command,
+    // Waits for a grant settling in the background too, unless the test collects it.
+    private static async Task Execute(SubmitPromptCommand command,
         Func<GrantPromptExecutionRequest, CancellationToken, Task<GrantPromptExecutionResponse>> grant,
         Func<SubmitPromptCommand, CancellationToken, Task<SessionProcessManager.PromptSubmissionResult>> invoke,
         Func<AcknowledgePromptResultRequest, CancellationToken, Task>? acknowledge = null,
@@ -492,8 +520,11 @@ public sealed class PromptExecutionPermissionTests
         Action? onGranted = null,
         CancellationToken hostShutdown = default,
         TimeSpan? grantSettleTimeout = null,
-        Action<string?>? setActiveDownloadSession = null)
-        => ServiceClientManager.HandleSubmitEditorActionAsync(
+        Action<string?>? setActiveDownloadSession = null,
+        Action<Func<Task>>? settleInBackground = null)
+    {
+        var settling = new List<Task>();
+        await ServiceClientManager.HandleSubmitEditorActionAsync(
             acknowledge ?? ((_, _) => Task.CompletedTask), (_, _) => Task.CompletedTask,
             command, RunnerId, InstanceId, isRuntimeCurrent ?? (_ => true), grant,
             ensureBridge ?? ((_, _, _, _) => Task.CompletedTask), setActiveDownloadSession ?? (_ => { }),
@@ -504,5 +535,8 @@ public sealed class PromptExecutionPermissionTests
                 if (nativeRequestAttempted) onNativeRequestAttempt();
                 return invoke(captured, token);
             }, mapPrompt ?? ((_, _, _, _) => { }), cancellationToken, onGranted: onGranted,
-            hostShutdown: hostShutdown, grantSettleTimeout: grantSettleTimeout);
+            hostShutdown: hostShutdown, grantSettleTimeout: grantSettleTimeout,
+            settleInBackground: settleInBackground ?? (settle => settling.Add(settle())));
+        await Task.WhenAll(settling);
+    }
 }

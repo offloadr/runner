@@ -181,11 +181,12 @@ most once and nothing is recovered or replayed:
    prepare downloads, artifacts and preflights and call the editor. Any other
    outcome, or a refused grant, drops the delivery with no native I/O and no
    acknowledgement. An interrupt or Stop after the grant was sent doesn't abandon
-   it: the grant may settle for 30 more seconds, and `GRANTED` then ends in
+   it. The prompt's work ends at once, so Stop never waits for a grant, and the
+   handoff is remembered as granted, so no redelivery runs it here. The grant
+   settles in the background for up to 30 more seconds; `GRANTED` then ends in
    `NOT_EXECUTED` without preparing anything, since another session may be active
-   by then. A grant still unanswered after that is remembered as granted,
-   so it never runs here; the platform releases it on Stop, a new runner process
-   or its expiry.
+   by then. A grant still unanswered is released by the platform on Stop, a new
+   runner process or its expiry.
 3. After `GRANTED`, every path ends in exactly one `AcknowledgePromptResult`: the
    editor's response (`NATIVE_RESPONSE`, with `body_omitted` when the body was too
    large to relay), `NOT_EXECUTED` when nothing reached the editor, or `UNKNOWN`
