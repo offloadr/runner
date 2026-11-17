@@ -77,8 +77,9 @@ internal sealed class PromptCommandWorkSet(CancellationToken shutdown, TimeProvi
         {
             PruneCompleted();
             PruneRetired(time.GetTimestamp());
-            if (shutdown.IsCancellationRequested || active.ContainsKey(command.HandoffId)
-                || held.ContainsKey(command.HandoffId) || retired.ContainsKey(command.HandoffId)) return false;
+            var key = Key(command.HandoffId);
+            if (shutdown.IsCancellationRequested || active.ContainsKey(key)
+                || held.ContainsKey(key) || retired.ContainsKey(key)) return false;
             // Every active handoff may still be granted and remembered, so admission leaves room for it.
             if (retired.Count + active.Count >= MaxRetiredHandoffs)
             {
@@ -89,7 +90,7 @@ internal sealed class PromptCommandWorkSet(CancellationToken shutdown, TimeProvi
             var identity = PromptWorkIdentity.Capture(captured, streamsHttpResponse);
             if (stopping.Any(boundary => boundary.Matches(identity))) return false;
             work = new(identity, new(shutdown), new(shutdown));
-            active.Add(work.Identity.HandoffId, work);
+            active.Add(key, work);
             operations.Add(work);
         }
         // Preserve synchronous admission/execution when the callback can finish
@@ -106,7 +107,7 @@ internal sealed class PromptCommandWorkSet(CancellationToken shutdown, TimeProvi
     {
         lock (gate)
         {
-            if (active.TryGetValue(handoffId, out var work)) work.Granted = true;
+            if (active.TryGetValue(Key(handoffId), out var work)) work.Granted = true;
         }
     }
 
@@ -115,7 +116,7 @@ internal sealed class PromptCommandWorkSet(CancellationToken shutdown, TimeProvi
         ArgumentNullException.ThrowIfNull(settling);
         lock (gate)
         {
-            if (active.TryGetValue(handoffId, out var work)) work.HeldDemand = settling;
+            if (active.TryGetValue(Key(handoffId), out var work)) work.HeldDemand = settling;
         }
     }
 
@@ -194,9 +195,13 @@ internal sealed class PromptCommandWorkSet(CancellationToken shutdown, TimeProvi
             retired.Remove(expired);
     }
 
+    // One handoff, however its UUID is spelled; other IDs (tests) are kept as given.
+    private static string Key(string handoffId)
+        => Guid.TryParse(handoffId, out var id) ? id.ToString("n") : handoffId;
+
     // Admission keeps the count within the bound, so nothing is evicted here.
     private void Retire(Work work)
-        => retired[work.Identity.HandoffId] = time.GetTimestamp() + (long)(GrantedHandoffRetention.TotalSeconds * time.TimestampFrequency);
+        => retired[Key(work.Identity.HandoffId)] = time.GetTimestamp() + (long)(GrantedHandoffRetention.TotalSeconds * time.TimestampFrequency);
 
     private async Task RunAsync(Work work, SubmitPromptCommand captured,
         Func<SubmitPromptCommand, CancellationToken, CancellationToken, Task> execute)
@@ -222,8 +227,9 @@ internal sealed class PromptCommandWorkSet(CancellationToken shutdown, TimeProvi
             Task? settling;
             lock (gate)
             {
-                if (active.TryGetValue(work.Identity.HandoffId, out var current) && ReferenceEquals(current, work))
-                    active.Remove(work.Identity.HandoffId);
+                var key = Key(work.Identity.HandoffId);
+                if (active.TryGetValue(key, out var current) && ReferenceEquals(current, work))
+                    active.Remove(key);
                 if (work.Granted) Retire(work);
                 settling = work.HeldDemand;
                 work.HeldDemand = null;
@@ -232,7 +238,7 @@ internal sealed class PromptCommandWorkSet(CancellationToken shutdown, TimeProvi
                     // Admission refuses a handoff that is active or held, so none is replaced here.
                     holding = new(work.Identity, work.Demand, settling);
                     work.TransferredDemand = holding;
-                    held.Add(work.Identity.HandoffId, holding);
+                    held.Add(key, holding);
                     operations.Add(holding);
                 }
             }
@@ -262,8 +268,9 @@ internal sealed class PromptCommandWorkSet(CancellationToken shutdown, TimeProvi
             await demand.Demand.CompleteAsync().ConfigureAwait(false);
             lock (gate)
             {
-                if (held.TryGetValue(demand.Identity.HandoffId, out var current) && ReferenceEquals(current, demand))
-                    held.Remove(demand.Identity.HandoffId);
+                var key = Key(demand.Identity.HandoffId);
+                if (held.TryGetValue(key, out var current) && ReferenceEquals(current, demand))
+                    held.Remove(key);
             }
         }
     }

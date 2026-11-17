@@ -175,6 +175,29 @@ public sealed partial class PromptCommandWorkSetTests
         Assert.That(calls, Is.EqualTo(2));
     }
 
+    [TestCase("D")]
+    [TestCase("B")]
+    [TestCase("upper")]
+    public async Task AGrantedHandoffRedeliveredWithAnotherSpellingOfItsIdIsNotRunAgain(string spelling)
+    {
+        var work = new PromptCommandWorkSet(CancellationToken.None);
+        var id = Guid.NewGuid();
+        var calls = 0;
+        Assert.That(work.Start(new() { HandoffId = id.ToString("n"), SessionId = "session" }, false, (captured, _) =>
+        {
+            calls++;
+            work.MarkGranted(captured.HandoffId);
+            return Task.CompletedTask;
+        }), Is.True);
+        await work.JoinCurrentOperationsAsync().WaitAsync(TimeSpan.FromSeconds(2));
+
+        var respelled = spelling == "upper" ? id.ToString("n").ToUpperInvariant() : id.ToString(spelling);
+        Assert.That(work.Start(new() { HandoffId = respelled, SessionId = "session" }, false,
+            (_, _) => { calls++; return Task.CompletedTask; }), Is.False);
+        await work.CancelAndWaitAsync(_ => true);
+        Assert.That(calls, Is.EqualTo(1));
+    }
+
     [TestCase("ahead")]
     [TestCase("adjusted")]
     public async Task TheWallClockDoesNotShortenHowLongAGrantedHandoffIsRemembered(string clockChange)
