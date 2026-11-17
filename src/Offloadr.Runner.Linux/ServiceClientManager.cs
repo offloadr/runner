@@ -1458,7 +1458,8 @@ internal static partial class ServiceClientManager
                             demandCancellation,
                             CreatePromptQueueProbe(sessionManager.ReadComfyPromptQueueAsync, captured.SessionId, runtime),
                             settling => commandWorkState.Prompts.HoldDemand(handoffId, settling),
-                            () => commandWorkState.Prompts.MarkGranted(handoffId));
+                            () => commandWorkState.Prompts.MarkGranted(handoffId),
+                            shutdown);
                         });
                     }
                 }
@@ -3130,6 +3131,19 @@ internal static partial class ServiceClientManager
                    StatusCode.DataLoss
            };
 
+    // How long a sent grant may still settle after its prompt was interrupted or stopped.
+    internal static readonly TimeSpan GrantSettleTimeout = TimeSpan.FromSeconds(30);
+
+    // A grant that was sent but never answered may be held by this instance. It is
+    // remembered as granted, so no redelivery runs it here; the platform releases it on
+    // Stop, a new runner instance or its expiry. At host shutdown nothing is remembered.
+    private static void AbandonUnsettledGrant(SubmitPromptCommand prompt, CancellationToken hostShutdown, Action? onGranted)
+    {
+        if (hostShutdown.IsCancellationRequested) return;
+        RunnerLog.Warning(nameof(ServiceClientManager), $"Prompt grant {prompt.HandoffId} was not answered after the prompt was interrupted; it will not run.");
+        onGranted?.Invoke();
+    }
+
     /// <summary>
     /// Runs one prompt handoff at most once. The handoff is checked against the session's
     /// current runtime and then granted by the platform; only GRANTED touches the runtime.
@@ -3160,7 +3174,9 @@ internal static partial class ServiceClientManager
         CancellationToken promptDemandCancellation = default,
         Func<string, CancellationToken, Task<bool?>>? isPromptQueued = null,
         Action<Task>? holdPromptDemand = null,
-        Action? onGranted = null)
+        Action? onGranted = null,
+        CancellationToken hostShutdown = default,
+        TimeSpan? grantSettleTimeout = null)
     {
         // Reject malformed wire identities before granting or touching a runtime.
         if (!PromptHandoff.HasValidIdentity(prompt)
@@ -3183,6 +3199,16 @@ internal static partial class ServiceClientManager
             RuntimeEpoch = prompt.RuntimeEpoch,
             RuntimeInstanceId = prompt.RuntimeInstanceId,
         };
+        // Nothing has been asked yet, so an interrupt or Stop here leaves nothing behind.
+        if (cancellationToken.IsCancellationRequested) return;
+        // Once a grant request is sent, the platform may record GRANTED for this instance
+        // whatever happens here. An interrupt or Stop therefore doesn't abandon the grant:
+        // it lets the request settle under the host lifetime, within a bound, so a GRANTED
+        // answer is still remembered and acknowledged NOT_EXECUTED below. Abandoning it would
+        // leave a grant with no acknowledgement, and a redelivery that this process runs.
+        using var grantLifetime = CancellationTokenSource.CreateLinkedTokenSource(hostShutdown);
+        var settleTimeout = grantSettleTimeout ?? GrantSettleTimeout;
+        using var settleAfterCancel = cancellationToken.Register(() => grantLifetime.CancelAfter(settleTimeout));
         GrantPromptExecutionResponse permission;
         var grantAttempt = 0;
         var grantRetryDelay = TimeSpan.FromMilliseconds(250);
@@ -3191,18 +3217,27 @@ internal static partial class ServiceClientManager
             grantAttempt++;
             try
             {
-                permission = await grantExecution(grant, cancellationToken).ConfigureAwait(false);
+                permission = await grantExecution(grant, grantLifetime.Token).ConfigureAwait(false);
                 break;
             }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { return; }
+            // Cancelled, as an exception or a gRPC status: the grant's answer is not known.
+            catch (Exception) when (grantLifetime.Token.IsCancellationRequested)
+            {
+                AbandonUnsettledGrant(prompt, hostShutdown, onGranted);
+                return;
+            }
             catch (Exception ex) when (IsRetryableTransientAcknowledgementFailure(ex))
             {
                 // A retry from this instance after a lost reply is answered GRANTED
                 // again, so retrying the same grant cannot run the handoff twice.
                 if (grantAttempt == 1 || grantAttempt % 12 == 0)
                     RunnerLog.Warning(nameof(ServiceClientManager), $"Prompt grant {prompt.HandoffId} unavailable ({ex.GetType().Name}); retrying the same grant.");
-                try { await Task.Delay(grantRetryDelay, cancellationToken).ConfigureAwait(false); }
-                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { return; }
+                try { await Task.Delay(grantRetryDelay, grantLifetime.Token).ConfigureAwait(false); }
+                catch (OperationCanceledException) when (grantLifetime.Token.IsCancellationRequested)
+                {
+                    AbandonUnsettledGrant(prompt, hostShutdown, onGranted);
+                    return;
+                }
                 grantRetryDelay = TimeSpan.FromMilliseconds(Math.Min(grantRetryDelay.TotalMilliseconds * 2, 5000));
             }
             catch (Exception ex)
@@ -3211,6 +3246,7 @@ internal static partial class ServiceClientManager
                 return;
             }
         }
+        settleAfterCancel.Dispose();
         if (permission.Outcome != PromptGrantOutcome.Granted)
         {
             // Another instance holds it, it expired, its runtime moved on or the account

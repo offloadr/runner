@@ -180,7 +180,11 @@ most once and nothing is recovered or replayed:
    retrying transient failures with the same request. Only `GRANTED` lets it
    prepare downloads, artifacts and preflights and call the editor. Any other
    outcome, or a refused grant, drops the delivery with no native I/O and no
-   acknowledgement.
+   acknowledgement. An interrupt or Stop after the grant was sent doesn't abandon
+   it: the grant may settle for 30 more seconds, and `GRANTED` then ends in
+   `NOT_EXECUTED`. A grant still unanswered after that is remembered as granted,
+   so it never runs here; the platform releases it on Stop, a new runner process
+   or its expiry.
 3. After `GRANTED`, every path ends in exactly one `AcknowledgePromptResult`: the
    editor's response (`NATIVE_RESPONSE`, with `body_omitted` when the body was too
    large to relay), `NOT_EXECUTED` when nothing reached the editor, or `UNKNOWN`
@@ -189,9 +193,12 @@ most once and nothing is recovered or replayed:
    is dropped.
 
 One handler runs per handoff in a process. A redelivery is refused while its
-handler or its held model demand is active, and after a grant until the handoff
-expires (a bounded memory), because the platform answers a retried grant from the
-same process with `GRANTED` again. Forge `queue/data` streams its chunks as
+handler or its held model demand is active, and for 65 minutes after a grant,
+because the platform answers a retried grant from the same process with `GRANTED`
+again. The platform keeps a handoff 60 minutes from acceptance, so this covers its
+whole life; it is timed on the monotonic clock, so neither wall clock can shorten
+it. The memory is bounded at 16,384 handoffs: at the bound new handoffs are
+refused, and the platform delivers them again, instead of forgetting one early. Forge `queue/data` streams its chunks as
 `http.response.chunk` session events and is acknowledged when the stream ends:
 `NATIVE_RESPONSE` with the HTTP status after a normal end, `UNKNOWN` when it broke.
 ComfyUI's `prompt_id` is read from its response; the bridge maps it to the handoff

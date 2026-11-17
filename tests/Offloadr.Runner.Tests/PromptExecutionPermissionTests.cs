@@ -192,23 +192,130 @@ public sealed class PromptExecutionPermissionTests
     }
 
     [Test]
-    public async Task CancellationWhileWaitingForTheGrantSendsNoAcknowledgement()
+    public async Task CancellationBeforeTheGrantIsAskedAsksNothing()
+    {
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+        await Execute(Command(),
+            (_, _) => throw new AssertionException("A cancelled handoff asked for a grant"),
+            (_, _) => throw new AssertionException("A cancelled handoff invoked the runtime"),
+            acknowledge: (_, _) => throw new AssertionException("Nothing was granted, so nothing is acknowledged"),
+            cancellationToken: cancellation.Token);
+    }
+
+    [Test]
+    public async Task AGrantAnsweredAfterAnInterruptIsRememberedAndAcknowledgedNotExecuted()
+    {
+        // The platform recorded GRANTED while the interrupt arrived. The answer is still
+        // read, so the grant ends in an acknowledgement and is never run.
+        var command = Command();
+        using var cancellation = new CancellationTokenSource();
+        var acknowledgements = new List<AcknowledgePromptResultRequest>();
+        var granted = 0;
+        await Execute(command,
+            async (_, token) =>
+            {
+                cancellation.Cancel();
+                await Task.Delay(TimeSpan.FromMilliseconds(50), token);
+                Assert.That(token.IsCancellationRequested, Is.False, "The interrupt abandoned a sent grant.");
+                return await Granted();
+            },
+            (_, _) => throw new AssertionException("An interrupted handoff invoked the runtime"),
+            acknowledge: (ack, _) => { acknowledgements.Add(ack.Clone()); return Task.CompletedTask; },
+            cancellationToken: cancellation.Token,
+            onGranted: () => granted++);
+        Assert.Multiple(() =>
+        {
+            Assert.That(granted, Is.EqualTo(1));
+            Assert.That(acknowledgements.Single().Outcome, Is.EqualTo(PromptResultOutcome.NotExecuted));
+            Assert.That(acknowledgements.Single().DiagnosticCode, Is.EqualTo("prompt_preparation_incomplete"));
+        });
+    }
+
+    [Test]
+    public async Task AGrantThatNeverSettlesAfterAnInterruptIsRememberedSoItNeverRuns()
     {
         var command = Command();
         using var cancellation = new CancellationTokenSource();
         var grants = 0;
+        var granted = 0;
         await Execute(command,
             async (_, token) =>
             {
                 grants++;
                 cancellation.Cancel();
                 await Task.Delay(Timeout.Infinite, token);
-                throw new AssertionException("The cancelled grant returned.");
+                throw new AssertionException("The unsettled grant returned.");
             },
-            (_, _) => throw new AssertionException("A cancelled grant invoked the runtime"),
+            (_, _) => throw new AssertionException("An interrupted handoff invoked the runtime"),
             acknowledge: (_, _) => throw new AssertionException("No grant was received, so nothing is acknowledged"),
-            cancellationToken: cancellation.Token);
+            cancellationToken: cancellation.Token,
+            onGranted: () => granted++,
+            grantSettleTimeout: TimeSpan.FromMilliseconds(100)).WaitAsync(TimeSpan.FromSeconds(5));
         Assert.That(grants, Is.EqualTo(1));
+        Assert.That(granted, Is.EqualTo(1), "The platform may hold this grant, so a redelivery must not run it.");
+    }
+
+    [Test]
+    public async Task HostShutdownWhileWaitingForTheGrantRemembersNothing()
+    {
+        using var shutdown = new CancellationTokenSource();
+        var granted = 0;
+        await Execute(Command(),
+            async (_, token) =>
+            {
+                shutdown.Cancel();
+                await Task.Delay(Timeout.Infinite, token);
+                throw new AssertionException("The grant outlived the host.");
+            },
+            (_, _) => throw new AssertionException("A shut-down handoff invoked the runtime"),
+            acknowledge: (_, _) => throw new AssertionException("Nothing was granted, so nothing is acknowledged"),
+            onGranted: () => granted++,
+            hostShutdown: shutdown.Token).WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.That(granted, Is.Zero);
+    }
+
+    [TestCase("answered")]
+    [TestCase("unsettled")]
+    public async Task AHandoffInterruptedDuringItsGrantIsNotRunByARedelivery(string grantAnswer)
+    {
+        // An interrupt cancels the work while its grant is in flight; the command stream
+        // then delivers the same handoff again, and the platform answers this instance GRANTED.
+        var work = new PromptCommandWorkSet(CancellationToken.None);
+        var command = Command();
+        var invocations = 0;
+        var acknowledgements = new List<AcknowledgePromptResultRequest>();
+        var grantSent = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var interrupted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Assert.That(work.Start(command, false, (captured, physical) => Execute(captured,
+            async (_, token) =>
+            {
+                grantSent.TrySetResult();
+                await interrupted.Task;
+                if (grantAnswer == "unsettled") await Task.Delay(Timeout.Infinite, token);
+                return await Granted();
+            },
+            (_, _) => { invocations++; return Task.FromResult(new SessionProcessManager.PromptSubmissionResult(true, 200, "{}"u8.ToArray(), "ran")); },
+            acknowledge: (ack, _) => { acknowledgements.Add(ack.Clone()); return Task.CompletedTask; },
+            cancellationToken: physical,
+            onGranted: () => work.MarkGranted(captured.HandoffId),
+            grantSettleTimeout: TimeSpan.FromMilliseconds(100))), Is.True);
+        await grantSent.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        work.Cancel(_ => true);
+        interrupted.SetResult();
+        await work.JoinCurrentOperationsAsync().WaitAsync(TimeSpan.FromSeconds(5));
+
+        var redelivered = work.Start(command, false, (captured, physical) => Execute(captured, (_, _) => Granted(),
+            (_, _) => { invocations++; return Task.FromResult(new SessionProcessManager.PromptSubmissionResult(true, 200, "{}"u8.ToArray(), "ran")); },
+            cancellationToken: physical));
+        await work.CancelAndWaitAsync(_ => true);
+        Assert.Multiple(() =>
+        {
+            Assert.That(redelivered, Is.False);
+            Assert.That(invocations, Is.Zero);
+            Assert.That(acknowledgements.Select(ack => ack.Outcome),
+                Is.EqualTo(grantAnswer == "answered" ? new[] { PromptResultOutcome.NotExecuted } : Array.Empty<PromptResultOutcome>()));
+        });
     }
 
     [Test]
@@ -376,7 +483,9 @@ public sealed class PromptExecutionPermissionTests
         Func<SubmitPromptCommand, bool>? isRuntimeCurrent = null,
         Func<string, string, string, CancellationToken, Task>? ensureBridge = null,
         Action<string, string, string, string>? mapPrompt = null,
-        Action? onGranted = null)
+        Action? onGranted = null,
+        CancellationToken hostShutdown = default,
+        TimeSpan? grantSettleTimeout = null)
         => ServiceClientManager.HandleSubmitEditorActionAsync(
             acknowledge ?? ((_, _) => Task.CompletedTask), (_, _) => Task.CompletedTask,
             command, RunnerId, InstanceId, isRuntimeCurrent ?? (_ => true), grant,
@@ -387,5 +496,6 @@ public sealed class PromptExecutionPermissionTests
             {
                 if (nativeRequestAttempted) onNativeRequestAttempt();
                 return invoke(captured, token);
-            }, mapPrompt ?? ((_, _, _, _) => { }), cancellationToken, onGranted: onGranted);
+            }, mapPrompt ?? ((_, _, _, _) => { }), cancellationToken, onGranted: onGranted,
+            hostShutdown: hostShutdown, grantSettleTimeout: grantSettleTimeout);
 }

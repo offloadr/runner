@@ -150,17 +150,47 @@ public sealed partial class PromptCommandWorkSetTests
     }
 
     [Test]
-    public async Task AGrantedHandoffIsNotRunAgainUntilItExpires()
+    public async Task AGrantedHandoffIsNotRunAgainUntilThePlatformCanNoLongerGrantIt()
     {
         // A retried grant from this process is answered GRANTED again, so the process
         // itself must refuse a late redelivery of a handoff it already ran.
         var clock = new ManualClock(DateTimeOffset.UtcNow);
         var work = new PromptCommandWorkSet(CancellationToken.None, clock);
+        var command = new SubmitPromptCommand { HandoffId = "granted", SessionId = "session" };
+        var calls = 0;
+        Assert.That(work.Start(command, false, (captured, _) =>
+        {
+            calls++;
+            work.MarkGranted(captured.HandoffId);
+            return Task.CompletedTask;
+        }), Is.True);
+        await work.JoinCurrentOperationsAsync().WaitAsync(TimeSpan.FromSeconds(2));
+        clock.Advance(PromptCommandWorkSet.GrantedHandoffRetention - TimeSpan.FromSeconds(1));
+        Assert.That(work.Start(command, false, (_, _) => { calls++; return Task.CompletedTask; }), Is.False);
+
+        clock.Advance(TimeSpan.FromSeconds(2));
+        Assert.That(work.Start(command, false, (_, _) => { calls++; return Task.CompletedTask; }), Is.True,
+            "Past the platform's handoff lifetime the handoff is forgotten; the platform refuses its grant.");
+        await work.CancelAndWaitAsync(_ => true);
+        Assert.That(calls, Is.EqualTo(2));
+    }
+
+    [TestCase("ahead")]
+    [TestCase("adjusted")]
+    public async Task TheWallClockDoesNotShortenHowLongAGrantedHandoffIsRemembered(string clockChange)
+    {
+        // This process's wall clock is three minutes ahead of the platform's, or is set
+        // forward after the grant. The handoff is still valid on the platform, so a
+        // redelivery must not run it while its acknowledgement may still be pending.
+        var clock = new ManualClock(DateTimeOffset.UtcNow);
+        var work = new PromptCommandWorkSet(CancellationToken.None, clock);
+        if (clockChange == "ahead") clock.SetWallClock(clock.GetUtcNow() + TimeSpan.FromMinutes(3));
         var command = new SubmitPromptCommand
         {
-            HandoffId = "granted",
+            HandoffId = "skewed",
             SessionId = "session",
-            ExpiresUtc = Google.Protobuf.WellKnownTypes.Timestamp.FromDateTimeOffset(clock.GetUtcNow() + TimeSpan.FromMinutes(2)),
+            // Two minutes left by the platform's clock, already past by this one.
+            ExpiresUtc = Google.Protobuf.WellKnownTypes.Timestamp.FromDateTimeOffset(DateTimeOffset.UtcNow + TimeSpan.FromMinutes(2)),
         };
         var calls = 0;
         Assert.That(work.Start(command, false, (captured, _) =>
@@ -170,13 +200,12 @@ public sealed partial class PromptCommandWorkSetTests
             return Task.CompletedTask;
         }), Is.True);
         await work.JoinCurrentOperationsAsync().WaitAsync(TimeSpan.FromSeconds(2));
-        Assert.That(work.Start(command, false, (_, _) => { calls++; return Task.CompletedTask; }), Is.False);
+        if (clockChange == "adjusted") clock.SetWallClock(clock.GetUtcNow() + TimeSpan.FromHours(2));
+        clock.Advance(TimeSpan.FromSeconds(1));
 
-        clock.Advance(TimeSpan.FromMinutes(3));
-        Assert.That(work.Start(command, false, (_, _) => { calls++; return Task.CompletedTask; }), Is.True,
-            "An expired handoff is forgotten; the platform refuses its grant.");
+        Assert.That(work.Start(command, false, (_, _) => { calls++; return Task.CompletedTask; }), Is.False);
         await work.CancelAndWaitAsync(_ => true);
-        Assert.That(calls, Is.EqualTo(2));
+        Assert.That(calls, Is.EqualTo(1));
     }
 
     [Test]
@@ -193,11 +222,14 @@ public sealed partial class PromptCommandWorkSetTests
     }
 
     [Test]
-    public async Task GrantedHandoffMemoryIsBounded()
+    public async Task AtItsBoundGrantedHandoffMemoryRefusesNewHandoffsAndForgetsNone()
     {
-        var work = new PromptCommandWorkSet(CancellationToken.None);
-        for (var index = 0; index <= PromptCommandWorkSet.MaxRetiredHandoffs; index++)
+        var clock = new ManualClock(DateTimeOffset.UtcNow);
+        var work = new PromptCommandWorkSet(CancellationToken.None, clock);
+        for (var index = 0; index < PromptCommandWorkSet.MaxRetiredHandoffs; index++)
         {
+            // Later handoffs are remembered longer, so a "forget the oldest" bound would drop the first.
+            clock.Advance(TimeSpan.FromMilliseconds(1));
             Assert.That(work.Start(new() { HandoffId = "handoff-" + index, SessionId = "session" }, false, (captured, _) =>
             {
                 work.MarkGranted(captured.HandoffId);
@@ -205,17 +237,34 @@ public sealed partial class PromptCommandWorkSetTests
             }), Is.True);
         }
         await work.JoinCurrentOperationsAsync().WaitAsync(TimeSpan.FromSeconds(5));
-        var refused = Enumerable.Range(0, PromptCommandWorkSet.MaxRetiredHandoffs + 1)
-            .Count(index => !work.Start(new() { HandoffId = "handoff-" + index, SessionId = "session" }, false, (_, _) => Task.CompletedTask));
-        Assert.That(refused, Is.EqualTo(PromptCommandWorkSet.MaxRetiredHandoffs));
+
+        Assert.That(work.Start(new() { HandoffId = "one-more", SessionId = "session" }, false,
+            (_, _) => throw new AssertionException("A handoff over the bound ran.")), Is.False,
+            "The platform delivers a refused handoff again.");
+        var redelivered = Enumerable.Range(0, PromptCommandWorkSet.MaxRetiredHandoffs)
+            .Count(index => work.Start(new() { HandoffId = "handoff-" + index, SessionId = "session" }, false,
+                (_, _) => throw new AssertionException("A remembered handoff ran again.")));
+        Assert.That(redelivered, Is.Zero);
+
+        clock.Advance(PromptCommandWorkSet.GrantedHandoffRetention);
+        Assert.That(work.Start(new() { HandoffId = "one-more", SessionId = "session" }, false, (_, _) => Task.CompletedTask), Is.True);
         await work.CancelAndWaitAsync(_ => true);
     }
 
+    // The wall clock and the monotonic clock move separately, as on a real host.
     private sealed class ManualClock(DateTimeOffset now) : TimeProvider
     {
         private DateTimeOffset _now = now;
+        private long _elapsedTicks;
         public override DateTimeOffset GetUtcNow() => _now;
-        public void Advance(TimeSpan by) => _now += by;
+        public override long TimestampFrequency => TimeSpan.TicksPerSecond;
+        public override long GetTimestamp() => _elapsedTicks;
+        public void Advance(TimeSpan by)
+        {
+            _now += by;
+            _elapsedTicks += by.Ticks;
+        }
+        public void SetWallClock(DateTimeOffset value) => _now = value;
     }
 
     [Test]

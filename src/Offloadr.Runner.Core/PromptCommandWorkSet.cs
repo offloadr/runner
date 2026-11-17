@@ -7,15 +7,20 @@ namespace Offloadr.Runner.Core;
 /// delivery has its own shutdown lifetime and must never hold Stop or a replacement
 /// runtime open. A handoff runs at most once per process: a redelivery is refused
 /// while its handler or held model demand is active, and after a grant until the
-/// handoff expires, because the platform answers a retried grant from this instance
-/// with GRANTED again.
+/// handoff can no longer be granted, because the platform answers a retried grant
+/// from this instance with GRANTED again.
 /// </summary>
 internal sealed class PromptCommandWorkSet(CancellationToken shutdown, TimeProvider? timeProvider = null)
 {
-    // Bounds the granted-handoff memory; handoffs are short-lived, so this is generous.
-    internal const int MaxRetiredHandoffs = 4096;
-    internal static readonly TimeSpan DefaultHandoffLifetime = TimeSpan.FromMinutes(10);
-    internal static readonly TimeSpan MaxHandoffLifetime = TimeSpan.FromHours(1);
+    // Bounds the granted-handoff memory. A remembered handoff is never forgotten early:
+    // at the bound, new handoffs are refused (the platform delivers them again) until
+    // the oldest is past its retention.
+    internal const int MaxRetiredHandoffs = 16384;
+    // The platform keeps a handoff for 60 minutes from acceptance, without renewal, and
+    // never grants it after that. Remembering a granted handoff that long from this
+    // process's own grant, on a monotonic clock, covers its whole life whatever the
+    // wall clocks on either side say.
+    internal static readonly TimeSpan GrantedHandoffRetention = TimeSpan.FromMinutes(65);
 
     private abstract class Operation(PromptWorkIdentity identity, OwnedCancellation demand)
     {
@@ -26,11 +31,10 @@ internal sealed class PromptCommandWorkSet(CancellationToken shutdown, TimeProvi
         public TaskCompletionSource<Task> Original { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
     }
 
-    private sealed class Work(PromptWorkIdentity identity, DateTime retainUntilUtc, OwnedCancellation physical, OwnedCancellation demand)
+    private sealed class Work(PromptWorkIdentity identity, OwnedCancellation physical, OwnedCancellation demand)
         : Operation(identity, demand)
     {
         public OwnedCancellation Physical { get; } = physical;
-        public DateTime RetainUntilUtc { get; } = retainUntilUtc;
         public bool Granted { get; set; }
         public Task? HeldDemand { get; set; }
         public HeldDemand? TransferredDemand { get; set; }
@@ -47,7 +51,8 @@ internal sealed class PromptCommandWorkSet(CancellationToken shutdown, TimeProvi
     private readonly Dictionary<string, HeldDemand> held = new(StringComparer.Ordinal);
     private readonly HashSet<Operation> operations = [];
     private readonly HashSet<StopBoundary> stopping = [];
-    private readonly Dictionary<string, DateTime> retired = new(StringComparer.Ordinal);
+    // Handoff -> monotonic timestamp after which it is forgotten.
+    private readonly Dictionary<string, long> retired = new(StringComparer.Ordinal);
     private readonly TimeProvider time = timeProvider ?? TimeProvider.System;
 
     private sealed class StopBoundary(Func<PromptWorkIdentity, bool> matches)
@@ -71,14 +76,19 @@ internal sealed class PromptCommandWorkSet(CancellationToken shutdown, TimeProvi
         lock (gate)
         {
             PruneCompleted();
-            var now = time.GetUtcNow().UtcDateTime;
-            PruneRetired(now);
+            PruneRetired(time.GetTimestamp());
             if (shutdown.IsCancellationRequested || active.ContainsKey(command.HandoffId)
                 || held.ContainsKey(command.HandoffId) || retired.ContainsKey(command.HandoffId)) return false;
+            // Every active handoff may still be granted and remembered, so admission leaves room for it.
+            if (retired.Count + active.Count >= MaxRetiredHandoffs)
+            {
+                RunnerLog.Warning(nameof(PromptCommandWorkSet), $"Prompt handoff {command.HandoffId} refused: {retired.Count} granted handoffs are still remembered.");
+                return false;
+            }
             captured = command.Clone();
             var identity = PromptWorkIdentity.Capture(captured, streamsHttpResponse);
             if (stopping.Any(boundary => boundary.Matches(identity))) return false;
-            work = new(identity, RetainUntil(captured, now), new(shutdown), new(shutdown));
+            work = new(identity, new(shutdown), new(shutdown));
             active.Add(work.Identity.HandoffId, work);
             operations.Add(work);
         }
@@ -178,27 +188,15 @@ internal sealed class PromptCommandWorkSet(CancellationToken shutdown, TimeProvi
     private void PruneCompleted()
         => operations.RemoveWhere(operation => operation.Original.Task.IsCompletedSuccessfully && operation.Original.Task.Result.IsCompleted);
 
-    private void PruneRetired(DateTime now)
+    private void PruneRetired(long now)
     {
         foreach (var expired in retired.Where(entry => entry.Value <= now).Select(entry => entry.Key).ToArray())
             retired.Remove(expired);
     }
 
+    // Admission keeps the count within the bound, so nothing is evicted here.
     private void Retire(Work work)
-    {
-        retired[work.Identity.HandoffId] = work.RetainUntilUtc;
-        if (retired.Count <= MaxRetiredHandoffs) return;
-        // Over the bound, forget the handoff that expires first.
-        var oldest = retired.MinBy(entry => entry.Value).Key;
-        retired.Remove(oldest);
-    }
-
-    private static DateTime RetainUntil(SubmitPromptCommand command, DateTime now)
-    {
-        var expires = command.ExpiresUtc?.ToDateTime() ?? now + DefaultHandoffLifetime;
-        var latest = now + MaxHandoffLifetime;
-        return expires > latest ? latest : expires < now ? now : expires;
-    }
+        => retired[work.Identity.HandoffId] = time.GetTimestamp() + (long)(GrantedHandoffRetention.TotalSeconds * time.TimestampFrequency);
 
     private async Task RunAsync(Work work, SubmitPromptCommand captured,
         Func<SubmitPromptCommand, CancellationToken, CancellationToken, Task> execute)

@@ -1738,8 +1738,10 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
-    public async Task HandleSubmitEditorActionAsync_CancelledGrantCannotInvokeRuntimeOrSendAResult()
+    public async Task HandleSubmitEditorActionAsync_AnInterruptedGrantWhoseRepliesAreLostIsRememberedAndNeverRuns()
     {
+        // The grant may have committed, so it is retried until the settle bound and then
+        // remembered as granted: no redelivery runs it, and no result is sent for it.
         var prompt = new Offloadr.Runner.V1.SubmitPromptCommand
         {
             SessionId = PromptSessionId,
@@ -1750,6 +1752,7 @@ public partial class ServiceClientManagerTests
 
         Offloadr.Runner.V1.AcknowledgePromptResultRequest? capturedAck = null;
         var grantCalls = 0;
+        var remembered = 0;
         using var cts = new CancellationTokenSource();
 
         await ServiceClientManager.HandleSubmitEditorActionAsync(
@@ -1778,10 +1781,13 @@ public partial class ServiceClientManagerTests
             (_, token, _) => Task.FromCanceled<Task>(token),
             (_, _, _, _) => throw new AssertionException("No grant was received, so the runtime cannot be called"),
             (_, _, _, _) => { },
-                        cts.Token);
+            cts.Token,
+            onGranted: () => remembered++,
+            grantSettleTimeout: TimeSpan.FromMilliseconds(600));
 
         Assert.That(capturedAck, Is.Null);
-        Assert.That(grantCalls, Is.EqualTo(1));
+        Assert.That(grantCalls, Is.GreaterThan(1), "A lost grant reply is retried after the interrupt.");
+        Assert.That(remembered, Is.EqualTo(1));
     }
 
     [TestCase(PromptGrantOutcome.Granted)]
