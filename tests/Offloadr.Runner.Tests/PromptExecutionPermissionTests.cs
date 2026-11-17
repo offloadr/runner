@@ -182,6 +182,7 @@ public sealed class PromptExecutionPermissionTests
         var acknowledgements = new List<AcknowledgePromptResultRequest>();
         await Execute(command, (_, _) => { cancellation.Cancel(); return Granted(); },
             (_, _) => throw new AssertionException("Cancelled preparation invoked the runtime"),
+            setActiveDownloadSession: _ => throw new AssertionException("A cancelled handoff became the active download session"),
             acknowledge: (ack, token) => { Assert.That(token.IsCancellationRequested, Is.False); acknowledgements.Add(ack.Clone()); return Task.CompletedTask; },
             cancellationToken: cancellation.Token);
         Assert.Multiple(() =>
@@ -223,6 +224,11 @@ public sealed class PromptExecutionPermissionTests
             (_, _) => throw new AssertionException("An interrupted handoff invoked the runtime"),
             acknowledge: (ack, _) => { acknowledgements.Add(ack.Clone()); return Task.CompletedTask; },
             cancellationToken: cancellation.Token,
+            // Another session may be active by now; none of its state may be claimed.
+            captureRefresh: _ => throw new AssertionException("An interrupted handoff captured artifact refresh"),
+            prepareDownloads: (_, _, _) => throw new AssertionException("An interrupted handoff prepared downloads"),
+            ensureBridge: (_, _, _, _) => throw new AssertionException("An interrupted handoff opened a bridge"),
+            setActiveDownloadSession: _ => throw new AssertionException("An interrupted handoff became the active download session"),
             onGranted: () => granted++);
         Assert.Multiple(() =>
         {
@@ -485,11 +491,12 @@ public sealed class PromptExecutionPermissionTests
         Action<string, string, string, string>? mapPrompt = null,
         Action? onGranted = null,
         CancellationToken hostShutdown = default,
-        TimeSpan? grantSettleTimeout = null)
+        TimeSpan? grantSettleTimeout = null,
+        Action<string?>? setActiveDownloadSession = null)
         => ServiceClientManager.HandleSubmitEditorActionAsync(
             acknowledge ?? ((_, _) => Task.CompletedTask), (_, _) => Task.CompletedTask,
             command, RunnerId, InstanceId, isRuntimeCurrent ?? (_ => true), grant,
-            ensureBridge ?? ((_, _, _, _) => Task.CompletedTask), _ => { },
+            ensureBridge ?? ((_, _, _, _) => Task.CompletedTask), setActiveDownloadSession ?? (_ => { }),
             (_, _, _, _) => Task.CompletedTask, (_, _, _, _, _) => Task.CompletedTask,
             captureRefresh ?? (_ => () => Task.CompletedTask), (_, _) => { }, prepareDownloads ?? ((_, _, _) => Task.FromResult(Task.CompletedTask)),
             (captured, _, onNativeRequestAttempt, token) =>

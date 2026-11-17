@@ -3263,6 +3263,20 @@ internal static partial class ServiceClientManager
             HandoffId = prompt.HandoffId,
             InstanceId = instanceId,
         };
+        if (cancellationToken.IsCancellationRequested)
+        {
+            // Interrupted or stopped while the grant settled. Nothing is prepared: by now
+            // another session may be this runner's active one, and preparing would claim
+            // its downloads and models for this one.
+            ack.Outcome = PromptResultOutcome.NotExecuted;
+            ack.DiagnosticCode = "prompt_preparation_incomplete";
+            try { await ackSubmitPrompt(ack, CancellationToken.None).ConfigureAwait(false); }
+            catch (Exception ex)
+            {
+                RunnerLog.Warning(nameof(ServiceClientManager), $"Prompt acknowledgement {prompt.HandoffId} could not be queued ({ex.GetType().Name}).");
+            }
+            return;
+        }
 
         var clientId = string.IsNullOrWhiteSpace(prompt.ClientId) ? null : prompt.ClientId.Trim();
         var nativeInvocationStarted = false;
