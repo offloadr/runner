@@ -1,4 +1,4 @@
-using Offloadr.Common.V1;
+using Offloadr.Runner.V1;
 
 namespace Offloadr.Runner.Tests;
 
@@ -69,7 +69,7 @@ public class SessionArtifactPathsTests
             Directory.CreateSymbolicLink(Path.Combine(paths.TempDirectory, "forge-queue"), outside);
             var references = new[]
             {
-                new PromptArtifactReference
+                new PromptArtifact
                 {
                     Placeholder = "offloadr://forge-artifact/submission-1/0",
                     Filename = "image.png",
@@ -110,7 +110,7 @@ public class SessionArtifactPathsTests
             };
             var references = new[]
             {
-                new PromptArtifactReference
+                new PromptArtifact
                 {
                     Placeholder = "offloadr://forge-artifact/submission-1/0",
                     Filename = filename,

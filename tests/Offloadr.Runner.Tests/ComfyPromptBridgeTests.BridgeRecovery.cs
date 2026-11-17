@@ -11,7 +11,7 @@ using Offloadr.Runner.V1;
 
 namespace Offloadr.Runner.Tests;
 
-public sealed partial class ComfyPromptEvidenceTests
+public sealed partial class ComfyPromptBridgeTests
 {
     [Test]
     public async Task WaitingForSendLockCannotExtendAnAcceptedBridgeDeadline()
@@ -23,7 +23,7 @@ public sealed partial class ComfyPromptEvidenceTests
         var activeEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var allowActive = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var responseReady = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var sink = new EvidenceSink((_, _) => Task.CompletedTask);
+        var sink = new BridgeSink();
         sink.Authority.BeforeReportResponse = async (request, ct) =>
         {
             if (request.State != EditorRuntimeBridgeState.Active) return;
@@ -38,11 +38,11 @@ public sealed partial class ComfyPromptEvidenceTests
             responseReady.TrySetResult();
             return result;
         };
-        await using var relay = new ComfySessionEventRelay(static (_, _) => { }, command.Target.RunnerId, "127.0.0.1", port,
+        await using var relay = new ComfySessionEventRelay(static (_, _) => { }, RunnerId, "127.0.0.1", port,
             "test-process", _ => new SessionSealingStatus(), (_, _) => true);
         relay.AttachSink(sink);
-        await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", command.Target.GpuGeneration,
-            command.Target.RuntimeEpoch, command.Target.RuntimeInstanceId, "expired features"u8.ToArray(), CancellationToken.None);
+        await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", command.LifecycleGeneration,
+            command.RuntimeEpoch, command.RuntimeInstanceId, "expired features"u8.ToArray(), CancellationToken.None);
         var context = await listener.GetContextAsync().WaitAsync(TimeSpan.FromSeconds(3));
         using var socket = (await context.AcceptWebSocketAsync(null)).WebSocket;
         await activeEntered.Task.WaitAsync(TimeSpan.FromSeconds(3));
@@ -85,7 +85,7 @@ public sealed partial class ComfyPromptEvidenceTests
         var command = Command();
         var retryEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var allowRetry = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var sink = new EvidenceSink((_, _) => Task.CompletedTask);
+        var sink = new BridgeSink();
         var heartbeatCalls = 0;
         sink.Authority.BeforeReportResponse = async (request, ct) =>
         {
@@ -98,11 +98,11 @@ public sealed partial class ComfyPromptEvidenceTests
             retryEntered.TrySetResult();
             await allowRetry.Task.WaitAsync(ct);
         };
-        await using var relay = new ComfySessionEventRelay(static (_, _) => { }, command.Target.RunnerId, "127.0.0.1", port,
+        await using var relay = new ComfySessionEventRelay(static (_, _) => { }, RunnerId, "127.0.0.1", port,
             "test-process", _ => new SessionSealingStatus(), (_, _) => true);
         relay.AttachSink(sink);
-        await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", command.Target.GpuGeneration,
-            command.Target.RuntimeEpoch, command.Target.RuntimeInstanceId, "initial features"u8.ToArray(), CancellationToken.None);
+        await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", command.LifecycleGeneration,
+            command.RuntimeEpoch, command.RuntimeInstanceId, "initial features"u8.ToArray(), CancellationToken.None);
         var context = await listener.GetContextAsync().WaitAsync(TimeSpan.FromSeconds(3));
         using var socket = (await context.AcceptWebSocketAsync(null)).WebSocket;
         var buffer = new byte[1024];
@@ -116,8 +116,8 @@ public sealed partial class ComfyPromptEvidenceTests
             await retryEntered.Task.WaitAsync(TimeSpan.FromSeconds(15));
             Assert.That(Stopwatch.GetTimestamp(), Is.LessThan(deadline));
             Assert.That(BridgeField<long>(connection, "Deadline"), Is.EqualTo(deadline), "A lost renewal response cannot extend the accepted lease.");
-            await relay.SendClientMessageAsync(command.SessionId, command.EditorSid, "client", command.Target.GpuGeneration,
-                command.Target.RuntimeEpoch, command.Target.RuntimeInstanceId, "during heartbeat retry"u8.ToArray(),
+            await relay.SendClientMessageAsync(command.SessionId, command.EditorSid, "client", command.LifecycleGeneration,
+                command.RuntimeEpoch, command.RuntimeInstanceId, "during heartbeat retry"u8.ToArray(),
                 active.BridgeConnectionId, active.LeaseRevision, CancellationToken.None);
             var received = await socket.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(3));
             Assert.That(System.Text.Encoding.UTF8.GetString(buffer, 0, received.Count), Is.EqualTo("during heartbeat retry"));
@@ -139,7 +139,7 @@ public sealed partial class ComfyPromptEvidenceTests
         portReservation.Start(); var port = ((IPEndPoint)portReservation.LocalEndpoint).Port; portReservation.Stop();
         using var listener = new HttpListener(); listener.Prefixes.Add($"http://127.0.0.1:{port}/"); listener.Start();
         var command = Command();
-        var sink = new EvidenceSink((_, _) => Task.CompletedTask);
+        var sink = new BridgeSink();
         var calls = 0;
         var timedOut = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var retryEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -154,12 +154,12 @@ public sealed partial class ComfyPromptEvidenceTests
             retryEntered.TrySetResult();
             await allowRetry.Task.WaitAsync(ct);
         };
-        await using var relay = new ComfySessionEventRelay(static (_, _) => { }, command.Target.RunnerId, "127.0.0.1", port,
+        await using var relay = new ComfySessionEventRelay(static (_, _) => { }, RunnerId, "127.0.0.1", port,
             "test-process", _ => new SessionSealingStatus(), (_, _) => true);
         relay.AttachSink(sink);
         var accept = listener.GetContextAsync();
-        await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", command.Target.GpuGeneration,
-            command.Target.RuntimeEpoch, command.Target.RuntimeInstanceId, "after timeout"u8.ToArray(), CancellationToken.None);
+        await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", command.LifecycleGeneration,
+            command.RuntimeEpoch, command.RuntimeInstanceId, "after timeout"u8.ToArray(), CancellationToken.None);
         try
         {
             await timedOut.Task.WaitAsync(TimeSpan.FromSeconds(4));
@@ -198,9 +198,9 @@ public sealed partial class ComfyPromptEvidenceTests
     public async Task TerminalReservationRejectionDoesNotConsumeCapacityForLaterClients(EditorRuntimeBridgeOutcome outcome)
     {
         var command = Command();
-        var sink = new EvidenceSink((_, _) => Task.CompletedTask);
+        var sink = new BridgeSink();
         sink.Authority.TransformReservationResult = result => { result.Outcome = outcome; return result; };
-        await using var relay = new ComfySessionEventRelay(static (_, _) => { }, command.Target.RunnerId, "127.0.0.1", 1,
+        await using var relay = new ComfySessionEventRelay(static (_, _) => { }, RunnerId, "127.0.0.1", 1,
             "test-process", _ => new SessionSealingStatus(), (_, _) => true);
         relay.AttachSink(sink);
         try
@@ -208,8 +208,8 @@ public sealed partial class ComfyPromptEvidenceTests
             for (var index = 0; index < 40; index++)
             {
                 var client = "rejected-client-" + index;
-                await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, client, command.Target.GpuGeneration,
-                    command.Target.RuntimeEpoch, command.Target.RuntimeInstanceId, [], CancellationToken.None);
+                await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, client, command.LifecycleGeneration,
+                    command.RuntimeEpoch, command.RuntimeInstanceId, [], CancellationToken.None);
                 var bridge = BridgeForClient(relay, client);
                 await BridgeField<Task>(bridge, "_loopTask").WaitAsync(TimeSpan.FromSeconds(1));
                 Assert.That(sink.Authority.ReserveCalls.Count(call => call.ClientId == client), Is.EqualTo(1));
@@ -227,18 +227,18 @@ public sealed partial class ComfyPromptEvidenceTests
         portReservation.Start(); var port = ((IPEndPoint)portReservation.LocalEndpoint).Port; portReservation.Stop();
         using var listener = new HttpListener(); listener.Prefixes.Add($"http://127.0.0.1:{port}/"); listener.Start();
         var command = Command();
-        var sink = new EvidenceSink((_, _) => Task.CompletedTask);
+        var sink = new BridgeSink();
         var responses = 0;
         sink.Authority.TransformReservationResult = result =>
         {
             if (Interlocked.Increment(ref responses) == 1) result.Outcome = EditorRuntimeBridgeOutcome.Stale;
             return result;
         };
-        await using var relay = new ComfySessionEventRelay(static (_, _) => { }, command.Target.RunnerId, "127.0.0.1", port,
+        await using var relay = new ComfySessionEventRelay(static (_, _) => { }, RunnerId, "127.0.0.1", port,
             "test-process", _ => new SessionSealingStatus(), (_, _) => true);
         relay.AttachSink(sink);
-        await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", command.Target.GpuGeneration,
-            command.Target.RuntimeEpoch, command.Target.RuntimeInstanceId, "winning features"u8.ToArray(), CancellationToken.None);
+        await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", command.LifecycleGeneration,
+            command.RuntimeEpoch, command.RuntimeInstanceId, "winning features"u8.ToArray(), CancellationToken.None);
         var context = await listener.GetContextAsync().WaitAsync(TimeSpan.FromSeconds(5));
         using var socket = (await context.AcceptWebSocketAsync(null)).WebSocket;
         var buffer = new byte[1024];
@@ -258,17 +258,17 @@ public sealed partial class ComfyPromptEvidenceTests
     public async Task UntrackedRuntimeBridgesReleaseCapacityAcrossDifferentClients()
     {
         var command = Command();
-        var tracked = new RuntimeIdentity(command.Target.GpuGeneration, command.Target.RuntimeEpoch, command.Target.RuntimeInstanceId);
-        var sink = new EvidenceSink((_, _) => Task.CompletedTask);
+        var tracked = new RuntimeIdentity(command.LifecycleGeneration, command.RuntimeEpoch, command.RuntimeInstanceId);
+        var sink = new BridgeSink();
         sink.Authority.BeforeReservationResponse = async (_, ct) => await Task.Delay(Timeout.InfiniteTimeSpan, ct);
-        await using var relay = new ComfySessionEventRelay(static (_, _) => { }, command.Target.RunnerId, "127.0.0.1", 1,
+        await using var relay = new ComfySessionEventRelay(static (_, _) => { }, RunnerId, "127.0.0.1", 1,
             "test-process", _ => new SessionSealingStatus(), (_, runtime) => runtime.SameRuntime(tracked));
         relay.AttachSink(sink);
         try
         {
             for (var index = 0; index < 40; index++)
             {
-                tracked = new(command.Target.GpuGeneration, command.Target.RuntimeEpoch + (ulong)index, Guid.NewGuid().ToString("n"));
+                tracked = new(command.LifecycleGeneration, command.RuntimeEpoch + (ulong)index, Guid.NewGuid().ToString("n"));
                 await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "runtime-client-" + index,
                     tracked.LifecycleGeneration, tracked.RuntimeEpoch, tracked.RuntimeInstanceId, [], CancellationToken.None);
                 Assert.That(BridgeCount(relay), Is.LessThanOrEqualTo(32));

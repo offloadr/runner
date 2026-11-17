@@ -86,19 +86,18 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
 
     /// <summary>
     /// A prompt's terminal event (success, error or interrupt) as the runtime
-    /// reported it. <see cref="SubmissionId"/> is known only while the bridge
+    /// reported it. <see cref="HandoffId"/> is known only while the bridge
     /// still maps the prompt.
     /// </summary>
     internal readonly record struct PromptTerminalEvent(
         string SessionId,
         RuntimeIdentity Runtime,
         string PromptId,
-        string? SubmissionId);
+        string? HandoffId);
 
     /// <summary>
-    /// Raised for every terminal prompt event, independently of the bounded
-    /// evidence cache, so a prompt's model demand ends even when its evidence
-    /// identity was evicted.
+    /// Raised for every terminal prompt event, mapped or not, so a prompt's
+    /// model demand ends even when its mapping was evicted.
     /// </summary>
     internal event Action<PromptTerminalEvent>? PromptFinished;
 
@@ -239,28 +238,17 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
         await bridge.SendClientMessageAsync(payload, bridgeConnectionId, bridgeLeaseRevision, cancellationToken).ConfigureAwait(false);
     }
 
-    public void RegisterSubmission(string sessionId, string clientId, SubmitPromptCommand command)
-    {
-        if (TryGetBridge(sessionId, clientId, TargetRuntime(command), out var bridge))
-        {
-            bridge.RegisterSubmission(command);
-        }
-    }
-
-    public void UnregisterUninvokedSubmission(string sessionId, string clientId, SubmitPromptCommand command)
-    {
-        if (TryGetBridge(sessionId, clientId, TargetRuntime(command), out var bridge))
-        {
-            bridge.UnregisterUninvokedSubmission(command);
-        }
-    }
-
+    /// <summary>
+    /// Maps the prompt id ComfyUI returned for a handoff to that handoff, so the bridge
+    /// tags the prompt's WebSocket events with it and its terminal event ends its demand.
+    /// </summary>
     public void MapPrompt(string sessionId, string clientId, SubmitPromptCommand command, string promptId)
     {
-        if (string.IsNullOrWhiteSpace(promptId) || string.IsNullOrWhiteSpace(command.SubmissionId)) return;
-        if (TryGetBridge(sessionId, clientId, TargetRuntime(command), out var bridge))
+        if (string.IsNullOrWhiteSpace(promptId) || string.IsNullOrWhiteSpace(command.HandoffId)) return;
+        if (TryGetBridge(sessionId, clientId, PromptHandoff.Runtime(command), out var bridge)
+            && bridge.MatchesEditor(command.EditorSid?.Trim() ?? string.Empty))
         {
-            bridge.MapPrompt(promptId, command.SubmissionId);
+            bridge.MapPrompt(promptId, command.HandoffId);
         }
     }
 
@@ -278,11 +266,6 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
             RunnerLog.Warning(nameof(ComfySessionEventRelay), $"Prompt completion handling failed ({ex.GetType().Name}).");
         }
     }
-
-    private static RuntimeIdentity TargetRuntime(SubmitPromptCommand command)
-        => command.Target is { } target
-            ? new RuntimeIdentity(target.GpuGeneration, target.RuntimeEpoch, target.RuntimeInstanceId)
-            : default;
 
     public async Task StopSessionAsync(string sessionId)
     {
@@ -642,8 +625,8 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            // Artifact refresh is ancillary to the live websocket frame and
-            // its durable terminal evidence. Stop can remove the uploader first.
+            // Artifact refresh is ancillary to the live websocket frame.
+            // Stop can remove the uploader first.
             RunnerLog.Warning(nameof(ComfySessionEventRelay),
                 $"Skipping artifact refresh for session {sessionId}: {ex.GetType().Name}.");
             return;
@@ -679,14 +662,13 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
         private byte[] _clientMessage = [];
         private readonly CancellationTokenSource _cts = new();
         private readonly ConcurrentDictionary<string, string> _promptMap = new(StringComparer.Ordinal);
-        private readonly ConcurrentDictionary<string, SubmitPromptCommand> _submissionCommands = new(StringComparer.Ordinal);
-        private readonly Queue<KeyValuePair<string, SubmitPromptCommand>> _submissionOrder = new();
-        private readonly object _submissionGate = new();
+        private readonly Queue<KeyValuePair<string, string>> _promptOrder = new();
+        private readonly object _promptGate = new();
         private readonly SemaphoreSlim _startLock = new(1, 1);
         private readonly SemaphoreSlim _sendLock = new(1, 1);
         private readonly object _socketGate = new();
         private Task? _loopTask;
-        private string? _latestSubmissionId;
+        private string? _latestHandoffId;
 
         public SessionBridge(
             ComfySessionEventRelay owner,
@@ -746,66 +728,24 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
             await SendPayloadAsync(connection, payload, wait.Token).ConfigureAwait(false);
         }
 
-        public void RegisterSubmission(SubmitPromptCommand command)
+        /// <summary>
+        /// A bounded correlation cache from ComfyUI's prompt id to its handoff. It is
+        /// filled from the native response, never an execution or deduplication record.
+        /// </summary>
+        public void MapPrompt(string promptId, string handoffId)
         {
-            _ = Offloadr.Common.V1.PromptRuntimeMarker.TargetFingerprint(command.Target);
-            if (command.SessionId != _sessionId || command.EditorSid != _editorSid
-                || command.Target.GpuGeneration != _lifecycleGeneration || command.Target.RuntimeEpoch != _runtimeEpoch
-                || Guid.Parse(command.Target.RuntimeInstanceId) != Guid.Parse(_runtimeInstanceId))
-                throw new InvalidOperationException("The prompt does not belong to this bridge.");
-            _latestSubmissionId = command.SubmissionId;
-            if (!string.IsNullOrWhiteSpace(command.NativeIdentifiers?.PromptId))
+            if (string.IsNullOrWhiteSpace(promptId) || string.IsNullOrWhiteSpace(handoffId)) return;
+            var entry = new KeyValuePair<string, string>(promptId.Trim(), handoffId.Trim());
+            lock (_promptGate)
             {
-                // This is a bounded live-evidence correlation cache, never an
-                // execution/deduplication record. Missed terminal frames fall back
-                // to durable history recovery; retain no prompt or download body.
-                var identity = new SubmitPromptCommand
+                _promptMap[entry.Key] = entry.Value;
+                _promptOrder.Enqueue(entry);
+                _latestHandoffId = entry.Value;
+                while (_promptOrder.Count > MaxRetainedPromptIdentities)
                 {
-                    CommandId = command.CommandId,
-                    SubmissionId = command.SubmissionId,
-                    SessionId = command.SessionId,
-                    EditorSid = command.EditorSid,
-                    Target = command.Target.Clone(),
-                    NativeIdentifiers = command.NativeIdentifiers.Clone(),
-                };
-                var promptId = command.NativeIdentifiers.PromptId;
-                lock (_submissionGate)
-                {
-                    if (_submissionCommands.TryAdd(promptId, identity))
-                    {
-                        _submissionOrder.Enqueue(new(promptId, identity));
-                        _promptMap.TryAdd(promptId, command.SubmissionId);
-                    }
-                    while (_submissionOrder.Count > MaxRetainedPromptIdentities)
-                    {
-                        var oldest = _submissionOrder.Dequeue();
-                        ((ICollection<KeyValuePair<string, SubmitPromptCommand>>)_submissionCommands).Remove(oldest);
-                        ((ICollection<KeyValuePair<string, string>>)_promptMap).Remove(new(oldest.Key, oldest.Value.SubmissionId));
-                    }
+                    ((ICollection<KeyValuePair<string, string>>)_promptMap).Remove(_promptOrder.Dequeue());
                 }
             }
-        }
-
-        public void UnregisterUninvokedSubmission(SubmitPromptCommand command)
-        {
-            var promptId = command.NativeIdentifiers?.PromptId;
-            if (string.IsNullOrEmpty(promptId)) return;
-            if (_submissionCommands.TryGetValue(promptId, out var retained)
-                && retained.CommandId == command.CommandId && retained.SubmissionId == command.SubmissionId
-                && retained.Target.Equals(command.Target))
-            {
-                ((ICollection<KeyValuePair<string, SubmitPromptCommand>>)_submissionCommands)
-                    .Remove(new(promptId, retained));
-                ((ICollection<KeyValuePair<string, string>>)_promptMap)
-                    .Remove(new(promptId, command.SubmissionId));
-                if (_latestSubmissionId == command.SubmissionId) _latestSubmissionId = null;
-            }
-        }
-
-        public void MapPrompt(string promptId, string submissionId)
-        {
-            if (string.IsNullOrWhiteSpace(promptId) || string.IsNullOrWhiteSpace(submissionId)) return;
-            _promptMap[promptId.Trim()] = submissionId.Trim();
         }
 
         public async Task StartAsync(CancellationToken cancellationToken)
@@ -916,25 +856,17 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
                     if (!string.IsNullOrWhiteSpace(promptId))
                     {
                         evt.PromptId = promptId;
-                        if (_promptMap.TryGetValue(promptId, out var submissionId) && !string.IsNullOrWhiteSpace(submissionId))
+                        if (_promptMap.TryGetValue(promptId, out var handoffId) && !string.IsNullOrWhiteSpace(handoffId))
                         {
-                            evt.SubmissionId = submissionId;
+                            evt.HandoffId = handoffId;
                         }
                     }
-                    else if (!string.IsNullOrWhiteSpace(_latestSubmissionId))
+                    else if (_latestHandoffId is { Length: > 0 } latestHandoffId)
                     {
-                        evt.SubmissionId = _latestSubmissionId;
+                        evt.HandoffId = latestHandoffId;
                     }
 
                     _owner.Enqueue(evt);
-                    if (promptId is not null && _submissionCommands.TryGetValue(promptId, out var command)
-                        && _owner.CapturePromptEvidence(command, evt) is { } evidence
-                        && _submissionCommands.TryRemove(promptId, out _))
-                    {
-                        // Terminal evidence owns its immutable bytes and identity;
-                        // releasing the full command does not depend on delivery.
-                        _ = _owner.ReportRetainedPromptEvidenceAsync(evidence);
-                    }
 
                     if (promptId is not null && IsTerminalPromptEvent(eventType))
                     {
@@ -942,7 +874,7 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
                             _sessionId,
                             new RuntimeIdentity(_lifecycleGeneration, _runtimeEpoch, _runtimeInstanceId),
                             promptId,
-                            string.IsNullOrWhiteSpace(evt.SubmissionId) ? null : evt.SubmissionId));
+                            string.IsNullOrWhiteSpace(evt.HandoffId) ? null : evt.HandoffId));
                     }
                 }
             }

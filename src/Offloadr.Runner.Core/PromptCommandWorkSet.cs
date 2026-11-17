@@ -3,12 +3,25 @@ using Offloadr.Runner.V1;
 namespace Offloadr.Runner.Core;
 
 /// <summary>
-/// Tracks physical execution/observation only. Acknowledgement delivery has its
-/// own shutdown lifetime and must never hold Stop or a replacement runtime open.
-/// Durable execution permission, not this process-local set, prevents replay.
+/// Tracks physical execution/observation only, keyed by handoff. Acknowledgement
+/// delivery has its own shutdown lifetime and must never hold Stop or a replacement
+/// runtime open. A handoff runs at most once per process: a redelivery is refused
+/// while its handler or held model demand is active, and after a grant until the
+/// handoff can no longer be granted, because the platform answers a retried grant
+/// from this instance with GRANTED again.
 /// </summary>
-internal sealed class PromptCommandWorkSet(CancellationToken shutdown)
+internal sealed class PromptCommandWorkSet(CancellationToken shutdown, TimeProvider? timeProvider = null)
 {
+    // Bounds the granted-handoff memory. A remembered handoff is never forgotten early:
+    // at the bound, new handoffs are refused (the platform delivers them again) until
+    // the oldest is past its retention.
+    internal const int MaxRetiredHandoffs = 16384;
+    // The platform keeps a handoff for 60 minutes from acceptance, without renewal, and
+    // never grants it after that. Remembering a granted handoff that long from this
+    // process's own grant, on a monotonic clock, covers its whole life whatever the
+    // wall clocks on either side say.
+    internal static readonly TimeSpan GrantedHandoffRetention = TimeSpan.FromMinutes(65);
+
     private abstract class Operation(PromptWorkIdentity identity, OwnedCancellation demand)
     {
         public PromptWorkIdentity Identity { get; } = identity;
@@ -22,6 +35,7 @@ internal sealed class PromptCommandWorkSet(CancellationToken shutdown)
         : Operation(identity, demand)
     {
         public OwnedCancellation Physical { get; } = physical;
+        public bool Granted { get; set; }
         public Task? HeldDemand { get; set; }
         public HeldDemand? TransferredDemand { get; set; }
     }
@@ -37,6 +51,9 @@ internal sealed class PromptCommandWorkSet(CancellationToken shutdown)
     private readonly Dictionary<string, HeldDemand> held = new(StringComparer.Ordinal);
     private readonly HashSet<Operation> operations = [];
     private readonly HashSet<StopBoundary> stopping = [];
+    // Handoff -> monotonic timestamp after which it is forgotten.
+    private readonly Dictionary<string, long> retired = new(StringComparer.Ordinal);
+    private readonly TimeProvider time = timeProvider ?? TimeProvider.System;
 
     private sealed class StopBoundary(Func<PromptWorkIdentity, bool> matches)
     {
@@ -52,19 +69,28 @@ internal sealed class PromptCommandWorkSet(CancellationToken shutdown)
     /// </summary>
     public bool Start(SubmitPromptCommand command, bool streamsHttpResponse, Func<SubmitPromptCommand, CancellationToken, CancellationToken, Task> execute)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(command.CommandId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(command.HandoffId);
         ArgumentNullException.ThrowIfNull(execute);
         Work work;
         SubmitPromptCommand captured;
         lock (gate)
         {
             PruneCompleted();
-            if (shutdown.IsCancellationRequested || active.ContainsKey(command.CommandId)) return false;
+            PruneRetired(time.GetTimestamp());
+            var key = Key(command.HandoffId);
+            if (shutdown.IsCancellationRequested || active.ContainsKey(key)
+                || held.ContainsKey(key) || retired.ContainsKey(key)) return false;
+            // Every active handoff may still be granted and remembered, so admission leaves room for it.
+            if (retired.Count + active.Count >= MaxRetiredHandoffs)
+            {
+                RunnerLog.Warning(nameof(PromptCommandWorkSet), $"Prompt handoff {command.HandoffId} refused: {retired.Count} granted handoffs are still remembered.");
+                return false;
+            }
             captured = command.Clone();
             var identity = PromptWorkIdentity.Capture(captured, streamsHttpResponse);
             if (stopping.Any(boundary => boundary.Matches(identity))) return false;
             work = new(identity, new(shutdown), new(shutdown));
-            active.Add(work.Identity.CommandId, work);
+            active.Add(key, work);
             operations.Add(work);
         }
         // Preserve synchronous admission/execution when the callback can finish
@@ -73,12 +99,24 @@ internal sealed class PromptCommandWorkSet(CancellationToken shutdown)
         return true;
     }
 
-    public void HoldDemand(string commandId, Task settling)
+    /// <summary>
+    /// Records that the platform granted this handoff to this process. Once its handler
+    /// ends, the handoff is remembered until it expires so a redelivery cannot run it again.
+    /// </summary>
+    public void MarkGranted(string handoffId)
+    {
+        lock (gate)
+        {
+            if (active.TryGetValue(Key(handoffId), out var work)) work.Granted = true;
+        }
+    }
+
+    public void HoldDemand(string handoffId, Task settling)
     {
         ArgumentNullException.ThrowIfNull(settling);
         lock (gate)
         {
-            if (active.TryGetValue(commandId, out var work)) work.HeldDemand = settling;
+            if (active.TryGetValue(Key(handoffId), out var work)) work.HeldDemand = settling;
         }
     }
 
@@ -151,6 +189,20 @@ internal sealed class PromptCommandWorkSet(CancellationToken shutdown)
     private void PruneCompleted()
         => operations.RemoveWhere(operation => operation.Original.Task.IsCompletedSuccessfully && operation.Original.Task.Result.IsCompleted);
 
+    private void PruneRetired(long now)
+    {
+        foreach (var expired in retired.Where(entry => entry.Value <= now).Select(entry => entry.Key).ToArray())
+            retired.Remove(expired);
+    }
+
+    // One handoff, however its UUID is spelled; other IDs (tests) are kept as given.
+    private static string Key(string handoffId)
+        => Guid.TryParse(handoffId, out var id) ? id.ToString("n") : handoffId;
+
+    // Admission keeps the count within the bound, so nothing is evicted here.
+    private void Retire(Work work)
+        => retired[Key(work.Identity.HandoffId)] = time.GetTimestamp() + (long)(GrantedHandoffRetention.TotalSeconds * time.TimestampFrequency);
+
     private async Task RunAsync(Work work, SubmitPromptCommand captured,
         Func<SubmitPromptCommand, CancellationToken, CancellationToken, Task> execute)
     {
@@ -162,7 +214,7 @@ internal sealed class PromptCommandWorkSet(CancellationToken shutdown)
         catch (OperationCanceledException) when (work.Physical.Token.IsCancellationRequested) { }
         catch (Exception error)
         {
-            RunnerLog.Warning(nameof(PromptCommandWorkSet), $"Prompt work {work.Identity.CommandId} ended with {error.GetType().Name}; recover its retained receipt.");
+            RunnerLog.Warning(nameof(PromptCommandWorkSet), $"Prompt handoff {work.Identity.HandoffId} ended with {error.GetType().Name}.");
         }
         finally
         {
@@ -172,24 +224,24 @@ internal sealed class PromptCommandWorkSet(CancellationToken shutdown)
             execute = null!;
             await work.Physical.CompleteAsync().ConfigureAwait(false);
             HeldDemand? holding = null;
-            HeldDemand? replaced = null;
             Task? settling;
             lock (gate)
             {
-                if (active.TryGetValue(work.Identity.CommandId, out var current) && ReferenceEquals(current, work))
-                    active.Remove(work.Identity.CommandId);
+                var key = Key(work.Identity.HandoffId);
+                if (active.TryGetValue(key, out var current) && ReferenceEquals(current, work))
+                    active.Remove(key);
+                if (work.Granted) Retire(work);
                 settling = work.HeldDemand;
                 work.HeldDemand = null;
                 if (settling is { IsCompleted: false })
                 {
+                    // Admission refuses a handoff that is active or held, so none is replaced here.
                     holding = new(work.Identity, work.Demand, settling);
                     work.TransferredDemand = holding;
-                    held.Remove(work.Identity.CommandId, out replaced);
-                    held.Add(work.Identity.CommandId, holding);
+                    held.Add(key, holding);
                     operations.Add(holding);
                 }
             }
-            if (replaced is not null) _ = replaced.Demand.RequestAsync();
             if (holding is not null) holding.Original.SetResult(ReleaseAsync(holding));
             else
             {
@@ -216,8 +268,9 @@ internal sealed class PromptCommandWorkSet(CancellationToken shutdown)
             await demand.Demand.CompleteAsync().ConfigureAwait(false);
             lock (gate)
             {
-                if (held.TryGetValue(demand.Identity.CommandId, out var current) && ReferenceEquals(current, demand))
-                    held.Remove(demand.Identity.CommandId);
+                var key = Key(demand.Identity.HandoffId);
+                if (held.TryGetValue(key, out var current) && ReferenceEquals(current, demand))
+                    held.Remove(key);
             }
         }
     }

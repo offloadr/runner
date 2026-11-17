@@ -7,7 +7,7 @@ using System.Runtime.ExceptionServices;
 
 namespace Offloadr.Runner.Tests;
 
-public sealed partial class ComfyPromptEvidenceTests
+public sealed partial class ComfyPromptBridgeTests
 {
     [TestCase(false)]
     [TestCase(true)]
@@ -22,9 +22,9 @@ public sealed partial class ComfyPromptEvidenceTests
         listener.Start();
         var command = Command();
         var replacement = command.Clone();
-        replacement.CommandId = Guid.NewGuid().ToString("n");
-        replacement.Target.RuntimeEpoch++;
-        replacement.Target.RuntimeInstanceId = Guid.NewGuid().ToString("n");
+        replacement.HandoffId = Guid.NewGuid().ToString("n");
+        replacement.RuntimeEpoch++;
+        replacement.RuntimeInstanceId = Guid.NewGuid().ToString("n");
         var work = new PromptCommandWorkSet(CancellationToken.None);
         var originalDemand = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var otherDemand = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -38,9 +38,9 @@ public sealed partial class ComfyPromptEvidenceTests
         Exception? bodyFailure = null;
         Exception? cleanupFailure = null;
         var callbacks = 0;
-        await using var relay = new ComfySessionEventRelay(static (_, _) => { }, command.Target.RunnerId,
+        await using var relay = new ComfySessionEventRelay(static (_, _) => { }, RunnerId,
             "127.0.0.1", port, "test-process", _ => new SessionSealingStatus(), isTrackedRuntime: (_, _) => true);
-        relay.AttachSink(new EvidenceSink((_, _) => Task.CompletedTask));
+        relay.AttachSink(new BridgeSink());
         void Withdraw(ComfySessionEventRelay.PromptTerminalEvent finished)
         {
             work.WithdrawDemand(prompt => ServiceClientManager.IsFinishedPrompt(prompt, finished));
@@ -59,27 +59,27 @@ public sealed partial class ComfyPromptEvidenceTests
                     releaseCallback.Task.GetAwaiter().GetResult();
                     if (callbackFails) throw new InvalidOperationException("synthetic terminal callback failure");
                 });
-                work.HoldDemand(command.CommandId, ServiceClientManager.SettlePromptDemandAsync(originalDemand.Task, true, lifetime));
+                work.HoldDemand(command.HandoffId, ServiceClientManager.SettlePromptDemandAsync(originalDemand.Task, true, lifetime));
                 return Task.CompletedTask;
             }), Is.True);
             Assert.That(work.Start(replacement, false, (_, _, demand) =>
             {
                 var lifetime = new OwnedCancellation(demand);
                 otherToken = lifetime.Token;
-                work.HoldDemand(replacement.CommandId, ServiceClientManager.SettlePromptDemandAsync(otherDemand.Task, true, lifetime));
+                work.HoldDemand(replacement.HandoffId, ServiceClientManager.SettlePromptDemandAsync(otherDemand.Task, true, lifetime));
                 return Task.CompletedTask;
             }), Is.True);
-            await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", command.Target.GpuGeneration,
-                command.Target.RuntimeEpoch, command.Target.RuntimeInstanceId, [], CancellationToken.None);
+            await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", command.LifecycleGeneration,
+                command.RuntimeEpoch, command.RuntimeInstanceId, [], CancellationToken.None);
             var context = await listener.GetContextAsync().WaitAsync(TimeSpan.FromSeconds(5));
             using var socket = (await context.AcceptWebSocketAsync(null)).WebSocket;
-            relay.RegisterSubmission(command.SessionId, "client", command);
+            relay.MapPrompt(command.SessionId, "client", command, NativePromptId(command));
             await socket.SendAsync(Frame(command).Payload.Memory, WebSocketMessageType.Text, true, CancellationToken.None);
             await terminal.Task.WaitAsync(TimeSpan.FromSeconds(5));
             await callbackEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
             originalDemand.SetResult();
-            stop = work.CancelAndWaitAsync(prompt => prompt.CommandId == command.CommandId);
-            secondStop = work.CancelAndWaitAsync(prompt => prompt.CommandId == command.CommandId);
+            stop = work.CancelAndWaitAsync(prompt => prompt.HandoffId == command.HandoffId);
+            secondStop = work.CancelAndWaitAsync(prompt => prompt.HandoffId == command.HandoffId);
             await Task.Delay(50);
             Assert.Multiple(() =>
             {

@@ -34,29 +34,6 @@ public static class RegistrationPolicy
         return delay;
     }
 
-    public static string? TryExtractClientId(string? promptJson)
-    {
-        if (string.IsNullOrWhiteSpace(promptJson))
-        {
-            return null;
-        }
-
-        try
-        {
-            using var doc = JsonDocument.Parse(promptJson);
-            if (doc.RootElement.TryGetProperty("client_id", out var node) && node.ValueKind == JsonValueKind.String)
-            {
-                return node.GetString();
-            }
-        }
-        catch (JsonException)
-        {
-            // Invalid payload should be treated as missing metadata.
-        }
-
-        return null;
-    }
-
     public static string? TryExtractPromptId(string? responseJson)
     {
         if (string.IsNullOrWhiteSpace(responseJson))

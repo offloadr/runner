@@ -26,21 +26,6 @@ public class RegistrationPolicyTests
     }
 
     [Test]
-    public void TryExtractClientId_ReadsClientIdFromJson()
-    {
-        var clientId = RegistrationPolicy.TryExtractClientId("{\"client_id\":\"abc\"}");
-
-        Assert.That(clientId, Is.EqualTo("abc"));
-    }
-
-    [Test]
-    public void TryExtractClientId_ReturnsNullForMissingOrInvalidJson()
-    {
-        Assert.That(RegistrationPolicy.TryExtractClientId("{\"x\":1}"), Is.Null);
-        Assert.That(RegistrationPolicy.TryExtractClientId("not json"), Is.Null);
-    }
-
-    [Test]
     public void TryExtractPromptId_ReadsPromptIdFromJson()
     {
         var promptId = RegistrationPolicy.TryExtractPromptId("{\"prompt_id\":\"p-1\"}");

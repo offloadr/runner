@@ -12,7 +12,6 @@ internal interface IRunnerSessionSink : IAsyncDisposable
     Task<GrantGpuPowerExecutionResponse> GrantGpuPowerExecutionAsync(GrantGpuPowerExecutionRequest request, CancellationToken cancellationToken);
     Task AckGpuPowerLimitAsync(AcknowledgeGpuPowerLimitRequest request, CancellationToken cancellationToken);
     Task<GrantPromptExecutionResponse> GrantPromptExecutionAsync(GrantPromptExecutionRequest request, CancellationToken cancellationToken);
-    Task ReportPromptEvidenceAsync(ReportPromptEvidenceRequest request, CancellationToken cancellationToken);
     Task AckSubmitEditorActionAsync(AcknowledgePromptResultRequest request, CancellationToken cancellationToken);
     Task AckEditorRuntimeRequestAsync(AcknowledgeEditorRuntimeRequestRequest request, CancellationToken cancellationToken)
         => Task.CompletedTask;
@@ -78,10 +77,6 @@ internal sealed class GrpcRunnerControlSink : IRunnerSessionSink
 
     public async Task<GrantPromptExecutionResponse> GrantPromptExecutionAsync(GrantPromptExecutionRequest request, CancellationToken cancellationToken)
         => await _commandClient.GrantPromptExecutionAsync(request, deadline: GetDeadline(), cancellationToken: cancellationToken)
-            .ResponseAsync.ConfigureAwait(false);
-
-    public async Task ReportPromptEvidenceAsync(ReportPromptEvidenceRequest request, CancellationToken cancellationToken)
-        => await _sessionEventClient.ReportPromptEvidenceAsync(request, deadline: GetDeadline(), cancellationToken: cancellationToken)
             .ResponseAsync.ConfigureAwait(false);
 
     public async Task AckSubmitEditorActionAsync(AcknowledgePromptResultRequest request, CancellationToken cancellationToken)

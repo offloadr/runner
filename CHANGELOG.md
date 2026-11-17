@@ -25,4 +25,5 @@ The first public release.
 - Forge Neo keeps its models in a cache shared by its sessions.
 - Extra editor arguments: after the image name, or in `RUNNER_EDITOR_ARGS_COMFYUI` and `RUNNER_EDITOR_ARGS_FORGE_NEO`. Flags the runner sets or relies on are refused at startup.
 - Image signatures (cosign) and build provenance attestations.
+- Protocol 2: a prompt is a short-lived handoff the runner runs at most once, only after Offloadr grants it, and acknowledges with the editor's answer. Nothing is recovered or replayed after a lost connection.
 - A runner Offloadr no longer speaks the protocol of stops and says so instead of retrying; the desktop app then downloads the image Offloadr names. Images also carry a `<channel>-p<protocol>` tag, and the bare channel tags move to a new protocol only when Offloadr has switched to it.

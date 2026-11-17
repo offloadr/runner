@@ -1418,29 +1418,31 @@ internal static partial class ServiceClientManager
                         continue;
                     }
 
-                    if (evt.SubmitPrompt != null && !string.IsNullOrWhiteSpace(evt.SubmitPrompt.SessionId))
+                    if (evt.SubmitPrompt != null && !string.IsNullOrWhiteSpace(evt.SubmitPrompt.HandoffId))
                     {
                         var prompt = evt.SubmitPrompt;
+                        // A redelivery of a handoff this process is running, or already ran, starts nothing.
                         commandWorkState.Prompts.Start(prompt, ShouldStreamHttpResponse(prompt), (captured, physicalCancellation, demandCancellation) =>
                         {
+                            var handoffId = captured.HandoffId;
+                            var runtime = PromptHandoff.Runtime(captured);
                             return HandleSubmitEditorActionAsync(
                             (ack, _) => QueuePromptAcknowledgementAsync(commandTasks, sessionSink, ack, shutdown),
                             (events, token) => sessionSink.ReportSessionEventsAsync(events, token),
                             captured,
                             runnerId,
+                            instanceId,
+                            sessionManager.IsPromptRuntimeCurrent,
                             sessionSink.GrantPromptExecutionAsync,
-                            sessionSink.ReportPromptEvidenceAsync,
-                            (command, token) => sessionManager.RecoverPromptAsync(command, runnerId, sessionSink.ReportPromptEvidenceAsync, token),
                             (sessionId, editorSid, clientId, token) => sessionEventRelay.EnsureBridgeAsync(
                                 sessionId,
                                 editorSid,
                                 clientId,
-                                captured.Target.GpuGeneration,
-                                captured.Target.RuntimeEpoch,
-                                captured.Target.RuntimeInstanceId,
+                                runtime.LifecycleGeneration,
+                                runtime.RuntimeEpoch,
+                                runtime.RuntimeInstanceId,
                                 captured.WebsocketClientMessage.ToByteArray(),
                                 token),
-                            (sessionId, clientId, submissionId) => sessionEventRelay.RegisterSubmission(sessionId, clientId, captured),
                             downloadService.SetActiveSession,
                             (sessionId, editorSid, owner, token) => artifactUploadService.ActivateSessionAsync(sessionId, editorSid, owner, token),
                             (sessionId, editorSid, owner, artifacts, token) => artifactUploadService.SeedSessionAsync(sessionId, editorSid, owner, artifacts, token),
@@ -1453,12 +1455,13 @@ internal static partial class ServiceClientManager
                             physicalCancellation,
                             localModelProjectionReconciler,
                             sessionId => sessionManager.TryGetSessionPaths(sessionId, out var paths) ? paths : null,
-                            shutdown,
-                            sessionEventRelay.UnregisterUninvokedSubmission,
                             demandCancellation,
-                            CreatePromptQueueProbe(sessionManager.ReadComfyPromptQueueAsync, captured.SessionId,
-                                new RuntimeIdentity(captured.Target.GpuGeneration, captured.Target.RuntimeEpoch, captured.Target.RuntimeInstanceId)),
-                            settling => commandWorkState.Prompts.HoldDemand(captured.CommandId, settling));
+                            CreatePromptQueueProbe(sessionManager.ReadComfyPromptQueueAsync, captured.SessionId, runtime),
+                            settling => commandWorkState.Prompts.HoldDemand(handoffId, settling),
+                            () => commandWorkState.Prompts.MarkGranted(handoffId),
+                            hostShutdown: shutdown,
+                            // Off the prompt's own work, so Stop never waits for a grant.
+                            settleInBackground: settle => _ = commandTasks.Start(settle));
                         });
                     }
                 }
@@ -1521,7 +1524,7 @@ internal static partial class ServiceClientManager
         // closure, so it does not retain that callback's complete command body.
         var captured = acknowledgement.Clone();
         _ = commandTasks.Start(() => AcknowledgeRuntimeCommandWithRetryAsync(
-            sessionSink.AckSubmitEditorActionAsync, captured, captured.CommandId, shutdown));
+            sessionSink.AckSubmitEditorActionAsync, captured, captured.HandoffId, shutdown));
         return Task.CompletedTask;
     }
 
@@ -2416,7 +2419,7 @@ internal static partial class ServiceClientManager
 
     private static bool PromptTargetsRuntime(PromptWorkIdentity prompt, string sessionId, RuntimeIdentity runtimeIdentity)
         => string.Equals(prompt.SessionId, sessionId, StringComparison.Ordinal) &&
-           prompt.Runtime is { } runtime && runtime.SameRuntime(runtimeIdentity);
+           prompt.Runtime.SameRuntime(runtimeIdentity);
 
     /// <summary>
     /// Stops and cleans up a session only while its tracked child is the expected
@@ -3066,10 +3069,8 @@ internal static partial class ServiceClientManager
         string commandId,
         CancellationToken cancellationToken,
         TimeSpan? initialRetryDelay = null,
-        TimeSpan? maximumRetryDelay = null,
-        int? maxAttempts = null)
+        TimeSpan? maximumRetryDelay = null)
     {
-        if (maxAttempts is <= 0) throw new ArgumentOutOfRangeException(nameof(maxAttempts));
         var retryDelay = initialRetryDelay ?? TimeSpan.FromMilliseconds(250);
         var maxRetryDelay = maximumRetryDelay ?? TimeSpan.FromSeconds(5);
         var attempt = 0;
@@ -3087,11 +3088,6 @@ internal static partial class ServiceClientManager
             }
             catch (Exception ex) when (IsRetryableTransientAcknowledgementFailure(ex))
             {
-                if (maxAttempts is { } limit && attempt >= limit)
-                {
-                    RunnerLog.Warning(nameof(ServiceClientManager), $"Runtime command acknowledgement {commandId} exhausted {limit} attempts; retained status requires recovery.");
-                    return false;
-                }
                 if (attempt == 1 || attempt % 12 == 0)
                 {
                     RunnerLog.Warning(
@@ -3137,16 +3133,95 @@ internal static partial class ServiceClientManager
                    StatusCode.DataLoss
            };
 
+    // How long a sent grant may still settle after its prompt was interrupted or stopped.
+    internal static readonly TimeSpan GrantSettleTimeout = TimeSpan.FromSeconds(30);
+
+    // Asks for the grant, retrying a lost reply with the same request: a retry from this
+    // instance is answered GRANTED again, so it cannot run the handoff twice. Null when the
+    // grant was refused, or was not answered before its lifetime ended.
+    private static async Task<GrantPromptExecutionResponse?> RequestGrantAsync(
+        GrantPromptExecutionRequest grant,
+        Func<GrantPromptExecutionRequest, CancellationToken, Task<GrantPromptExecutionResponse>> grantExecution,
+        string handoffId,
+        CancellationToken lifetime)
+    {
+        var attempt = 0;
+        var retryDelay = TimeSpan.FromMilliseconds(250);
+        while (true)
+        {
+            attempt++;
+            try
+            {
+                return await grantExecution(grant, lifetime).ConfigureAwait(false);
+            }
+            // Cancelled, as an exception or a gRPC status: the grant's answer is not known.
+            catch (Exception) when (lifetime.IsCancellationRequested) { return null; }
+            catch (Exception ex) when (IsRetryableTransientAcknowledgementFailure(ex))
+            {
+                if (attempt == 1 || attempt % 12 == 0)
+                    RunnerLog.Warning(nameof(ServiceClientManager), $"Prompt grant {handoffId} unavailable ({ex.GetType().Name}); retrying the same grant.");
+                try { await Task.Delay(retryDelay, lifetime).ConfigureAwait(false); }
+                catch (OperationCanceledException) when (lifetime.IsCancellationRequested) { return null; }
+                retryDelay = TimeSpan.FromMilliseconds(Math.Min(retryDelay.TotalMilliseconds * 2, 5000));
+            }
+            catch (Exception ex)
+            {
+                RunnerLog.Warning(nameof(ServiceClientManager), $"Prompt grant {handoffId} rejected ({ex.GetType().Name}); dropping the delivery.");
+                return null;
+            }
+        }
+    }
+
+    // The grant of an interrupted or stopped handoff, settling after its work ended. The
+    // handoff is already remembered as granted. If the platform granted it, it is reported
+    // not executed; if no answer comes, the platform releases it on Stop, a new runner
+    // process or its expiry.
+    private static async Task SettleInterruptedGrantAsync(
+        Task<GrantPromptExecutionResponse?> grantRequest,
+        CancellationTokenSource grantLifetime,
+        AcknowledgePromptResultRequest ack,
+        Func<AcknowledgePromptResultRequest, CancellationToken, Task> ackSubmitPrompt,
+        CancellationToken hostShutdown)
+    {
+        try
+        {
+            var permission = await grantRequest.ConfigureAwait(false);
+            if (permission?.Outcome == PromptGrantOutcome.Granted)
+                await AcknowledgeNotExecutedAsync(ack, ackSubmitPrompt).ConfigureAwait(false);
+            else if (permission is null && grantLifetime.IsCancellationRequested && !hostShutdown.IsCancellationRequested)
+                RunnerLog.Warning(nameof(ServiceClientManager), $"Prompt grant {ack.HandoffId} was not answered after the prompt was interrupted; it will not run.");
+        }
+        finally { grantLifetime.Dispose(); }
+    }
+
+    private static async Task AcknowledgeNotExecutedAsync(
+        AcknowledgePromptResultRequest ack, Func<AcknowledgePromptResultRequest, CancellationToken, Task> ackSubmitPrompt)
+    {
+        ack.Outcome = PromptResultOutcome.NotExecuted;
+        ack.DiagnosticCode = "prompt_preparation_incomplete";
+        try { await ackSubmitPrompt(ack, CancellationToken.None).ConfigureAwait(false); }
+        catch (Exception ex)
+        {
+            RunnerLog.Warning(nameof(ServiceClientManager), $"Prompt acknowledgement {ack.HandoffId} could not be queued ({ex.GetType().Name}).");
+        }
+    }
+
+    /// <summary>
+    /// Runs one prompt handoff at most once. The handoff is checked against the session's
+    /// current runtime and then granted by the platform; only GRANTED touches the runtime.
+    /// Any other grant outcome drops the delivery without native I/O or an acknowledgement.
+    /// After GRANTED every path ends in exactly one acknowledgement: the native response,
+    /// NOT_EXECUTED when nothing reached the runtime, or UNKNOWN once native I/O started.
+    /// </summary>
     internal static async Task HandleSubmitEditorActionAsync(
         Func<AcknowledgePromptResultRequest, CancellationToken, Task> ackSubmitPrompt,
         Func<ReportSessionEventsRequest, CancellationToken, Task> reportSessionEvents,
         SubmitPromptCommand prompt,
         string runnerId,
+        string instanceId,
+        Func<SubmitPromptCommand, bool> isPromptRuntimeCurrent,
         Func<GrantPromptExecutionRequest, CancellationToken, Task<GrantPromptExecutionResponse>> grantExecution,
-        Func<ReportPromptEvidenceRequest, CancellationToken, Task> reportEvidence,
-        Func<SubmitPromptCommand, CancellationToken, Task> recover,
         Func<string, string, string, CancellationToken, Task> ensureBridge,
-        Action<string, string, string> registerSubmission,
         Action<string?> setActiveDownloadSession,
         Func<string, string, string?, CancellationToken, Task> activateSessionUploads,
         Func<string, string, string?, IEnumerable<EditorArtifactMetadata>, CancellationToken, Task> seedSessionArtifacts,
@@ -3158,88 +3233,84 @@ internal static partial class ServiceClientManager
         CancellationToken cancellationToken,
         Func<SessionProcessManager.SessionPaths?, IEnumerable<ModelDownloadRequest>, bool, CancellationToken, Task>? localModelProjectionReconciler = null,
         Func<string, SessionProcessManager.SessionPaths?>? sessionPathsProvider = null,
-        CancellationToken evidenceDeliveryCancellationToken = default,
-        Action<string, string, SubmitPromptCommand>? unregisterUninvokedSubmission = null,
         CancellationToken promptDemandCancellation = default,
         Func<string, CancellationToken, Task<bool?>>? isPromptQueued = null,
-        Action<Task>? holdPromptDemand = null)
+        Action<Task>? holdPromptDemand = null,
+        Action? onGranted = null,
+        CancellationToken hostShutdown = default,
+        TimeSpan? grantSettleTimeout = null,
+        Action<Func<Task>>? settleInBackground = null)
     {
         // Reject malformed wire identities before granting or touching a runtime.
-        _ = PromptRuntimeMarker.TargetFingerprint(prompt.Target);
-        if (!Guid.TryParse(prompt.CommandId, out var commandId) || commandId == Guid.Empty
-            || !Guid.TryParse(prompt.SubmissionId, out var submissionId) || submissionId == Guid.Empty
-            || !Guid.TryParse(runnerId, out var runner) || runner != Guid.Parse(prompt.Target.RunnerId)
-            || !Guid.TryParse(prompt.SessionId, out var session) || session != Guid.Parse(prompt.Target.RunnerSessionId))
-            throw new ArgumentException("The prompt command must retain its exact executor identity.", nameof(prompt));
-        if (prompt.RecoveryOnly)
+        if (!PromptHandoff.HasValidIdentity(prompt)
+            || !Guid.TryParse(runnerId, out var runner) || runner == Guid.Empty || string.IsNullOrWhiteSpace(instanceId))
+            throw new ArgumentException("The prompt handoff must name its exact session and runtime.", nameof(prompt));
+        // A handoff for a stopped, replaced or unknown runtime is never granted here.
+        if (!isPromptRuntimeCurrent(prompt))
         {
-            await recover(prompt, cancellationToken).ConfigureAwait(false);
+            RunnerLog.Warning(nameof(ServiceClientManager), $"Prompt handoff {prompt.HandoffId} targets a runtime that is not current; dropping it.");
             return;
         }
+
         var grant = new GrantPromptExecutionRequest
         {
             RunnerId = runnerId,
             SessionId = prompt.SessionId,
-            SubmissionId = prompt.SubmissionId,
-            CommandId = prompt.CommandId,
-            Target = prompt.Target.Clone(),
+            HandoffId = prompt.HandoffId,
+            InstanceId = instanceId,
+            LifecycleGeneration = prompt.LifecycleGeneration,
+            RuntimeEpoch = prompt.RuntimeEpoch,
+            RuntimeInstanceId = prompt.RuntimeInstanceId,
         };
-        GrantPromptExecutionResponse permission;
-        var grantAttempt = 0;
-        var grantRetryDelay = TimeSpan.FromMilliseconds(250);
-        while (true)
-        {
-            grantAttempt++;
-            try
-            {
-                permission = await grantExecution(grant, cancellationToken).ConfigureAwait(false);
-                break;
-            }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { return; }
-            catch (Exception ex) when (IsRetryableTransientAcknowledgementFailure(ex))
-            {
-                // Only the first affirmative committed permission authorizes
-                // execution. Retrying the same identity after a lost response
-                // yields recovery-only, never another native invocation.
-                if (grantAttempt == 1 || grantAttempt % 12 == 0)
-                    RunnerLog.Warning(nameof(ServiceClientManager), $"Prompt permission {prompt.CommandId} unavailable ({ex.GetType().Name}); retrying the same grant.");
-                try { await Task.Delay(grantRetryDelay, cancellationToken).ConfigureAwait(false); }
-                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { return; }
-                grantRetryDelay = TimeSpan.FromMilliseconds(Math.Min(grantRetryDelay.TotalMilliseconds * 2, 5000));
-            }
-            catch (Exception ex)
-            {
-                RunnerLog.Warning(nameof(ServiceClientManager), $"Prompt permission {prompt.CommandId} rejected ({ex.GetType().Name}); retaining its receipt for recovery.");
-                return;
-            }
-        }
-        if (permission.Submission is null || permission.Submission.SubmissionId != prompt.SubmissionId
-            || !prompt.Target.Equals(permission.Submission.Target))
-            throw new InvalidOperationException("Prompt permission returned a different submission identity.");
-        // An expired receipt retains outcome and permission facts only. It does
-        // not authorize native recovery, downloads, new invocation or another ACK.
-        if (permission.Submission.ContentAvailability == PromptContentAvailability.Expired)
-            return;
-        if (permission.Submission.ContentAvailability != PromptContentAvailability.Available)
-            throw new InvalidOperationException("Prompt permission returned an unknown content availability state.");
-        if (!permission.MayExecute)
-        {
-            await recover(prompt, cancellationToken).ConfigureAwait(false);
-            return;
-        }
-        if (permission.Submission.ExecutionPermissionUtc is null)
-            throw new InvalidOperationException("Prompt execution requires committed permission evidence.");
-
+        // Nothing has been asked yet, so an interrupt or Stop here leaves nothing behind.
+        if (cancellationToken.IsCancellationRequested) return;
         var ack = new AcknowledgePromptResultRequest
         {
-            SessionId = prompt.SessionId,
-            SubmissionId = prompt.SubmissionId,
             RunnerId = runnerId,
-            CommandId = prompt.CommandId,
-            Target = prompt.Target.Clone(),
+            SessionId = prompt.SessionId,
+            HandoffId = prompt.HandoffId,
+            InstanceId = instanceId,
         };
+        // Once a grant request is sent, the platform may record GRANTED for this instance
+        // whatever happens here, so an interrupt or Stop never abandons it. This work still
+        // ends at once, so neither Stop nor the command loop waits for the grant, and the
+        // handoff is remembered as granted, so no redelivery runs it here. The request goes
+        // on settling apart from this work, under the host lifetime and within a bound; a
+        // GRANTED answer is acknowledged NOT_EXECUTED, which releases the platform's lane.
+        var grantLifetime = CancellationTokenSource.CreateLinkedTokenSource(hostShutdown);
+        var grantRequest = RequestGrantAsync(grant, grantExecution, prompt.HandoffId, grantLifetime.Token);
+        var interrupted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using (cancellationToken.Register(() => interrupted.TrySetResult()))
+            await Task.WhenAny(grantRequest, interrupted.Task).ConfigureAwait(false);
+        if (!grantRequest.IsCompleted)
+        {
+            onGranted?.Invoke();
+            grantLifetime.CancelAfter(grantSettleTimeout ?? GrantSettleTimeout);
+            (settleInBackground ?? (settle => _ = settle()))(
+                () => SettleInterruptedGrantAsync(grantRequest, grantLifetime, ack, ackSubmitPrompt, hostShutdown));
+            return;
+        }
+        grantLifetime.Dispose();
+        var permission = await grantRequest.ConfigureAwait(false);
+        if (permission is null) return;
+        if (permission.Outcome != PromptGrantOutcome.Granted)
+        {
+            // Another instance holds it, it expired, its runtime moved on or the account
+            // cannot start work. None of these is run here or acknowledged by this runner.
+            RunnerLog.Info(nameof(ServiceClientManager), $"Prompt handoff {prompt.HandoffId} was not granted ({permission.Outcome}); dropping the delivery.");
+            return;
+        }
+        onGranted?.Invoke();
+        if (cancellationToken.IsCancellationRequested)
+        {
+            // Interrupted or stopped as the grant arrived. Nothing is prepared: by now
+            // another session may be this runner's active one, and preparing would claim
+            // its downloads and models for this one.
+            await AcknowledgeNotExecutedAsync(ack, ackSubmitPrompt).ConfigureAwait(false);
+            return;
+        }
 
-        string? clientId = null;
+        var clientId = string.IsNullOrWhiteSpace(prompt.ClientId) ? null : prompt.ClientId.Trim();
         var nativeInvocationStarted = false;
         // Prompt model demand outlives preparation; this work owns its lifetime.
         // Until the native request starts, cancelling this work (interrupt, Stop)
@@ -3267,26 +3338,22 @@ internal static partial class ServiceClientManager
         Task? promptDemand = null;
         var keepPromptDemand = false;
         string? acceptedPromptId = null;
-        using var forgeEvidence = ShouldStreamHttpResponse(prompt)
-            ? new ForgePromptEvidenceReader(prompt.NativeIdentifiers.SessionHash) : null;
 
-        try
+        if (clientId is not null)
         {
-            clientId = RegistrationPolicy.TryExtractClientId(prompt.PromptJson);
-            if (!string.IsNullOrWhiteSpace(clientId))
+            try
             {
-                await ensureBridge(prompt.SessionId, prompt.EditorSid, clientId!, cancellationToken).ConfigureAwait(false);
-                registerSubmission(prompt.SessionId, clientId!, prompt.SubmissionId);
+                await ensureBridge(prompt.SessionId, prompt.EditorSid, clientId, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                RunnerLog.Warning(nameof(ServiceClientManager), $"Prompt websocket preparation unavailable ({ex.GetType().Name}).");
             }
         }
-        catch (Exception ex)
-        {
-            RunnerLog.Warning(nameof(ServiceClientManager), $"Prompt websocket preparation unavailable ({ex.GetType().Name}).");
-        }
 
         try
         {
-            // Capture the uploader under this command's permission, inside the
+            // Capture the uploader under this handoff's grant, inside the
             // acknowledgement path. A missing uploader is proven pre-invocation
             // failure; a delayed sweep can never bind a replacement session.
             var capturedRefresh = captureSessionArtifactRefresh(prompt.SessionId);
@@ -3328,17 +3395,6 @@ internal static partial class ServiceClientManager
                 ShouldStreamHttpResponse(prompt)
                     ? async (eventType, chunk, token) =>
                     {
-                        if (eventType == HttpResponseChunkEventType && forgeEvidence is not null)
-                            foreach (var evidence in forgeEvidence.Append(chunk.Span))
-                                _ = ReportRetainedForgeEvidenceAsync(reportEvidence, new()
-                                {
-                                    RunnerId = runnerId,
-                                    SessionId = prompt.SessionId,
-                                    SubmissionId = prompt.SubmissionId,
-                                    CommandId = prompt.CommandId,
-                                    Target = prompt.Target.Clone(),
-                                    Evidence = evidence,
-                                }, evidenceDeliveryCancellationToken);
                         try
                         {
                             await ReportHttpResponseEventAsync(reportSessionEvents, runnerId, prompt, eventType, chunk, token).ConfigureAwait(false);
@@ -3346,9 +3402,9 @@ internal static partial class ServiceClientManager
                         catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
                         catch (Exception ex)
                         {
-                            // Live fan-out loss cannot cancel an accepted consuming
-                            // reader. Terminal evidence has its independent delivery.
-                            RunnerLog.Warning(nameof(ServiceClientManager), $"Prompt live relay unavailable ({ex.GetType().Name}); use retained recovery evidence.");
+                            // Live fan-out loss cannot cancel an accepted consuming reader;
+                            // the acknowledgement still reports how the stream ended.
+                            RunnerLog.Warning(nameof(ServiceClientManager), $"Prompt live relay unavailable ({ex.GetType().Name}).");
                         }
                     }
             : null,
@@ -3362,74 +3418,53 @@ internal static partial class ServiceClientManager
                 },
                 cancellationToken).ConfigureAwait(false);
             keepPromptDemand = result.Success;
-            if (keepPromptDemand)
+            if (result.Success && !result.BodyOmitted)
             {
-                acceptedPromptId = !string.IsNullOrWhiteSpace(prompt.NativeIdentifiers?.PromptId)
-                    ? prompt.NativeIdentifiers.PromptId
-                    : RegistrationPolicy.TryExtractPromptId(System.Text.Encoding.UTF8.GetString(result.Body));
+                // ComfyUI names the prompt it queued; the platform injects no id of its own.
+                acceptedPromptId = RegistrationPolicy.TryExtractPromptId(System.Text.Encoding.UTF8.GetString(result.Body));
             }
-            ack.Result = new()
-            {
-                Outcome = PromptInvocationOutcome.NativeResponse,
-                NativeResponse = new() { StatusCode = result.StatusCode, Body = ByteString.CopyFrom(result.Body), ContentType = result.ContentType },
-            };
+            ack.Outcome = PromptResultOutcome.NativeResponse;
+            ack.StatusCode = result.StatusCode;
+            ack.Body = ByteString.CopyFrom(result.Body);
+            ack.ContentType = result.ContentType;
             if (result.BodyOmitted)
             {
-                ack.Result.DiagnosticCode = PromptProtocolCodes.NativeResponseBodyOmitted;
-                ack.Result.Message = "The native response exceeded the retained size; its body was not kept.";
+                ack.BodyOmitted = true;
+                ack.DiagnosticCode = PromptProtocolCodes.NativeResponseBodyOmitted;
             }
 
-            if (result.Success && !string.IsNullOrWhiteSpace(clientId))
+            if (clientId is not null && !string.IsNullOrWhiteSpace(acceptedPromptId))
             {
-                var promptId = RegistrationPolicy.TryExtractPromptId(System.Text.Encoding.UTF8.GetString(result.Body));
-                if (!string.IsNullOrWhiteSpace(promptId))
-                {
-                    mapPrompt(prompt.SessionId, clientId!, promptId!, prompt.SubmissionId);
-                }
+                mapPrompt(prompt.SessionId, clientId, acceptedPromptId!, prompt.HandoffId);
             }
 
             if (result.Success && ShouldRefreshArtifactsAfterPrompt(prompt))
             {
-                KickOffPromptArtifactRefresh(prompt.SessionId, prompt.SubmissionId, RefreshCapturedArtifacts, cancellationToken);
+                KickOffPromptArtifactRefresh(prompt.SessionId, prompt.HandoffId, RefreshCapturedArtifacts, cancellationToken);
             }
         }
         catch (Exception ex)
         {
-            if (!nativeInvocationStarted && !string.IsNullOrWhiteSpace(clientId))
-            {
-                try { unregisterUninvokedSubmission?.Invoke(prompt.SessionId, clientId, prompt); }
-                catch (Exception cleanupEx)
-                {
-                    RunnerLog.Warning(nameof(ServiceClientManager), $"Uninvoked prompt registration cleanup failed ({cleanupEx.GetType().Name}).");
-                }
-            }
             RunnerLog.Warning(nameof(ServiceClientManager), nativeInvocationStarted
-                ? $"Prompt {prompt.CommandId} ended with {ex.GetType().Name}; retaining invocation uncertainty."
-                : $"Prompt {prompt.CommandId} ended with {ex.GetType().Name} before native request I/O.");
-            if (ex is ModelDownloadsDisabledException && !nativeInvocationStarted)
+                ? $"Prompt handoff {prompt.HandoffId} ended with {ex.GetType().Name}; its native result is unknown."
+                : $"Prompt handoff {prompt.HandoffId} ended with {ex.GetType().Name} before native request I/O.");
+            // A native response already recorded stays the result.
+            if (ack.Outcome == PromptResultOutcome.Unspecified)
             {
-                ack.Result ??= new()
-                {
-                    Outcome = PromptInvocationOutcome.NotExecuted,
-                    DiagnosticCode = ModelDownloadsDisabledException.DiagnosticCode,
-                    Message = ex.Message,
-                };
+                ack.Outcome = nativeInvocationStarted ? PromptResultOutcome.Unknown : PromptResultOutcome.NotExecuted;
+                ack.DiagnosticCode = nativeInvocationStarted
+                    ? "prompt_native_result_unknown"
+                    : ex is ModelDownloadsDisabledException
+                        ? ModelDownloadsDisabledException.DiagnosticCode
+                        : "prompt_preparation_incomplete";
             }
-
-            ack.Result ??= new()
-            {
-                Outcome = nativeInvocationStarted ? PromptInvocationOutcome.Unknown : PromptInvocationOutcome.NotExecuted,
-                DiagnosticCode = nativeInvocationStarted ? "prompt_native_result_unknown" : "prompt_preparation_incomplete",
-                Message = nativeInvocationStarted ? "The runtime result could not be confirmed. Refresh the submission status."
-                    : "Preparation ended before the native runtime was invoked.",
-            };
         }
 
         // ackSubmitPrompt must retain this exact acknowledgement and retry it until it is
         // delivered or the host shuts down, independently of the prompt's own cancellation:
-        // a redelivered prompt is denied execution and recovery cannot rebuild an arbitrary
-        // native result. The command loop wires it to AcknowledgeRuntimeCommandWithRetryAsync
-        // on the host shutdown token, so this only sees a failure to hand it over.
+        // the handoff is never run again, so this is its only result. The command loop wires
+        // it to AcknowledgeRuntimeCommandWithRetryAsync on the host shutdown token, so this
+        // only sees a failure to hand it over.
         try
         {
             var ackCancellationToken = cancellationToken.IsCancellationRequested
@@ -3439,7 +3474,7 @@ internal static partial class ServiceClientManager
         }
         catch (Exception ex)
         {
-            RunnerLog.Warning(nameof(ServiceClientManager), $"Prompt acknowledgement unavailable ({ex.GetType().Name}); recover its receipt.");
+            RunnerLog.Warning(nameof(ServiceClientManager), $"Prompt acknowledgement {prompt.HandoffId} could not be queued ({ex.GetType().Name}).");
         }
 
         withdrawDemandBeforeInvocation.Dispose();
@@ -3452,8 +3487,8 @@ internal static partial class ServiceClientManager
                 : null);
         if (holdPromptDemand is not null && !settling.IsCompleted)
         {
-            // The command ends with its acknowledgement; only the demand stays, so a
-            // recovery delivery of the same command is not refused as a duplicate.
+            // The command ends with its acknowledgement; only the demand stays, so the
+            // completed command and its body are released while hydration settles.
             holdPromptDemand(settling);
             return;
         }
@@ -3595,54 +3630,32 @@ internal static partial class ServiceClientManager
         }
     }
 
+    /// <summary>
+    /// A terminal event ends the demand of the handoff its prompt id was mapped to, on
+    /// the same runtime. An unmapped prompt's demand ends once it leaves the queue.
+    /// </summary>
     internal static bool IsFinishedPrompt(PromptWorkIdentity prompt, ComfySessionEventRelay.PromptTerminalEvent finished)
         => PromptTargetsRuntime(prompt, finished.SessionId, finished.Runtime)
-           && (!string.IsNullOrEmpty(finished.PromptId)
-               && string.Equals(prompt.NativePromptId, finished.PromptId, StringComparison.Ordinal)
-               || finished.SubmissionId is not null
-               && string.Equals(prompt.SubmissionId, finished.SubmissionId, StringComparison.Ordinal));
+           && finished.HandoffId is not null
+           && string.Equals(prompt.HandoffId, finished.HandoffId, StringComparison.Ordinal);
 
     internal static bool TargetsPromptRuntime(RelayEditorRuntimeRequestCommand request, PromptWorkIdentity prompt)
-        => prompt.Runtime is { } target && request.LifecycleGeneration > 0 && request.RuntimeEpoch > 0
+        => request.LifecycleGeneration > 0 && request.RuntimeEpoch > 0
             && Guid.TryParse(request.SessionId, out var session) && session != Guid.Empty
             && Guid.TryParse(prompt.SessionId, out var promptSession) && session == promptSession
-            && request.LifecycleGeneration == target.LifecycleGeneration && request.RuntimeEpoch == target.RuntimeEpoch
+            && request.LifecycleGeneration == prompt.Runtime.LifecycleGeneration && request.RuntimeEpoch == prompt.Runtime.RuntimeEpoch
             && Guid.TryParse(request.RuntimeInstanceId, out var instance) && instance != Guid.Empty
-            && Guid.TryParse(target.RuntimeInstanceId, out var promptInstance) && instance == promptInstance;
-
-    private static Task ReportRetainedForgeEvidenceAsync(
-        Func<ReportPromptEvidenceRequest, CancellationToken, Task> reportEvidence,
-        ReportPromptEvidenceRequest retained,
-        CancellationToken lifetime)
-    {
-        // The consuming native SSE reader and browser relay must never wait for
-        // the evidence RPC. Retry only these captured bytes/identities, even if
-        // Stop cancels the physical stream while this runner remains alive.
-        return Task.Run(() => AcknowledgeRuntimeCommandWithRetryAsync(
-            async (ReportPromptEvidenceRequest evidence, CancellationToken token) =>
-            {
-                using var attempt = CancellationTokenSource.CreateLinkedTokenSource(token);
-                attempt.CancelAfter(TimeSpan.FromSeconds(5));
-                try
-                {
-                    await reportEvidence(evidence, attempt.Token).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException) when (!token.IsCancellationRequested)
-                {
-                    throw new TimeoutException("Prompt evidence reporting timed out.");
-                }
-            }, retained, retained.CommandId, lifetime, maxAttempts: 6));
-    }
+            && Guid.TryParse(prompt.Runtime.RuntimeInstanceId, out var promptInstance) && instance == promptInstance;
 
     private static bool ShouldStreamHttpResponse(SubmitPromptCommand prompt)
         => string.Equals(prompt.EditorRuntimeKind, "forge-neo", StringComparison.OrdinalIgnoreCase)
-           && string.Equals(prompt.HttpMethod, "GET", StringComparison.OrdinalIgnoreCase)
-           && PathMatchesRoute((prompt.HttpPath ?? string.Empty).Trim().TrimStart('/'), "queue/data");
+           && string.Equals(prompt.Request?.Method, "GET", StringComparison.OrdinalIgnoreCase)
+           && PathMatchesRoute((prompt.Request?.Path ?? string.Empty).Trim().TrimStart('/'), "queue/data");
 
     internal static bool IsSideEffectFreePromptRelay(SubmitPromptCommand prompt)
         => string.Equals(prompt.EditorRuntimeKind, "forge-neo", StringComparison.OrdinalIgnoreCase)
-           && string.Equals(prompt.HttpMethod, "POST", StringComparison.OrdinalIgnoreCase)
-           && PathMatchesRoute((prompt.HttpPath ?? string.Empty).Trim().TrimStart('/'), "internal/progress");
+           && string.Equals(prompt.Request?.Method, "POST", StringComparison.OrdinalIgnoreCase)
+           && PathMatchesRoute((prompt.Request?.Path ?? string.Empty).Trim().TrimStart('/'), "internal/progress");
 
     private static bool ShouldRefreshArtifactsBeforePrompt(SubmitPromptCommand prompt)
         => ShouldPrepareGenerationDependencies(prompt)
@@ -3651,7 +3664,7 @@ internal static partial class ServiceClientManager
 
     internal static bool ShouldPrepareGenerationDependencies(SubmitPromptCommand prompt)
         => !string.Equals(prompt.EditorRuntimeKind, "comfyui", StringComparison.OrdinalIgnoreCase) ||
-           ComfyRuntimeRoutes.Classify(prompt.HttpMethod, prompt.HttpPath) == ComfyRuntimeRouteOwnership.DurableGeneration;
+           ComfyRuntimeRoutes.Classify(prompt.Request?.Method, prompt.Request?.Path) == ComfyRuntimeRouteOwnership.DurableGeneration;
 
     private static bool ShouldRefreshArtifactsAfterPrompt(SubmitPromptCommand prompt)
         => ShouldPrepareGenerationDependencies(prompt) && !IsSideEffectFreePromptRelay(prompt);
@@ -3828,15 +3841,15 @@ internal static partial class ServiceClientManager
             RunnerId = runnerId,
             SessionId = prompt.SessionId,
             EditorSid = prompt.EditorSid,
-            ClientId = $"http-relay:{prompt.SubmissionId}",
-            SubmissionId = prompt.SubmissionId,
+            ClientId = $"http-relay:{prompt.HandoffId}",
+            HandoffId = prompt.HandoffId,
             EventType = string.IsNullOrWhiteSpace(eventType) ? HttpResponseChunkEventType : eventType,
             FrameType = SessionStreamFrameType.Binary,
             Payload = ByteString.CopyFrom(chunk.ToArray()),
             CreatedUtc = Timestamp.FromDateTime(DateTime.UtcNow),
-            LifecycleGeneration = prompt.Target.GpuGeneration,
-            RuntimeEpoch = prompt.Target.RuntimeEpoch,
-            RuntimeInstanceId = prompt.Target.RuntimeInstanceId,
+            LifecycleGeneration = prompt.LifecycleGeneration,
+            RuntimeEpoch = prompt.RuntimeEpoch,
+            RuntimeInstanceId = prompt.RuntimeInstanceId,
         });
 
         await reportSessionEvents(request, cancellationToken).ConfigureAwait(false);
@@ -3872,7 +3885,7 @@ internal static partial class ServiceClientManager
 
     private static void KickOffPromptArtifactRefresh(
         string sessionId,
-        string submissionId,
+        string handoffId,
         Func<string, Task> refreshSessionArtifacts,
         CancellationToken cancellationToken)
     {
@@ -3889,7 +3902,7 @@ internal static partial class ServiceClientManager
                 }
                 catch (Exception ex)
                 {
-                    RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed to refresh artifacts after prompt {submissionId}: {ex.Message}");
+                    RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed to refresh artifacts after prompt handoff {handoffId}: {ex.Message}");
                 }
             },
             CancellationToken.None);

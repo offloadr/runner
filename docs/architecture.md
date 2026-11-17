@@ -167,22 +167,52 @@ join with a cancelled waiting wrapper, and a reaper failure fails startup. This
 helper retains the account and data for its startup owner; it does not retire
 the session or establish the lifetime of the editor child or bridge.
 
-## Expired prompt receipts
+## Prompt handoff
 
-Prompt execution permission includes explicit content availability. An expired
-or unspecified receipt cannot start generation, probe native recovery, prepare
-artifacts or create another acknowledgement, even if its permission flag is
-contradictory. Recorded permission and outcome facts remain distinct from access
-to the original content. Unspecified or unknown availability is an explicit
-protocol error, rather than a silent successful return. Recovery-only command
-lifetimes, local memory and spool cleanup still require their own finite retention enforcement; this check alone
-does not establish complete data deletion.
+A prompt reaches the runner as a transient handoff (`SubmitPromptCommand`) that
+the control plane keeps only until its `expires_utc`. The runner runs a handoff at
+most once and nothing is recovered or replayed:
+
+1. It checks the handoff's identity and that its lifecycle generation, runtime
+   epoch and runtime instance are the session's current runtime. A handoff for
+   any other runtime is dropped before it is granted.
+2. It asks `GrantPromptExecution` with its registered process `instance_id`,
+   retrying transient failures with the same request. Only `GRANTED` lets it
+   prepare downloads, artifacts and preflights and call the editor. Any other
+   outcome, or a refused grant, drops the delivery with no native I/O and no
+   acknowledgement. An interrupt or Stop after the grant was sent doesn't abandon
+   it. The prompt's work ends at once, so Stop never waits for a grant, and the
+   handoff is remembered as granted, so no redelivery runs it here. The grant
+   settles in the background for up to 30 more seconds; `GRANTED` then ends in
+   `NOT_EXECUTED` without preparing anything, since another session may be active
+   by then. A grant still unanswered is released by the platform on Stop, a new
+   runner process or its expiry.
+3. After `GRANTED`, every path ends in exactly one `AcknowledgePromptResult`: the
+   editor's response (`NATIVE_RESPONSE`, with `body_omitted` when the body was too
+   large to relay), `NOT_EXECUTED` when nothing reached the editor, or `UNKNOWN`
+   once native I/O started. The acknowledgement is retried on transient failures
+   until shutdown; a refusal, such as `FAILED_PRECONDITION` for an expired handoff,
+   is dropped.
+
+One handler runs per handoff in a process. A redelivery is refused while its
+handler or its held model demand is active, and for 65 minutes after a grant,
+because the platform answers a retried grant from the same process with `GRANTED`
+again. The platform keeps a handoff 60 minutes from acceptance, so this covers its
+whole life; it is timed on the monotonic clock, so neither wall clock can shorten
+it. The memory is bounded at 16,384 handoffs: at the bound new handoffs are
+refused, and the platform delivers them again, instead of forgetting one early. Forge `queue/data` streams its chunks as
+`http.response.chunk` session events and is acknowledged when the stream ends:
+`NATIVE_RESPONSE` with the HTTP status after a normal end, `UNKNOWN` when it broke.
+ComfyUI's `prompt_id` is read from its response; the bridge maps it to the handoff
+to tag the prompt's WebSocket events and to end its model demand. Process-local
+memory and spool cleanup still need their own retention enforcement; this does
+not establish complete data deletion.
 
 ## Prompt model-demand identity
 
 Physical prompt execution owns a cloned command. Cancellation and model-demand
-tracking use a separate immutable identity: command, session, submission, native
-prompt and exact GPU runtime, plus the response-stream classification. Once
+tracking use a separate immutable identity: handoff, session and exact GPU
+runtime, plus the response-stream classification. Once
 execution hands off its acknowledgement, held demand retains that identity and
 its cancellation/settling tasks. It does not retain the command or prompt body.
 Queue probes capture only the queue reader, session/runtime and accepted prompt
@@ -193,7 +223,7 @@ publication only wakes joiners, which then await those originals. Stop closes
 matching admission until its join ends, requests each physical/demand cancellation
 outside the admission lock, and joins the original cancellation callbacks even
 when one fails. Concurrent Stops share those original callback tasks. A demand
-handoff during Stop and a held demand replaced by recovery both remain owned.
+handoff during Stop remains owned.
 Execution drops its command and callback references before joining cleanup, so a
 held cancellation callback need not retain completed prompt content. Once settling
 ends, the registry drops that task reference as well, since a faulted task can
@@ -209,7 +239,8 @@ or Stop. Controlled task/reference tests do not establish native queue cancellat
 transport delivery, complete data deletion or physical memory erasure.
 
 An accepted prompt keeps model demand while queued or while its queue cannot be
-read. Terminal withdrawal, Stop, replacement and shutdown keep their existing
+read. Its terminal event withdraws it once the bridge mapped its prompt id to the
+handoff; an unmapped prompt's demand ends when it leaves the queue. Terminal withdrawal, Stop, replacement and shutdown keep their existing
 ownership and joining rules. This change releases these runner-owned references;
 it does not erase native queues/history, framework buffers or operating-system
 memory, or establish a retention policy for every other copy.
