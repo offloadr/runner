@@ -1,6 +1,6 @@
 name: PR-Agent review
 
-# PR-Agent review with OpenAI gpt-6.1-sol, billed to the API organization that holds OPENAI_KEY.
+# PR-Agent review with OpenAI gpt-6.2-sol, billed to the API organization that holds OPENAI_KEY.
 # The shared workflow fails its review job when the review does not complete and its
 # findings job while a finding is open; see offloadr/pr-agent-review for how findings clear.
 
@@ -30,7 +30,7 @@ jobs:
     secrets:
       OPENAI_KEY: ${{ secrets.OPENAI_KEY }}
     with:
-      model: gpt-6.1-sol
+      model: gpt-6.2-sol
       # A public repository, so the review runs on GitHub-hosted runners rather than offloadr-runners.
       runs-on: ubuntu-latest
       instructions: |
