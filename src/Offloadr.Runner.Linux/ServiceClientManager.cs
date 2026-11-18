@@ -3312,6 +3312,7 @@ internal static partial class ServiceClientManager
 
         var clientId = string.IsNullOrWhiteSpace(prompt.ClientId) ? null : prompt.ClientId.Trim();
         var nativeInvocationStarted = false;
+        var streamIncomplete = false;
         // Prompt model demand outlives preparation; this work owns its lifetime.
         // Until the native request starts, cancelling this work (interrupt, Stop)
         // withdraws the demand. From then on the native outcome decides: an
@@ -3403,7 +3404,9 @@ internal static partial class ServiceClientManager
                         catch (Exception ex)
                         {
                             // Live fan-out loss cannot cancel an accepted consuming reader;
-                            // the acknowledgement still reports how the stream ended.
+                            // the acknowledgement still reports how the stream ended, and
+                            // that the page did not get all of it.
+                            streamIncomplete = true;
                             RunnerLog.Warning(nameof(ServiceClientManager), $"Prompt live relay unavailable ({ex.GetType().Name}).");
                         }
                     }
@@ -3431,6 +3434,10 @@ internal static partial class ServiceClientManager
             {
                 ack.BodyOmitted = true;
                 ack.DiagnosticCode = PromptProtocolCodes.NativeResponseBodyOmitted;
+            }
+            else if (streamIncomplete)
+            {
+                ack.DiagnosticCode = PromptProtocolCodes.StreamIncomplete;
             }
 
             if (clientId is not null && !string.IsNullOrWhiteSpace(acceptedPromptId))

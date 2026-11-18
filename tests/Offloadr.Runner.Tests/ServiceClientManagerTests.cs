@@ -2141,6 +2141,49 @@ public partial class ServiceClientManagerTests
         Assert.That(acknowledgement.ContentType, Is.EqualTo("text/event-stream"));
     }
 
+    [TestCase(false)]
+    [TestCase(true)]
+    public async Task HandleSubmitEditorActionAsync_ForForgeQueueData_AStreamWithAFailedChunkReportIsAcknowledgedIncomplete(bool reportFails)
+    {
+        var prompt = WithPromptIdentity(new Offloadr.Runner.V1.SubmitPromptCommand
+        {
+            SessionId = PromptSessionId,
+            HandoffId = PromptHandoffId,
+            EditorSid = "editor-1",
+            EditorRuntimeKind = "forge-neo",
+            Request = new() { Method = "GET", Path = "queue/data" }
+        });
+        var acknowledgements = new List<AcknowledgePromptResultRequest>();
+        var reports = 0;
+
+        await ServiceClientManager.HandleSubmitEditorActionAsync(
+            (ack, _) => { acknowledgements.Add(ack.Clone()); return Task.CompletedTask; },
+            (_, _) =>
+            {
+                // The first report fails, perhaps by timing out; it may still be published late.
+                return reportFails && reports++ == 0 ? throw new RpcException(new Status(StatusCode.DeadlineExceeded, "slow")) : Task.CompletedTask;
+            },
+            prompt, PromptRunnerId, PromptInstanceId, _ => true, GrantPromptForTestAsync,
+            (_, _, _, _) => Task.CompletedTask, _ => { },
+            (_, _, _, _) => Task.CompletedTask, (_, _, _, _, _) => Task.CompletedTask,
+            _ => () => Task.CompletedTask, (_, _) => { }, (_, _, _) => Task.FromResult(Task.CompletedTask),
+            async (_, stream, onNativeRequestAttempt, token) =>
+            {
+                onNativeRequestAttempt();
+                await stream!(ServiceClientManager.HttpResponseChunkEventType, System.Text.Encoding.UTF8.GetBytes("data: {\"msg\":\"progress\"}\n\n"), token);
+                await stream(ServiceClientManager.HttpResponseChunkEventType, System.Text.Encoding.UTF8.GetBytes("data: {\"msg\":\"process_completed\"}\n\n"), token);
+                return new SessionProcessManager.PromptSubmissionResult(true, 200, [], "Prompt submitted", "text/event-stream");
+            }, (_, _, _, _) => { }, CancellationToken.None);
+
+        var acknowledgement = acknowledgements.Single();
+        Assert.Multiple(() =>
+        {
+            Assert.That(acknowledgement.Outcome, Is.EqualTo(PromptResultOutcome.NativeResponse));
+            Assert.That(acknowledgement.StatusCode, Is.EqualTo(200));
+            Assert.That(acknowledgement.DiagnosticCode, Is.EqualTo(reportFails ? Offloadr.Common.V1.PromptProtocolCodes.StreamIncomplete : string.Empty));
+        });
+    }
+
     [TestCase(true)]
     [TestCase(false)]
     public async Task HandleSubmitEditorActionAsync_ForForgeQueueData_ABrokenStreamIsAcknowledgedUnknown(bool liveRelayFails)

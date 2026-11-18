@@ -11,4 +11,9 @@ public static class PromptProtocolCodes
     // A completed native response whose body exceeded the retained limit. The
     // status and content type are exact; the body is intentionally absent.
     public const string NativeResponseBodyOmitted = "prompt_native_response_body_omitted";
+
+    // A streamed native response one of whose chunk reports failed. The platform then
+    // ends the page's stream as cut rather than complete: a failed report may still be
+    // published late, after the chunks that followed it.
+    public const string StreamIncomplete = "prompt_stream_incomplete";
 }
