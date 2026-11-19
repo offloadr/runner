@@ -203,6 +203,9 @@ it. The memory is bounded at 16,384 handoffs: at the bound new handoffs are
 refused, and the platform delivers them again, instead of forgetting one early. Forge `queue/data` streams its chunks as
 `http.response.chunk` session events and is acknowledged when the stream ends:
 `NATIVE_RESPONSE` with the HTTP status after a normal end, `UNKNOWN` when it broke.
+A failed chunk report never stops the native reader, but the acknowledgement then
+carries diagnostic `prompt_stream_incomplete`, so the platform cuts the page's stream
+instead of ending it as complete (a report that timed out may still be published late).
 ComfyUI's `prompt_id` is read from its response; the bridge maps it to the handoff
 to tag the prompt's WebSocket events and to end its model demand. Process-local
 memory and spool cleanup still need their own retention enforcement; this does
