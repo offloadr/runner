@@ -1918,10 +1918,12 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                       && (status.Length > 0
                           || (previousState is { PlaceholderIsOwn: true } && previousState.PlaceholderVersion == found)
                           || previousState?.IsCopy(found) == true);
-            secureRoot.TruncateRegularFile(relativePath, state.CreatedUtc.UtcDateTime);
+            secureRoot.TruncateRegularFile(relativePath, state.CreatedUtc.UtcDateTime, out var asEmptied);
             var emptied = secureRoot.GetVersion(relativePath);
-            // Still that file: the session may have put another in its place meanwhile.
-            state.MarkPlaceholder(emptied, StoredArtifact.Of(state.CatalogArtifact), own && emptied?.Inode == before?.Inode);
+            // Still that file, as it was emptied here: the session may have put another in its
+            // place meanwhile, or opened and written this one (empty again, even).
+            state.MarkPlaceholder(emptied, StoredArtifact.Of(state.CatalogArtifact),
+                own && emptied is { } now && now == asEmptied && now.Inode == before?.Inode);
         }
 
         private static bool ShouldKeepExistingArtifactFile(
@@ -2139,6 +2141,8 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         // asks again.
                         if (replacing is { } placeholder && secureRoot.GetVersion(relativePath) is { } current && current.IsSameFileAs(placeholder))
                         {
+                            // The attempt moved its change time; the entry goes on recognizing it.
+                            state.RefreshVersion(current);
                             throw new PlaceholderInUseException();
                         }
 

@@ -375,7 +375,16 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
     /// sets its modification time. Returns false when it is missing.
     /// </summary>
     public bool TruncateRegularFile(string relativePath, DateTime? modifiedUtc)
+        => TruncateRegularFile(relativePath, modifiedUtc, out _);
+
+    /// <summary>
+    /// As <see cref="TruncateRegularFile(string, DateTime?)"/>; <paramref name="truncated"/> is the
+    /// version of the file as this call left it, read from that file itself, so the caller can
+    /// tell it from one written or put in its place right after.
+    /// </summary>
+    public bool TruncateRegularFile(string relativePath, DateTime? modifiedUtc, out SecureFileVersion? truncated)
     {
+        truncated = null;
         using var handle = OpenExistingRegularFile(relativePath, OWriteOnly, out _);
         if (handle is null)
         {
@@ -392,6 +401,7 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
             SetModifiedUtc(handle, modifiedUtc.Value);
         }
 
+        truncated = ReadVersion(handle, relativePath);
         return true;
     }
 
