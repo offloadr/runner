@@ -553,6 +553,111 @@ public partial class ArtifactUploadServiceTests
     }
 
     [Test]
+    public async Task ACopyReadBackStaysKnownWhenAListingFromBeforeItsArtifactAnswersLate()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = UploadIdentityPaths(root);
+            var path = Path.Combine(paths.OutputDirectory, "early.bin");
+            var stored = StoredOutput("early.bin", FirstStoredUtc, sizeBytes: 4);
+            var listing = new RunnerArtifactServiceListArtifactsResponse { Artifacts = { stored } };
+            var client = new FakeRunnerArtifactClient(listing) { ReadArtifactModifiedUtc = FirstStoredUtc };
+            await using var service = new ArtifactUploadService("secret", client, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            Assert.That(await service.TryEnsureArtifactAvailableAsync(path, highPriority: true, CancellationToken.None), Is.True);
+
+            // A listing read before the artifact existed answers only now: it lists nothing.
+            listing.Artifacts.Clear();
+            await service.RefreshSessionAsync("session-1");
+            await WaitForIdentityUploadsToFinishAsync(service);
+            Assert.That(client.UploadCount, Is.Zero, "a copy read back is never uploaded as new data");
+            Assert.That(await File.ReadAllBytesAsync(path), Is.EqualTo(new byte[] { 1, 2, 3, 4 }));
+
+            // The artifact was in fact deleted since.
+            listing.DeletedArtifacts.Add(stored);
+            await service.RefreshSessionAsync("session-1");
+            await WaitForIdentityUploadsToFinishAsync(service);
+
+            Assert.That(File.Exists(path), Is.False);
+            Assert.That(client.UploadCount, Is.Zero);
+            Assert.That(await service.StopSessionAsync("session-1"), Is.Zero);
+        }
+        finally { TryDelete(root); }
+    }
+
+    [Test]
+    public async Task ACopyWaitingToBeRemovedIsNotCountedAtStopWhateverTheCatalogLists()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = UploadIdentityPaths(root);
+            var path = Path.Combine(paths.OutputDirectory, "waiting.bin");
+            var stored = StoredOutput("waiting.bin", FirstStoredUtc.AddMinutes(30), sizeBytes: 4);
+            var listing = new RunnerArtifactServiceListArtifactsResponse { Artifacts = { stored } };
+            var client = new FakeRunnerArtifactClient(listing) { ReadArtifactModifiedUtc = FirstStoredUtc.AddMinutes(30) };
+            await using var service = new ArtifactUploadService("secret", client, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            Assert.That(await service.TryEnsureArtifactAvailableAsync(path, highPriority: true, CancellationToken.None), Is.True);
+
+            // An older listing's late answer leaves the entry listed with another artifact.
+            listing.Artifacts.Clear();
+            listing.Artifacts.Add(StoredOutput("waiting.bin", FirstStoredUtc, sizeBytes: 3));
+            await service.RefreshSessionAsync("session-1");
+            // Then the copy's artifact is named deleted while a process still has the file open.
+            listing.Artifacts.Clear();
+            listing.DeletedArtifacts.Add(stored);
+            await using (new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            {
+                await service.RefreshSessionAsync("session-1");
+                await WaitForIdentityUploadsToFinishAsync(service);
+            }
+
+            Assert.That(File.Exists(path), Is.True);
+            Assert.That(client.UploadCount, Is.Zero);
+            Assert.That(await service.StopSessionAsync("session-1"), Is.Zero, "a deleted output that only waits to be removed is not unsaved");
+        }
+        finally { TryDelete(root); }
+    }
+
+    [Test]
+    public async Task AnEmptyFileTheSessionMadeIsNotRemovedAsThePlaceholder()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = UploadIdentityPaths(root);
+            var path = Path.Combine(paths.OutputDirectory, "emptied.bin");
+            var stored = StoredOutput("emptied.bin", FirstStoredUtc);
+            var listing = new RunnerArtifactServiceListArtifactsResponse { Artifacts = { stored } };
+            var client = new FakeRunnerArtifactClient(listing);
+            await using var service = new ArtifactUploadService("secret", client, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            Assert.That(new FileInfo(path).Length, Is.Zero);
+
+            // The session replaces the placeholder with an empty file of its own.
+            File.Delete(path);
+            await File.WriteAllBytesAsync(path, []);
+            listing.Artifacts.Clear();
+            listing.DeletedArtifacts.Add(stored);
+            await service.SeedSessionAsync("session-1", "editor-1", "owner-1",
+                [new EditorArtifactMetadata { EditorSid = "editor-1", Filename = "emptied.bin", Type = "output", Subfolder = string.Empty }],
+                CancellationToken.None);
+            await service.RefreshSessionAsync("session-1");
+
+            Assert.That(File.Exists(path), Is.True, "only a placeholder the agent left is its own to remove");
+        }
+        finally { TryDelete(root); }
+    }
+
+    [Test]
     public async Task APlaceholderSeededByNameGoesWhenAnArtifactUnderThatNameWasDeleted()
     {
         LinuxTestPrerequisites.RequireLinux();

@@ -454,6 +454,47 @@ public class LinuxSecureDirectoryRootReplaceLinuxTests
     }
 
     [Test]
+    public void DeleteFileUnopened_RemovesTheExpectedFileWhenItsNameWasTakenWhileItWasOpened()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = CreateRoot();
+        try
+        {
+            var path = Path.Combine(root, "a.png");
+            File.WriteAllText(path, "uploaded");
+            using var secureRoot = new LinuxSecureDirectoryRoot(root);
+            var version = secureRoot.GetVersion("a.png")!.Value;
+
+            // A reader opens it just as it is moved aside, and something creates the name again.
+            Thread? opener = null;
+            string? read = null;
+            using var looked = new ManualResetEventSlim();
+            secureRoot.BeforeMoveAside = () =>
+            {
+                opener = new Thread(() =>
+                {
+                    looked.Set();
+                    read = File.ReadAllText(path);
+                });
+                opener.Start();
+                looked.Wait();
+                Thread.Sleep(300);
+            };
+            secureRoot.AfterMoveAside = () => File.WriteAllText(path, "created");
+
+            Assert.That(secureRoot.DeleteFileUnopened("a.png", version, out _), Is.True, "it cannot go back, and it is the file that was to go");
+            Assert.That(opener!.Join(TimeSpan.FromSeconds(10)), Is.True);
+            Assert.That(read, Is.EqualTo("uploaded").Or.EqualTo("created"), "the reader keeps whichever file it opened");
+            Assert.That(File.ReadAllText(path), Is.EqualTo("created"));
+            Assert.That(Directory.GetFiles(root), Has.Length.EqualTo(1), "no copy of the removed file is left under another name");
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Test]
     public void Publication_ReportsItsOwnFileNotWhateverTookTheDestinationSince()
     {
         LinuxTestPrerequisites.RequireLinux();

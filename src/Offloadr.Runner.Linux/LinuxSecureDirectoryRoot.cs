@@ -617,8 +617,9 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
     /// and no other process has it open or mapped. It is moved aside under a name of this agent's
     /// own and removed once it proves to be that file, with a write lease held across the move: an
     /// open that came meanwhile breaks the lease, and the file then goes back. Nothing but the
-    /// expected, unopened file is ever removed: if its name was taken while it was aside, the file
-    /// that cannot go back is kept beside it under a name of its own. What remains, as when a file is replaced while unopened, is an
+    /// expected file is ever removed: another file found in its place, which cannot go back
+    /// because the name was taken while it was aside, is kept beside the newcomer under a name
+    /// of its own. What remains, as when a file is replaced while unopened, is an
     /// open that had already looked the name up before the move and reaches the file only after
     /// the lease was last checked, a moment within that one system call. Returns whether the file
     /// was removed.
@@ -684,22 +685,30 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
 
             // The rename moved the file's change time, so the comparison leaves that out. A broken
             // lease means something opened it since the lease was taken.
-            if (ReadVersion(parent, aside, relativePath) is { } moved && moved.IsSameFileAs(expected) && lease.IsHeld)
+            var isExpected = ReadVersion(parent, aside, relativePath) is { } moved && moved.IsSameFileAs(expected);
+            if (isExpected && lease.IsHeld)
             {
                 _ = unlinkat(GetDescriptor(parent), aside, 0);
                 return true;
             }
 
-            // Back under its name, where an open the lease held expects it. What was moved aside
-            // may be a file the session put there after the check, or one a process is opening:
-            // it is not this agent's to remove. If the name was taken meanwhile, it is kept beside
-            // the newcomer under a name of its own, where the session and the uploader find it.
+            // Back under its name, where an open the lease held expects it. If the name was taken
+            // meanwhile: the expected file, unchanged, is the one that was to be removed, and goes
+            // (whoever opened it keeps what it opened). Any other is a file the session put there
+            // after the check, its own new data: it is kept beside the newcomer under a name of
+            // its own, where the session and the uploader find it.
             if (renameat2(GetDescriptor(parent), aside, GetDescriptor(parent), leafName, RenameNoReplace) != 0)
             {
                 var error = Marshal.GetLastPInvokeError();
                 if (error != AlreadyExists)
                 {
                     throw CreateException($"restoring '{relativePath}' after it was opened", error);
+                }
+
+                if (isExpected)
+                {
+                    _ = unlinkat(GetDescriptor(parent), aside, 0);
+                    return true;
                 }
 
                 var stem = Path.GetFileNameWithoutExtension(leafName);

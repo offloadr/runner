@@ -50,15 +50,22 @@ not what the control plane holds and is not counted as saved, but it is still th
 copy of what was stored, so it is not uploaded as new data, a deletion of that
 artifact removes it, and a listing of that artifact recognizes it again. A
 download records the version of the file the agent wrote, never of a file the
-session put in its place right after. A file the session wrote since, or
+session put in its place right after. A listing that gives nothing under the
+name of an output or temporary copy read back by this session (one read before
+the artifact existed, say) keeps the record too, where it used to forget the
+file and let the next scan upload it as new data; such a copy counts as unsaved
+until something lists it or names it deleted. A file the session wrote since, or
 the copy of another artifact stored under the same name, is the session's own
 data and stays. An empty placeholder holds no bytes of any artifact; it goes once
 nothing is listed under its name and the artifact deleted there is its own or one
-stored after it.
+stored after it. That is a placeholder the agent left itself; an empty file the
+session made at the path is treated as the placeholder, but it is the session's
+and is not removed.
 
 The copy is removed only while no process has it open or mapped, the way an
 evicted file is replaced. One in use stays, with its entry left as it was (so
 it is neither counted nor uploaded as new), and the next listing tries again.
+Stop does not count a file that the latest listing said to remove.
 The same residue remains as for eviction: an open that had already looked the
 name up before the file was moved aside and reaches it only after the last check. Inputs are not removed this way; they keep their own rules.
 
