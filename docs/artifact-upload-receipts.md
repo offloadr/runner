@@ -33,10 +33,11 @@ uploaded snapshot. An artifact the control plane now lists under the same name
 with other metadata was replaced by another upload, not deleted: what this
 session produced is no longer held, and it still counts as unsaved.
 Only a full listing of the editor's own artifacts establishes a deletion, and only
-one requested after the control plane stored the artifact and not older than the
-last listing that judged it. A prompt's seed names only the artifacts that prompt
-uses, and listings can answer out of order; neither turns an upload into a
-deleted one. Any list that names the artifact again counts as it being there.
+one requested after the control plane stored the artifact. A prompt's seed names
+only the artifacts that prompt uses, so it never does. Listings can answer in any
+order, so a replacement does not depend on it: once any list from after the
+artifact was stored names another upload under its name, the artifact was
+replaced for good, whichever answer arrives last.
 A rewritten file, replaced placeholder or other unacknowledged local file remains
 unsaved data. Counting does not delete or rewrite either local path.
 A remotely deleted artifact is not eligible for eviction into a download placeholder.

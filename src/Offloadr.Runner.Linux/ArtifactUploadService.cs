@@ -1415,11 +1415,12 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
         /// <summary>
         /// Decides, for each retained entry the control plane no longer holds, whether its
-        /// artifact was deleted there. Only a full listing of this editor's artifacts can say
-        /// so (<paramref name="listing"/> above zero), and only one requested after the control
-        /// plane stored the artifact and not older than the last one that judged it: a seed
-        /// names only some artifacts, and listings can answer out of order. Any list that
-        /// names the artifact again says it is there.
+        /// artifact was deleted there or replaced by another upload. Evidence counts only from
+        /// after the control plane stored the artifact: a full listing requested since
+        /// (<paramref name="listing"/> above zero), or a seed, whose age is unknown and which
+        /// can only say an artifact is there. Listings can answer in any order, so the two
+        /// kinds don't depend on it: a name seen again under other metadata means replaced, for
+        /// good; only a full listing of this editor's artifacts without the name means deleted.
         /// </summary>
         private void JudgeRemoteDeletions(HashSet<EditorArtifactMetadata> currentArtifacts, string editorSid, int listing)
         {
@@ -1430,28 +1431,22 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     if (state.HasRemoteArtifact)
                     {
                         state.DeletedRemotely = false;
+                        state.ReplacedRemotely = false;
                         continue;
                     }
 
                     var stored = state.CommittedArtifact ?? state.CatalogArtifact;
-                    if (stored is null) continue;
+                    if (stored is null || (listing != 0 && listing <= state.StoredAsOfListing)) continue;
                     if (IsListedUnderItsName(stored, currentArtifacts))
                     {
-                        // Replaced by another upload, not deleted. A seed can't be placed in the
-                        // order of listings, so it always counts: that only errs towards unsaved.
-                        if (listing == 0 || listing >= state.DeletionJudgedByListing)
-                        {
-                            state.DeletedRemotely = false;
-                            if (listing > 0) state.DeletionJudgedByListing = listing;
-                        }
-                        continue;
+                        state.ReplacedRemotely = true;
+                        state.DeletedRemotely = false;
                     }
-
-                    if (listing <= state.StoredAsOfListing || listing < state.DeletionJudgedByListing
-                        || !string.Equals(stored.EditorSid, editorSid, StringComparison.Ordinal))
-                        continue;
-                    state.DeletionJudgedByListing = listing;
-                    state.DeletedRemotely = true;
+                    else if (listing != 0 && !state.ReplacedRemotely
+                        && string.Equals(stored.EditorSid, editorSid, StringComparison.Ordinal))
+                    {
+                        state.DeletedRemotely = true;
+                    }
                 }
             }
         }
@@ -3069,8 +3064,11 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             /// <summary>How many full listings had been requested when the control plane stored or listed the artifact.</summary>
             public int StoredAsOfListing { get; set; }
 
-            /// <summary>The newest full listing that decided <see cref="DeletedRemotely"/>.</summary>
-            public int DeletionJudgedByListing { get; set; }
+            /// <summary>
+            /// True once the control plane listed another upload under the artifact's name: it was
+            /// replaced, and no later absence of the name makes that a deletion.
+            /// </summary>
+            public bool ReplacedRemotely { get; set; }
 
             /// <summary>
             /// True when <paramref name="version"/> is no loss if the session's data is removed: the

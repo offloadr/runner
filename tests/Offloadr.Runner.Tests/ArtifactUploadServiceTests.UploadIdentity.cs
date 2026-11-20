@@ -929,6 +929,59 @@ public partial class ArtifactUploadServiceTests
     }
 
     [Test]
+    public async Task AReplacementSeenInAnOlderListingsLateAnswerIsNotUndoneByANewerEmptyOne()
+    {
+        var root = CreateTempDirectory();
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
+        {
+            var paths = UploadIdentityPaths(root);
+            var path = Path.Combine(paths.OutputDirectory, "receipt.bin");
+            var catalog = new RunnerArtifactServiceListArtifactsResponse();
+            EditorArtifactMetadata? committed = null;
+            var client = new FakeRunnerArtifactClient(catalog)
+            {
+                RewriteUploadArtifact = artifact =>
+                {
+                    artifact.Filename = "RECEIPT.BIN";
+                    artifact.CreatedUtc = Timestamp.FromDateTime(DateTime.UtcNow);
+                    committed = artifact.Clone();
+                    return artifact;
+                },
+            };
+            await using var service = new ArtifactUploadService("secret", client, NullLogger<ArtifactUploadService>.Instance);
+            try
+            {
+                await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+                await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+                await File.WriteAllBytesAsync(path, [1, 2, 3]);
+                await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+                await WaitForIdentityUploadsToFinishAsync(service);
+                client.RejectAsRetiredUpload = true;
+                // An earlier listing is still on its way; it will read the catalog once another
+                // upload has taken the name.
+                var replacement = committed!.Clone();
+                replacement.CreatedUtc = Timestamp.FromDateTime(DateTime.UtcNow.AddSeconds(5));
+                client.DelayListResponse = async listed => { await release.Task; listed.Artifacts.Add(replacement); return listed; };
+                var listings = client.ListCallCount;
+                var earlier = service.SeedSessionAsync("session-1", "editor-1", "owner-1", null, CancellationToken.None);
+                for (var waited = 0; client.ListCallCount == listings && waited < 500; waited++) await Task.Delay(10);
+                Assert.That(client.ListCallCount, Is.EqualTo(listings + 1), "the earlier listing was requested");
+                client.DelayListResponse = null;
+                // A newer listing answers first, while the name is empty.
+                await service.SeedSessionAsync("session-1", "editor-1", "owner-1", null, CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(10));
+                release.TrySetResult();
+                await earlier.WaitAsync(TimeSpan.FromSeconds(10));
+                await WaitForIdentityUploadsToFinishAsync(service);
+                Assert.That(await service.StopSessionAsync("session-1"), Is.EqualTo(1),
+                    "the upload was replaced; the empty answer that arrived first does not make it a deletion");
+            }
+            finally { release.TrySetResult(); }
+        }
+        finally { TryDelete(root); }
+    }
+
+    [Test]
     public async Task RemoteReplacementCountsTheUploadAndItsCatalogAliasAsOneLostArtifact()
     {
         var root = CreateTempDirectory();
