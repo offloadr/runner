@@ -2499,6 +2499,13 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     // writer above all, would go on with an inode nobody can reach again.
                     if (!placeholder.CommitReplacing(version, whileUnopened: true))
                     {
+                        // Swapped back for a process that opened it: the same file, with only its
+                        // change time moved by the attempt, so the entry goes on recognizing it.
+                        if (secureRoot.GetVersion(relativePath) is { } back && back.IsSameFileAs(version))
+                        {
+                            state.RefreshVersion(back);
+                        }
+
                         continue;
                     }
 
