@@ -1071,6 +1071,51 @@ public partial class ArtifactUploadServiceTests
     }
 
     [Test]
+    public async Task AReplacementSeenByAListingThatDoesNotPruneIsStillRemembered()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = UploadIdentityPaths(root);
+            var path = Path.Combine(paths.OutputDirectory, "out.bin");
+            var catalog = new RunnerArtifactServiceListArtifactsResponse();
+            EditorArtifactMetadata? committed = null;
+            var client = new FakeRunnerArtifactClient(catalog)
+            {
+                RewriteUploadArtifact = artifact =>
+                {
+                    artifact.CreatedUtc = Timestamp.FromDateTime(DateTime.UtcNow);
+                    committed = artifact.Clone();
+                    return artifact;
+                },
+            };
+            await using var service = new ArtifactUploadService("secret", client, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            await File.WriteAllBytesAsync(path, [1, 2, 3]);
+            await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            await WaitForIdentityUploadsToFinishAsync(service);
+            client.RejectAsRetiredUpload = true;
+            // A prompt's seed names the upload, so the listing after it does not prune and the
+            // upload goes on reading as held. That listing shows another upload under its name.
+            var replacement = committed!.Clone();
+            replacement.Filename = "OUT.BIN";
+            replacement.CreatedUtc = Timestamp.FromDateTime(DateTime.UtcNow.AddSeconds(5));
+            catalog.Artifacts.Add(replacement);
+            await service.SeedSessionAsync("session-1", "editor-1", "owner-1", [committed.Clone()], CancellationToken.None);
+            await WaitForIdentityUploadsToFinishAsync(service);
+            // The replacement is deleted; a later listing names nothing.
+            catalog.Artifacts.Clear();
+            await service.SeedSessionAsync("session-1", "editor-1", "owner-1", null, CancellationToken.None);
+            await WaitForIdentityUploadsToFinishAsync(service);
+            Assert.That(await File.ReadAllBytesAsync(path), Is.EqualTo(new byte[] { 1, 2, 3 }));
+            Assert.That(await service.StopSessionAsync("session-1"), Is.EqualTo(1),
+                "the upload was replaced before the name was emptied; that is not a deletion of it");
+        }
+        finally { TryDelete(root); }
+    }
+
+    [Test]
     public async Task AListingRequestedBeforeAReplacementExistedSaysNothingAboutIt()
     {
         var root = CreateTempDirectory();

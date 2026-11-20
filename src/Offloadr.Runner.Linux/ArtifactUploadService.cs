@@ -1444,12 +1444,10 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             {
                 foreach (var state in _catalog.Values)
                 {
-                    if (state.HasRemoteArtifact)
-                    {
-                        state.DeletedRemotely = false;
-                        continue;
-                    }
-
+                    // An entry the control plane is taken to hold is not deleted, but this
+                    // listing may still show that it was replaced: a listing after a seed does
+                    // not prune, so the entry can go on reading as held.
+                    if (state.HasRemoteArtifact) state.DeletedRemotely = false;
                     var stored = state.CommittedArtifact ?? state.CatalogArtifact;
                     if (stored is null || listing <= state.StoredAsOfListing) continue;
                     if (currentArtifacts.Contains(stored))
@@ -1462,7 +1460,8 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         state.ReplacedRemotely = true;
                         state.DeletedRemotely = false;
                     }
-                    else if (!state.ReplacedRemotely && string.Equals(stored.EditorSid, editorSid, StringComparison.Ordinal))
+                    else if (!state.HasRemoteArtifact && !state.ReplacedRemotely
+                        && string.Equals(stored.EditorSid, editorSid, StringComparison.Ordinal))
                     {
                         state.DeletedRemotely = true;
                     }
