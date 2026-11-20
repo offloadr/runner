@@ -584,6 +584,9 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         private Task? _worker;
         private bool _activated;
         private bool _catalogLoaded;
+        // Full catalog listings requested so far. A listing can say an artifact was deleted only
+        // if it was requested after the control plane stored that artifact.
+        private int _listingsStarted;
         private long _droppedUploads;
         private int _rescanOwed;
         private long _lastDropWarningTicks = long.MinValue / 2;
@@ -1240,6 +1243,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     Requester = _readRequester.Clone()
                 };
 
+                var listing = Interlocked.Increment(ref _listingsStarted);
                 var response = await _artifactClient.ListArtifactsAsync(request, headers: _authHeaders, cancellationToken: token).ConfigureAwait(false);
                 var currentPaths = new HashSet<string>(StringComparer.Ordinal);
                 var currentArtifacts = new HashSet<EditorArtifactMetadata>();
@@ -1257,6 +1261,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 {
                     PruneCatalogEntries(currentPaths, currentArtifacts);
                 }
+                JudgeRemoteDeletions(currentArtifacts, editorSid, listing);
                 _catalogLoaded = true;
                 return true;
             }
@@ -1309,6 +1314,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             }
 
             PruneCatalogEntries(currentPaths, currentArtifacts);
+            JudgeRemoteDeletions(currentArtifacts, editorSid, listing: 0);
             return true;
         }
 
@@ -1349,6 +1355,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 state.UploadSnapshot = previousState?.UploadSnapshot;
                 state.CommittedArtifact = previousState?.CommittedArtifact;
                 state.CatalogArtifact = item.Clone();
+                state.StoredAsOfListing = Volatile.Read(ref _listingsStarted);
                 _catalog[normalized] = state;
 
                 try
@@ -1384,7 +1391,6 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                             // snapshot saved; another file is never selected by it.
                             state.HasRemoteArtifact = state.CommittedArtifact is { } committed
                                 && currentArtifacts.Contains(committed);
-                            state.DeletedRemotely = !state.HasRemoteArtifact && WasDeletedRemotely(state, currentArtifacts);
                         }
                         else if (state.PlaceholderVersion is { } placeholder
                             && IsLiveRegularFile(state.Type, path, placeholder))
@@ -1394,7 +1400,6 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                             // It is saved only while its committed receipt remains.
                             state.HasRemoteArtifact = state.CommittedArtifact is { } committed
                                 && currentArtifacts.Contains(committed);
-                            state.DeletedRemotely = !state.HasRemoteArtifact && WasDeletedRemotely(state, currentArtifacts);
                             if (!state.HasRemoteArtifact)
                             {
                                 state.UploadSnapshot = null;
@@ -1409,23 +1414,62 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         }
 
         /// <summary>
-        /// Whether the control plane stored this entry's artifact and no longer lists any artifact
-        /// under that name: it was deleted there. One listed under the name with other metadata
-        /// was replaced by another upload instead. The control plane's names ignore case, as an
-        /// upload's receipt does.
+        /// Decides, for each retained entry the control plane no longer holds, whether its
+        /// artifact was deleted there. Only a full listing of this editor's artifacts can say
+        /// so (<paramref name="listing"/> above zero), and only one requested after the control
+        /// plane stored the artifact and not older than the last one that judged it: a seed
+        /// names only some artifacts, and listings can answer out of order. Any list that
+        /// names the artifact again says it is there.
         /// </summary>
-        private static bool WasDeletedRemotely(RemoteArtifactState state, HashSet<EditorArtifactMetadata> currentArtifacts)
+        private void JudgeRemoteDeletions(HashSet<EditorArtifactMetadata> currentArtifacts, string editorSid, int listing)
         {
-            var stored = state.CommittedArtifact ?? state.CatalogArtifact;
-            if (stored is null) return false;
+            lock (_evictionGate)
+            {
+                foreach (var state in _catalog.Values)
+                {
+                    if (state.HasRemoteArtifact)
+                    {
+                        state.DeletedRemotely = false;
+                        continue;
+                    }
+
+                    var stored = state.CommittedArtifact ?? state.CatalogArtifact;
+                    if (stored is null) continue;
+                    if (IsListedUnderItsName(stored, currentArtifacts))
+                    {
+                        // Replaced by another upload, not deleted. A seed can't be placed in the
+                        // order of listings, so it always counts: that only errs towards unsaved.
+                        if (listing == 0 || listing >= state.DeletionJudgedByListing)
+                        {
+                            state.DeletedRemotely = false;
+                            if (listing > 0) state.DeletionJudgedByListing = listing;
+                        }
+                        continue;
+                    }
+
+                    if (listing <= state.StoredAsOfListing || listing < state.DeletionJudgedByListing
+                        || !string.Equals(stored.EditorSid, editorSid, StringComparison.Ordinal))
+                        continue;
+                    state.DeletionJudgedByListing = listing;
+                    state.DeletedRemotely = true;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Whether the control plane lists an artifact under the name it stored this one as. Its
+        /// names ignore case, as an upload's receipt does.
+        /// </summary>
+        private static bool IsListedUnderItsName(EditorArtifactMetadata stored, HashSet<EditorArtifactMetadata> currentArtifacts)
+        {
             foreach (var current in currentArtifacts)
             {
                 if (string.Equals(current.Type, stored.Type, StringComparison.OrdinalIgnoreCase)
                     && string.Equals(current.Subfolder, stored.Subfolder, StringComparison.OrdinalIgnoreCase)
                     && string.Equals(current.Filename, stored.Filename, StringComparison.OrdinalIgnoreCase))
-                    return false;
+                    return true;
             }
-            return true;
+            return false;
         }
 
         private bool TryGetCatalogEntry(string path, out RemoteArtifactState? state)
@@ -2707,6 +2751,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                             remote.UploadSnapshot = snapshot;
                             remote.CommittedArtifact = response.Artifact.Clone();
                             remote.CatalogArtifact = remote.CommittedArtifact;
+                            remote.StoredAsOfListing = Volatile.Read(ref _listingsStarted);
                             _catalog[remote.LocalPath] = remote;
                             _uncertainUploads.TryRemove(fullPath, out _);
                             _pending[fullPath].Completed = !changedDuringUpload;
@@ -3020,6 +3065,12 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             /// any version: it was deleted there, not replaced by another upload.
             /// </summary>
             public bool DeletedRemotely { get; set; }
+
+            /// <summary>How many full listings had been requested when the control plane stored or listed the artifact.</summary>
+            public int StoredAsOfListing { get; set; }
+
+            /// <summary>The newest full listing that decided <see cref="DeletedRemotely"/>.</summary>
+            public int DeletionJudgedByListing { get; set; }
 
             /// <summary>
             /// True when <paramref name="version"/> is no loss if the session's data is removed: the

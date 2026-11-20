@@ -825,6 +825,109 @@ public partial class ArtifactUploadServiceTests
         finally { TryDelete(root); }
     }
 
+    // A prompt's seed names only the artifacts that prompt uses. Being absent from it proves
+    // nothing; the full listing that follows decides whether the upload was deleted or replaced.
+    [TestCase("deleted", 0)]
+    [TestCase("replaced", 1)]
+    public async Task APartialSeedLeavesTheFullListingToDecideWhetherAnUploadWasDeleted(string remote, int expectedUnsaved)
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = UploadIdentityPaths(root);
+            var path = Path.Combine(paths.OutputDirectory, "receipt.bin");
+            var catalog = new RunnerArtifactServiceListArtifactsResponse();
+            EditorArtifactMetadata? committed = null;
+            var client = new FakeRunnerArtifactClient(catalog)
+            {
+                RewriteUploadArtifact = artifact =>
+                {
+                    artifact.Filename = "RECEIPT.BIN";
+                    artifact.CreatedUtc = Timestamp.FromDateTime(DateTime.UtcNow);
+                    committed = artifact.Clone();
+                    return artifact;
+                },
+            };
+            await using var service = new ArtifactUploadService("secret", client, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            await File.WriteAllBytesAsync(path, [1, 2, 3]);
+            await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            await WaitForIdentityUploadsToFinishAsync(service);
+            var unrelated = committed!.Clone();
+            unrelated.Filename = "unrelated.bin";
+            catalog.Artifacts.Add(unrelated.Clone());
+            if (remote == "replaced")
+            {
+                var replacement = committed.Clone();
+                replacement.CreatedUtc = Timestamp.FromDateTime(DateTime.UtcNow.AddSeconds(5));
+                catalog.Artifacts.Add(replacement);
+            }
+            client.RejectAsRetiredUpload = true;
+            await service.SeedSessionAsync("session-1", "editor-1", "owner-1", [unrelated], CancellationToken.None);
+            await WaitForIdentityUploadsToFinishAsync(service);
+            Assert.That(await File.ReadAllBytesAsync(path), Is.EqualTo(new byte[] { 1, 2, 3 }));
+            Assert.That(await service.StopSessionAsync("session-1"), Is.EqualTo(expectedUnsaved));
+        }
+        finally { TryDelete(root); }
+    }
+
+    [Test]
+    public async Task AListingRequestedBeforeAnUploadWasStoredCannotSayItWasDeleted()
+    {
+        var root = CreateTempDirectory();
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
+        {
+            var paths = UploadIdentityPaths(root);
+            var path = Path.Combine(paths.OutputDirectory, "receipt.bin");
+            var catalog = new RunnerArtifactServiceListArtifactsResponse();
+            EditorArtifactMetadata? committed = null;
+            var client = new FakeRunnerArtifactClient(catalog)
+            {
+                RewriteUploadArtifact = artifact =>
+                {
+                    artifact.Filename = "RECEIPT.BIN";
+                    artifact.CreatedUtc = Timestamp.FromDateTime(DateTime.UtcNow);
+                    committed = artifact.Clone();
+                    return artifact;
+                },
+            };
+            await using var service = new ArtifactUploadService("secret", client, NullLogger<ArtifactUploadService>.Instance);
+            try
+            {
+                await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+                await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+                // A listing is requested while the catalog is empty, and answered late.
+                client.DelayListResponse = async listed => { await release.Task; return listed; };
+                var listings = client.ListCallCount;
+                var stale = service.SeedSessionAsync("session-1", "editor-1", "owner-1", null, CancellationToken.None);
+                for (var waited = 0; client.ListCallCount == listings && waited < 500; waited++) await Task.Delay(10);
+                Assert.That(client.ListCallCount, Is.EqualTo(listings + 1), "the delayed listing was requested");
+                client.DelayListResponse = null;
+                await File.WriteAllBytesAsync(path, [1, 2, 3]);
+                await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+                await WaitForIdentityUploadsToFinishAsync(service);
+                // The upload is then replaced remotely, and a newer listing says so.
+                var replacement = committed!.Clone();
+                replacement.CreatedUtc = Timestamp.FromDateTime(DateTime.UtcNow.AddSeconds(5));
+                catalog.Artifacts.Add(replacement);
+                client.RejectAsRetiredUpload = true;
+                await service.SeedSessionAsync("session-1", "editor-1", "owner-1", null, CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(10));
+                // The old, empty answer arrives last: it names nothing, but it was asked before the upload existed.
+                release.TrySetResult();
+                await stale.WaitAsync(TimeSpan.FromSeconds(10));
+                await WaitForIdentityUploadsToFinishAsync(service);
+                // The replaced upload still counts. The stale answer also no longer lists the
+                // replacement, so the placeholder left for that counts too, as it always did.
+                Assert.That(await service.StopSessionAsync("session-1"), Is.EqualTo(2),
+                    "an answer older than the upload can't turn its replacement into a deletion");
+            }
+            finally { release.TrySetResult(); }
+        }
+        finally { TryDelete(root); }
+    }
+
     [Test]
     public async Task RemoteReplacementCountsTheUploadAndItsCatalogAliasAsOneLostArtifact()
     {
