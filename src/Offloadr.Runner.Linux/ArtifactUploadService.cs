@@ -1346,8 +1346,10 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             var seeded = new SeededCatalog(new(StringComparer.Ordinal), []);
             foreach (var item in artifacts)
             {
-                var appliedPath = ApplyCatalogEntry(item, editorSid);
-                if (!string.IsNullOrWhiteSpace(appliedPath))
+                var appliedPath = ApplyCatalogEntry(item, editorSid, leave: null, out var leftKnownCopy);
+                // A name tells an entry that already holds a copy nothing new, and is no word that
+                // the control plane still holds it: the listing judges such an entry as any other.
+                if (!string.IsNullOrWhiteSpace(appliedPath) && !leftKnownCopy)
                 {
                     seeded.Paths.Add(appliedPath);
                     seeded.Artifacts.Add(item);
@@ -1358,7 +1360,11 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         }
 
         private string? ApplyCatalogEntry(EditorArtifactMetadata item, string activeEditorSid, HashSet<string>? leave = null)
+            => ApplyCatalogEntry(item, activeEditorSid, leave, out _);
+
+        private string? ApplyCatalogEntry(EditorArtifactMetadata item, string activeEditorSid, HashSet<string>? leave, out bool leftKnownCopy)
         {
+            leftKnownCopy = false;
             var localPath = ResolveLocalPath(item.Type, item.Subfolder, item.Filename);
             if (localPath is null)
             {
@@ -1395,6 +1401,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 if (previousState is not null && IsNameOnly(item) && !string.Equals(item.Type, "input", StringComparison.OrdinalIgnoreCase)
                     && KnowsItsFile(previousState))
                 {
+                    leftKnownCopy = previousState.PlaceholderVersion is null;
                     return normalized;
                 }
 

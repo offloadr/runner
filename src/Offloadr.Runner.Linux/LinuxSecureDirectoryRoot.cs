@@ -635,7 +635,8 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
 
     /// <summary>
     /// Removes the file at <paramref name="relativePath"/> only when it is <paramref name="expected"/>
-    /// and no other process has it open or mapped. It is moved aside under a name of this agent's
+    /// and no other process has it open or mapped (as far as a lease tells: on overlayfs a mapping
+    /// kept after its descriptor was closed does not hold a lease off). It is moved aside under a name of this agent's
     /// own and removed once it proves to be that file, with a write lease held across the move: an
     /// open that came meanwhile breaks the lease, and the file then goes back. Nothing but the
     /// expected, unopened file is ever removed: a file created under the name while it was aside

@@ -72,10 +72,14 @@ evicted file is replaced. One in use stays, with its entry left as it was (so
 it is neither counted nor uploaded as new), and the next listing tries again.
 Stop does not count a file that the latest listing said to remove.
 The same residue remains as for eviction: an open that had already looked the
-name up before the file was moved aside and reaches it only after the last check. Inputs are not removed this way; they keep their own rules.
+name up before the file was moved aside and reaches it only after the last check;
+and, on overlayfs, a writable mapping kept after its descriptor was closed, which
+does not hold a lease off. Inputs are not removed this way; they keep their own rules.
 
-A seed never prunes the catalog. Its entries stand beside those of the listing
-that follows, and only that listing decides which artifacts are no longer there.
+A seed never prunes the catalog. The entries it adds stand beside those of the
+listing that follows, and only that listing decides which artifacts are no longer
+there. An entry that already holds a copy is not shielded by a seed that names
+it: the listing judges it as any other.
 When catalog casing leaves an additional agent-created placeholder, Stop counts
 one lost artifact for the exact retained catalog record shared with its uploaded
 snapshot or evicted placeholder. A rewritten file, replaced placeholder or other

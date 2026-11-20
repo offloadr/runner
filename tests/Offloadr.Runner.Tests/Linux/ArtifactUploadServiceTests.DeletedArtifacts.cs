@@ -410,6 +410,49 @@ public partial class ArtifactUploadServiceTests
     }
 
     [Test]
+    public async Task ASeedNamingACopyDoesNotShieldItFromTheListing()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = CreateEvictionPaths(root, sealedSession: true);
+            var path = Path.Combine(paths.OutputDirectory, "a.bin");
+            var listing = new RunnerArtifactServiceListArtifactsResponse();
+            // The control plane spells the name its own way, as an earlier upload did.
+            var stored = 0;
+            var client = new FakeRunnerArtifactClient(listing)
+            {
+                RewriteUploadArtifact = artifact =>
+                {
+                    artifact.Filename = "A.bin";
+                    artifact.CreatedUtc = Timestamp.FromDateTime(FirstStoredUtc.AddMinutes(stored++));
+                    return artifact;
+                },
+            };
+            await using var service = new ArtifactUploadService("secret", client, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            await File.WriteAllBytesAsync(path, [1, 2, 3]);
+            await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            await WaitForIdentityUploadsToFinishAsync(service);
+
+            // Another upload replaced it under that spelling; a prompt names the local file.
+            listing.Artifacts.Add(StoredOutput("A.bin", FirstStoredUtc.AddHours(1), sizeBytes: 5));
+            await service.SeedSessionAsync("session-1", "editor-1", "owner-1",
+                [new EditorArtifactMetadata { EditorSid = "editor-1", Filename = "a.bin", Type = "output", Subfolder = string.Empty }],
+                CancellationToken.None);
+            await WaitForIdentityUploadsToFinishAsync(service);
+
+            Assert.That(service.EvictUploadedArtifacts("session-1", long.MaxValue, TimeSpan.Zero), Is.Zero,
+                "bytes the control plane no longer holds are never replaced by a placeholder");
+            Assert.That(await File.ReadAllBytesAsync(path), Is.EqualTo(new byte[] { 1, 2, 3 }));
+            Assert.That(await service.StopSessionAsync("session-1"), Is.EqualTo(1));
+        }
+        finally { TryDelete(root); }
+    }
+
+    [Test]
     public async Task ASeedByNameLeavesAPlaceholderStandingForItsArtifact()
     {
         LinuxTestPrerequisites.RequireLinux();
