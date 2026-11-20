@@ -2053,6 +2053,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         {
             var unsaved = 0;
             var unsendable = new HashSet<(ulong Device, ulong Inode)>();
+            var lostArtifacts = new HashSet<EditorArtifactMetadata>();
             foreach (var (type, root) in new[] { ("output", _paths.OutputDirectory), ("temp", _paths.TempDirectory) })
             {
                 if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root))
@@ -2091,7 +2092,13 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         // empty rewrite by the editor is neither.
                         if (!_catalog.TryGetValue(NormalizePath(file), out var state) || !state.IsSavedAs(version))
                         {
-                            unsaved++;
+                            // Catalog spelling can leave a second, agent-created
+                            // placeholder for one uploaded snapshot. Count that
+                            // lost artifact once, while an editor rewrite remains
+                            // independent unsaved data even at the same path.
+                            var artifact = state is not null && state.PlaceholderVersion == version ? state.CatalogArtifact
+                                : state is not null && state.UploadSnapshot is not null && state.MatchesLocalFile(version) ? state.CommittedArtifact : null;
+                            if (artifact is null || lostArtifacts.Add(artifact)) unsaved++;
                         }
                     }
                 }

@@ -826,6 +826,53 @@ public partial class ArtifactUploadServiceTests
     }
 
     [Test]
+    public async Task RemoteReplacementCountsTheUploadAndItsCatalogAliasAsOneLostArtifact()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = UploadIdentityPaths(root);
+            var path = Path.Combine(paths.OutputDirectory, "receipt.bin");
+            var canonical = Path.Combine(paths.OutputDirectory, "RECEIPT.BIN");
+            var catalog = new RunnerArtifactServiceListArtifactsResponse();
+            EditorArtifactMetadata? committed = null;
+            var client = new FakeRunnerArtifactClient(catalog)
+            {
+                RewriteUploadArtifact = artifact =>
+                {
+                    artifact.Filename = "RECEIPT.BIN";
+                    artifact.CreatedUtc = Timestamp.FromDateTime(DateTime.UtcNow);
+                    committed = artifact.Clone();
+                    return artifact;
+                },
+            };
+            await using var service = new ArtifactUploadService("secret", client, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            await File.WriteAllBytesAsync(path, [1, 2, 3]);
+            await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            await WaitForIdentityUploadsToFinishAsync(service);
+            // The catalog's spelling leaves the agent's placeholder beside the uploaded file.
+            catalog.Artifacts.Add(committed!.Clone());
+            await service.SeedSessionAsync("session-1", "editor-1", "owner-1", null, CancellationToken.None);
+            await WaitForIdentityUploadsToFinishAsync(service);
+            Assert.That(new FileInfo(canonical).Length, Is.Zero);
+            // Another upload replaces it under a third spelling of the same name.
+            var replacement = committed.Clone();
+            replacement.Filename = "Receipt.bin";
+            replacement.CreatedUtc = Timestamp.FromDateTime(DateTime.UtcNow.AddSeconds(5));
+            catalog.Artifacts.Clear();
+            catalog.Artifacts.Add(replacement);
+            client.RejectAsRetiredUpload = true;
+            await service.SeedSessionAsync("session-1", "editor-1", "owner-1", null, CancellationToken.None);
+            await WaitForIdentityUploadsToFinishAsync(service);
+            Assert.That(await service.StopSessionAsync("session-1"), Is.EqualTo(1),
+                "the uploaded file and the agent's placeholder for it stand for one replaced artifact");
+        }
+        finally { TryDelete(root); }
+    }
+
+    [Test]
     public async Task RemoteReplacementUnderAnotherSpellingStillCountsTheLocalBytesUnsaved()
     {
         var root = CreateTempDirectory();
