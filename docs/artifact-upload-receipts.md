@@ -62,7 +62,10 @@ data and stays. An empty placeholder holds no bytes of any artifact; it goes onc
 nothing is listed under its name and the artifact deleted there is its own or one
 stored after it. That is a placeholder the agent left itself; an empty file the
 session made at the path is treated as the placeholder, but it is the session's
-and is not removed.
+and is not removed. The agent tells its own by the file it created or emptied
+and the time it gave it; a write by the session that leaves the file empty again
+in the very moment the agent empties and dates it cannot be told apart, and no
+bytes are at stake then.
 
 The copy is removed only while no process has it open or mapped, the way an
 evicted file is replaced. One in use stays, with its entry left as it was (so

@@ -1918,18 +1918,12 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                       && (status.Length > 0
                           || (previousState is { PlaceholderIsOwn: true } && previousState.PlaceholderVersion == found)
                           || previousState?.IsCopy(found) == true);
-            // Its own placeholder, already as this entry would leave it: nothing to do, and so no
-            // moment in which a write by the session could be taken for the agent's.
-            if (own && status.Length == 0 && before is { } asItIs && IsAsTheAgentLeftIt(asItIs, state))
-            {
-                state.MarkPlaceholder(asItIs, StoredArtifact.Of(state.CatalogArtifact), own: true);
-                return;
-            }
-
             secureRoot.TruncateRegularFile(relativePath, state.CreatedUtc.UtcDateTime, out var asEmptied);
             var emptied = secureRoot.GetVersion(relativePath);
             // Still that file, as it was emptied here: the session may have put another in its
-            // place meanwhile, or opened and written this one (empty again, even).
+            // place meanwhile, or opened and written this one (empty again, even). What cannot be
+            // told apart is a write by the session that leaves the file empty again within the
+            // agent's own two steps of emptying and dating it; no bytes are at stake then.
             state.MarkPlaceholder(emptied, StoredArtifact.Of(state.CatalogArtifact),
                 own && emptied is { } now && now == asEmptied && now.Inode == before?.Inode && IsAsTheAgentLeftIt(now, state));
         }
