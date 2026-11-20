@@ -1257,11 +1257,16 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     }
                 }
 
-                if (pruneMissing)
+                // One step: another listing's answer must not prune between this one's pruning
+                // and its judgement of what it pruned.
+                lock (_evictionGate)
                 {
-                    PruneCatalogEntries(currentPaths, currentArtifacts);
+                    if (pruneMissing)
+                    {
+                        PruneCatalogEntries(currentPaths, currentArtifacts);
+                    }
+                    JudgeRemoteDeletions(currentArtifacts, editorSid, listing);
                 }
-                JudgeRemoteDeletions(currentArtifacts, editorSid, listing);
                 _catalogLoaded = true;
                 return true;
             }
@@ -1357,7 +1362,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 // The same upload or listed artifact keeps what was learned about it: listing it
                 // again must not move the point after which a listing is evidence.
                 if (previousState is not null
-                    && (previousState.CommittedArtifact is not null || previousState.CatalogArtifact?.Equals(item) == true))
+                    && (previousState.CommittedArtifact?.Equals(item) == true || previousState.CatalogArtifact?.Equals(item) == true))
                 {
                     state.StoredAsOfListing = previousState.StoredAsOfListing;
                     state.ReplacedRemotely = previousState.ReplacedRemotely;
@@ -1447,7 +1452,12 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
                     var stored = state.CommittedArtifact ?? state.CatalogArtifact;
                     if (stored is null || listing <= state.StoredAsOfListing) continue;
-                    if (IsListedUnderItsName(stored, currentArtifacts))
+                    if (currentArtifacts.Contains(stored))
+                    {
+                        // This listing still holds the artifact itself; another answer pruned it.
+                        state.DeletedRemotely = false;
+                    }
+                    else if (IsListedUnderItsName(stored, currentArtifacts))
                     {
                         state.ReplacedRemotely = true;
                         state.DeletedRemotely = false;

@@ -829,6 +829,7 @@ public partial class ArtifactUploadServiceTests
     // nothing; the full listing that follows decides whether the upload was deleted or replaced.
     [TestCase("deleted", 0)]
     [TestCase("replaced", 1)]
+    [TestCase("listed-then-deleted", 0)]
     public async Task APartialSeedLeavesTheFullListingToDecideWhetherAnUploadWasDeleted(string remote, int expectedUnsaved)
     {
         var root = CreateTempDirectory();
@@ -864,6 +865,16 @@ public partial class ArtifactUploadServiceTests
                 catalog.Artifacts.Add(replacement);
             }
             client.RejectAsRetiredUpload = true;
+            if (remote == "listed-then-deleted")
+            {
+                // A first prompt's listing still names the upload itself: that is no replacement,
+                // and it must not stop a later listing from recognizing the deletion.
+                catalog.Artifacts.Add(committed.Clone());
+                await service.SeedSessionAsync("session-1", "editor-1", "owner-1", [unrelated], CancellationToken.None);
+                await WaitForIdentityUploadsToFinishAsync(service);
+                catalog.Artifacts.Clear();
+                catalog.Artifacts.Add(unrelated.Clone());
+            }
             await service.SeedSessionAsync("session-1", "editor-1", "owner-1", [unrelated], CancellationToken.None);
             await WaitForIdentityUploadsToFinishAsync(service);
             Assert.That(await File.ReadAllBytesAsync(path), Is.EqualTo(new byte[] { 1, 2, 3 }));
@@ -1055,6 +1066,59 @@ public partial class ArtifactUploadServiceTests
                 releaseOriginal.TrySetResult();
                 releaseReplacement.TrySetResult();
             }
+        }
+        finally { TryDelete(root); }
+    }
+
+    [Test]
+    public async Task AListingRequestedBeforeAReplacementExistedSaysNothingAboutIt()
+    {
+        var root = CreateTempDirectory();
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
+        {
+            var paths = CreateEvictionPaths(root, sealedSession: true);
+            var path = Path.Combine(paths.OutputDirectory, "evicted.bin");
+            var catalog = new RunnerArtifactServiceListArtifactsResponse();
+            EditorArtifactMetadata? committed = null;
+            var client = new FakeRunnerArtifactClient(catalog)
+            {
+                RewriteUploadArtifact = artifact =>
+                {
+                    artifact.CreatedUtc = Timestamp.FromDateTime(DateTime.UtcNow);
+                    committed = artifact.Clone();
+                    return artifact;
+                },
+            };
+            await using var service = new ArtifactUploadService("secret", client, NullLogger<ArtifactUploadService>.Instance);
+            try
+            {
+                await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+                await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+                await File.WriteAllBytesAsync(path, [1, 2, 3]);
+                await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+                await WaitForIdentityUploadsToFinishAsync(service);
+                Assert.That(await EvictWhenRecordedAsync(service, "session-1"), Is.EqualTo(3));
+                // The upload is deleted; a listing reads the empty catalog and answers late.
+                client.DelayListResponse = async listed => { await release.Task; return listed; };
+                var listings = client.ListCallCount;
+                var stale = service.SeedSessionAsync("session-1", "editor-1", "owner-1", null, CancellationToken.None);
+                for (var waited = 0; client.ListCallCount == listings && waited < 500; waited++) await Task.Delay(10);
+                Assert.That(client.ListCallCount, Is.EqualTo(listings + 1), "the listing was requested");
+                client.DelayListResponse = null;
+                // Another artifact then takes the same name, and a newer listing names it.
+                var replacement = committed!.Clone();
+                replacement.CreatedUtc = Timestamp.FromDateTime(DateTime.UtcNow.AddSeconds(5));
+                catalog.Artifacts.Add(replacement);
+                await service.SeedSessionAsync("session-1", "editor-1", "owner-1", null, CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(10));
+                release.TrySetResult();
+                await stale.WaitAsync(TimeSpan.FromSeconds(10));
+                await WaitForIdentityUploadsToFinishAsync(service);
+                // The late, empty answer drops the newer artifact's listing, as it always did, so
+                // its placeholder counts; it is not evidence that the newer artifact was deleted.
+                Assert.That(await service.StopSessionAsync("session-1"), Is.EqualTo(1));
+            }
+            finally { release.TrySetResult(); }
         }
         finally { TryDelete(root); }
     }
