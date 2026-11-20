@@ -584,9 +584,6 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         private Task? _worker;
         private bool _activated;
         private bool _catalogLoaded;
-        // The control plane's time of the first listing this session received. Later listings ask
-        // it to name the artifacts deleted since then: nothing this session holds was deleted before.
-        private Timestamp? _deletedSince;
         private long _droppedUploads;
         private int _rescanOwed;
         private long _lastDropWarningTicks = long.MinValue / 2;
@@ -1240,8 +1237,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 var request = new RunnerArtifactServiceListArtifactsRequest
                 {
                     EditorSid = editorSid,
-                    Requester = _readRequester.Clone(),
-                    DeletedSince = Volatile.Read(ref _deletedSince)
+                    Requester = _readRequester.Clone()
                 };
 
                 var response = await _artifactClient.ListArtifactsAsync(request, headers: _authHeaders, cancellationToken: token).ConfigureAwait(false);
@@ -1257,17 +1253,16 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     }
                 }
 
-                // One step: another listing's answer must not prune between this one's pruning
-                // and what it says was deleted.
+                // One step, deletions first: pruning keeps a downloaded file whose artifact the
+                // listing says was deleted, and another listing's answer must not come between.
                 lock (_evictionGate)
                 {
+                    NoteRemoteDeletions(response);
                     if (pruneMissing)
                     {
                         PruneCatalogEntries(currentPaths, currentArtifacts);
                     }
-                    NoteRemoteDeletions(response);
                 }
-                if (response.ListedUtc is not null) Interlocked.CompareExchange(ref _deletedSince, response.ListedUtc, null);
                 _catalogLoaded = true;
                 return true;
             }
@@ -1361,7 +1356,8 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 state.CommittedArtifact = previousState?.CommittedArtifact;
                 state.CatalogArtifact = item.Clone();
                 // The same artifact listed again keeps what a listing said about its deletion.
-                if (previousState is not null && (previousState.CommittedArtifact ?? previousState.CatalogArtifact)?.Equals(item) == true)
+                if (previousState is not null
+                    && (previousState.CommittedArtifact?.Equals(item) == true || previousState.CatalogArtifact?.Equals(item) == true))
                 {
                     state.DeletedRemotely = previousState.DeletedRemotely;
                     state.DeletionListedUtc = previousState.DeletionListedUtc;
@@ -1416,6 +1412,13 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                                 state.CommittedArtifact = null;
                             }
                         }
+                        else if (state.DeletedRemotely && state.Downloaded && state.LocalVersion is { } deletedVersion
+                            && IsLiveRegularFile(state.Type, path, deletedVersion))
+                        {
+                            // A downloaded file whose artifact the control plane deleted stays
+                            // known: it is neither a loss of this session nor new user data.
+                            state.HasRemoteArtifact = false;
+                        }
                         else
                             _catalog.TryRemove(path, out _);
                     }
@@ -1424,11 +1427,12 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         }
 
         /// <summary>
-        /// Records what a listing says the control plane deleted. It names each deleted artifact
-        /// as it was stored, so an entry is deleted only if exactly its artifact is named: one
-        /// replaced by another upload is not. A listing that names the artifact itself again
-        /// (it was restored) takes that back. Listings can answer out of order; each entry
-        /// follows the one the control plane read last.
+        /// Records what a listing says the control plane deleted since the session began. It
+        /// names each deleted artifact as it was stored, so an entry is deleted only if exactly
+        /// an artifact it stands for is named (its upload's receipt, or the catalog artifact its
+        /// local file was recognized as): one replaced by another upload is not. A listing that
+        /// names such an artifact itself again (it was restored) takes that back. Listings can
+        /// answer out of order; each entry follows the one the control plane read last.
         /// </summary>
         private void NoteRemoteDeletions(RunnerArtifactServiceListArtifactsResponse listing)
         {
@@ -1436,20 +1440,22 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             var listedUtc = listing.ListedUtc.ToDateTimeOffset();
             var deleted = new HashSet<EditorArtifactMetadata>(listing.DeletedArtifacts);
             var listed = new HashSet<EditorArtifactMetadata>(listing.Artifacts);
+            bool Names(HashSet<EditorArtifactMetadata> set, RemoteArtifactState state)
+                => (state.CommittedArtifact is { } committed && set.Contains(committed))
+                    || (state.CatalogArtifact is { } catalog && set.Contains(catalog));
             lock (_evictionGate)
             {
                 foreach (var state in _catalog.Values)
                 {
-                    var stored = state.CommittedArtifact ?? state.CatalogArtifact;
-                    if (stored is null || listedUtc < state.DeletionListedUtc) continue;
-                    if (deleted.Contains(stored))
-                    {
-                        state.DeletedRemotely = true;
-                        state.DeletionListedUtc = listedUtc;
-                    }
-                    else if (listed.Contains(stored))
+                    if (listedUtc < state.DeletionListedUtc) continue;
+                    if (Names(listed, state))
                     {
                         state.DeletedRemotely = false;
+                        state.DeletionListedUtc = listedUtc;
+                    }
+                    else if (Names(deleted, state))
+                    {
+                        state.DeletedRemotely = true;
                         state.DeletionListedUtc = listedUtc;
                     }
                 }
@@ -1940,6 +1946,14 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
                     var published = secureRoot.GetVersion(relativePath);
                     state.MarkDownloaded(published);
+                    // These bytes were just read from the control plane, so they are not those
+                    // of an artifact it deleted. Listings no longer judge this entry; the next
+                    // one that lists the path brings its own.
+                    if (state.DeletedRemotely)
+                    {
+                        state.DeletedRemotely = false;
+                        state.DeletionListedUtc = DateTimeOffset.MaxValue;
+                    }
                     state.MarkServed(DateTimeOffset.UtcNow);
                     return published;
                 }
@@ -2535,7 +2549,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     lock (_evictionGate)
                     {
                         if (_catalog.TryGetValue(fullPath, out var known)
-                            && (known.AccountsFor(snapshotVersion) || known.PlaceholderVersion == snapshotVersion)
+                            && (known.IsSavedAs(snapshotVersion) || known.PlaceholderVersion == snapshotVersion)
                             && !RetainCurrentUploadUncertainty(fullPath, snapshotVersion))
                         {
                             // No uncertain receipt remains for this version.

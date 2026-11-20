@@ -696,14 +696,11 @@ message RunnerArtifactServiceListArtifactsRequest {
     string type = 2;
     string subfolder = 3;
     RunnerReadRequester requester = 4;
-    // Also name the artifacts deleted since this time, by the control plane's clock: the
-    // listed_utc of the first listing the runner's session received. Unset names none.
-    google.protobuf.Timestamp deleted_since = 5;
 }
 
 message RunnerArtifactServiceListArtifactsResponse {
     repeated offloadr.editor_runtime.v1.EditorArtifactMetadata artifacts = 1;
-    // Artifacts deleted since the request's deleted_since, each as it was stored: the user
+    // Artifacts deleted since the requester's session began, each as it was stored: the user
     // removed them from their files, or a temporary one expired. A runner that still holds
     // one of them locally loses nothing when its session's data is removed. One replaced by
     // another upload is not among them.

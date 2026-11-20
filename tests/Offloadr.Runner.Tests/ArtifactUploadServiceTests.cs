@@ -1937,9 +1937,6 @@ public partial class ArtifactUploadServiceTests
         /// <summary>The control plane's clock at the fake's first listing; each listing is a second later.</summary>
         public static readonly DateTime ListClock = new(2026, 11, 20, 8, 0, 0, DateTimeKind.Utc);
 
-        /// <summary>Every listing request, oldest first.</summary>
-        public List<RunnerArtifactServiceListArtifactsRequest> ListRequests { get; } = [];
-
         /// <summary>Answers a listing later, with the catalog as it was read when the listing was requested.</summary>
         public Func<RunnerArtifactServiceListArtifactsResponse, Task<RunnerArtifactServiceListArtifactsResponse>>? DelayListResponse { get; set; }
         public int ReadArtifactCallCount { get; private set; }
@@ -1967,7 +1964,6 @@ public partial class ArtifactUploadServiceTests
             // As the control plane: each listing says when it was read, later ones later.
             var listed = _listResponse.Clone();
             listed.ListedUtc ??= Timestamp.FromDateTime(ListClock.AddSeconds(ListCallCount));
-            ListRequests.Add(request.Clone());
             var responseTask = ListArtifactsException is not null
                 ? Task.FromException<RunnerArtifactServiceListArtifactsResponse>(ListArtifactsException)
                 : DelayListResponse is { } delay ? delay(listed)

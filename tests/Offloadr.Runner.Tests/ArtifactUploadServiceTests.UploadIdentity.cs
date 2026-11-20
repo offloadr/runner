@@ -823,8 +823,8 @@ public partial class ArtifactUploadServiceTests
         finally { TryDelete(root); }
     }
 
-    // The control plane names the artifacts deleted since the session's first listing, each as
-    // it was stored. An upload it names was saved and then removed by the user: no loss.
+    // The control plane names the artifacts deleted since the session began, each as it was
+    // stored. An upload it names was saved and then removed by the user: no loss.
     [TestCase(false)]
     [TestCase(true)]
     public async Task AnUploadTheControlPlaneSaysWasDeletedIsNotCountedUnsaved(bool evicted)
@@ -857,11 +857,92 @@ public partial class ArtifactUploadServiceTests
             catalog.DeletedArtifacts.Add(committed!.Clone());
             await service.SeedSessionAsync("session-1", "editor-1", "owner-1", null, CancellationToken.None);
             await WaitForIdentityUploadsToFinishAsync(service);
-            // The first listing asks for no deletions; later ones ask since the first one's time.
-            Assert.That(client.ListRequests[0].DeletedSince, Is.Null);
-            Assert.That(client.ListRequests[^1].DeletedSince, Is.EqualTo(Timestamp.FromDateTime(FakeRunnerArtifactClient.ListClock.AddSeconds(1))));
             Assert.That(await service.StopSessionAsync("session-1"), Is.Zero);
             Assert.That(service.TakeUnsavedUploads("session-1"), Is.EqualTo(new UnsavedUploads(0, false)));
+        }
+        finally { TryDelete(root); }
+    }
+
+    [Test]
+    public async Task ADownloadedOutputTheControlPlaneSaysWasDeletedIsNeitherCountedNorUploadedAgain()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = UploadIdentityPaths(root);
+            var path = Path.Combine(paths.OutputDirectory, "earlier.bin");
+            var catalog = new RunnerArtifactServiceListArtifactsResponse();
+            // An output of an earlier session: listed, and read back by the editor.
+            var earlier = new EditorArtifactMetadata
+            {
+                EditorSid = "editor-1",
+                Filename = "earlier.bin",
+                Type = "output",
+                Subfolder = string.Empty,
+                SizeBytes = 4,
+                CreatedUtc = Timestamp.FromDateTime(DateTime.UtcNow.AddHours(-1)),
+            };
+            catalog.Artifacts.Add(earlier.Clone());
+            var client = new FakeRunnerArtifactClient(catalog) { ReadArtifactContent = "kept"u8.ToArray() };
+            await using var service = new ArtifactUploadService("secret", client, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            Assert.That(await service.TryEnsureArtifactAvailableAsync(path, highPriority: true, CancellationToken.None), Is.True);
+            Assert.That(await File.ReadAllBytesAsync(path), Is.EqualTo("kept"u8.ToArray()));
+            // The user removes it from their files while the session runs.
+            catalog.Artifacts.Clear();
+            catalog.DeletedArtifacts.Add(earlier.Clone());
+            await service.SeedSessionAsync("session-1", "editor-1", "owner-1", null, CancellationToken.None);
+            // Another refresh scans the output folder: the local copy is not new user data.
+            await service.RefreshSessionAsync("session-1");
+            await WaitForIdentityUploadsToFinishAsync(service);
+            Assert.That(client.UploadCount, Is.Zero, "a deleted output is not uploaded again from its local copy");
+            Assert.That(await File.ReadAllBytesAsync(path), Is.EqualTo("kept"u8.ToArray()));
+            Assert.That(await service.StopSessionAsync("session-1"), Is.Zero);
+        }
+        finally { TryDelete(root); }
+    }
+
+    [Test]
+    public async Task ADeletionNamedForAnotherUploadOfTheSameBytesIsStillRecognized()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = UploadIdentityPaths(root);
+            var path = Path.Combine(paths.OutputDirectory, "same-bytes.bin");
+            var catalog = new RunnerArtifactServiceListArtifactsResponse();
+            EditorArtifactMetadata? committed = null;
+            var client = new FakeRunnerArtifactClient(catalog)
+            {
+                RewriteUploadArtifact = artifact =>
+                {
+                    artifact.CreatedUtc = Timestamp.FromDateTime(DateTime.UtcNow);
+                    committed = artifact.Clone();
+                    return artifact;
+                },
+            };
+            await using var service = new ArtifactUploadService("secret", client, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            await File.WriteAllBytesAsync(path, [1, 2, 3]);
+            await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            await WaitForIdentityUploadsToFinishAsync(service);
+            client.RejectAsRetiredUpload = true;
+            // Another upload of the same bytes takes the path; the local file is recognized as it.
+            var same = committed!.Clone();
+            same.CreatedUtc = Timestamp.FromDateTime(DateTime.UtcNow.AddSeconds(5));
+            same.Sha256 = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData([1, 2, 3])).ToLowerInvariant();
+            catalog.Artifacts.Add(same.Clone());
+            await service.SeedSessionAsync("session-1", "editor-1", "owner-1", null, CancellationToken.None);
+            await WaitForIdentityUploadsToFinishAsync(service);
+            // The user then deletes that one: the control plane names it, not this session's receipt.
+            catalog.Artifacts.Clear();
+            catalog.DeletedArtifacts.Add(same.Clone());
+            await service.SeedSessionAsync("session-1", "editor-1", "owner-1", null, CancellationToken.None);
+            await WaitForIdentityUploadsToFinishAsync(service);
+            Assert.That(await service.StopSessionAsync("session-1"), Is.Zero,
+                "the local bytes are those of the artifact the control plane says was deleted");
         }
         finally { TryDelete(root); }
     }
