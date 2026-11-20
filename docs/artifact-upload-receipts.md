@@ -22,15 +22,18 @@ for each deletion. Inspection errors do not prove deletion. Acknowledged binding
 one-entry-per-current-file catalog, rather than retaining version history. Remote
 catalog refresh/deletion cannot erase that local binding while the exact
 acknowledged local version survives. An evicted placeholder is not that version;
-if its remote artifact disappears, the exact placeholder remains recognizable
-but Stop cannot count it as saved. A retained binding for live local bytes also
-counts as unsaved after remote deletion; retaining identity is not proof that the
-control plane still holds those bytes.
-When catalog casing leaves an additional agent-created placeholder, Stop counts
-one lost artifact for the exact retained catalog record shared with its uploaded
-snapshot or evicted placeholder. A rewritten file, replaced placeholder or other
-unacknowledged local file remains independent unsaved data. Counting does not
-delete or rewrite either local path and never turns a lost artifact into a saved one.
+if its remote artifact disappears, the exact placeholder remains recognizable.
+Stop does not count either as unsaved when the artifact was deleted: the control
+plane stored those bytes, and an artifact it no longer lists under any version
+was deleted from the user's files afterwards (the user removed an output while
+the session ran, say). That is not a loss of the session, and reporting it would
+tell the user that an output they deleted was not saved. The same holds for an
+additional agent-created placeholder that catalog casing leaves beside the
+uploaded snapshot. An artifact the control plane now lists under the same name
+with other metadata was replaced by another upload, not deleted: what this
+session produced is no longer held, and it still counts as unsaved.
+A rewritten file, replaced placeholder or other unacknowledged local file remains
+unsaved data. Counting does not delete or rewrite either local path.
 A remotely deleted artifact is not eligible for eviction into a download placeholder.
 The existing catalog's total size is a separate resource constraint; this does not
 establish a global runner memory bound.
@@ -70,7 +73,7 @@ preserves the binding even when catalog spelling differs; deletion or changed
 metadata cannot mark that alias saved. No per-version catalog history is retained.
 This also preserves readback for the exact empty placeholder left by eviction.
 If the remote metadata disappears or changes, that placeholder remains recognizable
-as unsaved; its old upload binding is cleared. A late watcher event or another
+(as unsaved when it changed) and its old upload binding is cleared. A late watcher event or another
 output scan cannot upload the agent's empty placeholder as new user data. A
 replaced local file does not inherit that placeholder's saving status.
 The uploader rechecks the securely opened version before issuing an upload ID,

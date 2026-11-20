@@ -1384,6 +1384,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                             // snapshot saved; another file is never selected by it.
                             state.HasRemoteArtifact = state.CommittedArtifact is { } committed
                                 && currentArtifacts.Contains(committed);
+                            state.DeletedRemotely = !state.HasRemoteArtifact && WasDeletedRemotely(state, currentArtifacts);
                         }
                         else if (state.PlaceholderVersion is { } placeholder
                             && IsLiveRegularFile(state.Type, path, placeholder))
@@ -1393,6 +1394,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                             // It is saved only while its committed receipt remains.
                             state.HasRemoteArtifact = state.CommittedArtifact is { } committed
                                 && currentArtifacts.Contains(committed);
+                            state.DeletedRemotely = !state.HasRemoteArtifact && WasDeletedRemotely(state, currentArtifacts);
                             if (!state.HasRemoteArtifact)
                             {
                                 state.UploadSnapshot = null;
@@ -1404,6 +1406,25 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     }
                 }
             }
+        }
+
+        /// <summary>
+        /// Whether the control plane stored this entry's artifact and no longer lists any artifact
+        /// under that name: it was deleted there. One listed under the name with other metadata
+        /// was replaced by another upload instead.
+        /// </summary>
+        private static bool WasDeletedRemotely(RemoteArtifactState state, HashSet<EditorArtifactMetadata> currentArtifacts)
+        {
+            var stored = state.CommittedArtifact ?? state.CatalogArtifact;
+            if (stored is null) return false;
+            foreach (var current in currentArtifacts)
+            {
+                if (string.Equals(current.Type, stored.Type, StringComparison.Ordinal)
+                    && string.Equals(current.Subfolder, stored.Subfolder, StringComparison.Ordinal)
+                    && string.Equals(current.Filename, stored.Filename, StringComparison.Ordinal))
+                    return false;
+            }
+            return true;
         }
 
         private bool TryGetCatalogEntry(string path, out RemoteArtifactState? state)
@@ -2031,7 +2052,6 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         {
             var unsaved = 0;
             var unsendable = new HashSet<(ulong Device, ulong Inode)>();
-            var lostArtifacts = new HashSet<EditorArtifactMetadata>();
             foreach (var (type, root) in new[] { ("output", _paths.OutputDirectory), ("temp", _paths.TempDirectory) })
             {
                 if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root))
@@ -2064,17 +2084,13 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         }
 
                         // Saved means the control plane holds this exact file, or it is the empty
-                        // placeholder the agent left for a remote artifact. An empty rewrite by the
-                        // editor is neither.
-                        if (!_catalog.TryGetValue(NormalizePath(file), out var state) || !state.AccountsFor(version))
+                        // placeholder the agent left for a remote artifact. An artifact the control
+                        // plane stored and no longer lists under any version was deleted from the
+                        // user's files afterwards: its local copy is not a loss of this session. An
+                        // empty rewrite by the editor is neither.
+                        if (!_catalog.TryGetValue(NormalizePath(file), out var state) || !state.IsSavedAs(version))
                         {
-                            // Catalog spelling can leave a second, agent-created
-                            // placeholder for one uploaded snapshot. Count that
-                            // lost artifact once, while an editor rewrite remains
-                            // independent unsaved data even at the same path.
-                            var artifact = state is not null && state.PlaceholderVersion == version ? state.CatalogArtifact
-                                : state is not null && state.UploadSnapshot is not null && state.MatchesLocalFile(version) ? state.CommittedArtifact : null;
-                            if (artifact is null || lostArtifacts.Add(artifact)) unsaved++;
+                            unsaved++;
                         }
                     }
                 }
@@ -2990,6 +3006,20 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             /// </summary>
             public bool AccountsFor(SecureFileVersion version)
                 => HasRemoteArtifact && (MatchesLocalFile(version) || PlaceholderVersion == version);
+
+            /// <summary>
+            /// True when the control plane stored the artifact and then stopped listing it under
+            /// any version: it was deleted there, not replaced by another upload.
+            /// </summary>
+            public bool DeletedRemotely { get; set; }
+
+            /// <summary>
+            /// True when <paramref name="version"/> is no loss if the session's data is removed: the
+            /// control plane holds what it stands for, or stored it before the artifact was
+            /// deleted there.
+            /// </summary>
+            public bool IsSavedAs(SecureFileVersion version)
+                => (HasRemoteArtifact || DeletedRemotely) && (MatchesLocalFile(version) || PlaceholderVersion == version);
 
             /// <summary>When the VFS last told a reader the local file is ready.</summary>
             public DateTimeOffset LastServedUtc { get; private set; }

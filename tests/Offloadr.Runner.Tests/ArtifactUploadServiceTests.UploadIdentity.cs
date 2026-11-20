@@ -207,7 +207,9 @@ public partial class ArtifactUploadServiceTests
 
     [TestCase("unchanged", false, 0)]
     [TestCase("unchanged", true, 0)]
-    [TestCase("deleted", false, 1)]
+    // Deleted remotely after it was stored, the evicted upload is no loss; replaced there by
+    // another upload under its name, what this session produced is no longer held.
+    [TestCase("deleted", false, 0)]
     [TestCase("changed", false, 1)]
     [TestCase("replaced-placeholder", false, 1)]
     public async Task CatalogSpellingRetainsOnlyItsExactEvictedPlaceholder(
@@ -277,7 +279,7 @@ public partial class ArtifactUploadServiceTests
             if (change != "replaced-placeholder")
                 Assert.That(client.UploadCount, Is.EqualTo(1), "Stop must not republish an evicted placeholder as new bytes");
             Assert.That(unsaved, Is.EqualTo(expectedUnsaved),
-                "only an unchanged remote receipt and the agent's exact placeholder remain saved");
+                "an unchanged remote receipt, or one deleted remotely after it was stored, leaves the agent's exact placeholder saved");
         }
         finally { TryDelete(root); }
     }
@@ -664,12 +666,12 @@ public partial class ArtifactUploadServiceTests
         finally { TryDelete(root); }
     }
 
-    [TestCase("live", 1)]
-    [TestCase("deleted", 1)]
-    [TestCase("rewritten", 2)]
-    [TestCase("evicted", 1)]
-    [TestCase("replaced-placeholder", 2)]
-    public async Task RemoteDeletionCountsOnlyExactCatalogAliasesOnce(string change, int expectedUnsaved)
+    [TestCase("live", 0)]
+    [TestCase("deleted", 0)]
+    [TestCase("rewritten", 1)]
+    [TestCase("evicted", 0)]
+    [TestCase("replaced-placeholder", 1)]
+    public async Task RemoteDeletionLeavesOnlyNewUserBytesUnsaved(string change, int expectedUnsaved)
     {
         var root = CreateTempDirectory();
         try
@@ -716,7 +718,7 @@ public partial class ArtifactUploadServiceTests
             await service.SeedSessionAsync("session-1", "editor-1", "owner-1", null, CancellationToken.None);
             await WaitForIdentityUploadsToFinishAsync(service);
             Assert.That(await service.StopSessionAsync("session-1"), Is.EqualTo(expectedUnsaved),
-                "Only the agent's exact placeholder and captured upload may share one lost artifact; new user bytes remain separate.");
+                "An artifact deleted remotely after it was stored is not a loss; only new user bytes are.");
             Assert.That(service.TakeUnsavedUploads("session-1"), Is.EqualTo(new UnsavedUploads(expectedUnsaved, false)));
             if (change == "live")
                 Assert.That(await File.ReadAllBytesAsync(path), Is.EqualTo(new byte[] { 1, 2, 3 }), "Counting must not remove or rewrite the live alias.");
@@ -725,7 +727,7 @@ public partial class ArtifactUploadServiceTests
     }
 
     [Test]
-    public async Task RemoteDeletionOfAnEvictedUploadDoesNotCountItsPlaceholderAsSaved()
+    public async Task RemoteDeletionOfAnEvictedUploadIsNotALossOfTheSession()
     {
         var root = CreateTempDirectory();
         try
@@ -746,8 +748,8 @@ public partial class ArtifactUploadServiceTests
             // starting a new output scan that could replace the lost evidence.
             await service.SeedSessionAsync("session-1", "editor-1", "owner-1", null, CancellationToken.None);
             Assert.That(client.UploadCount, Is.EqualTo(1));
-            Assert.That(await service.StopSessionAsync("session-1"), Is.EqualTo(1),
-                "the placeholder no longer stands for bytes held by the control plane");
+            Assert.That(await service.StopSessionAsync("session-1"), Is.Zero,
+                "the upload was stored before it was deleted remotely; its placeholder holds no user bytes");
         }
         finally { TryDelete(root); }
     }
@@ -797,7 +799,7 @@ public partial class ArtifactUploadServiceTests
     }
 
     [Test]
-    public async Task RemoteDeletionOfLiveUploadedBytesRetainsIdentityButCountsThemUnsaved()
+    public async Task RemoteDeletionOfLiveUploadedBytesRetainsIdentityAndIsNotCountedUnsaved()
     {
         var root = CreateTempDirectory();
         try
@@ -816,9 +818,9 @@ public partial class ArtifactUploadServiceTests
             Assert.That(client.IssuedIdentityCount, Is.EqualTo(1), "remote deletion cannot reissue an unchanged snapshot");
             Assert.That(client.UploadCount, Is.EqualTo(1));
             Assert.That(await File.ReadAllBytesAsync(path), Is.EqualTo(new byte[] { 1, 2, 3 }));
-            Assert.That(await service.StopSessionAsync("session-1"), Is.EqualTo(1),
-                "retaining the old ID does not prove remote bytes still exist");
-            Assert.That(service.TakeUnsavedUploads("session-1"), Is.EqualTo(new UnsavedUploads(1, false)));
+            Assert.That(await service.StopSessionAsync("session-1"), Is.Zero,
+                "the bytes were stored; deleting them from the user's files afterwards loses nothing of this session");
+            Assert.That(service.TakeUnsavedUploads("session-1"), Is.EqualTo(new UnsavedUploads(0, false)));
         }
         finally { TryDelete(root); }
     }
