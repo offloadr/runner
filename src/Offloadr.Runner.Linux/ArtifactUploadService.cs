@@ -2452,7 +2452,10 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         continue;
                     }
 
-                    state.MarkEvicted(secureRoot.GetVersion(relativePath));
+                    // The agent's own placeholder only while the path still holds the file it
+                    // published: the session may put a file of its own there right after.
+                    var left = secureRoot.GetVersion(relativePath);
+                    state.MarkEvicted(left, own: left is not null && left == placeholder.GetVersion());
                     released += status.Length;
                     var freed = freeBefore is { } before && ReadSealedFreeBytes() is { } after ? after - before : released;
                     if (freed >= bytesToFree)
@@ -3281,10 +3284,10 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             }
 
             /// <summary>The placeholder is left for the artifact the evicted file was a copy of.</summary>
-            public void MarkEvicted(SecureFileVersion? placeholder)
+            public void MarkEvicted(SecureFileVersion? placeholder, bool own)
             {
                 Downloaded = false;
-                MarkPlaceholder(placeholder, StandsFor, own: true);
+                MarkPlaceholder(placeholder, StandsFor, own);
             }
 
             /// <summary>

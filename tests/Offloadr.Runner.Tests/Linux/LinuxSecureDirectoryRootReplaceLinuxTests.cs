@@ -497,6 +497,48 @@ public class LinuxSecureDirectoryRootReplaceLinuxTests
     }
 
     [Test]
+    public void DeleteFileUnopened_KeepsANewcomerBesideAFileWhoseNameIsAsLongAsNamesGet()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = CreateRoot();
+        try
+        {
+            var name = new string('a', 251) + ".png";
+            var path = Path.Combine(root, name);
+            File.WriteAllText(path, "uploaded");
+            using var secureRoot = new LinuxSecureDirectoryRoot(root);
+            var version = secureRoot.GetVersion(name)!.Value;
+            Thread? opener = null;
+            using var looked = new ManualResetEventSlim();
+            secureRoot.BeforeMoveAside = () =>
+            {
+                opener = new Thread(() =>
+                {
+                    looked.Set();
+                    _ = File.ReadAllText(path);
+                });
+                opener.Start();
+                looked.Wait();
+                Thread.Sleep(300);
+            };
+            secureRoot.AfterMoveAside = () => File.WriteAllText(path, "created");
+
+            Assert.That(secureRoot.DeleteFileUnopened(name, version, out var restored), Is.False);
+            Assert.That(opener!.Join(TimeSpan.FromSeconds(10)), Is.True);
+            Assert.That(restored, Is.Not.Null);
+            Assert.That(File.ReadAllText(path), Is.EqualTo("uploaded"));
+            var others = Directory.GetFiles(root).Where(file => file != path).ToArray();
+            Assert.That(others, Has.Length.EqualTo(1));
+            Assert.That(Path.GetFileName(others[0]), Does.Contain(".kept-").And.EndsWith(".png"));
+            Assert.That(File.ReadAllText(others[0]), Is.EqualTo("created"));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Test]
     public void Publication_ReportsItsOwnFileNotWhateverTookTheDestinationSince()
     {
         LinuxTestPrerequisites.RequireLinux();

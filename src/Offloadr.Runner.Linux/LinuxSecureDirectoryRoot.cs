@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Runtime.InteropServices;
+using System.Text;
 using Microsoft.Win32.SafeHandles;
 
 namespace Offloadr.Runner.Linux;
@@ -722,8 +723,14 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
 
                 if (renameat2(GetDescriptor(parent), aside, GetDescriptor(parent), leafName, RenameExchange) == 0)
                 {
+                    // The file is back whatever becomes of the newcomer: say so first.
+                    if (ReadVersion(parent, leafName, relativePath) is { } exchanged && exchanged.IsSameFileAs(expected))
+                    {
+                        restored = exchanged;
+                    }
+
                     KeepBeside(parent, aside, leafName, relativePath);
-                    break;
+                    return false;
                 }
 
                 // The newcomer went away again between the two attempts.
@@ -748,6 +755,19 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
     {
         var stem = Path.GetFileNameWithoutExtension(leafName);
         var extension = Path.GetExtension(leafName);
+        // A name may be as long as the filesystem allows already: the stem gives way to the mark.
+        const int MaximumNameBytes = 255;
+        const int MarkLength = 6 + 11;
+        if (Encoding.UTF8.GetByteCount(extension) > 32)
+        {
+            extension = string.Empty;
+        }
+
+        while (stem.Length > 0 && Encoding.UTF8.GetByteCount(stem) + MarkLength + Encoding.UTF8.GetByteCount(extension) > MaximumNameBytes)
+        {
+            stem = stem[..^(stem.Length > 1 && char.IsLowSurrogate(stem[^1]) ? 2 : 1)];
+        }
+
         var error = 0;
         for (var attempt = 0; attempt < 16; attempt++)
         {
