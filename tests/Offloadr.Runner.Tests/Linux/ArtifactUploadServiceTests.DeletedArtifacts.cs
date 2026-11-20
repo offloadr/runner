@@ -1,0 +1,433 @@
+using Google.Protobuf.WellKnownTypes;
+using Microsoft.Extensions.Logging.Abstractions;
+using Offloadr.EditorRuntime.V1;
+using Offloadr.Runner.V1;
+
+namespace Offloadr.Runner.Tests;
+
+public partial class ArtifactUploadServiceTests
+{
+    private static readonly DateTime FirstStoredUtc = new(2026, 11, 20, 8, 0, 0, DateTimeKind.Utc);
+
+    /// <summary>An artifact as a listing gives it: its catalog name and the time it was stored.</summary>
+    private static EditorArtifactMetadata StoredOutput(string filename, DateTime storedUtc, long? sizeBytes = 3, string type = "output")
+        => new()
+        {
+            EditorSid = "editor-1",
+            Filename = filename,
+            Type = type,
+            Subfolder = string.Empty,
+            SizeBytes = sizeBytes,
+            CreatedUtc = Timestamp.FromDateTime(storedUtc),
+        };
+
+    /// <summary>Stamps each upload's receipt with the time it was stored: one minute after the previous one.</summary>
+    private static FakeRunnerArtifactClient ClientStoringUploads(RunnerArtifactServiceListArtifactsResponse listing, List<EditorArtifactMetadata>? receipts = null)
+    {
+        var stored = 0;
+        return new FakeRunnerArtifactClient(listing)
+        {
+            RewriteUploadArtifact = artifact =>
+            {
+                artifact.CreatedUtc = Timestamp.FromDateTime(FirstStoredUtc.AddMinutes(stored++));
+                receipts?.Add(artifact.Clone());
+                return artifact;
+            },
+        };
+    }
+
+    [Test]
+    public async Task ADeletedOutputsLocalCopyIsRemovedAndNeitherCountedNorUploadedAgain()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = UploadIdentityPaths(root);
+            var path = Path.Combine(paths.OutputDirectory, "deleted.bin");
+            var kept = Path.Combine(paths.OutputDirectory, "kept.bin");
+            var listing = new RunnerArtifactServiceListArtifactsResponse();
+            var receipts = new List<EditorArtifactMetadata>();
+            var client = ClientStoringUploads(listing, receipts);
+            await using var service = new ArtifactUploadService("secret", client, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            await File.WriteAllBytesAsync(path, [1, 2, 3]);
+            await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            await WaitForIdentityUploadsToFinishAsync(service);
+            await File.WriteAllBytesAsync(kept, [4, 5, 6]);
+            await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            await WaitForIdentityUploadsToFinishAsync(service);
+
+            // The user deletes the first output in their files; the other is still listed.
+            listing.Artifacts.Add(receipts[1]);
+            // The control plane names it as it holds it now, which may say more than the receipt did.
+            var deleted = receipts[0].Clone();
+            deleted.PromptId = "prompt-1";
+            deleted.Filename = "DELETED.bin";
+            listing.DeletedArtifacts.Add(deleted);
+            await service.RefreshSessionAsync("session-1");
+            await WaitForIdentityUploadsToFinishAsync(service);
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(File.Exists(path), Is.False, "the session's copy of a deleted output goes with it");
+                Assert.That(File.ReadAllBytes(kept), Is.EqualTo(new byte[] { 4, 5, 6 }));
+                Assert.That(Directory.GetFiles(paths.OutputDirectory), Has.Length.EqualTo(1), "nothing is left beside the kept output");
+                Assert.That(client.UploadCount, Is.EqualTo(2), "nothing is uploaded again");
+                Assert.That(client.IssuedIdentityCount, Is.EqualTo(2));
+            });
+            Assert.That(await service.StopSessionAsync("session-1"), Is.Zero, "a deleted output is not an unsaved one");
+        }
+        finally { TryDelete(root); }
+    }
+
+    [Test]
+    public async Task ADeletionOfAnotherArtifactStoredUnderTheNameLeavesTheCopy()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = UploadIdentityPaths(root);
+            var path = Path.Combine(paths.OutputDirectory, "same-name.bin");
+            var listing = new RunnerArtifactServiceListArtifactsResponse();
+            var client = ClientStoringUploads(listing);
+            await using var service = new ArtifactUploadService("secret", client, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            await File.WriteAllBytesAsync(path, [1, 2, 3]);
+            await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            await WaitForIdentityUploadsToFinishAsync(service);
+
+            // An output of an earlier session under this name was deleted; this session's is not listed either.
+            listing.DeletedArtifacts.Add(StoredOutput("same-name.bin", FirstStoredUtc.AddHours(-1)));
+            await service.RefreshSessionAsync("session-1");
+            await WaitForIdentityUploadsToFinishAsync(service);
+
+            Assert.That(await File.ReadAllBytesAsync(path), Is.EqualTo(new byte[] { 1, 2, 3 }));
+            Assert.That(await service.StopSessionAsync("session-1"), Is.EqualTo(1),
+                "the control plane did not say it deleted this one, and does not hold it");
+        }
+        finally { TryDelete(root); }
+    }
+
+    [Test]
+    public async Task AFileTheSessionWroteSinceIsNotTheDeletedArtifactsCopy()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = UploadIdentityPaths(root);
+            var path = Path.Combine(paths.OutputDirectory, "rewritten.bin");
+            var listing = new RunnerArtifactServiceListArtifactsResponse();
+            var receipts = new List<EditorArtifactMetadata>();
+            var client = ClientStoringUploads(listing, receipts);
+            await using var service = new ArtifactUploadService("secret", client, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            await File.WriteAllBytesAsync(path, [1, 2, 3]);
+            await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            await WaitForIdentityUploadsToFinishAsync(service);
+
+            // The editor writes the name again while the first upload is being deleted: the upload
+            // of the new bytes is held, so the entry still stands for the deleted artifact.
+            var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            client.UploadGate = release.Task;
+            await File.WriteAllBytesAsync(path, [7, 8, 9, 10]);
+            listing.DeletedArtifacts.Add(receipts[0]);
+            await service.RefreshSessionAsync("session-1");
+            Assert.That(await File.ReadAllBytesAsync(path), Is.EqualTo(new byte[] { 7, 8, 9, 10 }), "a file written since is the session's own data");
+
+            release.SetResult();
+            await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            await WaitForIdentityUploadsToFinishAsync(service);
+            listing.Artifacts.Add(receipts[1]);
+            await service.RefreshSessionAsync("session-1");
+            await WaitForIdentityUploadsToFinishAsync(service);
+
+            Assert.That(await File.ReadAllBytesAsync(path), Is.EqualTo(new byte[] { 7, 8, 9, 10 }));
+            Assert.That(await service.StopSessionAsync("session-1"), Is.Zero);
+        }
+        finally { TryDelete(root); }
+    }
+
+    [TestCase(true)]
+    [TestCase(false)]
+    public async Task ACopyReadBackIsOfTheArtifactTheReadSaidItWas(bool deleteTheOneRead)
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = UploadIdentityPaths(root);
+            var path = Path.Combine(paths.OutputDirectory, "earlier.bin");
+            // Listed as it was stored first; another upload replaced it before it was read.
+            var listed = StoredOutput("earlier.bin", FirstStoredUtc, sizeBytes: null);
+            var replacedUtc = FirstStoredUtc.AddMinutes(30);
+            var listing = new RunnerArtifactServiceListArtifactsResponse { Artifacts = { listed } };
+            var client = new FakeRunnerArtifactClient(listing)
+            {
+                ReadArtifactContent = [9, 9, 9, 9],
+                ReadArtifactModifiedUtc = replacedUtc,
+            };
+            await using var service = new ArtifactUploadService("secret", client, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            Assert.That(await service.TryEnsureArtifactAvailableAsync(path, highPriority: true, CancellationToken.None), Is.True);
+            Assert.That(await File.ReadAllBytesAsync(path), Is.EqualTo(new byte[] { 9, 9, 9, 9 }));
+
+            // Still listed under its name (as stored a third time), with one of the earlier two deleted.
+            listing.Artifacts.Clear();
+            listing.Artifacts.Add(StoredOutput("earlier.bin", FirstStoredUtc.AddHours(1), sizeBytes: null));
+            listing.DeletedArtifacts.Add(StoredOutput("earlier.bin", deleteTheOneRead ? replacedUtc : FirstStoredUtc, sizeBytes: null));
+            await service.SeedSessionAsync("session-1", "editor-1", "owner-1", null, CancellationToken.None);
+
+            if (deleteTheOneRead)
+            {
+                Assert.That(new FileInfo(path).Length, Is.Zero, "the copy is gone, and the artifact now listed has its placeholder");
+            }
+            else
+            {
+                Assert.That(await File.ReadAllBytesAsync(path), Is.EqualTo(new byte[] { 9, 9, 9, 9 }),
+                    "the bytes read were never those of the artifact deleted");
+            }
+        }
+        finally { TryDelete(root); }
+    }
+
+    [TestCase(0, true)]
+    [TestCase(10, true)]
+    [TestCase(-10, false)]
+    public async Task APlaceholderGoesWhenItsArtifactOrALaterOneUnderItsNameWasDeleted(int deletedMinutesAfter, bool removed)
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = UploadIdentityPaths(root);
+            var path = Path.Combine(paths.OutputDirectory, "never-read.bin");
+            var listing = new RunnerArtifactServiceListArtifactsResponse { Artifacts = { StoredOutput("never-read.bin", FirstStoredUtc) } };
+            var client = new FakeRunnerArtifactClient(listing);
+            await using var service = new ArtifactUploadService("secret", client, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            Assert.That(new FileInfo(path).Length, Is.Zero, "the listed artifact has a placeholder");
+
+            listing.Artifacts.Clear();
+            listing.DeletedArtifacts.Add(StoredOutput("never-read.bin", FirstStoredUtc.AddMinutes(deletedMinutesAfter)));
+            await service.SeedSessionAsync("session-1", "editor-1", "owner-1", null, CancellationToken.None);
+
+            Assert.That(File.Exists(path), Is.EqualTo(!removed));
+            Assert.That(client.UploadCount, Is.Zero);
+            Assert.That(await service.StopSessionAsync("session-1"), Is.EqualTo(removed ? 0 : 1));
+        }
+        finally { TryDelete(root); }
+    }
+
+    [Test]
+    public async Task ADeletedOutputsEvictedPlaceholderIsRemovedAndNotCounted()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = CreateEvictionPaths(root, sealedSession: true);
+            var path = Path.Combine(paths.OutputDirectory, "evicted.bin");
+            var listing = new RunnerArtifactServiceListArtifactsResponse();
+            var receipts = new List<EditorArtifactMetadata>();
+            var client = ClientStoringUploads(listing, receipts);
+            await using var service = new ArtifactUploadService("secret", client, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            await File.WriteAllBytesAsync(path, [1, 2, 3]);
+            await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            await WaitForIdentityUploadsToFinishAsync(service);
+            Assert.That(await EvictWhenRecordedAsync(service, "session-1"), Is.EqualTo(3));
+
+            listing.DeletedArtifacts.Add(receipts[0]);
+            await service.SeedSessionAsync("session-1", "editor-1", "owner-1", null, CancellationToken.None);
+
+            Assert.That(File.Exists(path), Is.False);
+            Assert.That(await service.StopSessionAsync("session-1"), Is.Zero);
+        }
+        finally { TryDelete(root); }
+    }
+
+    [Test]
+    public async Task ACopyAProcessHasOpenStaysUntilALaterListingAndIsNotCountedMeanwhile()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = UploadIdentityPaths(root);
+            var path = Path.Combine(paths.OutputDirectory, "open.bin");
+            var listing = new RunnerArtifactServiceListArtifactsResponse();
+            var receipts = new List<EditorArtifactMetadata>();
+            var client = ClientStoringUploads(listing, receipts);
+            await using var service = new ArtifactUploadService("secret", client, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            await File.WriteAllBytesAsync(path, [1, 2, 3]);
+            await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            await WaitForIdentityUploadsToFinishAsync(service);
+
+            listing.DeletedArtifacts.Add(receipts[0]);
+            // The same name is stored again by another session before the copy can be removed.
+            listing.Artifacts.Add(StoredOutput("open.bin", FirstStoredUtc.AddHours(1), sizeBytes: null));
+            await using (new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            {
+                await service.RefreshSessionAsync("session-1");
+                await WaitForIdentityUploadsToFinishAsync(service);
+                Assert.That(await File.ReadAllBytesAsync(path), Is.EqualTo(new byte[] { 1, 2, 3 }), "a reader still has it");
+            }
+
+            Assert.That(client.UploadCount, Is.EqualTo(1), "a copy waiting to be removed is not uploaded as new");
+            await service.RefreshSessionAsync("session-1");
+            await WaitForIdentityUploadsToFinishAsync(service);
+
+            Assert.That(new FileInfo(path).Length, Is.Zero, "removed once nothing has it open; the artifact now listed has its placeholder");
+            Assert.That(client.UploadCount, Is.EqualTo(1));
+            Assert.That(await service.StopSessionAsync("session-1"), Is.Zero);
+        }
+        finally { TryDelete(root); }
+    }
+
+    [Test]
+    public async Task APromptsSeedDoesNotForgetWhichArtifactACopyIs()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = UploadIdentityPaths(root);
+            var referenced = Path.Combine(paths.OutputDirectory, "referenced.bin");
+            var other = Path.Combine(paths.OutputDirectory, "other.bin");
+            var listing = new RunnerArtifactServiceListArtifactsResponse();
+            var receipts = new List<EditorArtifactMetadata>();
+            var client = ClientStoringUploads(listing, receipts);
+            await using var service = new ArtifactUploadService("secret", client, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            await File.WriteAllBytesAsync(referenced, [1, 2, 3]);
+            await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            await WaitForIdentityUploadsToFinishAsync(service);
+            await File.WriteAllBytesAsync(other, [4, 5, 6]);
+            await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            await WaitForIdentityUploadsToFinishAsync(service);
+
+            // Both were deleted; a prompt accepted just before still names one of them, by name alone.
+            listing.DeletedArtifacts.Add(receipts);
+            await service.SeedSessionAsync("session-1", "editor-1", "owner-1",
+                [new EditorArtifactMetadata { EditorSid = "editor-1", Filename = "referenced.bin", Type = "output", Subfolder = string.Empty }],
+                CancellationToken.None);
+            await WaitForIdentityUploadsToFinishAsync(service);
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(File.Exists(referenced), Is.False);
+                Assert.That(File.Exists(other), Is.False);
+                Assert.That(client.UploadCount, Is.EqualTo(2));
+            });
+            Assert.That(await service.StopSessionAsync("session-1"), Is.Zero);
+        }
+        finally { TryDelete(root); }
+    }
+
+    [Test]
+    public async Task ASeedKeepsACopyKnownSoTheListingAfterItStillRecognizesIt()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = UploadIdentityPaths(root);
+            var path = Path.Combine(paths.OutputDirectory, "seeded.bin");
+            var listing = new RunnerArtifactServiceListArtifactsResponse();
+            var receipts = new List<EditorArtifactMetadata>();
+            var client = ClientStoringUploads(listing, receipts);
+            await using var service = new ArtifactUploadService("secret", client, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            await File.WriteAllBytesAsync(path, [1, 2, 3]);
+            await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            await WaitForIdentityUploadsToFinishAsync(service);
+
+            // A prompt names the output while the listing does not give it yet; a later listing
+            // names it deleted.
+            await service.SeedSessionAsync("session-1", "editor-1", "owner-1",
+                [new EditorArtifactMetadata { EditorSid = "editor-1", Filename = "seeded.bin", Type = "output", Subfolder = string.Empty }],
+                CancellationToken.None);
+            Assert.That(await File.ReadAllBytesAsync(path), Is.EqualTo(new byte[] { 1, 2, 3 }));
+            listing.DeletedArtifacts.Add(receipts[0]);
+            await service.RefreshSessionAsync("session-1");
+            await WaitForIdentityUploadsToFinishAsync(service);
+
+            Assert.That(File.Exists(path), Is.False);
+            Assert.That(client.UploadCount, Is.EqualTo(1));
+            Assert.That(await service.StopSessionAsync("session-1"), Is.Zero);
+        }
+        finally { TryDelete(root); }
+    }
+
+    [Test]
+    public async Task ASeedNamingAnOutputTheControlPlaneNoLongerHoldsDoesNotMakeItSaved()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = CreateEvictionPaths(root, sealedSession: true);
+            var path = Path.Combine(paths.OutputDirectory, "gone.bin");
+            var listing = new RunnerArtifactServiceListArtifactsResponse();
+            var client = ClientStoringUploads(listing);
+            await using var service = new ArtifactUploadService("secret", client, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            await File.WriteAllBytesAsync(path, [1, 2, 3]);
+            await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            await WaitForIdentityUploadsToFinishAsync(service);
+
+            // No longer listed, and not named as deleted: the control plane does not hold it.
+            await service.SeedSessionAsync("session-1", "editor-1", "owner-1", null, CancellationToken.None);
+            // A prompt still names it. That is no word on whether it is held.
+            await service.SeedSessionAsync("session-1", "editor-1", "owner-1",
+                [new EditorArtifactMetadata { EditorSid = "editor-1", Filename = "gone.bin", Type = "output", Subfolder = string.Empty }],
+                CancellationToken.None);
+            await WaitForIdentityUploadsToFinishAsync(service);
+
+            Assert.That(service.EvictUploadedArtifacts("session-1", long.MaxValue, TimeSpan.Zero), Is.Zero,
+                "the only copy is never replaced by a placeholder");
+            Assert.That(await File.ReadAllBytesAsync(path), Is.EqualTo(new byte[] { 1, 2, 3 }));
+            Assert.That(await service.StopSessionAsync("session-1"), Is.EqualTo(1));
+        }
+        finally { TryDelete(root); }
+    }
+
+    [Test]
+    public async Task ADeletedInputIsLeftToTheRulesForInputs()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = UploadIdentityPaths(root);
+            var path = Path.Combine(paths.InputDirectory, "picture.bin");
+            var input = StoredOutput("picture.bin", FirstStoredUtc, type: "input");
+            var listing = new RunnerArtifactServiceListArtifactsResponse { Artifacts = { input } };
+            var client = new FakeRunnerArtifactClient(listing);
+            await using var service = new ArtifactUploadService("secret", client, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            Assert.That(File.Exists(path), Is.True);
+
+            listing.DeletedArtifacts.Add(input);
+            await service.SeedSessionAsync("session-1", "editor-1", "owner-1", null, CancellationToken.None);
+
+            Assert.That(File.Exists(path), Is.True, "only outputs and temporary files are removed");
+        }
+        finally { TryDelete(root); }
+    }
+}

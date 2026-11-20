@@ -323,6 +323,101 @@ public class LinuxSecureDirectoryRootReplaceLinuxTests
         }
     }
 
+    [Test]
+    public void DeleteFileUnopened_RemovesOnlyTheExpectedVersionWhileNothingHasItOpen()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = CreateRoot();
+        try
+        {
+            var path = Path.Combine(root, "a.png");
+            File.WriteAllText(path, "uploaded");
+            using var secureRoot = new LinuxSecureDirectoryRoot(root);
+            var version = secureRoot.GetVersion("a.png")!.Value;
+
+            using (new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            {
+                Assert.That(secureRoot.DeleteFileUnopened("a.png", version), Is.False, "a reader still has it");
+            }
+
+            File.WriteAllText(path, "rewritten");
+            Assert.That(secureRoot.DeleteFileUnopened("a.png", version), Is.False, "it is no longer that version");
+            Assert.That(File.ReadAllText(path), Is.EqualTo("rewritten"));
+
+            Assert.That(secureRoot.DeleteFileUnopened("a.png", secureRoot.GetVersion("a.png")!.Value), Is.True);
+            Assert.That(Directory.GetFileSystemEntries(root), Is.Empty, "nothing is left, under any name");
+            Assert.That(secureRoot.DeleteFileUnopened("a.png", version), Is.False, "nothing is there");
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Test]
+    public void DeleteFileUnopened_PutsTheFileBackForAnOpenDuringTheRemoval()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = CreateRoot();
+        try
+        {
+            var path = Path.Combine(root, "a.png");
+            File.WriteAllText(path, "uploaded");
+            using var secureRoot = new LinuxSecureDirectoryRoot(root);
+            var version = secureRoot.GetVersion("a.png")!.Value;
+
+            // A workflow opens it for writing just as it is moved aside: it looked the name up
+            // before the move, and the lease holds its open until the file is back.
+            Thread? opener = null;
+            using var looked = new ManualResetEventSlim();
+            secureRoot.BeforeMoveAside = () =>
+            {
+                opener = new Thread(() =>
+                {
+                    looked.Set();
+                    using var writer = new FileStream(path, FileMode.Open, FileAccess.Write);
+                    writer.Write("UP"u8);
+                });
+                opener.Start();
+                looked.Wait();
+                Thread.Sleep(300);
+            };
+
+            Assert.That(secureRoot.DeleteFileUnopened("a.png", version), Is.False);
+            Assert.That(opener!.Join(TimeSpan.FromSeconds(10)), Is.True, "the open goes on once the lease is let go");
+            Assert.That(File.ReadAllText(path), Is.EqualTo("UPloaded"), "it wrote to the file that stayed");
+            Assert.That(secureRoot.GetVersion("a.png")!.Value.Inode, Is.EqualTo(version.Inode));
+            Assert.That(Directory.GetFiles(root), Has.Length.EqualTo(1));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Test]
+    public void DeleteFileUnopened_KeepsAFileTheSessionPutThereDuringTheRemoval()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = CreateRoot();
+        try
+        {
+            var path = Path.Combine(root, "a.png");
+            File.WriteAllText(path, "uploaded");
+            using var secureRoot = new LinuxSecureDirectoryRoot(root);
+            var version = secureRoot.GetVersion("a.png")!.Value;
+            secureRoot.BeforeMoveAside = () => ReplaceAtomically(root, path, "rewrite");
+
+            Assert.That(secureRoot.DeleteFileUnopened("a.png", version), Is.False);
+            Assert.That(File.ReadAllText(path), Is.EqualTo("rewrite"), "the newer file is back under its name");
+            Assert.That(Directory.GetFiles(root), Has.Length.EqualTo(1));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
     private static void ReplaceAtomically(string root, string path, string content)
     {
         var staged = Path.Combine(root, $"staged-{Guid.NewGuid():N}");

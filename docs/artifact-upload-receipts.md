@@ -26,24 +26,35 @@ if its remote artifact disappears, the exact placeholder remains recognizable
 but Stop cannot count it as saved. A retained binding for live local bytes also
 counts as unsaved once its artifact is no longer listed; retaining identity is not
 proof that the control plane still holds those bytes.
+
 The exception is an artifact the control plane says it deleted. Every listing
-names the artifacts deleted since the runner's session began, each exactly as it
-was stored: the user removed it from their files, or a temporary one expired. A
-local file or placeholder that stands for a named artifact (through its upload's
-receipt, or as the listed artifact its bytes were recognized as) was saved and
-then removed on purpose. Stop does not count it, and its unchanged local copy is
-not uploaded again; reporting it would tell the user that an output they deleted
-was not saved. That holds for an output downloaded from an earlier session too,
-which stays known instead of being dropped from the catalog. An artifact replaced
-by another upload is not named, and still counts. A later listing that names the
-artifact itself again (it was restored) takes the deletion back. Bytes read back
-from the control plane are never those of a deleted artifact; a read says when
-its artifact was stored, and if that is not an artifact the entry has a record
-of (another upload took the path), no listing's word about those records applies
-to the bytes until a listing brings the entry its own. Every listing
-carries the time the control plane read it, and when answers arrive out of order
-each entry follows the later one. The runner infers nothing from an artifact
-merely being absent.
+names the output and temporary artifacts deleted since the runner's session
+began, each as it was stored (its catalog name and `created_utc`): the user
+removed it from their files, or a temporary one expired. The runner removes its
+local copy of each one before it applies the rest of the listing, so there is
+nothing left for Stop to count or for a scan to upload again, and nothing to
+remember about the deletion. The order in which listings answer does not matter:
+a copy removed for an artifact that was since restored comes back as a
+placeholder with the next listing and is read back on demand.
+
+A file is removed only when it is, unchanged, the copy of exactly the artifact
+named. Each catalog entry records which stored artifact its local file is a copy
+of, taken from where the bytes came from: an upload's receipt, the time a read
+says its artifact was stored (which may be a later one than the entry was
+listed with), or a digest match with the listed artifact. A caller's seed, which
+gives names only, leaves that record as it is. A file the session wrote since, or
+the copy of another artifact stored under the same name, is the session's own
+data and stays. An empty placeholder holds no bytes of any artifact; it goes once
+nothing is listed under its name and the artifact deleted there is its own or one
+stored after it.
+
+The copy is removed only while no process has it open or mapped, the way an
+evicted file is replaced. One in use stays, with its entry left exactly as it
+was (so it is neither counted nor uploaded as new), and the next listing tries
+again. Inputs are not removed this way; they keep their own rules.
+
+A seed never prunes the catalog. Its entries stand beside those of the listing
+that follows, and only that listing decides which artifacts are no longer there.
 When catalog casing leaves an additional agent-created placeholder, Stop counts
 one lost artifact for the exact retained catalog record shared with its uploaded
 snapshot or evicted placeholder. A rewritten file, replaced placeholder or other

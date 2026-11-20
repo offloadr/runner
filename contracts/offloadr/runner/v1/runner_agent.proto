@@ -700,14 +700,11 @@ message RunnerArtifactServiceListArtifactsRequest {
 
 message RunnerArtifactServiceListArtifactsResponse {
     repeated offloadr.editor_runtime.v1.EditorArtifactMetadata artifacts = 1;
-    // Artifacts deleted since the requester's session began, each as it was stored: the user
-    // removed them from their files, or a temporary one expired. A runner that still holds
-    // one of them locally loses nothing when its session's data is removed. One replaced by
-    // another upload is not among them.
+    // Artifacts deleted since the requester's session began, each as it was stored (its name and
+    // created_utc): the user removed it from their files, or a temporary one expired. The runner
+    // removes its unchanged local copy of each, so a deleted output is neither reported as
+    // unsaved nor uploaded again. One replaced by another upload is not among them.
     repeated offloadr.editor_runtime.v1.EditorArtifactMetadata deleted_artifacts = 2;
-    // When the control plane read this listing, by its own clock. Listings can answer out of
-    // order; the newer one is the one with the later time.
-    google.protobuf.Timestamp listed_utc = 3;
 }
 
 message RunnerReadStreamMetadata {

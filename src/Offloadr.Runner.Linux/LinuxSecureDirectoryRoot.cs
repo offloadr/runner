@@ -526,6 +526,164 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
         }
     }
 
+    /// <summary>
+    /// A write lease on <paramref name="leafName"/>, which is <paramref name="expected"/>, or null
+    /// when another process has it open or mapped. The kernel grants one only then, and only to the
+    /// file's owner, so it is asked for as that owner, on this thread alone.
+    /// </summary>
+    private static WriteLease? TakeWriteLease(SafeFileHandle parent, string leafName, string relativePath, SecureFileVersion expected)
+    {
+        // Non-blocking: opening a FIFO put there since must not wait for a writer.
+        var descriptor = openat(GetDescriptor(parent), leafName, OReadOnly | ONoFollow | OCloseOnExec | ONonBlock);
+        if (descriptor < 0)
+        {
+            return null;
+        }
+
+        var file = new SafeFileHandle((nint)descriptor, ownsHandle: true);
+        try
+        {
+            if (ReadVersion(file, relativePath) != expected || ReadOwnerId(file) is not { } ownerId)
+            {
+                file.Dispose();
+                return null;
+            }
+
+            // A break is signalled to this process, by default with SIGIO, which ends it:
+            // SIGURG instead, which is ignored unless handled.
+            if (fcntl(descriptor, FSetSignal, SignalUrgent) != 0)
+            {
+                throw CreateException($"preparing a lease on '{relativePath}'");
+            }
+
+            var previous = setfsuid(ownerId);
+            int result;
+            int error;
+            try
+            {
+                result = fcntl(descriptor, FSetLease, FWriteLock);
+                error = Marshal.GetLastPInvokeError();
+            }
+            finally
+            {
+                _ = setfsuid(unchecked((uint)previous));
+            }
+
+            if (result == 0)
+            {
+                return new WriteLease(file);
+            }
+
+            file.Dispose();
+            // Open or mapped elsewhere; anything else (leases turned off, say) is reported.
+            return error == ETryAgain ? null : throw CreateException($"taking a lease on '{relativePath}'", error);
+        }
+        catch
+        {
+            file.Dispose();
+            throw;
+        }
+    }
+
+    private sealed class WriteLease(SafeFileHandle file) : IDisposable
+    {
+        /// <summary>False once an open, by any process, has begun breaking it.</summary>
+        public bool IsHeld => fcntl(GetDescriptor(file), FGetLease, 0) == FWriteLock;
+
+        public void Dispose()
+        {
+            _ = fcntl(GetDescriptor(file), FSetLease, FUnlock);
+            file.Dispose();
+        }
+    }
+
+    /// <summary>Runs right before <see cref="DeleteFileUnopened"/> moves the file aside, after its last check; lets tests act at that moment.</summary>
+    internal Action? BeforeMoveAside { get; set; }
+
+    /// <summary>
+    /// Removes the file at <paramref name="relativePath"/> only when it is <paramref name="expected"/>
+    /// and no other process has it open or mapped. It is moved aside under a name of this agent's
+    /// own and removed once it proves to be that file, with a write lease held across the move: an
+    /// open that came meanwhile breaks the lease, and the file then goes back, unless something
+    /// newer has taken its name. What remains is an open that had already looked the name up and
+    /// reaches the file only after it is removed, a moment within one system call. Returns whether
+    /// the file was removed.
+    /// </summary>
+    public bool DeleteFileUnopened(string relativePath, SecureFileVersion expected)
+    {
+        var (_, parent, leafName) = TryOpenExistingParent(relativePath);
+        if (parent is null)
+        {
+            return false;
+        }
+
+        using (parent)
+        {
+            if (ReadVersion(parent, leafName, relativePath) is not { } before || before != expected)
+            {
+                return false;
+            }
+
+            // Let go only once the file is removed or back in place: an open it held then reaches
+            // whichever file has the name for good.
+            using var lease = TakeWriteLease(parent, leafName, relativePath, expected);
+            if (lease is null)
+            {
+                return false;
+            }
+
+            BeforeMoveAside?.Invoke();
+            string? aside = null;
+            for (var attempt = 0; attempt < 16 && aside is null; attempt++)
+            {
+                var candidate = $".{Path.GetRandomFileName()}.part";
+                if (renameat2(GetDescriptor(parent), leafName, GetDescriptor(parent), candidate, RenameNoReplace) == 0)
+                {
+                    aside = candidate;
+                    break;
+                }
+
+                var error = Marshal.GetLastPInvokeError();
+                if (error == ENoEntry)
+                {
+                    return false;
+                }
+
+                if (error != AlreadyExists)
+                {
+                    throw CreateException($"moving '{relativePath}' aside", error);
+                }
+            }
+
+            if (aside is null)
+            {
+                throw new IOException($"Could not allocate a unique temporary name to remove '{relativePath}'.");
+            }
+
+            // The rename moved the file's change time, so the comparison leaves that out. A broken
+            // lease means something opened it since the lease was taken.
+            if (ReadVersion(parent, aside, relativePath) is { } moved && moved.IsSameFileAs(expected) && lease.IsHeld)
+            {
+                _ = unlinkat(GetDescriptor(parent), aside, 0);
+                return true;
+            }
+
+            // Back under its name, where an open the lease held expects it. A file the session put
+            // there since is newer and stays; the one moved aside, already superseded, is removed.
+            if (renameat2(GetDescriptor(parent), aside, GetDescriptor(parent), leafName, RenameNoReplace) != 0)
+            {
+                var error = Marshal.GetLastPInvokeError();
+                _ = unlinkat(GetDescriptor(parent), aside, 0);
+                if (error != AlreadyExists)
+                {
+                    throw CreateException($"restoring '{relativePath}' after it was opened", error);
+                }
+            }
+
+            return false;
+        }
+    }
+
     /// <summary>Makes <see cref="MoveRegularFileWithoutReplacing"/> act as on a Windows folder, for tests.</summary>
     internal static bool RenameWithoutReplacingUnsupportedForTests { get; set; }
 
@@ -1424,76 +1582,8 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
             return false;
         }
 
-        /// <summary>
-        /// A write lease on the destination, which is <paramref name="expected"/>, or null when
-        /// another process has it open or mapped. The kernel grants one only then, and only to the
-        /// file's owner, so it is asked for as that owner, on this thread alone.
-        /// </summary>
         private WriteLease? TakeWriteLease(SecureFileVersion expected)
-        {
-            // Non-blocking: opening a FIFO put there since must not wait for a writer.
-            var descriptor = openat(GetDescriptor(_parent), _destinationName, OReadOnly | ONoFollow | OCloseOnExec | ONonBlock);
-            if (descriptor < 0)
-            {
-                return null;
-            }
-
-            var file = new SafeFileHandle((nint)descriptor, ownsHandle: true);
-            try
-            {
-                if (ReadVersion(file, _relativePath) != expected || ReadOwnerId(file) is not { } ownerId)
-                {
-                    file.Dispose();
-                    return null;
-                }
-
-                // A break is signalled to this process, by default with SIGIO, which ends it:
-                // SIGURG instead, which is ignored unless handled.
-                if (fcntl(descriptor, FSetSignal, SignalUrgent) != 0)
-                {
-                    throw CreateException($"preparing a lease on '{_relativePath}'");
-                }
-
-                var previous = setfsuid(ownerId);
-                int result;
-                int error;
-                try
-                {
-                    result = fcntl(descriptor, FSetLease, FWriteLock);
-                    error = Marshal.GetLastPInvokeError();
-                }
-                finally
-                {
-                    _ = setfsuid(unchecked((uint)previous));
-                }
-
-                if (result == 0)
-                {
-                    return new WriteLease(file);
-                }
-
-                file.Dispose();
-                // Open or mapped elsewhere; anything else (leases turned off, say) is reported.
-                return error == ETryAgain ? null : throw CreateException($"taking a lease on '{_relativePath}'", error);
-            }
-            catch
-            {
-                file.Dispose();
-                throw;
-            }
-        }
-
-        private sealed class WriteLease(SafeFileHandle file) : IDisposable
-        {
-            /// <summary>False once an open, by any process, has begun breaking it.</summary>
-            public bool IsHeld => fcntl(GetDescriptor(file), FGetLease, 0) == FWriteLock;
-
-            public void Dispose()
-            {
-                _ = fcntl(GetDescriptor(file), FSetLease, FUnlock);
-                file.Dispose();
-            }
-        }
+            => LinuxSecureDirectoryRoot.TakeWriteLease(_parent, _destinationName, _relativePath, expected);
 
         /// <summary>Runs right before the first exchange, after the last check; lets tests rewrite the destination then.</summary>
         internal Action? BeforeExchange { get; set; }

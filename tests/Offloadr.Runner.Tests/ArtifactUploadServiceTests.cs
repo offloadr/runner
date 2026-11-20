@@ -1933,12 +1933,6 @@ public partial class ArtifactUploadServiceTests
         }
         public RunnerArtifactServiceReadArtifactRequest? LastReadArtifactRequest { get; private set; }
         public int ListCallCount { get; private set; }
-
-        /// <summary>The control plane's clock at the fake's first listing; each listing is a second later.</summary>
-        public static readonly DateTime ListClock = new(2026, 11, 20, 8, 0, 0, DateTimeKind.Utc);
-
-        /// <summary>Answers a listing later, with the catalog as it was read when the listing was requested.</summary>
-        public Func<RunnerArtifactServiceListArtifactsResponse, Task<RunnerArtifactServiceListArtifactsResponse>>? DelayListResponse { get; set; }
         public int ReadArtifactCallCount { get; private set; }
 
         /// <summary>When set, the frames every read answers with, in place of one metadata frame and one chunk.</summary>
@@ -1961,13 +1955,9 @@ public partial class ArtifactUploadServiceTests
             ListCallCount++;
             LastListHeaders = options.Headers;
             LastListRequest = request.Clone();
-            // As the control plane: each listing says when it was read, later ones later.
-            var listed = _listResponse.Clone();
-            listed.ListedUtc ??= Timestamp.FromDateTime(ListClock.AddSeconds(ListCallCount));
-            var responseTask = ListArtifactsException is not null
-                ? Task.FromException<RunnerArtifactServiceListArtifactsResponse>(ListArtifactsException)
-                : DelayListResponse is { } delay ? delay(listed)
-                : Task.FromResult(listed);
+            var responseTask = ListArtifactsException is null
+                ? Task.FromResult(_listResponse)
+                : Task.FromException<RunnerArtifactServiceListArtifactsResponse>(ListArtifactsException);
             return new AsyncUnaryCall<RunnerArtifactServiceListArtifactsResponse>(
                 responseTask,
                 Task.FromResult(new Metadata()),
