@@ -1850,7 +1850,8 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     // the session may create one in the same moment, or put one in its place.
                     secureRoot.EnsurePlaceholder(relativePath, state.CreatedUtc.UtcDateTime, out var createdHere);
                     var placed = secureRoot.GetVersion(relativePath);
-                    state.MarkPlaceholder(placed, StoredArtifact.Of(state.CatalogArtifact), own: createdHere is not null && placed == createdHere);
+                    state.MarkPlaceholder(placed, StoredArtifact.Of(state.CatalogArtifact),
+                        own: createdHere is { } mine && placed == mine && IsAsTheAgentLeftIt(mine, state));
                     return;
                 case SecureEntryKind.Other:
                     throw new UnauthorizedAccessException($"Artifact path is not a regular file: '{state.LocalPath}'.");
@@ -1910,21 +1911,36 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             }
 
             // An empty file is taken for the placeholder whoever made it; only one the agent left
-            // (this entry's own placeholder as it was, or a file it empties here) is its own to
-            // remove when the artifact is deleted.
-            // Its own too: an empty file that is the unchanged copy of an empty stored artifact.
+            // (this entry's own placeholder as it was, the unchanged copy of an empty stored
+            // artifact, or a file it empties here) is its own to remove when the artifact is deleted.
             var before = secureRoot.GetVersion(relativePath);
             var own = before is { } found
                       && (status.Length > 0
                           || (previousState is { PlaceholderIsOwn: true } && previousState.PlaceholderVersion == found)
                           || previousState?.IsCopy(found) == true);
+            // Its own placeholder, already as this entry would leave it: nothing to do, and so no
+            // moment in which a write by the session could be taken for the agent's.
+            if (own && status.Length == 0 && before is { } asItIs && IsAsTheAgentLeftIt(asItIs, state))
+            {
+                state.MarkPlaceholder(asItIs, StoredArtifact.Of(state.CatalogArtifact), own: true);
+                return;
+            }
+
             secureRoot.TruncateRegularFile(relativePath, state.CreatedUtc.UtcDateTime, out var asEmptied);
             var emptied = secureRoot.GetVersion(relativePath);
             // Still that file, as it was emptied here: the session may have put another in its
             // place meanwhile, or opened and written this one (empty again, even).
             state.MarkPlaceholder(emptied, StoredArtifact.Of(state.CatalogArtifact),
-                own && emptied is { } now && now == asEmptied && now.Inode == before?.Inode);
+                own && emptied is { } now && now == asEmptied && now.Inode == before?.Inode && IsAsTheAgentLeftIt(now, state));
         }
+
+        /// <summary>
+        /// True when a placeholder still carries the time the agent gave it. A write by the session,
+        /// also one that leaves it empty, moves that time; this tells the two apart even when the
+        /// write falls between the agent's own steps.
+        /// </summary>
+        private static bool IsAsTheAgentLeftIt(SecureFileVersion placeholder, RemoteArtifactState state)
+            => placeholder.Status.Length == 0 && placeholder.Status.LastWriteTimeUtc == state.CreatedUtc.UtcDateTime;
 
         private static bool ShouldKeepExistingArtifactFile(
             RemoteArtifactState state,
