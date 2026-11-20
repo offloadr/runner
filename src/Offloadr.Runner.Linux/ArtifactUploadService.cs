@@ -2145,14 +2145,16 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 {
                     // Publish and record together: a queued watcher upload rechecks
                     // under this same gate before it can acquire another upload ID.
-                    if (!(replacing is { } expected ? publication.CommitReplacing(expected, whileUnopened: true) : publication.CommitIfAbsent()))
+                    SecureFileVersion? swappedBack = null;
+                    if (!(replacing is { } expected ? publication.CommitReplacing(expected, whileUnopened: true, out swappedBack) : publication.CommitIfAbsent()))
                     {
                         // Still the placeholder, only open elsewhere: not downloaded, so a later open
                         // asks again.
                         if (replacing is { } placeholder && secureRoot.GetVersion(relativePath) is { } current && current.IsSameFileAs(placeholder))
                         {
-                            // The attempt moved its change time; the entry goes on recognizing it.
-                            state.RefreshVersion(current);
+                            // Swapped back unchanged: the attempt moved its change time, and the
+                            // entry goes on recognizing it.
+                            if (swappedBack is { } back) state.RefreshVersion(back);
                             throw new PlaceholderInUseException();
                         }
 
@@ -2497,11 +2499,13 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     // Swapped in atomically and kept only if it displaced exactly that version,
                     // which no process had open, mapped or opened meanwhile: one holding it, a
                     // writer above all, would go on with an inode nobody can reach again.
-                    if (!placeholder.CommitReplacing(version, whileUnopened: true))
+                    if (!placeholder.CommitReplacing(version, whileUnopened: true, out var swappedBack))
                     {
                         // Swapped back for a process that opened it: the same file, with only its
                         // change time moved by the attempt, so the entry goes on recognizing it.
-                        if (secureRoot.GetVersion(relativePath) is { } back && back.IsSameFileAs(version))
+                        // Never on a look at the path alone: a rewrite that kept length and
+                        // modification time is what made the replacement fail.
+                        if (swappedBack is { } back)
                         {
                             state.RefreshVersion(back);
                         }

@@ -86,10 +86,14 @@ public class LinuxSecureDirectoryRootReplaceLinuxTests
                 Thread.Sleep(300);
             };
 
-            Assert.That(placeholder.CommitReplacing(version, whileUnopened: true), Is.False);
+            Assert.That(placeholder.CommitReplacing(version, whileUnopened: true, out var restored), Is.False);
             Assert.That(opener!.Join(TimeSpan.FromSeconds(10)), Is.True, "the open goes on once the lease is let go");
             Assert.That(File.ReadAllText(path), Is.EqualTo("UPloaded"), "it wrote to the file that stayed");
             Assert.That(secureRoot.GetVersion("a.png")!.Value.Inode, Is.EqualTo(version.Inode));
+            // As it was swapped back, before the writer went on: the same file (a filesystem may
+            // have moved its change time).
+            Assert.That(restored, Is.Not.Null);
+            Assert.That(restored!.Value.IsSameFileAs(version), Is.True);
         }
         finally
         {
@@ -198,7 +202,8 @@ public class LinuxSecureDirectoryRootReplaceLinuxTests
 
             File.SetLastWriteTimeUtc(path, modified);
 
-            Assert.That(placeholder.CommitReplacing(version), Is.False);
+            Assert.That(placeholder.CommitReplacing(version, whileUnopened: true, out var restored), Is.False);
+            Assert.That(restored, Is.Null, "a rewrite is never reported as the expected file put back");
             Assert.That(File.ReadAllText(path), Is.EqualTo("rewrite!"));
         }
         finally
@@ -388,10 +393,10 @@ public class LinuxSecureDirectoryRootReplaceLinuxTests
             Assert.That(File.ReadAllText(path), Is.EqualTo("UPloaded"), "it wrote to the file that stayed");
             Assert.That(secureRoot.GetVersion("a.png")!.Value.Inode, Is.EqualTo(version.Inode));
             Assert.That(Directory.GetFiles(root), Has.Length.EqualTo(1));
-            // As it was put back, before the writer went on: the same file, its change time moved.
+            // As it was put back, before the writer went on: the same file (a filesystem may have
+            // moved its change time).
             Assert.That(restored, Is.Not.Null);
             Assert.That(restored!.Value.IsSameFileAs(version), Is.True);
-            Assert.That(restored.Value, Is.Not.EqualTo(version));
         }
         finally
         {

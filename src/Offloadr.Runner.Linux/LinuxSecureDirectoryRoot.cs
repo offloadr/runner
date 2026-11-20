@@ -1651,7 +1651,18 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
         /// </para>
         /// </summary>
         public bool CommitReplacing(SecureFileVersion expected, bool whileUnopened = false)
+            => CommitReplacing(expected, whileUnopened, out _);
+
+        /// <summary>
+        /// As <see cref="CommitReplacing(SecureFileVersion, bool)"/>. Swapping a file out and back
+        /// moves its change time; <paramref name="restored"/> is the version of the expected file
+        /// when it was swapped back because a process opened it, read while the lease still held
+        /// that process off: unchanged, for the caller to go on recognizing. It is null whenever
+        /// the replacement failed for another reason, a rewrite of the destination above all.
+        /// </summary>
+        public bool CommitReplacing(SecureFileVersion expected, bool whileUnopened, out SecureFileVersion? restored)
         {
+            restored = null;
             if (fchmod(GetDescriptor(_file), Convert.ToUInt32("644", 8)) != 0)
             {
                 throw CreateException($"setting published workspace file mode for '{_relativePath}'");
@@ -1688,8 +1699,8 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
             // The temporary name now holds the displaced file. The rename itself moved its change
             // time, so the comparison leaves that out. A broken lease means something opened it
             // since the lease was taken: it then goes back.
-            if (ReadVersion(_parent, _temporaryName, _relativePath) is { } displaced && displaced.IsSameFileAs(expected) &&
-                lease?.IsHeld != false)
+            var displacedExpected = ReadVersion(_parent, _temporaryName, _relativePath) is { } displaced && displaced.IsSameFileAs(expected);
+            if (displacedExpected && lease?.IsHeld != false)
             {
                 _ = unlinkat(GetDescriptor(_parent), _temporaryName, 0);
                 _committed = true;
@@ -1703,10 +1714,20 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
             // restored file.
             if (placeholder is { } written &&
                 ReadVersion(_parent, _destinationName, _relativePath) is { } current &&
-                current.IsSameFileAs(written) &&
-                renameat2(GetDescriptor(_parent), _temporaryName, GetDescriptor(_parent), _destinationName, RenameExchange) != 0)
+                current.IsSameFileAs(written))
             {
-                throw CreateException($"restoring '{_relativePath}' after a replacement it did not expect");
+                if (renameat2(GetDescriptor(_parent), _temporaryName, GetDescriptor(_parent), _destinationName, RenameExchange) != 0)
+                {
+                    throw CreateException($"restoring '{_relativePath}' after a replacement it did not expect");
+                }
+
+                // The expected file went back only because its lease broke. Whoever opened it is
+                // still held off, so it is as it was but for its change time.
+                if (displacedExpected && lease is not null &&
+                    ReadVersion(_parent, _destinationName, _relativePath) is { } back && back.IsSameFileAs(expected))
+                {
+                    restored = back;
+                }
             }
 
             return false;
