@@ -1411,7 +1411,8 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         /// <summary>
         /// Whether the control plane stored this entry's artifact and no longer lists any artifact
         /// under that name: it was deleted there. One listed under the name with other metadata
-        /// was replaced by another upload instead.
+        /// was replaced by another upload instead. The control plane's names ignore case, as an
+        /// upload's receipt does.
         /// </summary>
         private static bool WasDeletedRemotely(RemoteArtifactState state, HashSet<EditorArtifactMetadata> currentArtifacts)
         {
@@ -1419,9 +1420,9 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             if (stored is null) return false;
             foreach (var current in currentArtifacts)
             {
-                if (string.Equals(current.Type, stored.Type, StringComparison.Ordinal)
-                    && string.Equals(current.Subfolder, stored.Subfolder, StringComparison.Ordinal)
-                    && string.Equals(current.Filename, stored.Filename, StringComparison.Ordinal))
+                if (string.Equals(current.Type, stored.Type, StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(current.Subfolder, stored.Subfolder, StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(current.Filename, stored.Filename, StringComparison.OrdinalIgnoreCase))
                     return false;
             }
             return true;

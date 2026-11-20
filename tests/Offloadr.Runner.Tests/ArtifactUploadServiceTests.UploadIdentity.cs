@@ -825,6 +825,45 @@ public partial class ArtifactUploadServiceTests
         finally { TryDelete(root); }
     }
 
+    [Test]
+    public async Task RemoteReplacementUnderAnotherSpellingStillCountsTheLocalBytesUnsaved()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = UploadIdentityPaths(root);
+            var path = Path.Combine(paths.OutputDirectory, "replaced-remotely.bin");
+            var catalog = new RunnerArtifactServiceListArtifactsResponse();
+            EditorArtifactMetadata? committed = null;
+            var client = new FakeRunnerArtifactClient(catalog)
+            {
+                RewriteUploadArtifact = artifact =>
+                {
+                    committed = artifact.Clone();
+                    return artifact;
+                },
+            };
+            await using var service = new ArtifactUploadService("secret", client, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            await File.WriteAllBytesAsync(path, [1, 2, 3]);
+            await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            await WaitForIdentityUploadsToFinishAsync(service);
+            // Another upload took the artifact's name, which ignores case: the control plane no
+            // longer holds what this session wrote, so it was replaced, not deleted.
+            var replacement = committed!.Clone();
+            replacement.Filename = "REPLACED-REMOTELY.BIN";
+            replacement.CreatedUtc = Timestamp.FromDateTime(DateTime.UtcNow.AddSeconds(5));
+            catalog.Artifacts.Add(replacement);
+            await service.SeedSessionAsync("session-1", "editor-1", "owner-1", null, CancellationToken.None);
+            await WaitForIdentityUploadsToFinishAsync(service);
+            Assert.That(await File.ReadAllBytesAsync(path), Is.EqualTo(new byte[] { 1, 2, 3 }));
+            Assert.That(await service.StopSessionAsync("session-1"), Is.EqualTo(1),
+                "bytes replaced remotely under their name are no longer held by the control plane");
+        }
+        finally { TryDelete(root); }
+    }
+
     [TestCase(false)]
     [TestCase(true)]
     public async Task ChangedSnapshotSurvivesTheFinalAttemptTimeout(bool expireTotalAllowance)
