@@ -1248,7 +1248,6 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 // entry whose copy could not be removed yet is left exactly as it is, for the next
                 // listing to try again.
                 var awaitingRemoval = RemoveDeletedArtifacts(response);
-                _awaitingRemoval = awaitingRemoval;
                 var currentPaths = new HashSet<string>(awaitingRemoval, StringComparer.Ordinal);
                 var currentArtifacts = new HashSet<EditorArtifactMetadata>();
                 foreach (var item in response.Artifacts)
@@ -1258,6 +1257,12 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     {
                         currentPaths.Add(appliedPath);
                         currentArtifacts.Add(item);
+                        // Listed again as the very artifact whose removal was awaited: it was restored.
+                        if (!awaitingRemoval.Contains(appliedPath) && _deletionsAwaited.TryGetValue(appliedPath, out var awaited)
+                            && awaited.Equals(StoredArtifact.Of(item)))
+                        {
+                            ((ICollection<KeyValuePair<string, StoredArtifact>>)_deletionsAwaited).Remove(new(appliedPath, awaited));
+                        }
                     }
                 }
 
@@ -1296,11 +1301,17 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         }
 
         /// <summary>
-        /// Paths whose file the latest listing said to remove while a process had it open. Stop
-        /// does not count such a file while it is still that copy or placeholder: it is a deleted
-        /// output that only waits to be removed.
+        /// Paths whose file a listing said to remove while a process had it open, each with the
+        /// stored artifact that was named. Stop does not count such a file while it is still that
+        /// artifact's copy or placeholder: it is a deleted output that only waits to be removed.
+        /// Kept by artifact, not by listing, so that an older listing answering late does not
+        /// undo it; it goes when the file is removed or a listing gives that artifact again.
         /// </summary>
-        private volatile HashSet<string> _awaitingRemoval = new(StringComparer.Ordinal);
+        private readonly ConcurrentDictionary<string, StoredArtifact> _deletionsAwaited = new(StringComparer.Ordinal);
+
+        /// <summary>The stored artifact an entry's file stands for; by name alone for a placeholder left for a name.</summary>
+        private static StoredArtifact StoodFor(RemoteArtifactState state)
+            => state.StandsFor ?? new StoredArtifact(state.Type, state.Subfolder, state.Filename, 0, 0);
 
         /// <summary>Entries a caller seeded: the listing that follows keeps them although it may not list them yet.</summary>
         private sealed record SeededCatalog(HashSet<string> Paths, HashSet<EditorArtifactMetadata> Artifacts);
@@ -1526,7 +1537,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     {
                         // A placeholder left for a name alone (a caller's seed of an output this
                         // session had not seen) stands for whatever is stored under that name.
-                        var name = state.StandsFor ?? new StoredArtifact(state.Type, state.Subfolder, state.Filename, 0, 0);
+                        var name = StoodFor(state);
                         named = !listed.Contains(name) && lastDeleted.TryGetValue(name, out var last)
                                 && (state.StandsFor is not { } leftFor || !leftFor.StoredAfter(last));
                     }
@@ -1553,6 +1564,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         if (secureRoot.DeleteFileUnopened(relativePath, current, out var restored))
                         {
                             ((ICollection<KeyValuePair<string, RemoteArtifactState>>)_catalog).Remove(new(path, state));
+                            _deletionsAwaited.TryRemove(path, out _);
                             PruneMissingUploadBindings(path);
                             _logger.LogInformation(
                                 "Removed the local copy of a deleted artifact session={SessionId} type={Type} path={Path}",
@@ -1572,6 +1584,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     }
 
                     awaitingRemoval.Add(path);
+                    _deletionsAwaited[path] = StoodFor(state);
                 }
             }
 
@@ -2301,7 +2314,8 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         // placeholder the agent left for a remote artifact. An empty rewrite by the
                         // editor is neither.
                         var known = _catalog.TryGetValue(NormalizePath(file), out var state);
-                        if (known && _awaitingRemoval.Contains(state!.LocalPath) && (state.IsCopy(version) || state.PlaceholderVersion == version))
+                        if (known && _deletionsAwaited.TryGetValue(state!.LocalPath, out var awaited) && awaited.Equals(StoodFor(state))
+                            && (state.IsCopy(version) || state.PlaceholderVersion == version))
                         {
                             continue;
                         }
@@ -3378,6 +3392,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 StopWatchers();
                 UnsavedUploadCount = CountUnsavedArtifacts();
                 _catalog.Clear();
+                _deletionsAwaited.Clear();
                 _downloadTasks.Clear();
                 _pending.Clear();
                 _uploadBudgets.Clear();

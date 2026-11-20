@@ -618,6 +618,15 @@ public partial class ArtifactUploadServiceTests
                 await WaitForIdentityUploadsToFinishAsync(service);
             }
 
+            // The older listing answers once more, after the one that named the deletion.
+            listing.DeletedArtifacts.Clear();
+            listing.Artifacts.Add(StoredOutput("waiting.bin", FirstStoredUtc, sizeBytes: 3));
+            await using (new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            {
+                await service.RefreshSessionAsync("session-1");
+                await WaitForIdentityUploadsToFinishAsync(service);
+            }
+
             Assert.That(File.Exists(path), Is.True);
             Assert.That(client.UploadCount, Is.Zero);
             Assert.That(await service.StopSessionAsync("session-1"), Is.Zero, "a deleted output that only waits to be removed is not unsaved");

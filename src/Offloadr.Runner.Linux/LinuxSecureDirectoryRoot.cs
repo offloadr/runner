@@ -729,7 +729,17 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
                         restored = exchanged;
                     }
 
-                    KeepBeside(parent, aside, leafName, relativePath);
+                    try
+                    {
+                        KeepBeside(parent, aside, leafName, relativePath);
+                    }
+                    catch (IOException)
+                    {
+                        // The newcomer stays where it is, under the temporary name: still there
+                        // for its writer and the uploader. The file put back is what the caller
+                        // must hear about either way.
+                    }
+
                     return false;
                 }
 
