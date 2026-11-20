@@ -1459,7 +1459,8 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         /// which the listing gives as it was stored: by name and by the time it was stored. A file
         /// the session wrote since, or the copy of another artifact stored under that name, stays.
         /// An empty placeholder holds no bytes of any artifact, so it goes once nothing is listed
-        /// under its name and the artifact deleted there is its own or one stored after it.
+        /// under its name and the artifact deleted there is its own or one stored after it; one
+        /// left for a name alone goes with any artifact deleted under that name.
         /// </para>
         /// Returns the paths whose copy is to be removed but could not be yet (a process has it open).
         /// </summary>
@@ -1490,16 +1491,29 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             {
                 foreach (var (path, state) in _catalog)
                 {
-                    if (state.StandsFor is not { } stood ||
-                        (!state.Type.Equals("output", StringComparison.OrdinalIgnoreCase) && !state.Type.Equals("temp", StringComparison.OrdinalIgnoreCase)))
+                    if (!state.Type.Equals("output", StringComparison.OrdinalIgnoreCase) && !state.Type.Equals("temp", StringComparison.OrdinalIgnoreCase))
                     {
                         continue;
                     }
 
-                    var named = state.LocalVersion is not null
-                        ? deleted.Contains(stood)
-                        : state.PlaceholderVersion is not null && !listed.Contains(stood)
-                          && lastDeleted.TryGetValue(stood, out var last) && !stood.StoredAfter(last);
+                    bool named;
+                    if (state.LocalVersion is not null)
+                    {
+                        named = state.StandsFor is { } copyOf && deleted.Contains(copyOf);
+                    }
+                    else if (state.PlaceholderVersion is not null)
+                    {
+                        // A placeholder left for a name alone (a caller's seed of an output this
+                        // session had not seen) stands for whatever is stored under that name.
+                        var name = state.StandsFor ?? new StoredArtifact(state.Type, state.Subfolder, state.Filename, 0, 0);
+                        named = !listed.Contains(name) && lastDeleted.TryGetValue(name, out var last)
+                                && (state.StandsFor is not { } leftFor || !leftFor.StoredAfter(last));
+                    }
+                    else
+                    {
+                        named = false;
+                    }
+
                     if (!named || !TryResolveSecureLocation(state.Type, path, out var root, out var relativePath))
                     {
                         continue;
@@ -1803,6 +1817,18 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     {
                         knownRemote = true;
                         standsFor = previousState.StandsFor;
+                    }
+                    else if (previousState is not null && previousState.MatchesLocalFile(current) &&
+                             previousState.StandsFor is { } read && read.Equals(StoredArtifact.Of(state.CatalogArtifact)) &&
+                             !read.Equals(StoredArtifact.Of(previousState.CatalogArtifact)) &&
+                             (state.SizeBytes is not { } listedSize || listedSize == status.Length))
+                    {
+                        // The file was read back as another artifact than the entry was listed
+                        // with (one stored under the name since). The catalog now gives that very
+                        // artifact, by name, time stored and size: the entry had no item of it to
+                        // compare with.
+                        knownRemote = true;
+                        standsFor = read;
                     }
                     else if (!string.IsNullOrWhiteSpace(state.Sha256) &&
                              ExistingFileMatchesCatalogMetadata(state, status.Length, secureRoot, relativePath))

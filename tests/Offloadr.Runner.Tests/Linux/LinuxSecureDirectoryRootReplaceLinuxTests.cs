@@ -423,6 +423,36 @@ public class LinuxSecureDirectoryRootReplaceLinuxTests
         }
     }
 
+    [Test]
+    public void DeleteFileUnopened_KeepsBothFilesWhenTheNameIsTakenWhileANewerFileIsAside()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = CreateRoot();
+        try
+        {
+            var path = Path.Combine(root, "a.png");
+            File.WriteAllText(path, "uploaded");
+            using var secureRoot = new LinuxSecureDirectoryRoot(root);
+            var version = secureRoot.GetVersion("a.png")!.Value;
+            // The session replaces the file after the last check, and something creates the name
+            // again in the moment the replacement is aside.
+            secureRoot.BeforeMoveAside = () => ReplaceAtomically(root, path, "rewrite");
+            secureRoot.AfterMoveAside = () => File.WriteAllText(path, "created");
+
+            Assert.That(secureRoot.DeleteFileUnopened("a.png", version, out var restored), Is.False);
+            Assert.That(restored, Is.Null);
+            Assert.That(File.ReadAllText(path), Is.EqualTo("created"));
+            var others = Directory.GetFiles(root).Where(file => file != path).ToArray();
+            Assert.That(others, Has.Length.EqualTo(1), "the file that could not go back is kept, not removed");
+            Assert.That(File.ReadAllText(others[0]), Is.EqualTo("rewrite"));
+            Assert.That(Path.GetFileName(others[0]), Does.StartWith("a.kept-").And.EndsWith(".png"));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
     private static void ReplaceAtomically(string root, string path, string content)
     {
         var staged = Path.Combine(root, $"staged-{Guid.NewGuid():N}");

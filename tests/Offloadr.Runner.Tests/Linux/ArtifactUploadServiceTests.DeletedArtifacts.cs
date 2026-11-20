@@ -477,6 +477,73 @@ public partial class ArtifactUploadServiceTests
     }
 
     [Test]
+    public async Task ACopyReadAsALaterArtifactIsRecognizedWhenTheCatalogListsThatOne()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = UploadIdentityPaths(root);
+            var path = Path.Combine(paths.OutputDirectory, "replaced.bin");
+            var replacedUtc = FirstStoredUtc.AddMinutes(30);
+            // Listed as first stored; the read gives the upload that replaced it. No digests, as for sealed artifacts.
+            var listing = new RunnerArtifactServiceListArtifactsResponse { Artifacts = { StoredOutput("replaced.bin", FirstStoredUtc, sizeBytes: 3) } };
+            var client = new FakeRunnerArtifactClient(listing) { ReadArtifactContent = [9, 9, 9, 9], ReadArtifactModifiedUtc = replacedUtc };
+            await using var service = new ArtifactUploadService("secret", client, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            Assert.That(await service.TryEnsureArtifactAvailableAsync(path, highPriority: true, CancellationToken.None), Is.True);
+
+            // The catalog catches up and lists the artifact that was read.
+            var replacement = StoredOutput("replaced.bin", replacedUtc, sizeBytes: 4);
+            listing.Artifacts.Clear();
+            listing.Artifacts.Add(replacement);
+            await service.RefreshSessionAsync("session-1");
+            await WaitForIdentityUploadsToFinishAsync(service);
+            Assert.That(client.UploadCount, Is.Zero, "the bytes read are the listed artifact's, not new data");
+
+            listing.Artifacts.Clear();
+            listing.DeletedArtifacts.Add(replacement);
+            await service.RefreshSessionAsync("session-1");
+            await WaitForIdentityUploadsToFinishAsync(service);
+
+            Assert.That(File.Exists(path), Is.False);
+            Assert.That(client.UploadCount, Is.Zero);
+            Assert.That(await service.StopSessionAsync("session-1"), Is.Zero);
+        }
+        finally { TryDelete(root); }
+    }
+
+    [Test]
+    public async Task APlaceholderSeededByNameGoesWhenAnArtifactUnderThatNameWasDeleted()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = UploadIdentityPaths(root);
+            var path = Path.Combine(paths.OutputDirectory, "unseen.bin");
+            var listing = new RunnerArtifactServiceListArtifactsResponse();
+            var client = new FakeRunnerArtifactClient(listing);
+            await using var service = new ArtifactUploadService("secret", client, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+
+            // A prompt names an output this session never saw, deleted before the listing was read.
+            listing.DeletedArtifacts.Add(StoredOutput("unseen.bin", FirstStoredUtc));
+            await service.SeedSessionAsync("session-1", "editor-1", "owner-1",
+                [new EditorArtifactMetadata { EditorSid = "editor-1", Filename = "unseen.bin", Type = "output", Subfolder = string.Empty }],
+                CancellationToken.None);
+            await WaitForIdentityUploadsToFinishAsync(service);
+
+            Assert.That(File.Exists(path), Is.False, "the seed's own listing says what was under that name is deleted");
+            Assert.That(client.UploadCount, Is.Zero);
+            Assert.That(await service.StopSessionAsync("session-1"), Is.Zero);
+        }
+        finally { TryDelete(root); }
+    }
+
+    [Test]
     public async Task ADeletedInputIsLeftToTheRulesForInputs()
     {
         LinuxTestPrerequisites.RequireLinux();

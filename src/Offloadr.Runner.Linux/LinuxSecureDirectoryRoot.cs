@@ -609,12 +609,16 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
     /// <summary>Runs right before <see cref="DeleteFileUnopened"/> moves the file aside, after its last check; lets tests act at that moment.</summary>
     internal Action? BeforeMoveAside { get; set; }
 
+    /// <summary>Runs right after <see cref="DeleteFileUnopened"/> moved the file aside; lets tests take its name at that moment.</summary>
+    internal Action? AfterMoveAside { get; set; }
+
     /// <summary>
     /// Removes the file at <paramref name="relativePath"/> only when it is <paramref name="expected"/>
     /// and no other process has it open or mapped. It is moved aside under a name of this agent's
     /// own and removed once it proves to be that file, with a write lease held across the move: an
-    /// open that came meanwhile breaks the lease, and the file then goes back, unless something
-    /// newer has taken its name. What remains, as when a file is replaced while unopened, is an
+    /// open that came meanwhile breaks the lease, and the file then goes back. Nothing but the
+    /// expected, unopened file is ever removed: if its name was taken while it was aside, the file
+    /// that cannot go back is kept beside it under a name of its own. What remains, as when a file is replaced while unopened, is an
     /// open that had already looked the name up before the move and reaches the file only after
     /// the lease was last checked, a moment within that one system call. Returns whether the file
     /// was removed.
@@ -676,6 +680,8 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
                 throw new IOException($"Could not allocate a unique temporary name to remove '{relativePath}'.");
             }
 
+            AfterMoveAside?.Invoke();
+
             // The rename moved the file's change time, so the comparison leaves that out. A broken
             // lease means something opened it since the lease was taken.
             if (ReadVersion(parent, aside, relativePath) is { } moved && moved.IsSameFileAs(expected) && lease.IsHeld)
@@ -684,18 +690,36 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
                 return true;
             }
 
-            // Back under its name, where an open the lease held expects it. A file the session put
-            // there since is newer and stays; the one moved aside, already superseded, is removed.
+            // Back under its name, where an open the lease held expects it. What was moved aside
+            // may be a file the session put there after the check, or one a process is opening:
+            // it is not this agent's to remove. If the name was taken meanwhile, it is kept beside
+            // the newcomer under a name of its own, where the session and the uploader find it.
             if (renameat2(GetDescriptor(parent), aside, GetDescriptor(parent), leafName, RenameNoReplace) != 0)
             {
                 var error = Marshal.GetLastPInvokeError();
-                _ = unlinkat(GetDescriptor(parent), aside, 0);
                 if (error != AlreadyExists)
                 {
                     throw CreateException($"restoring '{relativePath}' after it was opened", error);
                 }
 
-                return false;
+                var stem = Path.GetFileNameWithoutExtension(leafName);
+                var extension = Path.GetExtension(leafName);
+                for (var attempt = 0; attempt < 16; attempt++)
+                {
+                    var kept = $"{stem}.kept-{Path.GetRandomFileName().Replace(".", string.Empty, StringComparison.Ordinal)}{extension}";
+                    if (renameat2(GetDescriptor(parent), aside, GetDescriptor(parent), kept, RenameNoReplace) == 0)
+                    {
+                        return false;
+                    }
+
+                    error = Marshal.GetLastPInvokeError();
+                    if (error != AlreadyExists)
+                    {
+                        break;
+                    }
+                }
+
+                throw CreateException($"keeping the file moved aside from '{relativePath}'", error);
             }
 
             if (ReadVersion(parent, leafName, relativePath) is { } back && back.IsSameFileAs(expected))
