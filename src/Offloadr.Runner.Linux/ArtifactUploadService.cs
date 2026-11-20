@@ -1270,11 +1270,24 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     {
                         currentPaths.Add(appliedPath);
                         currentArtifacts.Add(item);
-                        // Listed again as the very artifact whose removal was awaited: it was restored.
-                        if (!awaitingRemoval.Contains(appliedPath) && _deletionsAwaited.TryGetValue(appliedPath, out var awaited)
-                            && awaited.Equals(StoredArtifact.Of(item)))
+                    }
+                }
+
+                // Listed again as the very artifact whose removal was awaited: it was restored. By
+                // the artifact, not the path: the catalog may spell its name unlike the local file.
+                if (!_deletionsAwaited.IsEmpty)
+                {
+                    var listedNow = new HashSet<StoredArtifact>();
+                    foreach (var item in response.Artifacts)
+                    {
+                        if (StoredArtifact.Of(item) is { } artifact) listedNow.Add(artifact);
+                    }
+
+                    foreach (var awaited in _deletionsAwaited)
+                    {
+                        if (!awaitingRemoval.Contains(awaited.Key) && listedNow.Contains(awaited.Value))
                         {
-                            ((ICollection<KeyValuePair<string, StoredArtifact>>)_deletionsAwaited).Remove(new(appliedPath, awaited));
+                            ((ICollection<KeyValuePair<string, StoredArtifact>>)_deletionsAwaited).Remove(awaited);
                         }
                     }
                 }
