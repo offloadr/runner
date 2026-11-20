@@ -981,6 +981,84 @@ public partial class ArtifactUploadServiceTests
         finally { TryDelete(root); }
     }
 
+    // Two listings overlap; each reads the catalog when it is requested and answers later. The
+    // original upload is replaced between them, and the replacement is deleted afterwards.
+    [TestCase("out.bin", true)]
+    [TestCase("OUT.BIN", false)]
+    public async Task AReplacementStaysOneWhicheverOverlappingListingAnswersFirst(string storedAs, bool originalAnswersFirst)
+    {
+        var root = CreateTempDirectory();
+        var releaseOriginal = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseReplacement = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
+        {
+            var paths = UploadIdentityPaths(root);
+            var path = Path.Combine(paths.OutputDirectory, "out.bin");
+            var catalog = new RunnerArtifactServiceListArtifactsResponse();
+            EditorArtifactMetadata? committed = null;
+            var client = new FakeRunnerArtifactClient(catalog)
+            {
+                RewriteUploadArtifact = artifact =>
+                {
+                    artifact.Filename = storedAs;
+                    artifact.CreatedUtc = Timestamp.FromDateTime(DateTime.UtcNow);
+                    committed = artifact.Clone();
+                    return artifact;
+                },
+            };
+            await using var service = new ArtifactUploadService("secret", client, NullLogger<ArtifactUploadService>.Instance);
+            try
+            {
+                await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+                await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+                await File.WriteAllBytesAsync(path, [1, 2, 3]);
+                await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+                await WaitForIdentityUploadsToFinishAsync(service);
+                client.RejectAsRetiredUpload = true;
+
+                async Task<Task> RequestListingAsync(TaskCompletionSource release)
+                {
+                    client.DelayListResponse = async listed => { await release.Task; return listed; };
+                    var listings = client.ListCallCount;
+                    var listing = service.SeedSessionAsync("session-1", "editor-1", "owner-1", null, CancellationToken.None);
+                    for (var waited = 0; client.ListCallCount == listings && waited < 500; waited++) await Task.Delay(10);
+                    Assert.That(client.ListCallCount, Is.EqualTo(listings + 1), "the listing was requested");
+                    client.DelayListResponse = null;
+                    return listing;
+                }
+
+                // The first listing reads the catalog while it still holds the original.
+                catalog.Artifacts.Add(committed!.Clone());
+                var original = await RequestListingAsync(releaseOriginal);
+                // Another upload replaces it under another spelling of its name; the second reads that.
+                var replacement = committed.Clone();
+                replacement.Filename = storedAs == "out.bin" ? "OUT.BIN" : "Out.bin";
+                replacement.CreatedUtc = Timestamp.FromDateTime(DateTime.UtcNow.AddSeconds(5));
+                catalog.Artifacts.Clear();
+                catalog.Artifacts.Add(replacement);
+                var replaced = await RequestListingAsync(releaseReplacement);
+
+                (originalAnswersFirst ? releaseOriginal : releaseReplacement).TrySetResult();
+                await (originalAnswersFirst ? original : replaced).WaitAsync(TimeSpan.FromSeconds(10));
+                (originalAnswersFirst ? releaseReplacement : releaseOriginal).TrySetResult();
+                await (originalAnswersFirst ? replaced : original).WaitAsync(TimeSpan.FromSeconds(10));
+                // The replacement is deleted too: a later listing names nothing.
+                catalog.Artifacts.Clear();
+                await service.SeedSessionAsync("session-1", "editor-1", "owner-1", null, CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(10));
+                await WaitForIdentityUploadsToFinishAsync(service);
+                Assert.That(await File.ReadAllBytesAsync(path), Is.EqualTo(new byte[] { 1, 2, 3 }));
+                Assert.That(await service.StopSessionAsync("session-1"), Is.EqualTo(1),
+                    "the upload was replaced before the name was emptied; that is not a deletion of it");
+            }
+            finally
+            {
+                releaseOriginal.TrySetResult();
+                releaseReplacement.TrySetResult();
+            }
+        }
+        finally { TryDelete(root); }
+    }
+
     [Test]
     public async Task RemoteReplacementCountsTheUploadAndItsCatalogAliasAsOneLostArtifact()
     {

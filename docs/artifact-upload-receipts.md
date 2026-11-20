@@ -32,12 +32,15 @@ additional agent-created placeholder that catalog casing leaves beside the
 uploaded snapshot. An artifact the control plane now lists under the same name
 with other metadata was replaced by another upload, not deleted: what this
 session produced is no longer held, and it still counts as unsaved.
-Only a full listing of the editor's own artifacts establishes a deletion, and only
-one requested after the control plane stored the artifact. A prompt's seed names
-only the artifacts that prompt uses, so it never does. Listings can answer in any
-order, so a replacement does not depend on it: once any list from after the
-artifact was stored names another upload under its name, the artifact was
-replaced for good, whichever answer arrives last.
+Only a full listing requested after the control plane stored the artifact is
+evidence of either: an older listing may not know the artifact yet, and a
+prompt's seed names only the artifacts that prompt uses, at an unknown time.
+Listings can answer in any order, so the outcome does not depend on it. Once
+such a listing names another upload under the artifact's name, it was replaced
+for good, whichever answer arrives last and whatever a stale answer says
+afterwards. Only a listing of the editor's own artifacts without the name
+establishes a deletion, and never once a replacement was seen. Listing the same
+artifact again does not move the point after which a listing counts.
 A rewritten file, replaced placeholder or other unacknowledged local file remains
 unsaved data. Counting does not delete or rewrite either local path.
 A remotely deleted artifact is not eligible for eviction into a download placeholder.

@@ -1314,7 +1314,6 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             }
 
             PruneCatalogEntries(currentPaths, currentArtifacts);
-            JudgeRemoteDeletions(currentArtifacts, editorSid, listing: 0);
             return true;
         }
 
@@ -1355,7 +1354,18 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 state.UploadSnapshot = previousState?.UploadSnapshot;
                 state.CommittedArtifact = previousState?.CommittedArtifact;
                 state.CatalogArtifact = item.Clone();
-                state.StoredAsOfListing = Volatile.Read(ref _listingsStarted);
+                // The same upload or listed artifact keeps what was learned about it: listing it
+                // again must not move the point after which a listing is evidence.
+                if (previousState is not null
+                    && (previousState.CommittedArtifact is not null || previousState.CatalogArtifact?.Equals(item) == true))
+                {
+                    state.StoredAsOfListing = previousState.StoredAsOfListing;
+                    state.ReplacedRemotely = previousState.ReplacedRemotely;
+                }
+                else
+                {
+                    state.StoredAsOfListing = Volatile.Read(ref _listingsStarted);
+                }
                 _catalog[normalized] = state;
 
                 try
@@ -1414,13 +1424,14 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         }
 
         /// <summary>
-        /// Decides, for each retained entry the control plane no longer holds, whether its
-        /// artifact was deleted there or replaced by another upload. Evidence counts only from
-        /// after the control plane stored the artifact: a full listing requested since
-        /// (<paramref name="listing"/> above zero), or a seed, whose age is unknown and which
-        /// can only say an artifact is there. Listings can answer in any order, so the two
-        /// kinds don't depend on it: a name seen again under other metadata means replaced, for
-        /// good; only a full listing of this editor's artifacts without the name means deleted.
+        /// Decides, for each entry, whether its artifact was deleted on the control plane or
+        /// replaced there by another upload. Only a full listing requested after the control
+        /// plane stored the artifact is evidence (<paramref name="listing"/> above the entry's
+        /// <see cref="RemoteArtifactState.StoredAsOfListing"/>): an older one may not know the
+        /// artifact yet, and a seed names only some artifacts at an unknown time. Listings can
+        /// answer in any order, so the outcome doesn't depend on it: a name seen under other
+        /// metadata means replaced, for good; only a listing of this editor's artifacts without
+        /// the name means deleted, and never once a replacement was seen.
         /// </summary>
         private void JudgeRemoteDeletions(HashSet<EditorArtifactMetadata> currentArtifacts, string editorSid, int listing)
         {
@@ -1431,19 +1442,17 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     if (state.HasRemoteArtifact)
                     {
                         state.DeletedRemotely = false;
-                        state.ReplacedRemotely = false;
                         continue;
                     }
 
                     var stored = state.CommittedArtifact ?? state.CatalogArtifact;
-                    if (stored is null || (listing != 0 && listing <= state.StoredAsOfListing)) continue;
+                    if (stored is null || listing <= state.StoredAsOfListing) continue;
                     if (IsListedUnderItsName(stored, currentArtifacts))
                     {
                         state.ReplacedRemotely = true;
                         state.DeletedRemotely = false;
                     }
-                    else if (listing != 0 && !state.ReplacedRemotely
-                        && string.Equals(stored.EditorSid, editorSid, StringComparison.Ordinal))
+                    else if (!state.ReplacedRemotely && string.Equals(stored.EditorSid, editorSid, StringComparison.Ordinal))
                     {
                         state.DeletedRemotely = true;
                     }
@@ -3066,7 +3075,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
             /// <summary>
             /// True once the control plane listed another upload under the artifact's name: it was
-            /// replaced, and no later absence of the name makes that a deletion.
+            /// replaced, and nothing later makes that a deletion. Never cleared for this upload.
             /// </summary>
             public bool ReplacedRemotely { get; set; }
 
