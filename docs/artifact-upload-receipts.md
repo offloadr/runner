@@ -33,9 +33,11 @@ began, each as it was stored (its catalog name and `created_utc`): the user
 removed it from their files, or a temporary one expired. The runner removes its
 local copy of each one before it applies the rest of the listing, so there is
 nothing left for Stop to count or for a scan to upload again, and nothing to
-remember about the deletion. The order in which listings answer does not matter:
-a copy removed for an artifact that was since restored comes back as a
-placeholder with the next listing and is read back on demand.
+remember about the deletion. A copy removed for an artifact that was since
+restored comes back as a placeholder with the next listing and is read back on
+demand. The uploader asks for one listing at a time, each only after the one
+before was applied, so the control plane reads them in the order they are
+applied and an older answer never arrives after a newer one.
 
 A file is removed only when it is, unchanged, the copy of exactly the artifact
 named. Each catalog entry records which stored artifact its local file is a copy

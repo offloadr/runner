@@ -1234,15 +1234,28 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             using var linked = CancellationTokenSource.CreateLinkedTokenSource(_operations.Token, cancellationToken);
             var token = linked.Token;
 
+            var listing = false;
             try
             {
+                // One listing at a time, each asked for only after the one before was applied: the
+                // control plane then reads them in the order they are applied here, and an older
+                // answer never arrives after a newer one to undo what it said.
+                await _listings.WaitAsync(token).ConfigureAwait(false);
+                listing = true;
+                if (_catalogLoaded && !forceReload)
+                {
+                    return true;
+                }
+
                 var request = new RunnerArtifactServiceListArtifactsRequest
                 {
                     EditorSid = editorSid,
                     Requester = _readRequester.Clone()
                 };
 
-                var response = await _artifactClient.ListArtifactsAsync(request, headers: _authHeaders, cancellationToken: token).ConfigureAwait(false);
+                // Bounded, since every other listing waits for this one.
+                var response = await _artifactClient.ListArtifactsAsync(request, headers: _authHeaders,
+                    deadline: DateTime.UtcNow + ListingTimeout, cancellationToken: token).ConfigureAwait(false);
                 // Deletions first, while each entry still says which stored artifact its file is a
                 // copy of: applying an artifact listed under the same name would forget that. An
                 // entry whose copy could not be removed yet is left exactly as it is, for the next
@@ -1298,7 +1311,14 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 _logger.LogDebug(ex, "Unexpected error fetching artifact catalog for session {SessionId}", _sessionId);
                 return false;
             }
+            finally
+            {
+                if (listing) _listings.Release();
+            }
         }
+
+        private readonly SemaphoreSlim _listings = new(1, 1);
+        private static readonly TimeSpan ListingTimeout = TimeSpan.FromMinutes(2);
 
         /// <summary>
         /// Paths whose file a listing said to remove while a process had it open, each with the

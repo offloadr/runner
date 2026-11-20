@@ -759,6 +759,39 @@ public partial class ArtifactUploadServiceTests
     }
 
     [Test]
+    public async Task ListingsAreAskedForOneAtATimeSoTheirAnswersApplyInOrder()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = UploadIdentityPaths(root);
+            var client = new FakeRunnerArtifactClient(new());
+            await using var service = new ArtifactUploadService("secret", client, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            var listed = client.ListCallCount;
+
+            var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            client.ListArtifactsGate = release.Task;
+            var refreshes = Enumerable.Range(0, 3).Select(_ => service.RefreshSessionAsync("session-1")).ToArray();
+            using (var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5)))
+            {
+                while (client.ListCallCount == listed) await Task.Delay(10, timeout.Token);
+            }
+
+            await Task.Delay(200);
+            Assert.That(client.ListCallCount, Is.EqualTo(listed + 1), "the others wait for the first answer to be applied");
+            release.SetResult();
+            await Task.WhenAll(refreshes);
+
+            Assert.That(client.ListCallCount, Is.EqualTo(listed + 3));
+            Assert.That(client.MaxListCallsInFlight, Is.EqualTo(1));
+        }
+        finally { TryDelete(root); }
+    }
+
+    [Test]
     public async Task ADeletedInputIsLeftToTheRulesForInputs()
     {
         LinuxTestPrerequisites.RequireLinux();

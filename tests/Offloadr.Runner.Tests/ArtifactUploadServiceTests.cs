@@ -1950,12 +1950,43 @@ public partial class ArtifactUploadServiceTests
             return new(response, Task.FromResult(new Metadata()), () => Status.DefaultSuccess, () => new Metadata(), () => { });
         }
 
+        /// <summary>When set, every listing answers only once this completes.</summary>
+        public Task? ListArtifactsGate { get; set; }
+
+        /// <summary>The most listings that were waiting for an answer at one time.</summary>
+        public int MaxListCallsInFlight => Volatile.Read(ref _maxListCallsInFlight);
+
+        private int _listCallsInFlight;
+        private int _maxListCallsInFlight;
+
+        private async Task<RunnerArtifactServiceListArtifactsResponse> AnswerListAfterGateAsync(Task gate, CancellationToken cancellationToken)
+        {
+            try
+            {
+                await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+                return ListArtifactsException is null ? _listResponse.Clone() : throw ListArtifactsException;
+            }
+            finally
+            {
+                Interlocked.Decrement(ref _listCallsInFlight);
+            }
+        }
+
         public override AsyncUnaryCall<RunnerArtifactServiceListArtifactsResponse> ListArtifactsAsync(RunnerArtifactServiceListArtifactsRequest request, CallOptions options)
         {
             ListCallCount++;
             LastListHeaders = options.Headers;
             LastListRequest = request.Clone();
-            var responseTask = ListArtifactsException is null
+            var inFlight = Interlocked.Increment(ref _listCallsInFlight);
+            int seen;
+            while (inFlight > (seen = Volatile.Read(ref _maxListCallsInFlight)) &&
+                   Interlocked.CompareExchange(ref _maxListCallsInFlight, inFlight, seen) != seen)
+            {
+            }
+
+            if (ListArtifactsGate is null) Interlocked.Decrement(ref _listCallsInFlight);
+            var responseTask = ListArtifactsGate is { } gate ? AnswerListAfterGateAsync(gate, options.CancellationToken)
+                : ListArtifactsException is null
                 ? Task.FromResult(_listResponse)
                 : Task.FromException<RunnerArtifactServiceListArtifactsResponse>(ListArtifactsException);
             return new AsyncUnaryCall<RunnerArtifactServiceListArtifactsResponse>(
