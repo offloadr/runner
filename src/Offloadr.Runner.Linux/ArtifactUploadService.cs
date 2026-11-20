@@ -2478,6 +2478,8 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     using var placeholder = secureRoot.CreatePublication(relativePath);
                     placeholder.SetModifiedUtc(status.LastWriteTimeUtc);
                     CarryOwnership(placeholder, state.LocalPath);
+                    // The placeholder as the agent made it, before the session can reach it.
+                    var made = placeholder.GetVersion();
                     // Swapped in atomically and kept only if it displaced exactly that version,
                     // which no process had open, mapped or opened meanwhile: one holding it, a
                     // writer above all, would go on with an inode nobody can reach again.
@@ -2487,9 +2489,10 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     }
 
                     // The agent's own placeholder only while the path still holds the file it
-                    // published: the session may put a file of its own there right after.
+                    // published, as it made it: the session may put a file of its own there right
+                    // after, or open this one and write it (empty again, even).
                     var left = secureRoot.GetVersion(relativePath);
-                    state.MarkEvicted(left, own: left is not null && left == placeholder.GetVersion());
+                    state.MarkEvicted(left, own: left is { } there && made is { } asMade && there == placeholder.GetVersion() && there.IsSameFileAs(asMade));
                     released += status.Length;
                     var freed = freeBefore is { } before && ReadSealedFreeBytes() is { } after ? after - before : released;
                     if (freed >= bytesToFree)
