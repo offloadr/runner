@@ -453,6 +453,36 @@ public class LinuxSecureDirectoryRootReplaceLinuxTests
         }
     }
 
+    [Test]
+    public void Publication_ReportsItsOwnFileNotWhateverTookTheDestinationSince()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = CreateRoot();
+        try
+        {
+            var path = Path.Combine(root, "a.png");
+            using var secureRoot = new LinuxSecureDirectoryRoot(root);
+            using var publication = secureRoot.CreatePublication("a.png");
+            using (var stream = publication.OpenWriteStream())
+            {
+                stream.Write("downloaded"u8);
+            }
+
+            var written = publication.GetVersion()!.Value;
+            Assert.That(publication.CommitIfAbsent(), Is.True);
+            Assert.That(publication.GetVersion()!.Value.IsSameFileAs(written), Is.True, "publishing moves only the change time");
+            Assert.That(secureRoot.GetVersion("a.png"), Is.EqualTo(publication.GetVersion()));
+
+            // The session puts its own file there right after.
+            ReplaceAtomically(root, path, "rewritten!");
+            Assert.That(secureRoot.GetVersion("a.png"), Is.Not.EqualTo(publication.GetVersion()));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
     private static void ReplaceAtomically(string root, string path, string content)
     {
         var staged = Path.Combine(root, $"staged-{Guid.NewGuid():N}");

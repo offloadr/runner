@@ -1497,6 +1497,13 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
         public void SetModifiedUtc(DateTime modifiedUtc)
             => LinuxSecureDirectoryRoot.SetModifiedUtc(_file, modifiedUtc);
 
+        /// <summary>
+        /// The version of the publication's own file, wherever its name is now: before it is
+        /// published, or after. Unlike a look at the destination, it is never another file that
+        /// took the destination's place since.
+        /// </summary>
+        public SecureFileVersion? GetVersion() => ReadVersion(_file, _relativePath);
+
         /// <summary>Gives the publication to an owner and group before it is published.</summary>
         public void SetOwner(uint ownerId, uint groupId)
         {

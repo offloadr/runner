@@ -44,7 +44,13 @@ says its artifact was stored (which may be a later one than the entry was
 listed with), or a digest match with the listed artifact. A caller's seed, which
 gives a name and nothing else, leaves an entry that still knows its file exactly
 as it is: the name says neither which stored artifact the file is nor whether
-the control plane holds it. A file the session wrote since, or
+the control plane holds it. The record outlives the catalog listing another
+artifact under the name (an older listing answering late, say): the file is then
+not what the control plane holds and is not counted as saved, but it is still the
+copy of what was stored, so it is not uploaded as new data, a deletion of that
+artifact removes it, and a listing of that artifact recognizes it again. A
+download records the version of the file the agent wrote, never of a file the
+session put in its place right after. A file the session wrote since, or
 the copy of another artifact stored under the same name, is the session's own
 data and stays. An empty placeholder holds no bytes of any artifact; it goes once
 nothing is listed under its name and the artifact deleted there is its own or one

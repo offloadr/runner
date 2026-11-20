@@ -515,6 +515,44 @@ public partial class ArtifactUploadServiceTests
     }
 
     [Test]
+    public async Task ACopyStaysKnownWhenAnOlderListingAnswersLate()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = UploadIdentityPaths(root);
+            var path = Path.Combine(paths.OutputDirectory, "late.bin");
+            var current = StoredOutput("late.bin", FirstStoredUtc.AddMinutes(30), sizeBytes: 4);
+            var listing = new RunnerArtifactServiceListArtifactsResponse { Artifacts = { current } };
+            var client = new FakeRunnerArtifactClient(listing) { ReadArtifactContent = [9, 9, 9, 9], ReadArtifactModifiedUtc = FirstStoredUtc.AddMinutes(30) };
+            await using var service = new ArtifactUploadService("secret", client, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            Assert.That(await service.TryEnsureArtifactAvailableAsync(path, highPriority: true, CancellationToken.None), Is.True);
+
+            // A listing read before that artifact was stored answers only now, with the one it replaced.
+            listing.Artifacts.Clear();
+            listing.Artifacts.Add(StoredOutput("late.bin", FirstStoredUtc, sizeBytes: 3));
+            await service.RefreshSessionAsync("session-1");
+            await WaitForIdentityUploadsToFinishAsync(service);
+            Assert.That(await File.ReadAllBytesAsync(path), Is.EqualTo(new byte[] { 9, 9, 9, 9 }));
+            Assert.That(client.UploadCount, Is.Zero, "a copy of a stored artifact is not uploaded as new data");
+
+            // The artifact the copy is of was deleted meanwhile.
+            listing.Artifacts.Clear();
+            listing.DeletedArtifacts.Add(current);
+            await service.RefreshSessionAsync("session-1");
+            await WaitForIdentityUploadsToFinishAsync(service);
+
+            Assert.That(File.Exists(path), Is.False);
+            Assert.That(client.UploadCount, Is.Zero);
+            Assert.That(await service.StopSessionAsync("session-1"), Is.Zero);
+        }
+        finally { TryDelete(root); }
+    }
+
+    [Test]
     public async Task APlaceholderSeededByNameGoesWhenAnArtifactUnderThatNameWasDeleted()
     {
         LinuxTestPrerequisites.RequireLinux();
