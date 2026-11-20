@@ -36,8 +36,11 @@ not uploaded again; reporting it would tell the user that an output they deleted
 was not saved. That holds for an output downloaded from an earlier session too,
 which stays known instead of being dropped from the catalog. An artifact replaced
 by another upload is not named, and still counts. A later listing that names the
-artifact itself again (it was restored) takes the deletion back, and bytes read
-back from the control plane are never those of a deleted artifact. Every listing
+artifact itself again (it was restored) takes the deletion back. Bytes read back
+from the control plane are never those of a deleted artifact; a read says when
+its artifact was stored, and if that is not an artifact the entry has a record
+of (another upload took the path), no listing's word about those records applies
+to the bytes until a listing brings the entry its own. Every listing
 carries the time the control plane read it, and when answers arrive out of order
 each entry follows the later one. The runner infers nothing from an artifact
 merely being absent.

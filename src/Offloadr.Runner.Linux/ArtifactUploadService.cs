@@ -1356,7 +1356,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 state.CommittedArtifact = previousState?.CommittedArtifact;
                 state.CatalogArtifact = item.Clone();
                 // The same artifact listed again keeps what a listing said about its deletion.
-                if (previousState is not null
+                if (previousState is not null && previousState.DeletionListedUtc != DateTimeOffset.MaxValue
                     && (previousState.CommittedArtifact?.Equals(item) == true || previousState.CatalogArtifact?.Equals(item) == true))
                 {
                     state.DeletedRemotely = previousState.DeletedRemotely;
@@ -1826,6 +1826,9 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 long bytesWritten = 0;
                 long? expectedSizeBytes = null;
                 string? expectedSha256 = null;
+                // When the control plane stored the artifact it is sending: the same time a
+                // listing gives as that artifact's created_utc.
+                Timestamp? readStoredUtc = null;
                 using var sinkSlot = new SealedReadSinkSlot();
                 await using (var destination = publication.OpenWriteStream())
                 using (var hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA256))
@@ -1839,6 +1842,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                             case RunnerArtifactServiceReadArtifactResponse.PayloadOneofCase.Metadata:
                                 sawMetadata = true;
                                 var metadata = response.Metadata;
+                                readStoredUtc = metadata.ModifiedUtc;
                                 expectedSizeBytes = metadata.SizeBytes;
                                 if (expectedSizeBytes > SealedReadSink.WireLimit(metadata.Envelope, MaxUploadBytes))
                                 {
@@ -1946,14 +1950,12 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
                     var published = secureRoot.GetVersion(relativePath);
                     state.MarkDownloaded(published);
-                    // These bytes were just read from the control plane, so they are not those
-                    // of an artifact it deleted. Listings no longer judge this entry; the next
-                    // one that lists the path brings its own.
-                    if (state.DeletedRemotely)
-                    {
-                        state.DeletedRemotely = false;
-                        state.DeletionListedUtc = DateTimeOffset.MaxValue;
-                    }
+                    // These bytes were just read from the control plane, so nothing it deleted.
+                    // If they are not of an artifact this entry has a record of (another upload
+                    // took the path since), no listing's word about those records applies to
+                    // them: the entry is no longer judged until a listing brings its own.
+                    state.DeletedRemotely = false;
+                    if (!state.StandsForArtifactStoredAt(readStoredUtc)) state.DeletionListedUtc = DateTimeOffset.MaxValue;
                     state.MarkServed(DateTimeOffset.UtcNow);
                     return published;
                 }
@@ -3062,8 +3064,20 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             /// </summary>
             public bool DeletedRemotely { get; set; }
 
-            /// <summary>When the control plane read the listing that last decided <see cref="DeletedRemotely"/>.</summary>
+            /// <summary>
+            /// When the control plane read the listing that last decided <see cref="DeletedRemotely"/>;
+            /// the latest possible time once the local bytes are of an artifact this entry has no
+            /// record of, so that no listing decides it.
+            /// </summary>
             public DateTimeOffset DeletionListedUtc { get; set; }
+
+            /// <summary>
+            /// True when this entry has a record (its upload's receipt or its catalog artifact) of
+            /// the artifact the control plane stored at <paramref name="storedUtc"/>.
+            /// </summary>
+            public bool StandsForArtifactStoredAt(Timestamp? storedUtc)
+                => storedUtc is not null
+                    && (CommittedArtifact?.CreatedUtc?.Equals(storedUtc) == true || CatalogArtifact?.CreatedUtc?.Equals(storedUtc) == true);
 
             /// <summary>
             /// True when <paramref name="version"/> is no loss if the session's data is removed: the
