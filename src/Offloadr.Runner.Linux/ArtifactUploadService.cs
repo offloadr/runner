@@ -1348,6 +1348,15 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             lock (_evictionGate)
             {
                 _catalog.TryGetValue(normalized, out var previousState);
+                // A caller's seed gives a name and nothing else. An entry that already knows the
+                // file at that path (its placeholder, or the copy it recognized) learns nothing
+                // from it, and would forget which stored artifact the file stands for and whether
+                // the control plane holds it. It stays exactly as it is.
+                if (previousState is not null && IsNameOnly(item) && KnowsItsFile(previousState))
+                {
+                    return normalized;
+                }
+
                 var state = new RemoteArtifactState(
                     activeEditorSid,
                     item.Type,
@@ -1373,6 +1382,29 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             }
 
             return normalized;
+        }
+
+        private static bool IsNameOnly(EditorArtifactMetadata item)
+            => item.CreatedUtc is null && item.SizeBytes is null && item.Sha256 is null && string.IsNullOrEmpty(item.ObjectKey);
+
+        /// <summary>True when the file at the entry's path is still the placeholder or the copy the entry recorded.</summary>
+        private bool KnowsItsFile(RemoteArtifactState state)
+        {
+            if (!TryResolveSecureLocation(state.Type, state.LocalPath, out var root, out var relativePath))
+            {
+                return false;
+            }
+
+            try
+            {
+                using var secureRoot = new LinuxSecureDirectoryRoot(root);
+                return secureRoot.GetVersion(relativePath) is { } current
+                       && (state.MatchesLocalFile(current) || state.PlaceholderVersion == current);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                return false;
+            }
         }
 
         private void PruneCatalogEntries(HashSet<string> currentPaths, HashSet<EditorArtifactMetadata> currentArtifacts)
@@ -1483,7 +1515,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                             continue;
                         }
 
-                        if (secureRoot.DeleteFileUnopened(relativePath, current))
+                        if (secureRoot.DeleteFileUnopened(relativePath, current, out var restored))
                         {
                             ((ICollection<KeyValuePair<string, RemoteArtifactState>>)_catalog).Remove(new(path, state));
                             PruneMissingUploadBindings(path);
@@ -1494,6 +1526,10 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                                 path);
                             continue;
                         }
+
+                        // Put back for a process that opened it: the same file, with only its
+                        // change time moved by the attempt, so the entry goes on recognizing it.
+                        if (restored is { } back) state.RefreshVersion(back);
                     }
                     catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
                     {
@@ -1757,9 +1793,8 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 var version = secureRoot.GetVersion(relativePath);
                 var knownRemote = false;
                 // Which stored artifact the kept file is a copy of. The previous entry knew, when it
-                // recognized this file and the catalog still gives the same artifact: the very same
-                // item, or a caller's seed, which gives the name and nothing to tell artifacts under
-                // it apart. A digest match makes it a copy of the listed one.
+                // recognized this file and the catalog still gives the very same item. A digest
+                // match makes it a copy of the listed one.
                 StoredArtifact? standsFor = null;
                 if (version is { } current)
                 {
@@ -1768,15 +1803,6 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     {
                         knownRemote = true;
                         standsFor = previousState.StandsFor;
-                    }
-                    else if (previousState is not null && previousState.MatchesLocalFile(current) &&
-                             previousState.StandsFor is { } stood && state.CatalogArtifact is { } named && stood.IsNamedBy(named))
-                    {
-                        // A name alone is no word on whether the control plane still holds the
-                        // artifact: that stays as the last listing left it.
-                        knownRemote = true;
-                        standsFor = stood;
-                        state.HasRemoteArtifact = previousState.HasRemoteArtifact;
                     }
                     else if (!string.IsNullOrWhiteSpace(state.Sha256) &&
                              ExistingFileMatchesCatalogMetadata(state, status.Length, secureRoot, relativePath))
@@ -3058,17 +3084,6 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
 
             public bool StoredAfter(StoredArtifact other)
                 => StoredSeconds > other.StoredSeconds || (StoredSeconds == other.StoredSeconds && StoredNanos > other.StoredNanos);
-
-            /// <summary>
-            /// True when <paramref name="item"/> gives this artifact's name and nothing else about
-            /// it: no time, size, digest or storage key that could be another artifact's.
-            /// </summary>
-            public bool IsNamedBy(EditorArtifactMetadata item)
-                => string.Equals(Type, item.Type, StringComparison.OrdinalIgnoreCase)
-                   && string.Equals(Subfolder, item.Subfolder ?? string.Empty, StringComparison.OrdinalIgnoreCase)
-                   && string.Equals(Filename, item.Filename, StringComparison.OrdinalIgnoreCase)
-                   && item.CreatedUtc is null && item.SizeBytes is null && item.Sha256 is null
-                   && string.IsNullOrEmpty(item.ObjectKey);
 
             /// <summary>Compares the catalog name alone.</summary>
             public static IEqualityComparer<StoredArtifact> ByName { get; } = new NameComparer();

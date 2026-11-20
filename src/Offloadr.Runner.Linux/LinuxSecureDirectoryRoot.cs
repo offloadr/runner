@@ -571,6 +571,15 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
 
             if (result == 0)
             {
+                // A rewrite that came and went between the check above and the lease left the
+                // file unopened but changed. From here on, any open breaks the lease.
+                if (ReadVersion(file, relativePath) != expected)
+                {
+                    _ = fcntl(descriptor, FSetLease, FUnlock);
+                    file.Dispose();
+                    return null;
+                }
+
                 return new WriteLease(file);
             }
 
@@ -605,12 +614,19 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
     /// and no other process has it open or mapped. It is moved aside under a name of this agent's
     /// own and removed once it proves to be that file, with a write lease held across the move: an
     /// open that came meanwhile breaks the lease, and the file then goes back, unless something
-    /// newer has taken its name. What remains is an open that had already looked the name up and
-    /// reaches the file only after it is removed, a moment within one system call. Returns whether
-    /// the file was removed.
+    /// newer has taken its name. What remains, as when a file is replaced while unopened, is an
+    /// open that had already looked the name up before the move and reaches the file only after
+    /// the lease was last checked, a moment within that one system call. Returns whether the file
+    /// was removed.
+    /// <para>
+    /// Moving a file aside and back moves its change time. <paramref name="restored"/> is the
+    /// version of a file put back, read while the lease still held off whoever opened it: the
+    /// same file as <paramref name="expected"/>, for the caller to go on recognizing.
+    /// </para>
     /// </summary>
-    public bool DeleteFileUnopened(string relativePath, SecureFileVersion expected)
+    public bool DeleteFileUnopened(string relativePath, SecureFileVersion expected, out SecureFileVersion? restored)
     {
+        restored = null;
         var (_, parent, leafName) = TryOpenExistingParent(relativePath);
         if (parent is null)
         {
@@ -678,6 +694,13 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
                 {
                     throw CreateException($"restoring '{relativePath}' after it was opened", error);
                 }
+
+                return false;
+            }
+
+            if (ReadVersion(parent, leafName, relativePath) is { } back && back.IsSameFileAs(expected))
+            {
+                restored = back;
             }
 
             return false;

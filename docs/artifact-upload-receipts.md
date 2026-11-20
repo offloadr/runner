@@ -42,16 +42,19 @@ named. Each catalog entry records which stored artifact its local file is a copy
 of, taken from where the bytes came from: an upload's receipt, the time a read
 says its artifact was stored (which may be a later one than the entry was
 listed with), or a digest match with the listed artifact. A caller's seed, which
-gives names only, leaves that record as it is. A file the session wrote since, or
+gives a name and nothing else, leaves an entry that still knows its file exactly
+as it is: the name says neither which stored artifact the file is nor whether
+the control plane holds it. A file the session wrote since, or
 the copy of another artifact stored under the same name, is the session's own
 data and stays. An empty placeholder holds no bytes of any artifact; it goes once
 nothing is listed under its name and the artifact deleted there is its own or one
 stored after it.
 
 The copy is removed only while no process has it open or mapped, the way an
-evicted file is replaced. One in use stays, with its entry left exactly as it
-was (so it is neither counted nor uploaded as new), and the next listing tries
-again. Inputs are not removed this way; they keep their own rules.
+evicted file is replaced. One in use stays, with its entry left as it was (so
+it is neither counted nor uploaded as new), and the next listing tries again.
+The same residue remains as for eviction: an open that had already looked the
+name up before the file was moved aside and reaches it only after the last check. Inputs are not removed this way; they keep their own rules.
 
 A seed never prunes the catalog. Its entries stand beside those of the listing
 that follows, and only that listing decides which artifacts are no longer there.

@@ -337,16 +337,16 @@ public class LinuxSecureDirectoryRootReplaceLinuxTests
 
             using (new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
             {
-                Assert.That(secureRoot.DeleteFileUnopened("a.png", version), Is.False, "a reader still has it");
+                Assert.That(secureRoot.DeleteFileUnopened("a.png", version, out _), Is.False, "a reader still has it");
             }
 
             File.WriteAllText(path, "rewritten");
-            Assert.That(secureRoot.DeleteFileUnopened("a.png", version), Is.False, "it is no longer that version");
+            Assert.That(secureRoot.DeleteFileUnopened("a.png", version, out _), Is.False, "it is no longer that version");
             Assert.That(File.ReadAllText(path), Is.EqualTo("rewritten"));
 
-            Assert.That(secureRoot.DeleteFileUnopened("a.png", secureRoot.GetVersion("a.png")!.Value), Is.True);
+            Assert.That(secureRoot.DeleteFileUnopened("a.png", secureRoot.GetVersion("a.png")!.Value, out _), Is.True);
             Assert.That(Directory.GetFileSystemEntries(root), Is.Empty, "nothing is left, under any name");
-            Assert.That(secureRoot.DeleteFileUnopened("a.png", version), Is.False, "nothing is there");
+            Assert.That(secureRoot.DeleteFileUnopened("a.png", version, out _), Is.False, "nothing is there");
         }
         finally
         {
@@ -383,11 +383,15 @@ public class LinuxSecureDirectoryRootReplaceLinuxTests
                 Thread.Sleep(300);
             };
 
-            Assert.That(secureRoot.DeleteFileUnopened("a.png", version), Is.False);
+            Assert.That(secureRoot.DeleteFileUnopened("a.png", version, out var restored), Is.False);
             Assert.That(opener!.Join(TimeSpan.FromSeconds(10)), Is.True, "the open goes on once the lease is let go");
             Assert.That(File.ReadAllText(path), Is.EqualTo("UPloaded"), "it wrote to the file that stayed");
             Assert.That(secureRoot.GetVersion("a.png")!.Value.Inode, Is.EqualTo(version.Inode));
             Assert.That(Directory.GetFiles(root), Has.Length.EqualTo(1));
+            // As it was put back, before the writer went on: the same file, its change time moved.
+            Assert.That(restored, Is.Not.Null);
+            Assert.That(restored!.Value.IsSameFileAs(version), Is.True);
+            Assert.That(restored.Value, Is.Not.EqualTo(version));
         }
         finally
         {
@@ -408,7 +412,8 @@ public class LinuxSecureDirectoryRootReplaceLinuxTests
             var version = secureRoot.GetVersion("a.png")!.Value;
             secureRoot.BeforeMoveAside = () => ReplaceAtomically(root, path, "rewrite");
 
-            Assert.That(secureRoot.DeleteFileUnopened("a.png", version), Is.False);
+            Assert.That(secureRoot.DeleteFileUnopened("a.png", version, out var restored), Is.False);
+            Assert.That(restored, Is.Null, "what went back is not the file that was to be removed");
             Assert.That(File.ReadAllText(path), Is.EqualTo("rewrite"), "the newer file is back under its name");
             Assert.That(Directory.GetFiles(root), Has.Length.EqualTo(1));
         }
