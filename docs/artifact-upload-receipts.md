@@ -24,8 +24,19 @@ catalog refresh/deletion cannot erase that local binding while the exact
 acknowledged local version survives. An evicted placeholder is not that version;
 if its remote artifact disappears, the exact placeholder remains recognizable
 but Stop cannot count it as saved. A retained binding for live local bytes also
-counts as unsaved after remote deletion; retaining identity is not proof that the
-control plane still holds those bytes.
+counts as unsaved once its artifact is no longer listed; retaining identity is not
+proof that the control plane still holds those bytes.
+The exception is an artifact the control plane says it deleted. From its session's
+first listing on, the runner asks each listing to name the artifacts deleted since
+then, and the control plane names each exactly as it was stored: the user removed
+it from their files, or a temporary one expired. A local file or placeholder whose
+stored artifact is named that way was saved and then removed on purpose, so Stop
+does not count it; reporting it would tell the user that an output they deleted
+was not saved. An artifact replaced by another upload is not named, and still
+counts. A later listing that names the artifact itself again (it was restored)
+takes the deletion back. Every listing carries the time the control plane read
+it, and when answers arrive out of order each entry follows the later one. The
+runner infers nothing from an artifact merely being absent.
 When catalog casing leaves an additional agent-created placeholder, Stop counts
 one lost artifact for the exact retained catalog record shared with its uploaded
 snapshot or evicted placeholder. A rewritten file, replaced placeholder or other

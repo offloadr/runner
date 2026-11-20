@@ -584,6 +584,9 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
         private Task? _worker;
         private bool _activated;
         private bool _catalogLoaded;
+        // The control plane's time of the first listing this session received. Later listings ask
+        // it to name the artifacts deleted since then: nothing this session holds was deleted before.
+        private Timestamp? _deletedSince;
         private long _droppedUploads;
         private int _rescanOwed;
         private long _lastDropWarningTicks = long.MinValue / 2;
@@ -1237,7 +1240,8 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 var request = new RunnerArtifactServiceListArtifactsRequest
                 {
                     EditorSid = editorSid,
-                    Requester = _readRequester.Clone()
+                    Requester = _readRequester.Clone(),
+                    DeletedSince = Volatile.Read(ref _deletedSince)
                 };
 
                 var response = await _artifactClient.ListArtifactsAsync(request, headers: _authHeaders, cancellationToken: token).ConfigureAwait(false);
@@ -1253,10 +1257,17 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     }
                 }
 
-                if (pruneMissing)
+                // One step: another listing's answer must not prune between this one's pruning
+                // and what it says was deleted.
+                lock (_evictionGate)
                 {
-                    PruneCatalogEntries(currentPaths, currentArtifacts);
+                    if (pruneMissing)
+                    {
+                        PruneCatalogEntries(currentPaths, currentArtifacts);
+                    }
+                    NoteRemoteDeletions(response);
                 }
+                if (response.ListedUtc is not null) Interlocked.CompareExchange(ref _deletedSince, response.ListedUtc, null);
                 _catalogLoaded = true;
                 return true;
             }
@@ -1349,6 +1360,12 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 state.UploadSnapshot = previousState?.UploadSnapshot;
                 state.CommittedArtifact = previousState?.CommittedArtifact;
                 state.CatalogArtifact = item.Clone();
+                // The same artifact listed again keeps what a listing said about its deletion.
+                if (previousState is not null && (previousState.CommittedArtifact ?? previousState.CatalogArtifact)?.Equals(item) == true)
+                {
+                    state.DeletedRemotely = previousState.DeletedRemotely;
+                    state.DeletionListedUtc = previousState.DeletionListedUtc;
+                }
                 _catalog[normalized] = state;
 
                 try
@@ -1401,6 +1418,39 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         }
                         else
                             _catalog.TryRemove(path, out _);
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Records what a listing says the control plane deleted. It names each deleted artifact
+        /// as it was stored, so an entry is deleted only if exactly its artifact is named: one
+        /// replaced by another upload is not. A listing that names the artifact itself again
+        /// (it was restored) takes that back. Listings can answer out of order; each entry
+        /// follows the one the control plane read last.
+        /// </summary>
+        private void NoteRemoteDeletions(RunnerArtifactServiceListArtifactsResponse listing)
+        {
+            if (listing.ListedUtc is null) return;
+            var listedUtc = listing.ListedUtc.ToDateTimeOffset();
+            var deleted = new HashSet<EditorArtifactMetadata>(listing.DeletedArtifacts);
+            var listed = new HashSet<EditorArtifactMetadata>(listing.Artifacts);
+            lock (_evictionGate)
+            {
+                foreach (var state in _catalog.Values)
+                {
+                    var stored = state.CommittedArtifact ?? state.CatalogArtifact;
+                    if (stored is null || listedUtc < state.DeletionListedUtc) continue;
+                    if (deleted.Contains(stored))
+                    {
+                        state.DeletedRemotely = true;
+                        state.DeletionListedUtc = listedUtc;
+                    }
+                    else if (listed.Contains(stored))
+                    {
+                        state.DeletedRemotely = false;
+                        state.DeletionListedUtc = listedUtc;
                     }
                 }
             }
@@ -2064,9 +2114,10 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         }
 
                         // Saved means the control plane holds this exact file, or it is the empty
-                        // placeholder the agent left for a remote artifact. An empty rewrite by the
-                        // editor is neither.
-                        if (!_catalog.TryGetValue(NormalizePath(file), out var state) || !state.AccountsFor(version))
+                        // placeholder the agent left for a remote artifact. An artifact the control
+                        // plane says was deleted after it stored it is no loss of this session:
+                        // the user removed that output. An empty rewrite by the editor is neither.
+                        if (!_catalog.TryGetValue(NormalizePath(file), out var state) || !state.IsSavedAs(version))
                         {
                             // Catalog spelling can leave a second, agent-created
                             // placeholder for one uploaded snapshot. Count that
@@ -2990,6 +3041,22 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             /// </summary>
             public bool AccountsFor(SecureFileVersion version)
                 => HasRemoteArtifact && (MatchesLocalFile(version) || PlaceholderVersion == version);
+
+            /// <summary>
+            /// True when the control plane said it deleted exactly this artifact after storing it:
+            /// the user removed it from their files, or a temporary one expired.
+            /// </summary>
+            public bool DeletedRemotely { get; set; }
+
+            /// <summary>When the control plane read the listing that last decided <see cref="DeletedRemotely"/>.</summary>
+            public DateTimeOffset DeletionListedUtc { get; set; }
+
+            /// <summary>
+            /// True when <paramref name="version"/> is no loss if the session's data is removed: the
+            /// control plane holds what it stands for, or stored it and then deleted it.
+            /// </summary>
+            public bool IsSavedAs(SecureFileVersion version)
+                => (HasRemoteArtifact || DeletedRemotely) && (MatchesLocalFile(version) || PlaceholderVersion == version);
 
             /// <summary>When the VFS last told a reader the local file is ready.</summary>
             public DateTimeOffset LastServedUtc { get; private set; }

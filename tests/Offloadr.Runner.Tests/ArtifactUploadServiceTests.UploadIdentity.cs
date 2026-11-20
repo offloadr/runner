@@ -823,6 +823,183 @@ public partial class ArtifactUploadServiceTests
         finally { TryDelete(root); }
     }
 
+    // The control plane names the artifacts deleted since the session's first listing, each as
+    // it was stored. An upload it names was saved and then removed by the user: no loss.
+    [TestCase(false)]
+    [TestCase(true)]
+    public async Task AnUploadTheControlPlaneSaysWasDeletedIsNotCountedUnsaved(bool evicted)
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = evicted ? CreateEvictionPaths(root, sealedSession: true) : UploadIdentityPaths(root);
+            var path = Path.Combine(paths.OutputDirectory, "removed.bin");
+            var catalog = new RunnerArtifactServiceListArtifactsResponse();
+            EditorArtifactMetadata? committed = null;
+            var client = new FakeRunnerArtifactClient(catalog)
+            {
+                RewriteUploadArtifact = artifact =>
+                {
+                    artifact.CreatedUtc = Timestamp.FromDateTime(DateTime.UtcNow);
+                    committed = artifact.Clone();
+                    return artifact;
+                },
+            };
+            await using var service = new ArtifactUploadService("secret", client, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            await File.WriteAllBytesAsync(path, [1, 2, 3]);
+            await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            await WaitForIdentityUploadsToFinishAsync(service);
+            if (evicted) Assert.That(await EvictWhenRecordedAsync(service, "session-1"), Is.EqualTo(3));
+            client.RejectAsRetiredUpload = true;
+            // The user removes the output from their files: it is no longer listed, and named as deleted.
+            catalog.DeletedArtifacts.Add(committed!.Clone());
+            await service.SeedSessionAsync("session-1", "editor-1", "owner-1", null, CancellationToken.None);
+            await WaitForIdentityUploadsToFinishAsync(service);
+            // The first listing asks for no deletions; later ones ask since the first one's time.
+            Assert.That(client.ListRequests[0].DeletedSince, Is.Null);
+            Assert.That(client.ListRequests[^1].DeletedSince, Is.EqualTo(Timestamp.FromDateTime(FakeRunnerArtifactClient.ListClock.AddSeconds(1))));
+            Assert.That(await service.StopSessionAsync("session-1"), Is.Zero);
+            Assert.That(service.TakeUnsavedUploads("session-1"), Is.EqualTo(new UnsavedUploads(0, false)));
+        }
+        finally { TryDelete(root); }
+    }
+
+    [Test]
+    public async Task AnUploadDeletedBeforeAPromptThatDoesNotUseItIsNotCountedUnsaved()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = UploadIdentityPaths(root);
+            var path = Path.Combine(paths.OutputDirectory, "removed.bin");
+            var catalog = new RunnerArtifactServiceListArtifactsResponse();
+            EditorArtifactMetadata? committed = null;
+            var client = new FakeRunnerArtifactClient(catalog)
+            {
+                RewriteUploadArtifact = artifact =>
+                {
+                    artifact.CreatedUtc = Timestamp.FromDateTime(DateTime.UtcNow);
+                    committed = artifact.Clone();
+                    return artifact;
+                },
+            };
+            await using var service = new ArtifactUploadService("secret", client, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            await File.WriteAllBytesAsync(path, [1, 2, 3]);
+            await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            await WaitForIdentityUploadsToFinishAsync(service);
+            client.RejectAsRetiredUpload = true;
+            // The user deletes the output, then sends a prompt that uses another artifact: its
+            // seed names only that one, and the listing after it names the deleted output.
+            var unrelated = committed!.Clone();
+            unrelated.Filename = "unrelated.bin";
+            catalog.Artifacts.Add(unrelated.Clone());
+            catalog.DeletedArtifacts.Add(committed.Clone());
+            await service.SeedSessionAsync("session-1", "editor-1", "owner-1", [unrelated], CancellationToken.None);
+            await WaitForIdentityUploadsToFinishAsync(service);
+            Assert.That(await File.ReadAllBytesAsync(path), Is.EqualTo(new byte[] { 1, 2, 3 }), "the local copy is left alone");
+            Assert.That(await service.StopSessionAsync("session-1"), Is.Zero);
+        }
+        finally { TryDelete(root); }
+    }
+
+    [Test]
+    public async Task AnUploadReplacedRemotelyStillCountsEvenWhenItsReplacementWasDeleted()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var paths = UploadIdentityPaths(root);
+            var path = Path.Combine(paths.OutputDirectory, "replaced.bin");
+            var catalog = new RunnerArtifactServiceListArtifactsResponse();
+            EditorArtifactMetadata? committed = null;
+            var client = new FakeRunnerArtifactClient(catalog)
+            {
+                RewriteUploadArtifact = artifact =>
+                {
+                    artifact.CreatedUtc = Timestamp.FromDateTime(DateTime.UtcNow);
+                    committed = artifact.Clone();
+                    return artifact;
+                },
+            };
+            await using var service = new ArtifactUploadService("secret", client, NullLogger<ArtifactUploadService>.Instance);
+            await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+            await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+            await File.WriteAllBytesAsync(path, [1, 2, 3]);
+            await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+            await WaitForIdentityUploadsToFinishAsync(service);
+            client.RejectAsRetiredUpload = true;
+            // Another upload took the name and was then deleted: the control plane names that
+            // one, as it was stored, not what this session uploaded.
+            var replacement = committed!.Clone();
+            replacement.CreatedUtc = Timestamp.FromDateTime(DateTime.UtcNow.AddSeconds(5));
+            catalog.DeletedArtifacts.Add(replacement);
+            await service.SeedSessionAsync("session-1", "editor-1", "owner-1", null, CancellationToken.None);
+            await WaitForIdentityUploadsToFinishAsync(service);
+            Assert.That(await service.StopSessionAsync("session-1"), Is.EqualTo(1),
+                "what this session uploaded was replaced, not deleted");
+        }
+        finally { TryDelete(root); }
+    }
+
+    [Test]
+    public async Task TheListingTheControlPlaneReadLastDecidesWhenAnOlderOneAnswersLater()
+    {
+        var root = CreateTempDirectory();
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
+        {
+            var paths = UploadIdentityPaths(root);
+            var path = Path.Combine(paths.OutputDirectory, "restored.bin");
+            var catalog = new RunnerArtifactServiceListArtifactsResponse();
+            EditorArtifactMetadata? committed = null;
+            var client = new FakeRunnerArtifactClient(catalog)
+            {
+                RewriteUploadArtifact = artifact =>
+                {
+                    artifact.CreatedUtc = Timestamp.FromDateTime(DateTime.UtcNow);
+                    committed = artifact.Clone();
+                    return artifact;
+                },
+            };
+            await using var service = new ArtifactUploadService("secret", client, NullLogger<ArtifactUploadService>.Instance);
+            try
+            {
+                await service.StartSessionAsync("session-1", paths, CancellationToken.None);
+                await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
+                await File.WriteAllBytesAsync(path, [1, 2, 3]);
+                await client.WaitForUploadAsync(TimeSpan.FromSeconds(5));
+                await WaitForIdentityUploadsToFinishAsync(service);
+                client.RejectAsRetiredUpload = true;
+                // A listing reads the catalog while the output is deleted, and answers late.
+                catalog.DeletedArtifacts.Add(committed!.Clone());
+                client.DelayListResponse = async listed => { await release.Task; return listed; };
+                var listings = client.ListCallCount;
+                var older = service.SeedSessionAsync("session-1", "editor-1", "owner-1", null, CancellationToken.None);
+                for (var waited = 0; client.ListCallCount == listings && waited < 500; waited++) await Task.Delay(10);
+                Assert.That(client.ListCallCount, Is.EqualTo(listings + 1), "the older listing was requested");
+                client.DelayListResponse = null;
+                // The user restores it; a newer listing names it again and answers first.
+                catalog.DeletedArtifacts.Clear();
+                catalog.Artifacts.Add(committed.Clone());
+                await service.SeedSessionAsync("session-1", "editor-1", "owner-1", null, CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(10));
+                release.TrySetResult();
+                await older.WaitAsync(TimeSpan.FromSeconds(10));
+                // It is then lost remotely without being deleted: the old answer must not make that a deletion.
+                catalog.Artifacts.Clear();
+                await service.SeedSessionAsync("session-1", "editor-1", "owner-1", null, CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(10));
+                await WaitForIdentityUploadsToFinishAsync(service);
+                Assert.That(await service.StopSessionAsync("session-1"), Is.EqualTo(1),
+                    "the newer listing restored it; an older answer arriving later says nothing");
+            }
+            finally { release.TrySetResult(); }
+        }
+        finally { TryDelete(root); }
+    }
+
     [TestCase(false)]
     [TestCase(true)]
     public async Task ChangedSnapshotSurvivesTheFinalAttemptTimeout(bool expireTotalAllowance)
