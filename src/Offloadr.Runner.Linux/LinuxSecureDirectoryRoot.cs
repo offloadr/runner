@@ -164,7 +164,16 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
     /// file already exists there. Returns true when this call created the file.
     /// </summary>
     public bool EnsurePlaceholder(string relativePath, DateTime? modifiedUtc)
+        => EnsurePlaceholder(relativePath, modifiedUtc, out _);
+
+    /// <summary>
+    /// As <see cref="EnsurePlaceholder(string, DateTime?)"/>; <paramref name="created"/> is the
+    /// version of the file this call created, read from that file itself, so the caller can tell
+    /// it from a file put in its place right after.
+    /// </summary>
+    public bool EnsurePlaceholder(string relativePath, DateTime? modifiedUtc, out SecureFileVersion? created)
     {
+        created = null;
         var (parent, leafName) = OpenParent(relativePath, createDirectories: true);
         using (parent)
         {
@@ -175,12 +184,13 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
                 Convert.ToUInt32("644", 8));
             if (descriptor >= 0)
             {
-                using var created = new SafeFileHandle((nint)descriptor, ownsHandle: true);
+                using var placeholder = new SafeFileHandle((nint)descriptor, ownsHandle: true);
                 if (modifiedUtc.HasValue)
                 {
-                    SetModifiedUtc(created, modifiedUtc.Value);
+                    SetModifiedUtc(placeholder, modifiedUtc.Value);
                 }
 
+                created = ReadVersion(placeholder, relativePath);
                 return true;
             }
 
@@ -617,9 +627,8 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
     /// and no other process has it open or mapped. It is moved aside under a name of this agent's
     /// own and removed once it proves to be that file, with a write lease held across the move: an
     /// open that came meanwhile breaks the lease, and the file then goes back. Nothing but the
-    /// expected file is ever removed: another file found in its place, which cannot go back
-    /// because the name was taken while it was aside, is kept beside the newcomer under a name
-    /// of its own. What remains, as when a file is replaced while unopened, is an
+    /// expected, unopened file is ever removed: a file created under the name while it was aside
+    /// is kept beside it under a name of its own. What remains, as when a file is replaced while unopened, is an
     /// open that had already looked the name up before the move and reaches the file only after
     /// the lease was last checked, a moment within that one system call. Returns whether the file
     /// was removed.
@@ -692,43 +701,37 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
                 return true;
             }
 
-            // Back under its name, where an open the lease held expects it. If the name was taken
-            // meanwhile: the expected file, unchanged, is the one that was to be removed, and goes
-            // (whoever opened it keeps what it opened). Any other is a file the session put there
-            // after the check, its own new data: it is kept beside the newcomer under a name of
-            // its own, where the session and the uploader find it.
-            if (renameat2(GetDescriptor(parent), aside, GetDescriptor(parent), leafName, RenameNoReplace) != 0)
+            // Back under its name, where an open the lease held expects it: whatever was moved
+            // aside (the expected file, opened meanwhile, or a file the session put there after the
+            // check) is not this agent's to remove. If something took the name while it was away,
+            // the two change places, and the newcomer, which exists only because the name was
+            // briefly free, is kept beside it under a name of its own, where its writer, the
+            // session and the uploader find it.
+            for (var attempt = 0; ; attempt++)
             {
+                if (renameat2(GetDescriptor(parent), aside, GetDescriptor(parent), leafName, RenameNoReplace) == 0)
+                {
+                    break;
+                }
+
                 var error = Marshal.GetLastPInvokeError();
                 if (error != AlreadyExists)
                 {
                     throw CreateException($"restoring '{relativePath}' after it was opened", error);
                 }
 
-                if (isExpected)
+                if (renameat2(GetDescriptor(parent), aside, GetDescriptor(parent), leafName, RenameExchange) == 0)
                 {
-                    _ = unlinkat(GetDescriptor(parent), aside, 0);
-                    return true;
+                    KeepBeside(parent, aside, leafName, relativePath);
+                    break;
                 }
 
-                var stem = Path.GetFileNameWithoutExtension(leafName);
-                var extension = Path.GetExtension(leafName);
-                for (var attempt = 0; attempt < 16; attempt++)
+                // The newcomer went away again between the two attempts.
+                error = Marshal.GetLastPInvokeError();
+                if (error != ENoEntry || attempt >= 8)
                 {
-                    var kept = $"{stem}.kept-{Path.GetRandomFileName().Replace(".", string.Empty, StringComparison.Ordinal)}{extension}";
-                    if (renameat2(GetDescriptor(parent), aside, GetDescriptor(parent), kept, RenameNoReplace) == 0)
-                    {
-                        return false;
-                    }
-
-                    error = Marshal.GetLastPInvokeError();
-                    if (error != AlreadyExists)
-                    {
-                        break;
-                    }
+                    throw CreateException($"restoring '{relativePath}' after it was opened", error);
                 }
-
-                throw CreateException($"keeping the file moved aside from '{relativePath}'", error);
             }
 
             if (ReadVersion(parent, leafName, relativePath) is { } back && back.IsSameFileAs(expected))
@@ -738,6 +741,30 @@ internal sealed class LinuxSecureDirectoryRoot : IDisposable
 
             return false;
         }
+    }
+
+    /// <summary>Gives the file under the temporary name <paramref name="aside"/> a lasting name next to <paramref name="leafName"/>.</summary>
+    private static void KeepBeside(SafeFileHandle parent, string aside, string leafName, string relativePath)
+    {
+        var stem = Path.GetFileNameWithoutExtension(leafName);
+        var extension = Path.GetExtension(leafName);
+        var error = 0;
+        for (var attempt = 0; attempt < 16; attempt++)
+        {
+            var kept = $"{stem}.kept-{Path.GetRandomFileName().Replace(".", string.Empty, StringComparison.Ordinal)}{extension}";
+            if (renameat2(GetDescriptor(parent), aside, GetDescriptor(parent), kept, RenameNoReplace) == 0)
+            {
+                return;
+            }
+
+            error = Marshal.GetLastPInvokeError();
+            if (error != AlreadyExists)
+            {
+                break;
+            }
+        }
+
+        throw CreateException($"keeping a file created at '{relativePath}' while it was being removed", error);
     }
 
     /// <summary>Makes <see cref="MoveRegularFileWithoutReplacing"/> act as on a Windows folder, for tests.</summary>

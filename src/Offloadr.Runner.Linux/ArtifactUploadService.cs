@@ -1359,8 +1359,10 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 // A caller's seed gives a name and nothing else. An entry that already knows the
                 // file at that path (its placeholder, or the copy it recognized) learns nothing
                 // from it, and would forget which stored artifact the file stands for and whether
-                // the control plane holds it. It stays exactly as it is.
-                if (previousState is not null && IsNameOnly(item) && KnowsItsFile(previousState))
+                // the control plane holds it. It stays exactly as it is. Inputs keep their own
+                // rule: a seed makes a downloaded input be read again.
+                if (previousState is not null && IsNameOnly(item) && !string.Equals(item.Type, "input", StringComparison.OrdinalIgnoreCase)
+                    && KnowsItsFile(previousState))
                 {
                     return normalized;
                 }
@@ -1811,9 +1813,11 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             switch (status.Kind)
             {
                 case SecureEntryKind.Missing:
-                    // Not the agent's own if the session created the file in the same moment.
-                    var created = secureRoot.EnsurePlaceholder(relativePath, state.CreatedUtc.UtcDateTime);
-                    state.MarkPlaceholder(secureRoot.GetVersion(relativePath), StoredArtifact.Of(state.CatalogArtifact), own: created);
+                    // The agent's own only if the file at the path is the very one it created here:
+                    // the session may create one in the same moment, or put one in its place.
+                    secureRoot.EnsurePlaceholder(relativePath, state.CreatedUtc.UtcDateTime, out var createdHere);
+                    var placed = secureRoot.GetVersion(relativePath);
+                    state.MarkPlaceholder(placed, StoredArtifact.Of(state.CatalogArtifact), own: createdHere is not null && placed == createdHere);
                     return;
                 case SecureEntryKind.Other:
                     throw new UnauthorizedAccessException($"Artifact path is not a regular file: '{state.LocalPath}'.");
@@ -1875,10 +1879,16 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             // An empty file is taken for the placeholder whoever made it; only one the agent left
             // (this entry's own placeholder as it was, or a file it empties here) is its own to
             // remove when the artifact is deleted.
-            var own = status.Length > 0
-                      || (previousState is { PlaceholderIsOwn: true, PlaceholderVersion: { } left } && secureRoot.GetVersion(relativePath) == left);
+            // Its own too: an empty file that is the unchanged copy of an empty stored artifact.
+            var before = secureRoot.GetVersion(relativePath);
+            var own = before is { } found
+                      && (status.Length > 0
+                          || (previousState is { PlaceholderIsOwn: true } && previousState.PlaceholderVersion == found)
+                          || previousState?.IsCopy(found) == true);
             secureRoot.TruncateRegularFile(relativePath, state.CreatedUtc.UtcDateTime);
-            state.MarkPlaceholder(secureRoot.GetVersion(relativePath), StoredArtifact.Of(state.CatalogArtifact), own);
+            var emptied = secureRoot.GetVersion(relativePath);
+            // Still that file: the session may have put another in its place meanwhile.
+            state.MarkPlaceholder(emptied, StoredArtifact.Of(state.CatalogArtifact), own && emptied?.Inode == before?.Inode);
         }
 
         private static bool ShouldKeepExistingArtifactFile(
