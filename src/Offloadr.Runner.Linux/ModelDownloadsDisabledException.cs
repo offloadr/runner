@@ -11,6 +11,15 @@ internal sealed class ModelDownloadsDisabledException(IReadOnlyCollection<string
 
     public IReadOnlyCollection<string> Filenames { get; } = filenames;
 
+    /// <summary>The models named for the runner's log, at most ten.</summary>
+    internal static string NameForLog(IEnumerable<string?> filenames)
+    {
+        var named = filenames.Where(static name => !string.IsNullOrWhiteSpace(name)).Select(static name => name!.Trim())
+            .Distinct(StringComparer.Ordinal).ToArray();
+        var shown = string.Join(", ", named.Take(10));
+        return named.Length > 10 ? $"{shown} and {named.Length - 10} more" : shown;
+    }
+
     private static string Describe(IReadOnlyCollection<string> filenames)
     {
         var named = filenames.Where(static name => !string.IsNullOrWhiteSpace(name)).Distinct(StringComparer.Ordinal).ToArray();
