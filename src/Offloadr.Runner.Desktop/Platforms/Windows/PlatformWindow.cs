@@ -235,13 +235,10 @@ internal static class PlatformWindow
 
 internal static class PlatformFiles
 {
-    public static async Task<string?> PickFolderAsync()
+    public static Task<string?> PickFolderAsync()
     {
-        var picker = new FolderPicker();
-        picker.FileTypeFilter.Add("*");
         var native = (Microsoft.UI.Xaml.Window)Application.Current!.Windows[0].Handler!.PlatformView!;
-        WinRT.Interop.InitializeWithWindow.Initialize(picker, WinRT.Interop.WindowNative.GetWindowHandle(native));
-        return (await picker.PickSingleFolderAsync())?.Path;
+        return Task.FromResult(FolderDialog.Show(WinRT.Interop.WindowNative.GetWindowHandle(native)));
     }
 
     public static async Task<string?> SaveTextFileAsync(string suggestedName, string text)
