@@ -5,9 +5,15 @@ namespace Offloadr.Runner.Desktop;
 
 public sealed class App(MainPage page, RunnerSupervisor supervisor, SingleInstanceLock instanceLock, IRunnerSettingsStore settings, ILoggerFactory loggers) : Application
 {
+    /// <summary>The window's first size, in device-independent pixels, when the screen has room for it.</summary>
+    internal const double PreferredWidth = 1100;
+
+    internal const double PreferredHeight = 800;
+
     protected override Window CreateWindow(IActivationState? activationState)
     {
-        var window = new Window(page) { Title = "Offloadr Runner", Width = 1100, Height = 860, MinimumWidth = 480, MinimumHeight = 560 };
+        // No size here: PlatformWindow.Attach gives the window its first size, which depends on the screen.
+        var window = new Window(page) { Title = "Offloadr Runner", MinimumWidth = 480, MinimumHeight = 480 };
         window.HandlerChanged += (_, _) => PlatformWindow.Attach(window, page, supervisor, instanceLock, settings, loggers);
         return window;
     }

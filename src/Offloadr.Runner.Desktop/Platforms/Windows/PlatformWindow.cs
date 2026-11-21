@@ -22,6 +22,7 @@ internal static class PlatformWindow
 
         _attached = true;
         var handle = WinRT.Interop.WindowNative.GetWindowHandle(native);
+        PlaceOnWorkArea(native, handle, App.PreferredWidth, App.PreferredHeight);
         var balloonShown = false;
         var activated = false;
         TrayIcon? tray = null;
@@ -200,6 +201,26 @@ internal static class PlatformWindow
     }
 
     private static string Tooltip(SupervisorView view) => $"Offloadr Runner: {view.StateTitle}";
+
+    /// <summary>
+    /// Sizes the window as asked, in device-independent pixels, but never larger than the work area of
+    /// its screen (a 1080p screen at 150 % has about 1280 × 690 beside the taskbar), and centres it there.
+    /// </summary>
+    private static void PlaceOnWorkArea(Microsoft.UI.Xaml.Window native, nint handle, double width, double height)
+    {
+        var area = Microsoft.UI.Windowing.DisplayArea.GetFromWindowId(native.AppWindow.Id, Microsoft.UI.Windowing.DisplayAreaFallback.Primary).WorkArea;
+        var scale = GetDpiForWindow(handle) is var dpi and > 0 ? dpi / 96.0 : 1.0;
+        var pixelWidth = Math.Min((int)Math.Round(width * scale), area.Width);
+        var pixelHeight = Math.Min((int)Math.Round(height * scale), area.Height);
+        native.AppWindow.MoveAndResize(new Windows.Graphics.RectInt32(
+            area.X + ((area.Width - pixelWidth) / 2),
+            area.Y + ((area.Height - pixelHeight) / 2),
+            pixelWidth,
+            pixelHeight));
+    }
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern uint GetDpiForWindow(nint hwnd);
 
     /// <summary>The title bar in the page's colors, so the window reads as one surface.</summary>
     private static void PaintTitleBar(Microsoft.UI.Xaml.Window native, AppTheme? theme)

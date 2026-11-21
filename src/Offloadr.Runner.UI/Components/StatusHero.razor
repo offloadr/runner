@@ -23,16 +23,16 @@
 @if (View.Fault is { } fault)
 {
     @* A retry is the same start as the button above: on Setup it saves the page's answers first. *@
-    <FaultCard Fault="fault" Waiting="@(View.State != SupervisorState.Faulted)" OnOpenSettings="OnOpenSettings" OnStart="StartAsync" Class="mt-4" />
+    <FaultCard Fault="fault" Waiting="@(View.State != SupervisorState.Faulted)" OnOpenSettings="OnOpenSettings" OnStart="StartAsync" Class="mt-3" />
 }
 @if (View.PullProgress is { Fraction: { } fraction } pull)
 {
-    <MudProgressLinear Value="@(fraction * 100)" Color="Color.Primary" Class="mt-4" aria-label="Image download" />
+    <MudProgressLinear Value="@(fraction * 100)" Color="Color.Primary" Class="mt-3" aria-label="Image download" />
     <MudText Typo="Typo.caption" Class="mud-text-secondary">@pull.Summary</MudText>
 }
 else if (View.State is SupervisorState.Pulling or SupervisorState.Checking or SupervisorState.ResolvingPlan or SupervisorState.Starting or SupervisorState.Stopping)
 {
-    <MudProgressLinear Indeterminate="true" Color="Color.Primary" Class="mt-4" aria-label="@View.StateTitle" />
+    <MudProgressLinear Indeterminate="true" Color="Color.Primary" Class="mt-3" aria-label="@View.StateTitle" />
     @if (View.PullProgress is { } measuring)
     {
         <MudText Typo="Typo.caption" Class="mud-text-secondary">@measuring.Summary</MudText>
@@ -40,11 +40,11 @@ else if (View.State is SupervisorState.Pulling or SupervisorState.Checking or Su
 }
 @if (View.HasActiveSession)
 {
-    <MudAlert Severity="Severity.Info" Dense="true" Class="mt-4">An editor session is using this runner. Stopping now interrupts it.</MudAlert>
+    <MudAlert Severity="Severity.Info" Dense="true" Class="mt-3">An editor session is using this runner. Stopping now interrupts it.</MudAlert>
 }
 @if (View.Plan?.Notice is { } notice && View.IsActive)
 {
-    <MudAlert Severity="Severity.Normal" Dense="true" Class="mt-4">@notice</MudAlert>
+    <MudAlert Severity="Severity.Normal" Dense="true" Class="mt-3">@notice</MudAlert>
 }
 
 @code {

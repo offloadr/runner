@@ -168,7 +168,7 @@ public static partial class DiagnosticsReport
         Line(text, "Download models", YesNo(settings.DownloadModels));
         Line(text, "Docker executable", string.IsNullOrWhiteSpace(settings.ContainerEngineExecutable) ? "found automatically" : settings.ContainerEngineExecutable);
         Line(text, "Editor in Settings", settings.SelectedEditorTemplate);
-        Line(text, "Start the runner when the app opens", YesNo(settings.AutoStart));
+        Line(text, "Make this GPU available when the app opens", YesNo(settings.AutoStart));
         Line(text, "Keep awake during sessions", YesNo(settings.KeepAwakeDuringSessions));
         Line(text, "GPU in Settings", string.IsNullOrWhiteSpace(settings.GpuUuid) ? "all" : settings.GpuUuid.Trim());
         Line(text, "Extra ComfyUI arguments", Flags(settings.ComfyUiArguments));

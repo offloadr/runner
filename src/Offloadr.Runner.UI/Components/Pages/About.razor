@@ -5,78 +5,91 @@
 
 <PageTitle>About - Offloadr Runner</PageTitle>
 
-<MudText Typo="Typo.h5" HtmlTag="h1" Class="mb-4">About</MudText>
+<MudText Typo="Typo.h5" HtmlTag="h1" Class="mb-3">About</MudText>
 
-<MudStack Spacing="4">
-    <MudPaper Outlined="true" Class="pa-5">
-        <MudStack Row="true" AlignItems="AlignItems.Center" Spacing="3">
-            <img src="_content/Offloadr.Runner.UI/icon.svg" alt="" class="runner-about-logo" />
-            <div>
-                <MudText Typo="Typo.h6" HtmlTag="h2">Offloadr Runner @Version.ToString(3)</MudText>
-                <MudText Typo="Typo.body2" Class="mud-text-secondary">Runs Offloadr sessions on the NVIDIA GPU in this computer.</MudText>
-            </div>
-        </MudStack>
-        <MudSimpleTable Dense="true" Elevation="0" Class="mt-4 runner-facts">
-            <tbody>
-                <tr><th scope="row">App</th><td>@Version.ToString(3)</td></tr>
-                <tr><th scope="row">Runner agent</th><td>@(View.RunnerStatus?.Version ?? "Shown while the runner runs")</td></tr>
-                <tr>
-                    <th scope="row">Updates</th>
-                    <td>
-                        <MudStack Row="true" AlignItems="AlignItems.Center" Justify="Justify.SpaceBetween" Wrap="Wrap.Wrap" Spacing="2">
-                            <span aria-live="polite">@(_updates?.Status.Summary ?? "This copy does not update itself.")</span>
-                            @if (_updates is { Status.CanCheck: true })
+@* Side by side in a wide window, so the page fits it without scrolling. *@
+<MudGrid Spacing="3">
+    <MudItem xs="12" md="6">
+        <MudPaper Outlined="true" Class="pa-4" Style="height: 100%">
+            <MudStack Row="true" AlignItems="AlignItems.Center" Spacing="3">
+                <img src="_content/Offloadr.Runner.UI/icon.svg" alt="" class="runner-about-logo" />
+                <div>
+                    <MudText Typo="Typo.h6" HtmlTag="h2">Offloadr Runner @Version.ToString(3)</MudText>
+                    <MudText Typo="Typo.body2" Class="mud-text-secondary">Runs Offloadr sessions on the NVIDIA GPU in this computer.</MudText>
+                </div>
+            </MudStack>
+            <MudSimpleTable Dense="true" Elevation="0" Class="mt-3 runner-facts">
+                <tbody>
+                    <tr><th scope="row">App</th><td>@Version.ToString(3)</td></tr>
+                    <tr><th scope="row">Runner agent</th><td title="@View.RunnerStatus?.Version">@(SupervisorView.ShortVersion(View.RunnerStatus?.Version) ?? "Shown while the runner runs")</td></tr>
+                    <tr>
+                        <th scope="row">Updates</th>
+                        <td>
+                            <MudStack Row="true" AlignItems="AlignItems.Center" Justify="Justify.SpaceBetween" Wrap="Wrap.Wrap" Spacing="2">
+                                <span aria-live="polite">@(_updates?.Status.Summary ?? "This copy does not update itself.")</span>
+                                @if (_updates is { Status.CanCheck: true })
+                                {
+                                    <MudButton Size="Size.Small" Variant="Variant.Text" StartIcon="@Icons.Material.Filled.Refresh"
+                                               OnClick="CheckForUpdatesAsync">Check for updates</MudButton>
+                                }
+                            </MudStack>
+                        </td>
+                    </tr>
+                </tbody>
+            </MudSimpleTable>
+        </MudPaper>
+    </MudItem>
+
+    <MudItem xs="12" md="6">
+        <MudPaper Outlined="true" Class="pa-4" Style="height: 100%">
+            <MudText Typo="Typo.h6" HtmlTag="h2">Support</MudText>
+            <MudText Typo="Typo.body2" Class="mud-text-secondary mt-2">
+                If the runner does not work as it should, save the diagnostics and send them to Offloadr support. They hold the app's checks of
+                Docker and the GPU, your settings and the recent log, never the runner key. Read the file before you send it.
+            </MudText>
+            <div class="mt-3"><SaveDiagnosticsButton /></div>
+        </MudPaper>
+    </MudItem>
+
+    <MudItem xs="12">
+        <MudPaper Outlined="true" Class="pa-4">
+            <MudGrid Spacing="3">
+                <MudItem xs="12" md="5">
+                    <MudText Typo="Typo.h6" HtmlTag="h2">Source code and licences</MudText>
+                    <MudText Typo="Typo.body2" Class="mt-2">
+                        Offloadr Runner is free software: you can redistribute it and change it under the GNU Affero General Public License, version 3 only.
+                        It comes with no warranty. Its complete source code, and that of the runner images, is public.
+                    </MudText>
+                    <MudStack Row="true" Wrap="Wrap.Wrap" Spacing="2" Class="mt-3">
+                        @foreach (var (label, url) in Links)
+                        {
+                            <MudButton Size="Size.Small" Variant="Variant.Outlined" EndIcon="@Icons.Material.Filled.OpenInNew"
+                                       OnClick="@(() => Host.OpenExternalAsync(url))">@label</MudButton>
+                        }
+                    </MudStack>
+                </MudItem>
+                <MudItem xs="12" md="7">
+                    <MudText Typo="Typo.subtitle2" HtmlTag="h3">Components of this app</MudText>
+                    <MudSimpleTable Dense="true" Elevation="0" Class="mt-1 runner-facts">
+                        <thead>
+                            <tr><th scope="col">Component</th><th scope="col">Licence</th></tr>
+                        </thead>
+                        <tbody>
+                            @foreach (var (component, licence) in Components)
                             {
-                                <MudButton Size="Size.Small" Variant="Variant.Text" StartIcon="@Icons.Material.Filled.Refresh"
-                                           OnClick="CheckForUpdatesAsync">Check for updates</MudButton>
+                                <tr><td>@component</td><td>@licence</td></tr>
                             }
-                        </MudStack>
-                    </td>
-                </tr>
-            </tbody>
-        </MudSimpleTable>
-    </MudPaper>
-
-    <MudPaper Outlined="true" Class="pa-5">
-        <MudText Typo="Typo.h6" HtmlTag="h2">Support</MudText>
-        <MudText Typo="Typo.body2" Class="mud-text-secondary mt-2">
-            If the runner does not work as it should, save the diagnostics and send them to Offloadr support. They hold the app's checks of
-            Docker and the GPU, your settings and the recent log, never the runner key. Read the file before you send it.
-        </MudText>
-        <div class="mt-3"><SaveDiagnosticsButton /></div>
-    </MudPaper>
-
-    <MudPaper Outlined="true" Class="pa-5">
-        <MudText Typo="Typo.h6" HtmlTag="h2">Source code and licences</MudText>
-        <MudText Typo="Typo.body2" Class="mt-2">
-            Offloadr Runner is free software: you can redistribute it and change it under the GNU Affero General Public License, version 3 only.
-            It comes with no warranty. Its complete source code, and that of the runner images, is public.
-        </MudText>
-        <MudStack Row="true" Wrap="Wrap.Wrap" Spacing="2" Class="mt-3">
-            @foreach (var (label, url) in Links)
-            {
-                <MudButton Size="Size.Small" Variant="Variant.Outlined" EndIcon="@Icons.Material.Filled.OpenInNew"
-                           OnClick="@(() => Host.OpenExternalAsync(url))">@label</MudButton>
-            }
-        </MudStack>
-        <MudText Typo="Typo.subtitle2" HtmlTag="h3" Class="mt-5">Components of this app</MudText>
-        <MudSimpleTable Dense="true" Elevation="0" Class="mt-1 runner-facts">
-            <thead>
-                <tr><th scope="col">Component</th><th scope="col">Licence</th></tr>
-            </thead>
-            <tbody>
-                @foreach (var (component, licence) in Components)
-                {
-                    <tr><td>@component</td><td>@licence</td></tr>
-                }
-            </tbody>
-        </MudSimpleTable>
-        <MudText Typo="Typo.caption" Class="mud-text-secondary mt-2">
-            The Microsoft Edge WebView2 Runtime that shows this window, Docker and the NVIDIA driver are installed separately, under their own terms.
-            The runner images list their own components in the third-party notices.
-        </MudText>
-    </MudPaper>
-</MudStack>
+                        </tbody>
+                    </MudSimpleTable>
+                    <MudText Typo="Typo.caption" Class="mud-text-secondary mt-2">
+                        The Microsoft Edge WebView2 Runtime that shows this window, Docker and the NVIDIA driver are installed separately, under their own terms.
+                        The runner images list their own components in the third-party notices.
+                    </MudText>
+                </MudItem>
+            </MudGrid>
+        </MudPaper>
+    </MudItem>
+</MudGrid>
 
 @code {
     private const string Source = "https://github.com/offloadr/runner";

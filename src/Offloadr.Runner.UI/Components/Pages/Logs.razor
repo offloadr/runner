@@ -6,7 +6,7 @@
 
 <PageTitle>Logs - Offloadr Runner</PageTitle>
 
-<MudStack Row="true" AlignItems="AlignItems.Center" Justify="Justify.SpaceBetween" Wrap="Wrap.Wrap" Class="mb-4">
+<MudStack Row="true" AlignItems="AlignItems.Center" Justify="Justify.SpaceBetween" Wrap="Wrap.Wrap" Class="mb-3">
     <MudText Typo="Typo.h5" HtmlTag="h1">Logs</MudText>
     <MudStack Row="true" Spacing="2">
         <MudButton Variant="Variant.Outlined" StartIcon="@Icons.Material.Filled.ContentCopy" OnClick="CopyAsync">Copy</MudButton>
@@ -14,13 +14,13 @@
     </MudStack>
 </MudStack>
 
-<MudText Typo="Typo.body2" Class="mud-text-secondary mb-4">
+<MudText Typo="Typo.body2" Class="mud-text-secondary mb-3">
     Image downloads and the runner's output since this app started. The log follows new lines while you are at the bottom; scroll up to stop it.
     Diagnostics are a text file for Offloadr support: this log, the app's checks of Docker and the GPU, and your settings.
     They never hold the runner key. Read the file before you send it, since the log can name your models and files.
 </MudText>
 
-<MudPaper Outlined="true" Class="pa-4">
+<MudPaper Outlined="true" Class="pa-4 runner-fill-card">
     @{
         // One snapshot per render: lines arrive on another thread, so reading the count twice could disagree.
         var lines = Supervisor.LogLines;
@@ -32,7 +32,7 @@
     }
     else
     {
-        <pre @ref="_log" class="runner-log runner-log-full" tabindex="0" aria-label="Runner log">@string.Join('\n', lines)</pre>
+        <pre @ref="_log" class="runner-log runner-log-fill" tabindex="0" aria-label="Runner log">@string.Join('\n', lines)</pre>
     }
 </MudPaper>
 

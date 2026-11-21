@@ -67,3 +67,16 @@ public class SettingsFormTests
         Assert.That(changes.Select(change => change.SameAs(Saved)), Has.All.False);
     }
 }
+
+public class ShortVersionTests
+{
+    [TestCase("0.1.0+88e11e6b9771eca61addf03c73976fffb4c6e745", "0.1.0+88e11e6")]
+    [TestCase("1.2.3-beta.4+ABCDEF0123456789", "1.2.3-beta.4+ABCDEF0")]
+    [TestCase("0.1.0+88e11e6", "0.1.0+88e11e6")]
+    [TestCase("0.1.0+local.build", "0.1.0+local.build")]
+    [TestCase("0.1.0", "0.1.0")]
+    [TestCase("", "")]
+    [TestCase(null, null)]
+    public void ShortVersion_CutsOnlyAFullCommitHash(string? version, string? shown)
+        => Assert.That(SupervisorView.ShortVersion(version), Is.EqualTo(shown));
+}

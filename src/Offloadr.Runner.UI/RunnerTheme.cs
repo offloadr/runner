@@ -72,9 +72,10 @@ public static class RunnerTheme
             {
                 FontFamily = ["Avenir Next", "Segoe UI Variable Text", "Segoe UI", "system-ui", "sans-serif"],
             },
+            Body1 = new Body1Typography { FontSize = "0.9375rem" },
             H4 = new H4Typography { FontFamily = DisplayFont, FontWeight = "650", LetterSpacing = "-0.02em" },
-            H5 = new H5Typography { FontFamily = DisplayFont, FontWeight = "650", LetterSpacing = "-0.01em" },
-            H6 = new H6Typography { FontFamily = DisplayFont, FontWeight = "600" },
+            H5 = new H5Typography { FontFamily = DisplayFont, FontSize = "1.375rem", FontWeight = "650", LetterSpacing = "-0.01em" },
+            H6 = new H6Typography { FontFamily = DisplayFont, FontSize = "1.125rem", FontWeight = "600" },
             Button = new ButtonTypography { FontWeight = "600", TextTransform = "none", LetterSpacing = "0" },
         },
         LayoutProperties = new LayoutProperties { DefaultBorderRadius = "12px" },

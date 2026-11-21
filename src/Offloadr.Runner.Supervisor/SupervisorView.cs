@@ -71,6 +71,25 @@ public sealed record SupervisorView(
 
     /// <summary>True when the runner reports an editor session; stopping now would interrupt someone's work.</summary>
     public bool HasActiveSession => !string.IsNullOrEmpty(RunnerStatus?.ActiveSessionId);
+
+    /// <summary>
+    /// A version to show in a narrow column: one that ends in a full commit hash
+    /// (<c>0.1.0+88e11e6b9771eca61addf03c73976fffb4c6e745</c>) keeps its first seven characters, as
+    /// git shortens it. Anything else is shown as it is.
+    /// </summary>
+    public static string? ShortVersion(string? version)
+    {
+        var plus = version?.IndexOf('+') ?? -1;
+        if (plus < 0)
+        {
+            return version;
+        }
+
+        var hash = version![(plus + 1)..];
+        return hash.Length > ShortHashLength && hash.All(Uri.IsHexDigit) ? version[..(plus + 1 + ShortHashLength)] : version;
+    }
+
+    private const int ShortHashLength = 7;
 }
 
 /// <summary>Bounded, thread-safe buffer of recent log lines.</summary>
