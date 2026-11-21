@@ -1,6 +1,6 @@
 name: PR-Agent review
 
-# PR-Agent review with OpenAI gpt-6.1-sol, billed to the API organization that holds OPENAI_KEY.
+# PR-Agent review with OpenAI gpt-6.2-sol, billed to the API organization that holds OPENAI_KEY.
 # The shared workflow fails its review job when the review does not complete and its
 # findings job while a finding is open; see offloadr/pr-agent-review for how findings clear.
 
@@ -20,7 +20,7 @@ jobs:
     # Fork pull requests get no secrets and a read-only token, so they are skipped here
     # (the shared workflow skips them too) rather than reported as failures.
     if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
-    uses: offloadr/pr-agent-review/.github/workflows/pr-agent-review.yml@4584049fd144ef6879d4490396a629c5cab4bf3f
+    uses: offloadr/pr-agent-review/.github/workflows/pr-agent-review.yml@15ba456ac4704ad3d6c2f23308e2216a597989b7
     # The findings job resolves PR-Agent's threads for fixed findings, which GitHub only
     # allows with contents: write. Neither job checks out or runs pull request code.
     permissions:
@@ -30,7 +30,7 @@ jobs:
     secrets:
       OPENAI_KEY: ${{ secrets.OPENAI_KEY }}
     with:
-      model: gpt-6.1-sol
+      model: gpt-6.2-sol
       # A public repository, so the review runs on GitHub-hosted runners rather than offloadr-runners.
       runs-on: ubuntu-latest
       instructions: |
