@@ -40,7 +40,7 @@ Every registration carries `RuntimeStatus` instead of the active session id: the
 | --- | --- |
 | `NONE` | No session, or a session held with no tracked editor process (after Quiesce) |
 | `STARTING` | A start or launch of the named runtime is running |
-| `READY` | The named runtime finished starting ready; `sealing` says what it got. Reported from the moment its acknowledgement is built, so a lost acknowledgement does not hold it back |
+| `READY` | The named runtime finished starting ready; `sealing` says what it got. Reported from the moment the startup knows its outcome, before the acknowledgement is sent, so a lost acknowledgement does not hold it back |
 | `FAILED` | The named runtime failed to start and the runner still holds its session; `message` (at most 512 bytes) says why |
 | `STOPPING` | A Stop of the session is running |
 

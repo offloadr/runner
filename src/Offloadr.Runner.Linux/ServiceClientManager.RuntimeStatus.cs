@@ -15,7 +15,7 @@ internal static partial class ServiceClientManager
     /// What the heartbeat reports about the runner's one logical session: the session, the
     /// runtime it runs and that runtime's phase. It reads the state the command handlers
     /// already own, so the report never runs ahead of them. READY needs a recorded ready
-    /// outcome, which is recorded only when the startup's acknowledgement is built.
+    /// outcome, recorded by the startup that owns it before it releases its slot.
     /// </summary>
     internal static RuntimeStatus DescribeRuntimeStatus(
         LogicalSessionState logicalSessionState,

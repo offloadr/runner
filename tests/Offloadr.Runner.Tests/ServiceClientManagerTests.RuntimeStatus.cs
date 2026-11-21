@@ -156,6 +156,20 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
+    public async Task RuntimeStatus_TheOutcomeIsRecordedBeforeTheStartupSlotIsReleased()
+    {
+        // A command arriving between slot release and acknowledgement must see the outcome.
+        var harness = new RuntimeCommandHarness();
+        harness.Sink.FailWhen = request => request is AcknowledgeEditorRuntimeLaunchRequest;
+        var launch = ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 3, InstanceA, revision: 1), harness.Deps);
+        await WaitUntilAsync(() => harness.WorkState.GetActiveStartup() is null && harness.Calls.Any(call => call.StartsWith("start:", StringComparison.Ordinal)));
+
+        Assert.That(harness.WorkState.StartupOutcome(CommandSessionId, new RuntimeIdentity(7, 3, InstanceA))?.Outcome.Ready, Is.True);
+        await harness.Shutdown.CancelAsync();
+        await launch.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Test]
     public void RuntimeStatus_ADelayedOutcomeOfAnOlderStartupDoesNotReplaceTheCurrentRuntimes()
     {
         var harness = RunningHarness(7, 4, InstanceB);

@@ -2677,13 +2677,13 @@ internal static partial class ServiceClientManager
                 RunnerLog.Warning(
                     nameof(ServiceClientManager),
                     $"Startup {acknowledgementKey} for session {sessionId} asks for other sealing than the one in progress; refusing it.");
-                return AcknowledgeOutcomeAsync(Task.FromResult(new StartupOutcome(false, OtherSealingMessage)), owner: false);
+                return AcknowledgeOutcomeAsync(Task.FromResult(new StartupOutcome(false, OtherSealingMessage)));
             }
 
             RunnerLog.Info(
                 nameof(ServiceClientManager),
                 $"Startup {acknowledgementKey} for session {sessionId} is already in progress; joining it.");
-            return AcknowledgeOutcomeAsync(inProgress, owner: false);
+            return AcknowledgeOutcomeAsync(inProgress);
         }
 
         TrackedCommandWork? previous = null;
@@ -2702,14 +2702,20 @@ internal static partial class ServiceClientManager
         tracked.Outcome = physical;
         previous = deps.WorkState.ReplaceActiveStartup(tracked);
         starter.Start(TaskScheduler.Default);
-        return AcknowledgeOutcomeAsync(physical, owner: true);
+        return AcknowledgeOutcomeAsync(physical);
 
         async Task<StartupOutcome> RunPhysicalAsync()
         {
             try
             {
                 await CancelTrackedWorkAsync(previous).ConfigureAwait(false);
-                return await startup(tracked.Token).ConfigureAwait(false);
+                var result = await startup(tracked.Token).ConfigureAwait(false);
+                // Recorded while this startup still holds the slot, so a later command for
+                // the same runtime sees either this startup in progress or its outcome. Only
+                // the owner records: a joined or refused command says nothing about it.
+                deps.WorkState.RecordStartupOutcome(sessionId, runtimeIdentity, result,
+                    (session, runtime) => deps.GetTrackedRuntime(session) is { } running && running.SameRuntime(runtime));
+                return result;
             }
             finally
             {
@@ -2718,16 +2724,9 @@ internal static partial class ServiceClientManager
             }
         }
 
-        async Task AcknowledgeOutcomeAsync(Task<StartupOutcome> outcome, bool owner)
+        async Task AcknowledgeOutcomeAsync(Task<StartupOutcome> outcome)
         {
             var result = await outcome.ConfigureAwait(false);
-            // Only the startup's owner records it: a refused or joined command
-            // says nothing about the runtime the owner is starting.
-            if (owner)
-            {
-                deps.WorkState.RecordStartupOutcome(sessionId, runtimeIdentity, result,
-                    (session, runtime) => deps.GetTrackedRuntime(session) is { } tracked && tracked.SameRuntime(runtime));
-            }
             var ack = toAcknowledgement(result);
             await AcknowledgeRuntimeCommandWithRetryAsync(
                 acknowledge,
