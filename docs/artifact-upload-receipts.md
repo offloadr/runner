@@ -74,7 +74,12 @@ Stop does not count a file that the latest listing said to remove.
 The same residue remains as for eviction: an open that had already looked the
 name up before the file was moved aside and reaches it only after the last check;
 and, on overlayfs, a writable mapping kept after its descriptor was closed, which
-does not hold a lease off. Inputs are not removed this way; they keep their own rules.
+does not hold a lease off. One more is the download's own: publishing a downloaded
+file renames it, which changes its change time, so the agent compares the published
+file with the one it wrote by inode, length and modification time alone. A session
+that rewrites the file in place in the moment between that rename and the agent's
+read of it, keeping its length and setting its modification time back, is taken for
+the downloaded copy. Inputs are not removed this way; they keep their own rules.
 
 A seed never prunes the catalog. The entries it adds stand beside those of the
 listing that follows, and only that listing decides which artifacts are no longer

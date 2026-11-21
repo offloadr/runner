@@ -26,6 +26,7 @@ internal sealed class RunnerLogRelay : IAsyncDisposable
     private volatile bool _completing;
 
     private IRunnerSessionSink? _sink;
+    private Task _sinkAccepted = Task.CompletedTask;
     private CancellationTokenSource? _sinkLifetime;
     private long _sinkGeneration;
 
@@ -52,7 +53,9 @@ internal sealed class RunnerLogRelay : IAsyncDisposable
         _senderTask = Task.Run(SenderLoopAsync);
     }
 
-    public void AttachSink(IRunnerSessionSink sink)
+    /// <param name="accepted">Completes once Offloadr has accepted this runner's registration. Until then
+    /// lines are kept, not sent: Offloadr refuses logs from a runner it has not registered yet.</param>
+    public void AttachSink(IRunnerSessionSink sink, Task? accepted = null)
     {
         ArgumentNullException.ThrowIfNull(sink);
 
@@ -61,6 +64,7 @@ internal sealed class RunnerLogRelay : IAsyncDisposable
             _sinkLifetime?.Cancel();
             _sinkLifetime?.Dispose();
             _sink = sink;
+            _sinkAccepted = accepted ?? Task.CompletedTask;
             _sinkLifetime = new CancellationTokenSource();
             _sinkGeneration++;
         }
@@ -76,6 +80,7 @@ internal sealed class RunnerLogRelay : IAsyncDisposable
                 _sinkLifetime?.Dispose();
                 _sinkLifetime = null;
                 _sink = null;
+                _sinkAccepted = Task.CompletedTask;
                 _sinkGeneration++;
             }
         }
@@ -228,14 +233,17 @@ internal sealed class RunnerLogRelay : IAsyncDisposable
 
         IRunnerSessionSink? sink;
         CancellationToken sinkToken;
+        Task accepted;
         lock (_sinkLock)
         {
             sink = _sink;
             // Capture the token while its source is still owned by this connection.
             sinkToken = _sinkLifetime?.Token ?? default;
+            accepted = _sinkAccepted;
         }
 
-        if (sink is null || !sinkToken.CanBeCanceled)
+        // Not yet registered: keep the batch and try again, within each line's own deadline.
+        if (sink is null || !sinkToken.CanBeCanceled || !accepted.IsCompletedSuccessfully)
         {
             return false;
         }

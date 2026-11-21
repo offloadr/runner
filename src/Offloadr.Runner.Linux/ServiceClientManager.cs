@@ -838,7 +838,8 @@ internal static partial class ServiceClientManager
                 sessionEventRelay.AttachSink(sessionSink);
                 sessionEventRelay.PromptFinished += WithdrawFinishedPromptDemand;
                 sessionProcessLogRelay.AttachSink(sessionSink);
-                runnerLogRelay.AttachSink(sessionSink);
+                // A first registration creates the runner, so lines before it would be refused.
+                runnerLogRelay.AttachSink(sessionSink, initialStatusApplied.Task);
                 sessionRuntimeTelemetryRelay.AttachSink(sessionSink);
 
                 initialLocalModelSnapshot = PrepareInitialLocalModelSnapshot(localModelSnapshotProvider, localModelSnapshotObserver);

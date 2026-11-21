@@ -58,6 +58,24 @@ public class RunnerLogRelayTests
     }
 
     [Test]
+    public async Task LogsWaitForTheRegistrationToBeAcceptedThenFlow()
+    {
+        await using var relay = new RunnerLogRelay("runner-1");
+        var accepted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var client = new RecordingSink();
+        relay.AttachSink(client, accepted.Task);
+        relay.Enqueue("RunnerAgent", "line-before-registration");
+
+        // Offloadr refuses logs from a runner it has not registered, so none are sent yet.
+        await Task.Delay(TimeSpan.FromMilliseconds(500));
+        Assert.That(client.FirstRequest.Task.IsCompleted, Is.False);
+
+        accepted.SetResult();
+        var request = await WaitForAsync(client.FirstRequest.Task, TimeSpan.FromSeconds(3));
+        Assert.That(request.Entries.Select(entry => entry.Message), Is.EqualTo(new[] { "line-before-registration" }));
+    }
+
+    [Test]
     public async Task DetachSink_DropsBufferedLogs_BeforeReattach()
     {
         await using var relay = new RunnerLogRelay("runner-1");
