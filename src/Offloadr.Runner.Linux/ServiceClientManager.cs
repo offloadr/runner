@@ -401,15 +401,36 @@ internal static partial class ServiceClientManager
         // replace a newer runtime's. Only the newest few runtimes matter to the heartbeat.
         private const int RetainedStartupOutcomes = 8;
         private readonly List<RecordedStartupOutcome> _startupOutcomes = [];
+        // Advances whenever a startup is published, cleared or records its outcome, so a
+        // reader can tell its snapshot was overtaken by a startup that began meanwhile.
+        private long _startupVersion;
 
         /// <summary>How the last owned startup of this exact runtime ended, if one did.</summary>
         public RecordedStartupOutcome? StartupOutcome(string sessionId, RuntimeIdentity runtime)
         {
-            var normalized = runtime.Normalized();
-            lock (_gate)
-                return _startupOutcomes.LastOrDefault(recorded =>
-                    string.Equals(recorded.SessionId, sessionId, StringComparison.Ordinal) && recorded.Runtime == normalized);
+            lock (_gate) return FindOutcome(sessionId, runtime.Normalized());
         }
+
+        /// <summary>The unfinished startup, the runtime's recorded outcome and their version, read together.</summary>
+        public (TrackedCommandWork? Startup, RecordedStartupOutcome? Outcome, long Version) ReadStartupState(
+            string sessionId, RuntimeIdentity? runtime)
+        {
+            lock (_gate)
+            {
+                var startup = _activeStartup?.Task is { IsCompleted: false } ? _activeStartup : null;
+                var outcome = runtime is { } current ? FindOutcome(sessionId, current.Normalized()) : null;
+                return (startup, outcome, _startupVersion);
+            }
+        }
+
+        public long StartupVersion
+        {
+            get { lock (_gate) return _startupVersion; }
+        }
+
+        private RecordedStartupOutcome? FindOutcome(string sessionId, RuntimeIdentity normalized)
+            => _startupOutcomes.LastOrDefault(recorded =>
+                string.Equals(recorded.SessionId, sessionId, StringComparison.Ordinal) && recorded.Runtime == normalized);
 
         /// <summary>
         /// Records how an owned startup of this runtime ended. <paramref name="isTracked"/>
@@ -421,6 +442,7 @@ internal static partial class ServiceClientManager
             var normalized = runtime.Normalized();
             lock (_gate)
             {
+                _startupVersion++;
                 var index = _startupOutcomes.FindIndex(recorded =>
                     string.Equals(recorded.SessionId, sessionId, StringComparison.Ordinal) && recorded.Runtime == normalized);
                 if (index >= 0)
@@ -458,6 +480,7 @@ internal static partial class ServiceClientManager
             {
                 var previous = _activeStartup?.Task is { IsCompleted: false } ? _activeStartup : null;
                 _activeStartup = work;
+                _startupVersion++;
                 return previous;
             }
         }
@@ -469,6 +492,7 @@ internal static partial class ServiceClientManager
                 if (ReferenceEquals(_activeStartup, work))
                 {
                     _activeStartup = null;
+                    _startupVersion++;
                 }
             }
         }

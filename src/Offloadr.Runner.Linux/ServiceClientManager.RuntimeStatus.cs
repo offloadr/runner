@@ -23,6 +23,25 @@ internal static partial class ServiceClientManager
         Func<string, bool> isStopping,
         Func<string, RuntimeIdentity, bool> isTrackedRuntime)
     {
+        // The process check runs outside the work state's lock. A startup that begins
+        // meanwhile could start a fresh process for the same runtime, so a snapshot that a
+        // startup overtook is read again; READY is never built from a stale one.
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            var status = DescribeRuntimeStatusOnce(logicalSessionState, workState, isStopping, isTrackedRuntime, out var version);
+            if (version == workState.StartupVersion) return status;
+        }
+        return new RuntimeStatus { SessionId = logicalSessionState.GetActiveSessionId(), Phase = RuntimePhase.None };
+    }
+
+    private static RuntimeStatus DescribeRuntimeStatusOnce(
+        LogicalSessionState logicalSessionState,
+        RunnerCommandWorkState workState,
+        Func<string, bool> isStopping,
+        Func<string, RuntimeIdentity, bool> isTrackedRuntime,
+        out long version)
+    {
+        version = workState.StartupVersion;
         var sessionId = logicalSessionState.GetActiveSessionId();
         var status = new RuntimeStatus { SessionId = sessionId, Phase = RuntimePhase.None };
         if (sessionId.Length == 0) return status;
@@ -35,8 +54,9 @@ internal static partial class ServiceClientManager
             return status;
         }
 
-        if (workState.GetActiveStartup() is { } startup &&
-            string.Equals(startup.SessionId, sessionId, StringComparison.Ordinal) &&
+        var (startup, recorded, read) = workState.ReadStartupState(sessionId, hasRuntime ? runtime : null);
+        version = read;
+        if (startup is not null && string.Equals(startup.SessionId, sessionId, StringComparison.Ordinal) &&
             startup.RuntimeIdentity.IsValid)
         {
             status.Phase = RuntimePhase.Starting;
@@ -44,7 +64,7 @@ internal static partial class ServiceClientManager
             return status;
         }
 
-        if (!hasRuntime || workState.StartupOutcome(sessionId, runtime) is not { } recorded)
+        if (!hasRuntime || recorded is null)
         {
             return status;
         }

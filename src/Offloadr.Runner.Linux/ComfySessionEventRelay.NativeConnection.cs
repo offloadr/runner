@@ -123,7 +123,11 @@ internal sealed partial class ComfySessionEventRelay
         }
 
         private void ReportBridgeState(PhysicalConnection connection)
-            => _owner.Enqueue(new SessionStreamEvent
+        {
+            // Never advertise a connection whose runtime retired, even between the
+            // handshake send and the guard that would abort it.
+            if (!RuntimeIsCurrent() || !connection.Active) return;
+            _owner.Enqueue(new SessionStreamEvent
             {
                 RunnerId = _runnerId,
                 SessionId = _sessionId,
@@ -135,6 +139,7 @@ internal sealed partial class ComfySessionEventRelay
                 RuntimeInstanceId = _runtimeInstanceId,
                 BridgeState = new BridgeState { ConnectionId = connection.Id.ToString("n") },
             });
+        }
 
         private async Task SendPayloadAsync(PhysicalConnection connection, byte[] payload, CancellationToken token)
         {

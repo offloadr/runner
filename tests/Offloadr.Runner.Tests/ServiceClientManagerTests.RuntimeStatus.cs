@@ -170,6 +170,32 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
+    public void RuntimeStatus_AStartupThatBeginsDuringTheProcessCheckIsNeverReportedReady()
+    {
+        var harness = RunningHarness(7, 3, InstanceA);
+        var runtime = new RuntimeIdentity(7, 3, InstanceA);
+        harness.WorkState.RecordStartupOutcome(CommandSessionId, runtime, new ServiceClientManager.StartupOutcome(true, ""), IsTracked(harness));
+        var relaunched = false;
+        var status = ServiceClientManager.DescribeRuntimeStatus(harness.Logical, harness.WorkState, _ => false, (session, checkedRuntime) =>
+        {
+            // A same-runtime relaunch publishes its startup and a fresh process right now.
+            if (!relaunched)
+            {
+                relaunched = true;
+                harness.WorkState.ReplaceActiveStartup(new ServiceClientManager.TrackedCommandWork(CancellationToken.None)
+                {
+                    SessionId = CommandSessionId,
+                    RuntimeIdentity = runtime,
+                    Task = new TaskCompletionSource().Task,
+                });
+            }
+            return true;
+        });
+
+        Assert.That(status.Phase, Is.EqualTo(RuntimePhase.Starting));
+    }
+
+    [Test]
     public void RuntimeStatus_ADelayedOutcomeOfAnOlderStartupDoesNotReplaceTheCurrentRuntimes()
     {
         var harness = RunningHarness(7, 4, InstanceB);
