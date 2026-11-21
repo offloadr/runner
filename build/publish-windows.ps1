@@ -111,7 +111,7 @@ try {
     $zip = [IO.Compression.ZipFile]::OpenRead($fullPackage)
     try {
         $packed = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-        foreach ($entry in $zip.Entries) { [void]$packed.Add([Uri]::UnescapeDataString($entry.FullName)) }
+        foreach ($entry in $zip.Entries) { [void]$packed.Add($entry.FullName) }
     }
     finally {
         $zip.Dispose()
