@@ -1468,6 +1468,7 @@ public partial class ServiceClientManagerTests
             => _tracked.TryGetValue(sessionId, out var identity) ? identity : null;
 
         public void Track(string sessionId, RuntimeIdentity identity) => _tracked[sessionId] = identity;
+        public void Untrack(string sessionId) => _tracked.TryRemove(sessionId, out _);
 
         /// <summary>Starts prompt work for the runtime that runs until it is cancelled.</summary>
         public Task StartPrompt(ulong generation, ulong epoch, string instance)
