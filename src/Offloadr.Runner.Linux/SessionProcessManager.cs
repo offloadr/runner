@@ -401,8 +401,9 @@ internal sealed partial class SessionProcessManager : IAsyncDisposable
     /// </summary>
     public Guid? TrackedProcess(string? sessionId, RuntimeIdentity runtimeIdentity)
     {
+        // One lookup: the token returned is that of the very context validated.
         if (string.IsNullOrWhiteSpace(sessionId) || !_sessions.TryGetValue(sessionId.Trim(), out var context)) return null;
-        return IsTrackedRuntime(sessionId, runtimeIdentity) ? context.ProcessToken : null;
+        return IsLive(context, runtimeIdentity) ? context.ProcessToken : null;
     }
 
     /// <summary>
@@ -411,11 +412,12 @@ internal sealed partial class SessionProcessManager : IAsyncDisposable
     /// </summary>
     public bool IsTrackedRuntime(string? sessionId, RuntimeIdentity runtimeIdentity)
     {
-        if (string.IsNullOrWhiteSpace(sessionId) || !_sessions.TryGetValue(sessionId.Trim(), out var context))
-        {
-            return false;
-        }
+        return !string.IsNullOrWhiteSpace(sessionId) && _sessions.TryGetValue(sessionId.Trim(), out var context)
+            && IsLive(context, runtimeIdentity);
+    }
 
+    private static bool IsLive(SessionContext context, RuntimeIdentity runtimeIdentity)
+    {
         try
         {
             return !context.StopInProgress &&
