@@ -185,7 +185,7 @@ internal sealed class ModelDownloadService : IAsyncDisposable
         var filtered = FilterRemoteDownloadRequests(downloads);
         if (!_downloadsEnabled)
         {
-            ReportRefused(sessionId, filtered);
+            LogNotDownloaded(sessionId, filtered);
             return;
         }
 
@@ -704,7 +704,10 @@ internal sealed class ModelDownloadService : IAsyncDisposable
         return LocalModelRelease.Released;
     }
 
-    private void ReportRefused(string sessionId, IReadOnlyCollection<ModelDownloadRequest> downloads)
+    // Not downloading is the owner's choice, not a failure: the session starts with the
+    // models it has, and only a prompt that needs a missing one is refused. Nothing is
+    // reported to Offloadr, which would otherwise take a failed download for a failed start.
+    private static void LogNotDownloaded(string sessionId, IReadOnlyCollection<ModelDownloadRequest> downloads)
     {
         var normalizedSessionId = string.IsNullOrWhiteSpace(sessionId) ? null : sessionId.Trim();
         if (downloads.Count == 0 || normalizedSessionId is null)
@@ -715,42 +718,6 @@ internal sealed class ModelDownloadService : IAsyncDisposable
         RunnerLog.Info(
             nameof(ModelDownloadService),
             $"Not downloading {downloads.Count} model(s) for session '{normalizedSessionId}': RUNNER_MODEL_DOWNLOADS is off.");
-        if (ProgressReporter is not { } reporter)
-        {
-            return;
-        }
-
-        var runtime = RuntimeResolver?.Invoke(normalizedSessionId);
-        var reports = downloads.Select(download => new ModelDownloadProgress(
-                normalizedSessionId,
-                download.ModelId ?? string.Empty,
-                download.Filename ?? Path.GetFileName(download.DestinationPath) ?? string.Empty,
-                download.DestinationPath ?? string.Empty,
-                BytesDownloaded: 0,
-                TotalBytes: download.SizeBytes,
-                Percent: 0,
-                BytesPerSecond: 0,
-                AverageBytesPerSecond: 0,
-                ModelDownloadState.Failed,
-                ModelDownloadsDisabledException.ReportMessage,
-                runtime))
-            .ToArray();
-        _ = ReportRefusedAsync(reporter, reports);
-    }
-
-    private static async Task ReportRefusedAsync(Func<ModelDownloadProgress, Task> reporter, IEnumerable<ModelDownloadProgress> reports)
-    {
-        foreach (var report in reports)
-        {
-            try
-            {
-                await reporter(report).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                RunnerLog.Warning(nameof(ModelDownloadService), $"Could not report a refused download ({ex.GetType().Name}).");
-            }
-        }
     }
 
     private static ModelDownloadRequest[] FilterRemoteDownloadRequests(IEnumerable<ModelDownloadRequest>? downloads)
