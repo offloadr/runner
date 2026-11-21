@@ -1,4 +1,5 @@
 name: Release desktop app
+run-name: ${{ inputs.dry_run && 'Dry run' || 'Release' }} ${{ inputs.version }}
 
 on:
   workflow_dispatch:
@@ -7,6 +8,11 @@ on:
         description: Version to release, for example 1.2.3
         required: true
         type: string
+      dry_run:
+        description: Sign, pack and check the signatures without tagging or publishing
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: release
@@ -125,8 +131,11 @@ jobs:
           path: artifacts/releases/windows-win-x64/
           if-no-files-found: error
 
+  # A dry run stops before this job: the signed installer stays a workflow artifact, and no tag or
+  # release is made.
   release:
     needs: package
+    if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
