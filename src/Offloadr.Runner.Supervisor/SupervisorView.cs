@@ -73,9 +73,9 @@ public sealed record SupervisorView(
     public bool HasActiveSession => !string.IsNullOrEmpty(RunnerStatus?.ActiveSessionId);
 
     /// <summary>
-    /// A version to show in a narrow column: one that ends in a full commit hash
-    /// (<c>0.1.0+88e11e6b9771eca61addf03c73976fffb4c6e745</c>) keeps its first seven characters, as
-    /// git shortens it. Anything else is shown as it is.
+    /// A version to show in a narrow column: one that ends in a full commit hash, SHA-1 or SHA-256
+    /// (<c>0.1.0+88e11e6b9771eca61addf03c73976fffb4c6e745</c>), keeps its first seven characters, as
+    /// git shortens it. Anything else, such as a build date, is shown as it is.
     /// </summary>
     public static string? ShortVersion(string? version)
     {
@@ -86,7 +86,7 @@ public sealed record SupervisorView(
         }
 
         var hash = version![(plus + 1)..];
-        return hash.Length > ShortHashLength && hash.All(Uri.IsHexDigit) ? version[..(plus + 1 + ShortHashLength)] : version;
+        return hash.Length is 40 or 64 && hash.All(Uri.IsHexDigit) ? version[..(plus + 1 + ShortHashLength)] : version;
     }
 
     private const int ShortHashLength = 7;

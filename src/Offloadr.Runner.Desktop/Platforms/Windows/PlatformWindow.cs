@@ -206,7 +206,8 @@ internal static class PlatformWindow
     /// <summary>
     /// Sizes the window as asked, in device-independent pixels, but never larger than the work area of
     /// the screen it opens on (a 1080p screen at 150 % has about 1280 × 690 beside the taskbar), and
-    /// centres it there. A screen smaller than the window's minimum size lowers that minimum to fit.
+    /// centres it there. A screen lower than the window's minimum height lowers that minimum to fit; the
+    /// minimum width stays, since the menu needs it and no screen in use is narrower.
     /// </summary>
     private static void PlaceOnWorkArea(Window window, Microsoft.UI.Xaml.Window native, nint handle, double width, double height)
     {
@@ -220,7 +221,6 @@ internal static class PlatformWindow
         var area = info.Work;
         var (areaWidth, areaHeight) = (area.Right - area.Left, area.Bottom - area.Top);
         var scale = GetDpiForWindow(handle) is var dpi and > 0 ? dpi / 96.0 : 1.0;
-        window.MinimumWidth = Math.Min(window.MinimumWidth, Math.Floor(areaWidth / scale));
         window.MinimumHeight = Math.Min(window.MinimumHeight, Math.Floor(areaHeight / scale));
         var pixelWidth = Math.Min((int)Math.Round(width * scale), areaWidth);
         var pixelHeight = Math.Min((int)Math.Round(height * scale), areaHeight);

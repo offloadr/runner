@@ -71,7 +71,9 @@ public class SettingsFormTests
 public class ShortVersionTests
 {
     [TestCase("0.1.0+88e11e6b9771eca61addf03c73976fffb4c6e745", "0.1.0+88e11e6")]
-    [TestCase("1.2.3-beta.4+ABCDEF0123456789", "1.2.3-beta.4+ABCDEF0")]
+    [TestCase("1.2.3-beta.4+ABCDEF0123456789ABCDEF0123456789ABCDEF01", "1.2.3-beta.4+ABCDEF0")]
+    [TestCase("0.1.0+0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "0.1.0+0123456")]
+    [TestCase("0.1.0+20261121", "0.1.0+20261121")]
     [TestCase("0.1.0+88e11e6", "0.1.0+88e11e6")]
     [TestCase("0.1.0+local.build", "0.1.0+local.build")]
     [TestCase("0.1.0", "0.1.0")]
