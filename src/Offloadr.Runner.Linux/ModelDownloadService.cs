@@ -717,9 +717,7 @@ internal sealed class ModelDownloadService : IAsyncDisposable
 
         RunnerLog.Info(
             nameof(ModelDownloadService),
-            $"Not downloading {downloads.Count} model(s) for session '{normalizedSessionId}' because RUNNER_MODEL_DOWNLOADS is off: " +
-            ModelDownloadsDisabledException.NameForLog(downloads.Select(static download =>
-                download.Filename ?? Path.GetFileName(download.DestinationPath))) + ".");
+            $"Not downloading {downloads.Count} model(s) for session '{normalizedSessionId}': RUNNER_MODEL_DOWNLOADS is off.");
     }
 
     private static ModelDownloadRequest[] FilterRemoteDownloadRequests(IEnumerable<ModelDownloadRequest>? downloads)

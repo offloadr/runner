@@ -3536,12 +3536,6 @@ internal static partial class ServiceClientManager
             RunnerLog.Warning(nameof(ServiceClientManager), nativeInvocationStarted
                 ? $"Prompt handoff {prompt.HandoffId} ended with {ex.GetType().Name}; its native result is unknown."
                 : $"Prompt handoff {prompt.HandoffId} ended with {ex.GetType().Name} before native request I/O.");
-            if (ex is ModelDownloadsDisabledException missing)
-            {
-                RunnerLog.Info(nameof(ServiceClientManager),
-                    $"Prompt handoff {prompt.HandoffId} needs models this runner does not have, and RUNNER_MODEL_DOWNLOADS is off: "
-                    + ModelDownloadsDisabledException.NameForLog(missing.Filenames) + ".");
-            }
             // A native response already recorded stays the result.
             if (ack.Outcome == PromptResultOutcome.Unspecified)
             {

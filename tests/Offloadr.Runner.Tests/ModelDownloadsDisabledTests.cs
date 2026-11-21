@@ -85,19 +85,6 @@ public class ModelDownloadsDisabledTests
     }
 
     [Test]
-    public void LogNamesAreBoundedAndDistinct()
-    {
-        var names = Enumerable.Range(1, 12).Select(index => $"model-{index}.safetensors").Append("model-1.safetensors").Append(" ");
-        var logged = ModelDownloadsDisabledException.NameForLog(names);
-        Assert.Multiple(() =>
-        {
-            Assert.That(logged, Does.StartWith("model-1.safetensors, model-2.safetensors"));
-            Assert.That(logged, Does.EndWith("and 2 more"));
-            Assert.That(logged, Does.Not.Contain("model-11.safetensors"));
-        });
-    }
-
-    [Test]
     public async Task Off_RefusesAPromptThatNeedsADownload()
     {
         var root = CreateTempDirectory();

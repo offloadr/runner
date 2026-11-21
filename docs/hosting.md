@@ -197,8 +197,8 @@ A runner downloads models only with `RUNNER_MODEL_DOWNLOADS=on`. Models are ofte
 
 With downloads off:
 
-- A session starts with the models it can load and lists only those. The models it would have downloaded are named in the runner's log; they are not reported to Offloadr, no placeholder is created for them, and the session starts as usual.
-- A prompt that needs a model the runner does not have is refused before the editor sees it, with the diagnostic code `model_downloads_disabled`. The runner's log names the missing models.
+- A session starts with the models it can load and lists only those. The runner's log notes how many models it did not download; they are not reported to Offloadr, no placeholder is created for them, and the session starts as usual.
+- A prompt that needs a model the runner does not have is refused before the editor sees it, with the diagnostic code `model_downloads_disabled`.
 - Models from the local models folder are linked into sessions as usual.
 
 ### Saving downloads in the models folder
