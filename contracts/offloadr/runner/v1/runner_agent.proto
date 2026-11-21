@@ -321,7 +321,8 @@ enum RuntimePhase {
     RUNTIME_PHASE_NONE = 1;     // No session, or a session held with no editor process.
     RUNTIME_PHASE_STARTING = 2; // A start or launch of the runtime below is running.
     RUNTIME_PHASE_READY = 3;    // The runtime below finished starting ready.
-    RUNTIME_PHASE_FAILED = 4;   // The runtime below failed to start or exited unexpectedly.
+    RUNTIME_PHASE_FAILED = 4;   // The runtime below failed to start and the runner still holds its session.
+                                // A runtime that exits unexpectedly ends the session: NONE.
     RUNTIME_PHASE_STOPPING = 5; // The session is stopping.
 }
 
