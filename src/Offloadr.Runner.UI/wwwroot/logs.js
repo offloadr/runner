@@ -13,10 +13,13 @@ export function follow(element) {
     element.addEventListener("scroll", () => {
         element.dataset.following = atBottom() ? "true" : "false";
     }, { passive: true });
-    new MutationObserver(() => {
+    const keepAtBottom = () => {
         if (element.dataset.following === "true") {
             element.scrollTop = element.scrollHeight;
         }
-    }).observe(element, { childList: true, characterData: true, subtree: true });
+    };
+    new MutationObserver(keepAtBottom).observe(element, { childList: true, characterData: true, subtree: true });
+    // The log takes the height the window leaves it, which changes with the window and with a banner above.
+    new ResizeObserver(keepAtBottom).observe(element);
     element.scrollTop = element.scrollHeight;
 }
