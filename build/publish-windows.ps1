@@ -100,9 +100,27 @@ try {
         --runtime $Runtime `
         --shortcuts StartMenuRoot `
         --noPortable `
-        --exclude '.*\.pdb|.*\.WebView2([\\/].*)?' `
         -o $releasesDir
     if ($LASTEXITCODE) { throw 'Packing the installer failed.' }
+
+    # Everything published ships, apart from what vpk always leaves out (symbols, and .NET's crash dump
+    # helper): a file missing from the package (an exclusion matching too much, say) makes an app that
+    # installs and then fails to start.
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $fullPackage = Join-Path $releasesDir "$packId-$Version-$Runtime-full.nupkg"
+    $zip = [IO.Compression.ZipFile]::OpenRead($fullPackage)
+    try {
+        $packed = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($entry in $zip.Entries) { [void]$packed.Add($entry.FullName) }
+    }
+    finally {
+        $zip.Dispose()
+    }
+    $missing = @(Get-ChildItem $publishDir -Recurse -File -Force |
+        Where-Object { $_.Extension -ne '.pdb' -and $_.Name -ne 'createdump.exe' } |
+        ForEach-Object { [IO.Path]::GetRelativePath($publishDir, $_.FullName).Replace('\', '/') } |
+        Where-Object { -not $packed.Contains("lib/app/$_") })
+    if ($missing) { throw "The full package lacks published files:`n$($missing -join "`n")" }
 }
 finally {
     Pop-Location
