@@ -1420,6 +1420,7 @@ public partial class ServiceClientManagerTests
     private sealed class RuntimeCommandHarness
     {
         private readonly ConcurrentDictionary<string, RuntimeIdentity> _tracked = new(StringComparer.Ordinal);
+        private readonly ConcurrentDictionary<string, Guid> _processes = new(StringComparer.Ordinal);
 
         public RuntimeCommandHarness()
         {
@@ -1467,8 +1468,22 @@ public partial class ServiceClientManagerTests
         public RuntimeIdentity? Tracked(string sessionId)
             => _tracked.TryGetValue(sessionId, out var identity) ? identity : null;
 
-        public void Track(string sessionId, RuntimeIdentity identity) => _tracked[sessionId] = identity;
-        public void Untrack(string sessionId) => _tracked.TryRemove(sessionId, out _);
+        /// <summary>Tracks a new process of <paramref name="identity"/>, as a fresh launch would.</summary>
+        public void Track(string sessionId, RuntimeIdentity identity)
+        {
+            _tracked[sessionId] = identity;
+            _processes[sessionId] = Guid.NewGuid();
+        }
+
+        public void Untrack(string sessionId)
+        {
+            _tracked.TryRemove(sessionId, out _);
+            _processes.TryRemove(sessionId, out _);
+        }
+
+        public Guid? TrackedProcess(string sessionId, RuntimeIdentity runtime)
+            => _tracked.TryGetValue(sessionId, out var tracked) && tracked.SameRuntime(runtime)
+                && _processes.TryGetValue(sessionId, out var process) ? process : null;
 
         /// <summary>Starts prompt work for the runtime that runs until it is cancelled.</summary>
         public Task StartPrompt(ulong generation, ulong epoch, string instance)
@@ -1520,6 +1535,7 @@ public partial class ServiceClientManagerTests
                 return true;
             },
             GetTrackedRuntime = sessionId => Tracked(sessionId),
+            GetTrackedProcess = TrackedProcess,
             StopSessionRelay = sessionId => Record("relay:" + sessionId),
             StopArtifactUploads = sessionId => Record("uploads:" + sessionId),
             StopWorkspaceMirrors = sessionId => Record("mirror:" + sessionId),
@@ -1561,14 +1577,14 @@ public partial class ServiceClientManagerTests
 
             await BeforeStart(command, token).ConfigureAwait(false);
             token.ThrowIfCancellationRequested();
-            _tracked[command.SessionId] = identity;
+            Track(command.SessionId, identity);
         }
 
         private async Task StopAsync(string sessionId, Func<string, CancellationToken, Task>? beforeCleanup, CancellationToken token)
         {
             Calls.Enqueue("stop:" + sessionId);
             await BeforeStop(sessionId, token).ConfigureAwait(false);
-            _tracked.TryRemove(sessionId, out _);
+            Untrack(sessionId);
             if (beforeCleanup is not null)
             {
                 await beforeCleanup(sessionId, token).ConfigureAwait(false);

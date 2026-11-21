@@ -30,6 +30,11 @@ control plane holds no lease on them.
   Completed or untracked sockets are joined before admission; Stop and shutdown cancel
   and join every socket of the session.
 
+A bridge state queued just before its runtime retires can still be delivered, as can
+any editor frame already in flight. What it triggers on the control plane passes the
+runtime's expected-target check and Ready fence, which refuse a stopping or replaced
+runtime.
+
 Socket transport acceptance is not evidence that the editor applied anything.
 Controlled native WebSocket tests cover ordering, reconnects, bridge state, waiting
 client messages and cleanup. They do not qualify actual GPU runtimes; those remain

@@ -9,26 +9,27 @@ internal static partial class ServiceClientManager
     internal const int MaxRuntimeStatusMessageBytes = 512;
 
     /// <summary>How the last startup this runner owned ended, for the runtime it started.</summary>
-    internal sealed record RecordedStartupOutcome(string SessionId, RuntimeIdentity Runtime, StartupOutcome Outcome);
+    internal sealed record RecordedStartupOutcome(string SessionId, RuntimeIdentity Runtime, StartupOutcome Outcome, Guid? Process);
 
     /// <summary>
     /// What the heartbeat reports about the runner's one logical session: the session, the
     /// runtime it runs and that runtime's phase. It reads the state the command handlers
     /// already own, so the report never runs ahead of them. READY needs a recorded ready
-    /// outcome, recorded by the startup that owns it before it releases its slot.
+    /// outcome of the process now running, recorded by the startup that owns it before it
+    /// releases its slot.
     /// </summary>
     internal static RuntimeStatus DescribeRuntimeStatus(
         LogicalSessionState logicalSessionState,
         RunnerCommandWorkState workState,
         Func<string, bool> isStopping,
-        Func<string, RuntimeIdentity, bool> isTrackedRuntime)
+        Func<string, RuntimeIdentity, Guid?> trackedProcess)
     {
         // The process check runs outside the work state's lock. A startup that begins
         // meanwhile could start a fresh process for the same runtime, so a snapshot that a
         // startup overtook is read again; READY is never built from a stale one.
         for (var attempt = 0; attempt < 3; attempt++)
         {
-            var status = DescribeRuntimeStatusOnce(logicalSessionState, workState, isStopping, isTrackedRuntime, out var version);
+            var status = DescribeRuntimeStatusOnce(logicalSessionState, workState, isStopping, trackedProcess, out var version);
             if (version == workState.StartupVersion) return status;
         }
         return new RuntimeStatus { SessionId = logicalSessionState.GetActiveSessionId(), Phase = RuntimePhase.None };
@@ -38,7 +39,7 @@ internal static partial class ServiceClientManager
         LogicalSessionState logicalSessionState,
         RunnerCommandWorkState workState,
         Func<string, bool> isStopping,
-        Func<string, RuntimeIdentity, bool> isTrackedRuntime,
+        Func<string, RuntimeIdentity, Guid?> trackedProcess,
         out long version)
     {
         version = workState.StartupVersion;
@@ -71,8 +72,9 @@ internal static partial class ServiceClientManager
 
         if (recorded.Outcome.Ready)
         {
-            // A ready runtime whose process is gone or stopping is no longer ready.
-            if (!isTrackedRuntime(sessionId, runtime)) return status;
+            // READY belongs to the process that started ready: one gone or stopping is no
+            // longer ready, and a relaunch of the same runtime is a new, unready process.
+            if (recorded.Process is not { } process || trackedProcess(sessionId, runtime) != process) return status;
             status.Phase = RuntimePhase.Ready;
             status.Sealing = recorded.Outcome.Sealing?.Clone();
         }

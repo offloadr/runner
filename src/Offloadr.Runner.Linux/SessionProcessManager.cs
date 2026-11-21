@@ -396,6 +396,16 @@ internal sealed partial class SessionProcessManager : IAsyncDisposable
     }
 
     /// <summary>
+    /// The token of the session's tracked child process while it is exactly
+    /// <paramref name="runtimeIdentity"/> and neither stopping nor exited; otherwise null.
+    /// </summary>
+    public Guid? TrackedProcess(string? sessionId, RuntimeIdentity runtimeIdentity)
+    {
+        if (string.IsNullOrWhiteSpace(sessionId) || !_sessions.TryGetValue(sessionId.Trim(), out var context)) return null;
+        return IsTrackedRuntime(sessionId, runtimeIdentity) ? context.ProcessToken : null;
+    }
+
+    /// <summary>
     /// True only while the session's tracked child is exactly <paramref name="runtimeIdentity"/>
     /// and is neither stopping nor exited.
     /// </summary>
@@ -3783,6 +3793,9 @@ internal sealed partial class SessionProcessManager : IAsyncDisposable
 
         public string SessionId { get; }
         public RuntimeIdentity RuntimeIdentity { get; }
+
+        /// <summary>Unique to this child process, so a relaunch of the same runtime is a different process.</summary>
+        public Guid ProcessToken { get; } = Guid.NewGuid();
 
         /// <summary>The sealing its start asked for; a duplicate start must ask for the same.</summary>
         public SessionSealing? Sealing { get; set; }

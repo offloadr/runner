@@ -368,6 +368,8 @@ internal static partial class ServiceClientManager
         public required Func<string, Func<string, CancellationToken, Task>?, CancellationToken, Task> StopRuntime { get; init; }
         public required Func<string, RuntimeIdentity, Func<string, CancellationToken, Task>?, CancellationToken, Task<bool>> StopRuntimeIfIdentityMatches { get; init; }
         public required Func<string, RuntimeIdentity?> GetTrackedRuntime { get; init; }
+        /// <summary>The token of the running process of exactly this runtime, if one runs.</summary>
+        public required Func<string, RuntimeIdentity, Guid?> GetTrackedProcess { get; init; }
         public required Func<string, Task> StopSessionRelay { get; init; }
         public required Func<string, Task> StopArtifactUploads { get; init; }
         public required Func<string, Task> StopWorkspaceMirrors { get; init; }
@@ -433,31 +435,34 @@ internal static partial class ServiceClientManager
                 string.Equals(recorded.SessionId, sessionId, StringComparison.Ordinal) && recorded.Runtime == normalized);
 
         /// <summary>
-        /// Records how an owned startup of this runtime ended. <paramref name="isTracked"/>
-        /// says whether a runtime's process is still running under this runner.
+        /// Records how an owned startup of this runtime ended. <paramref name="trackedProcess"/>
+        /// names a runtime's running process, if any.
         /// </summary>
         public void RecordStartupOutcome(string sessionId, RuntimeIdentity runtime, StartupOutcome outcome,
-            Func<string, RuntimeIdentity, bool> isTracked)
+            Func<string, RuntimeIdentity, Guid?> trackedProcess)
         {
             var normalized = runtime.Normalized();
             lock (_gate)
             {
                 _startupVersion++;
+                var process = trackedProcess(sessionId, normalized);
                 var index = _startupOutcomes.FindIndex(recorded =>
                     string.Equals(recorded.SessionId, sessionId, StringComparison.Ordinal) && recorded.Runtime == normalized);
                 if (index >= 0)
                 {
-                    // A failed command for a runtime that started ready and still runs (a
-                    // refusal of other sealing, say) left the process as it was. Once its
-                    // process is gone the failure is the runtime's own and replaces READY.
-                    if (_startupOutcomes[index].Outcome.Ready && !outcome.Ready && isTracked(sessionId, normalized)) return;
+                    // A failed command for a process that started ready and still runs (a
+                    // refusal of other sealing, say) left it as it was. Once that process is
+                    // gone the failure is the runtime's own and replaces READY.
+                    var existing = _startupOutcomes[index];
+                    if (existing.Outcome.Ready && !outcome.Ready && process is not null && existing.Process == process) return;
                     _startupOutcomes.RemoveAt(index);
                 }
-                _startupOutcomes.Add(new RecordedStartupOutcome(sessionId, normalized, outcome));
+                _startupOutcomes.Add(new RecordedStartupOutcome(sessionId, normalized, outcome, process));
                 if (_startupOutcomes.Count <= RetainedStartupOutcomes) return;
-                // Never evict the outcome of a runtime that is still running: the heartbeat
-                // describes it. A runner tracks one runtime, so an untracked one is found.
-                var evict = _startupOutcomes.FindIndex(recorded => !isTracked(recorded.SessionId, recorded.Runtime));
+                // Never evict the outcome of the process still running: the heartbeat
+                // describes it. A runner runs one process, so another entry is found.
+                var evict = _startupOutcomes.FindIndex(recorded =>
+                    recorded.Process is null || trackedProcess(recorded.SessionId, recorded.Runtime) != recorded.Process);
                 _startupOutcomes.RemoveAt(evict >= 0 ? evict : 0);
             }
         }
@@ -987,7 +992,7 @@ internal static partial class ServiceClientManager
                     logicalSessionState,
                     commandWorkState,
                     sessionManager.IsStopping,
-                    sessionManager.IsTrackedRuntime),
+                    sessionManager.TrackedProcess),
                 resources,
                 supportedEditorTemplates,
                 minBackoff,
@@ -1363,6 +1368,7 @@ internal static partial class ServiceClientManager
             StopRuntime = sessionManager.StopSessionAsync,
             StopRuntimeIfIdentityMatches = sessionManager.StopSessionIfRuntimeMatchesAsync,
             GetTrackedRuntime = sessionId => sessionManager.TryGetRuntimeIdentity(sessionId, out var tracked) ? tracked : null,
+            GetTrackedProcess = sessionManager.TrackedProcess,
             StopSessionRelay = sessionEventRelay.StopSessionAsync,
             StopArtifactUploads = artifactUploadService.StopSessionAsync,
             StopWorkspaceMirrors = workspaceMirrorService.StopSessionAsync,
@@ -2737,8 +2743,7 @@ internal static partial class ServiceClientManager
                 // Recorded while this startup still holds the slot, so a later command for
                 // the same runtime sees either this startup in progress or its outcome. Only
                 // the owner records: a joined or refused command says nothing about it.
-                deps.WorkState.RecordStartupOutcome(sessionId, runtimeIdentity, result,
-                    (session, runtime) => deps.GetTrackedRuntime(session) is { } running && running.SameRuntime(runtime));
+                deps.WorkState.RecordStartupOutcome(sessionId, runtimeIdentity, result, deps.GetTrackedProcess);
                 return result;
             }
             finally

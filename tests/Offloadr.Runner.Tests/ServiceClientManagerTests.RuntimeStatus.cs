@@ -9,10 +9,10 @@ public partial class ServiceClientManagerTests
             harness.Logical,
             harness.WorkState,
             _ => stopping,
-            (session, runtime) => harness.Tracked(session) is { } tracked && tracked.SameRuntime(runtime));
+            harness.TrackedProcess);
 
-    private static Func<string, RuntimeIdentity, bool> IsTracked(RuntimeCommandHarness harness)
-        => (session, runtime) => harness.Tracked(session) is { } tracked && tracked.SameRuntime(runtime);
+    private static Func<string, RuntimeIdentity, Guid?> IsTracked(RuntimeCommandHarness harness)
+        => harness.TrackedProcess;
 
     private static void AssertRuntime(RuntimeStatus status, ulong generation, ulong epoch, string instance)
         => Assert.That(
@@ -189,10 +189,32 @@ public partial class ServiceClientManagerTests
                     Task = new TaskCompletionSource().Task,
                 });
             }
-            return true;
+            return harness.TrackedProcess(session, checkedRuntime);
         });
 
         Assert.That(status.Phase, Is.EqualTo(RuntimePhase.Starting));
+    }
+
+    [Test]
+    public void RuntimeStatus_ARelaunchedProcessOfTheSameRuntimeIsNotReadyFromTheOldOutcome()
+    {
+        var harness = RunningHarness(7, 3, InstanceA);
+        var runtime = new RuntimeIdentity(7, 3, InstanceA);
+        harness.WorkState.RecordStartupOutcome(CommandSessionId, runtime, new ServiceClientManager.StartupOutcome(true, ""), IsTracked(harness));
+        Assert.That(Status(harness).Phase, Is.EqualTo(RuntimePhase.Ready));
+
+        // Quiesce, then a relaunch of the same runtime starts a new process that is not ready
+        // yet, while the startup slot belongs to another session's start.
+        harness.Untrack(CommandSessionId);
+        harness.Track(CommandSessionId, runtime);
+        harness.WorkState.ReplaceActiveStartup(new ServiceClientManager.TrackedCommandWork(CancellationToken.None)
+        {
+            SessionId = "33333333333343338333333333333333",
+            RuntimeIdentity = new RuntimeIdentity(1, 1, InstanceB),
+            Task = new TaskCompletionSource().Task,
+        });
+
+        Assert.That(Status(harness).Phase, Is.EqualTo(RuntimePhase.None));
     }
 
     [Test]
