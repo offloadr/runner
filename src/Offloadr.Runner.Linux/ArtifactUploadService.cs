@@ -682,15 +682,17 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 _owner = owner;
             }
 
-            var seededCatalog = SeedInitialCatalog(editorSid, initialArtifacts);
+            // The seed names what the caller is about to use, not everything there is: its entries
+            // stand beside the listing's, and only the listing decides what is no longer there.
+            var seeded = SeedInitialCatalog(editorSid, initialArtifacts);
 
             if (_activated)
             {
-                await EnsureCatalogAsync(cancellationToken, forceReload: true, pruneMissing: !seededCatalog).ConfigureAwait(false);
+                await EnsureCatalogAsync(cancellationToken, forceReload: true, seeded).ConfigureAwait(false);
                 return;
             }
 
-            await EnsureCatalogAsync(cancellationToken, pruneMissing: !seededCatalog).ConfigureAwait(false);
+            await EnsureCatalogAsync(cancellationToken, seeded: seeded).ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
             if (_operations.IsClosed) throw new OperationCanceledException(cancellationToken);
             _activated = true;
@@ -1216,7 +1218,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             }
         }
 
-        private async Task<bool> EnsureCatalogAsync(CancellationToken cancellationToken, bool forceReload = false, bool pruneMissing = true)
+        private async Task<bool> EnsureCatalogAsync(CancellationToken cancellationToken, bool forceReload = false, SeededCatalog? seeded = null)
         {
             if (_catalogLoaded && !forceReload)
             {
@@ -1232,20 +1234,38 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             using var linked = CancellationTokenSource.CreateLinkedTokenSource(_operations.Token, cancellationToken);
             var token = linked.Token;
 
+            var listing = false;
             try
             {
+                // One listing at a time, each asked for only after the one before was applied: the
+                // control plane then reads them in the order they are applied here, and an older
+                // answer never arrives after a newer one to undo what it said.
+                await _listings.WaitAsync(token).ConfigureAwait(false);
+                listing = true;
+                if (_catalogLoaded && !forceReload)
+                {
+                    return true;
+                }
+
                 var request = new RunnerArtifactServiceListArtifactsRequest
                 {
                     EditorSid = editorSid,
                     Requester = _readRequester.Clone()
                 };
 
-                var response = await _artifactClient.ListArtifactsAsync(request, headers: _authHeaders, cancellationToken: token).ConfigureAwait(false);
-                var currentPaths = new HashSet<string>(StringComparer.Ordinal);
+                // Bounded, since every other listing waits for this one.
+                var response = await _artifactClient.ListArtifactsAsync(request, headers: _authHeaders,
+                    deadline: DateTime.UtcNow + ListingTimeout, cancellationToken: token).ConfigureAwait(false);
+                // Deletions first, while each entry still says which stored artifact its file is a
+                // copy of: applying an artifact listed under the same name would forget that. An
+                // entry whose copy could not be removed yet is left exactly as it is, for the next
+                // listing to try again.
+                var awaitingRemoval = RemoveDeletedArtifacts(response);
+                var currentPaths = new HashSet<string>(awaitingRemoval, StringComparer.Ordinal);
                 var currentArtifacts = new HashSet<EditorArtifactMetadata>();
                 foreach (var item in response.Artifacts)
                 {
-                    var appliedPath = ApplyCatalogEntry(item, editorSid);
+                    var appliedPath = ApplyCatalogEntry(item, editorSid, awaitingRemoval);
                     if (!string.IsNullOrWhiteSpace(appliedPath))
                     {
                         currentPaths.Add(appliedPath);
@@ -1253,10 +1273,32 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     }
                 }
 
-                if (pruneMissing)
+                // Listed again as the very artifact whose removal was awaited: it was restored. By
+                // the artifact, not the path: the catalog may spell its name unlike the local file.
+                if (!_deletionsAwaited.IsEmpty)
                 {
-                    PruneCatalogEntries(currentPaths, currentArtifacts);
+                    var listedNow = new HashSet<StoredArtifact>();
+                    foreach (var item in response.Artifacts)
+                    {
+                        if (StoredArtifact.Of(item) is { } artifact) listedNow.Add(artifact);
+                    }
+
+                    foreach (var awaited in _deletionsAwaited)
+                    {
+                        if (!awaitingRemoval.Contains(awaited.Key) && listedNow.Contains(awaited.Value))
+                        {
+                            ((ICollection<KeyValuePair<string, StoredArtifact>>)_deletionsAwaited).Remove(awaited);
+                        }
+                    }
                 }
+
+                if (seeded is not null)
+                {
+                    currentPaths.UnionWith(seeded.Paths);
+                    currentArtifacts.UnionWith(seeded.Artifacts);
+                }
+
+                PruneCatalogEntries(currentPaths, currentArtifacts);
                 _catalogLoaded = true;
                 return true;
             }
@@ -1282,38 +1324,60 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 _logger.LogDebug(ex, "Unexpected error fetching artifact catalog for session {SessionId}", _sessionId);
                 return false;
             }
+            finally
+            {
+                if (listing) _listings.Release();
+            }
         }
 
-        private bool SeedInitialCatalog(string editorSid, IEnumerable<EditorArtifactMetadata>? artifacts)
+        private readonly SemaphoreSlim _listings = new(1, 1);
+        private static readonly TimeSpan ListingTimeout = TimeSpan.FromMinutes(2);
+
+        /// <summary>
+        /// Paths whose file a listing said to remove while a process had it open, each with the
+        /// stored artifact that was named. Stop does not count such a file while it is still that
+        /// artifact's copy or placeholder: it is a deleted output that only waits to be removed.
+        /// Kept by artifact, not by listing, so that an older listing answering late does not
+        /// undo it; it goes when the file is removed or a listing gives that artifact again.
+        /// </summary>
+        private readonly ConcurrentDictionary<string, StoredArtifact> _deletionsAwaited = new(StringComparer.Ordinal);
+
+        /// <summary>The stored artifact an entry's file stands for; by name alone for a placeholder left for a name.</summary>
+        private static StoredArtifact StoodFor(RemoteArtifactState state)
+            => state.StandsFor ?? new StoredArtifact(state.Type, state.Subfolder, state.Filename, 0, 0);
+
+        /// <summary>Entries a caller seeded: the listing that follows keeps them although it may not list them yet.</summary>
+        private sealed record SeededCatalog(HashSet<string> Paths, HashSet<EditorArtifactMetadata> Artifacts);
+
+        private SeededCatalog? SeedInitialCatalog(string editorSid, IEnumerable<EditorArtifactMetadata>? artifacts)
         {
             if (artifacts is null)
             {
-                return false;
+                return null;
             }
 
-            var currentPaths = new HashSet<string>(StringComparer.Ordinal);
-            var currentArtifacts = new HashSet<EditorArtifactMetadata>();
+            var seeded = new SeededCatalog(new(StringComparer.Ordinal), []);
             foreach (var item in artifacts)
             {
-                var appliedPath = ApplyCatalogEntry(item, editorSid);
-                if (!string.IsNullOrWhiteSpace(appliedPath))
+                var appliedPath = ApplyCatalogEntry(item, editorSid, leave: null, out var leftKnownCopy);
+                // A name tells an entry that already holds a copy nothing new, and is no word that
+                // the control plane still holds it: the listing judges such an entry as any other.
+                if (!string.IsNullOrWhiteSpace(appliedPath) && !leftKnownCopy)
                 {
-                    currentPaths.Add(appliedPath);
-                    currentArtifacts.Add(item);
+                    seeded.Paths.Add(appliedPath);
+                    seeded.Artifacts.Add(item);
                 }
             }
 
-            if (currentPaths.Count == 0)
-            {
-                return false;
-            }
-
-            PruneCatalogEntries(currentPaths, currentArtifacts);
-            return true;
+            return seeded.Paths.Count == 0 ? null : seeded;
         }
 
-        private string? ApplyCatalogEntry(EditorArtifactMetadata item, string activeEditorSid)
+        private string? ApplyCatalogEntry(EditorArtifactMetadata item, string activeEditorSid, HashSet<string>? leave = null)
+            => ApplyCatalogEntry(item, activeEditorSid, leave, out _);
+
+        private string? ApplyCatalogEntry(EditorArtifactMetadata item, string activeEditorSid, HashSet<string>? leave, out bool leftKnownCopy)
         {
+            leftKnownCopy = false;
             var localPath = ResolveLocalPath(item.Type, item.Subfolder, item.Filename);
             if (localPath is null)
             {
@@ -1331,12 +1395,29 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 _inputSeeds.TryRemove(normalized, out _);
             }
 
+            if (leave?.Contains(normalized) == true)
+            {
+                return normalized;
+            }
+
             var createdUtc = ToDateTimeOffset(item.CreatedUtc);
             // Under the eviction gate: a pass must not replace the file between this entry judging
             // it downloaded and taking the place of the one the pass is evicting.
             lock (_evictionGate)
             {
                 _catalog.TryGetValue(normalized, out var previousState);
+                // A caller's seed gives a name and nothing else. An entry that already knows the
+                // file at that path (its placeholder, or the copy it recognized) learns nothing
+                // from it, and would forget which stored artifact the file stands for and whether
+                // the control plane holds it. It stays exactly as it is. Inputs keep their own
+                // rule: a seed makes a downloaded input be read again.
+                if (previousState is not null && IsNameOnly(item) && !string.Equals(item.Type, "input", StringComparison.OrdinalIgnoreCase)
+                    && KnowsItsFile(previousState))
+                {
+                    leftKnownCopy = previousState.PlaceholderVersion is null;
+                    return normalized;
+                }
+
                 var state = new RemoteArtifactState(
                     activeEditorSid,
                     item.Type,
@@ -1362,6 +1443,29 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             }
 
             return normalized;
+        }
+
+        private static bool IsNameOnly(EditorArtifactMetadata item)
+            => item.CreatedUtc is null && item.SizeBytes is null && item.Sha256 is null && string.IsNullOrEmpty(item.ObjectKey);
+
+        /// <summary>True when the file at the entry's path is still the placeholder or the copy the entry recorded.</summary>
+        private bool KnowsItsFile(RemoteArtifactState state)
+        {
+            if (!TryResolveSecureLocation(state.Type, state.LocalPath, out var root, out var relativePath))
+            {
+                return false;
+            }
+
+            try
+            {
+                using var secureRoot = new LinuxSecureDirectoryRoot(root);
+                return secureRoot.GetVersion(relativePath) is { } current
+                       && (state.MatchesLocalFile(current) || state.IsCopy(current) || state.PlaceholderVersion == current);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                return false;
+            }
         }
 
         private void PruneCatalogEntries(HashSet<string> currentPaths, HashSet<EditorArtifactMetadata> currentArtifacts)
@@ -1399,11 +1503,132 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                                 state.CommittedArtifact = null;
                             }
                         }
+                        else if (!state.Type.Equals("input", StringComparison.OrdinalIgnoreCase) &&
+                                 state.CopyVersion is { } copy && IsLiveRegularFile(state.Type, path, copy))
+                        {
+                            // An unchanged copy of an output or temporary artifact the control
+                            // plane stored, read back by this session (an input no longer listed
+                            // is cleared instead, by the rules for inputs). Forgetting it would make the next scan upload it as
+                            // new data, bringing back an output that was deleted (or answering a
+                            // listing that was read before the artifact existed). It stays known,
+                            // and counts as unsaved for as long as nothing lists it or names it deleted.
+                            state.HasRemoteArtifact = false;
+                        }
                         else
                             _catalog.TryRemove(path, out _);
                     }
                 }
             }
+        }
+
+        /// <summary>
+        /// Removes this session's local copy of each output or temporary artifact the listing says
+        /// the control plane deleted: the user removed it from their files, or a temporary one
+        /// expired. With the copy gone there is nothing left for Stop to count or for a scan to
+        /// upload again, and nothing to remember about the deletion.
+        /// <para>
+        /// A file is removed only when it is, unchanged, the copy of exactly the artifact named,
+        /// which the listing gives as it was stored: by name and by the time it was stored. A file
+        /// the session wrote since, or the copy of another artifact stored under that name, stays.
+        /// An empty placeholder holds no bytes of any artifact, so it goes once nothing is listed
+        /// under its name and the artifact deleted there is its own or one stored after it; one
+        /// left for a name alone goes with any artifact deleted under that name.
+        /// </para>
+        /// Returns the paths whose copy is to be removed but could not be yet (a process has it open).
+        /// </summary>
+        private HashSet<string> RemoveDeletedArtifacts(RunnerArtifactServiceListArtifactsResponse listing)
+        {
+            var awaitingRemoval = new HashSet<string>(StringComparer.Ordinal);
+            if (listing.DeletedArtifacts.Count == 0)
+            {
+                return awaitingRemoval;
+            }
+
+            var deleted = new HashSet<StoredArtifact>();
+            var lastDeleted = new Dictionary<StoredArtifact, StoredArtifact>(StoredArtifact.ByName);
+            foreach (var item in listing.DeletedArtifacts)
+            {
+                if (StoredArtifact.Of(item) is not { } artifact) continue;
+                deleted.Add(artifact);
+                if (!lastDeleted.TryGetValue(artifact, out var latest) || artifact.StoredAfter(latest)) lastDeleted[artifact] = artifact;
+            }
+
+            var listed = new HashSet<StoredArtifact>(StoredArtifact.ByName);
+            foreach (var item in listing.Artifacts)
+            {
+                if (StoredArtifact.Of(item) is { } artifact) listed.Add(artifact);
+            }
+
+            lock (_evictionGate)
+            {
+                foreach (var (path, state) in _catalog)
+                {
+                    if (!state.Type.Equals("output", StringComparison.OrdinalIgnoreCase) && !state.Type.Equals("temp", StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    bool named;
+                    if (state.CopyVersion is not null)
+                    {
+                        named = state.StandsFor is { } copyOf && deleted.Contains(copyOf);
+                    }
+                    else if (state.PlaceholderVersion is not null && state.PlaceholderIsOwn)
+                    {
+                        // A placeholder left for a name alone (a caller's seed of an output this
+                        // session had not seen) stands for whatever is stored under that name.
+                        var name = StoodFor(state);
+                        named = !listed.Contains(name) && lastDeleted.TryGetValue(name, out var last)
+                                && (state.StandsFor is not { } leftFor || !leftFor.StoredAfter(last));
+                    }
+                    else
+                    {
+                        named = false;
+                    }
+
+                    if (!named || !TryResolveSecureLocation(state.Type, path, out var root, out var relativePath))
+                    {
+                        continue;
+                    }
+
+                    try
+                    {
+                        using var secureRoot = new LinuxSecureDirectoryRoot(root);
+                        // Gone, or no longer the copy: a file the session wrote is its own data.
+                        if (secureRoot.GetVersion(relativePath) is not { } current ||
+                            !(state.IsCopy(current) || state.PlaceholderVersion == current))
+                        {
+                            continue;
+                        }
+
+                        if (secureRoot.DeleteFileUnopened(relativePath, current, out var restored))
+                        {
+                            ((ICollection<KeyValuePair<string, RemoteArtifactState>>)_catalog).Remove(new(path, state));
+                            _deletionsAwaited.TryRemove(path, out _);
+                            PruneMissingUploadBindings(path);
+                            _logger.LogInformation(
+                                "Removed the local copy of a deleted artifact session={SessionId} type={Type} path={Path}",
+                                _sessionId,
+                                state.Type,
+                                path);
+                            continue;
+                        }
+
+                        // Put back for a process that opened it: the same file, with only its
+                        // change time moved by the attempt, so the entry goes on recognizing it.
+                        if (restored is { } back) state.RefreshVersion(back);
+                    }
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                    {
+                        _logger.LogDebug(ex, "Could not remove the local copy of a deleted artifact session={SessionId} type={Type}", _sessionId, state.Type);
+                    }
+
+                    awaitingRemoval.Add(path);
+                    _deletionsAwaited[path] = StoodFor(state);
+                }
+            }
+
+            return awaitingRemoval;
         }
 
         private bool TryGetCatalogEntry(string path, out RemoteArtifactState? state)
@@ -1641,8 +1866,12 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             switch (status.Kind)
             {
                 case SecureEntryKind.Missing:
-                    secureRoot.EnsurePlaceholder(relativePath, state.CreatedUtc.UtcDateTime);
-                    state.MarkPlaceholder(secureRoot.GetVersion(relativePath));
+                    // The agent's own only if the file at the path is the very one it created here:
+                    // the session may create one in the same moment, or put one in its place.
+                    secureRoot.EnsurePlaceholder(relativePath, state.CreatedUtc.UtcDateTime, out var createdHere);
+                    var placed = secureRoot.GetVersion(relativePath);
+                    state.MarkPlaceholder(placed, StoredArtifact.Of(state.CatalogArtifact),
+                        own: createdHere is { } mine && placed == mine && IsAsTheAgentLeftIt(mine, state));
                     return;
                 case SecureEntryKind.Other:
                     throw new UnauthorizedAccessException($"Artifact path is not a regular file: '{state.LocalPath}'.");
@@ -1654,22 +1883,78 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 // the remote artifact (the version this uploader sent or fetched, or the catalog's
                 // digest) counts as saved or may be evicted.
                 var version = secureRoot.GetVersion(relativePath);
-                var knownRemote = version is { } current &&
-                                  ((previousState is not null &&
-                                    previousState.CatalogArtifact?.Equals(state.CatalogArtifact) == true &&
-                                    previousState.MatchesLocalFile(current)) ||
-                                   (!string.IsNullOrWhiteSpace(state.Sha256) &&
-                                    ExistingFileMatchesCatalogMetadata(state, status.Length, secureRoot, relativePath)));
-                state.MarkDownloaded(knownRemote ? version : null);
+                var knownRemote = false;
+                // Which stored artifact the kept file is a copy of. The previous entry knew, when it
+                // recognized this file and the catalog still gives the very same item. A digest
+                // match makes it a copy of the listed one.
+                StoredArtifact? standsFor = null;
+                // The record of what the unchanged file is a copy of, whatever the catalog says now.
+                var copyOf = previousState is not null && version is { } unchanged && previousState.IsCopy(unchanged)
+                    ? previousState.StandsFor
+                    : null;
+                if (version is { } current)
+                {
+                    if (previousState is not null && previousState.MatchesLocalFile(current) &&
+                        previousState.CatalogArtifact?.Equals(state.CatalogArtifact) == true)
+                    {
+                        knownRemote = true;
+                        standsFor = previousState.StandsFor;
+                    }
+                    else if (copyOf is { } known && known.Equals(StoredArtifact.Of(state.CatalogArtifact)) &&
+                             !known.Equals(StoredArtifact.Of(previousState!.CatalogArtifact)) &&
+                             (state.SizeBytes is not { } listedSize || listedSize == status.Length))
+                    {
+                        // The file is a copy of another artifact than the previous entry was listed
+                        // with: one read back after it was stored under the name, or one an older
+                        // listing's late answer displaced from the entry. The catalog now gives
+                        // that very artifact, by name, time stored and size; the entry had no item
+                        // of it to compare with.
+                        knownRemote = true;
+                        standsFor = known;
+                    }
+                    else if (!string.IsNullOrWhiteSpace(state.Sha256) &&
+                             ExistingFileMatchesCatalogMetadata(state, status.Length, secureRoot, relativePath))
+                    {
+                        knownRemote = true;
+                        standsFor = StoredArtifact.Of(state.CatalogArtifact);
+                    }
+                }
+
+                state.MarkDownloaded(knownRemote ? version : null, standsFor);
+                // Not the artifact the catalog lists, so not counted as saved; but still the copy it
+                // was, which is what a deletion of that artifact, or its listing again, goes by.
+                if (!knownRemote && copyOf is { } still && version is { } copy) state.RememberCopy(copy, still);
                 // Reclaim recognized inactive budgets before either folder is
                 // scanned, so traversal order cannot strand a waiting file.
                 if (knownRemote) RetainCurrentUploadUncertainty(state.LocalPath, version);
                 return;
             }
 
-            secureRoot.TruncateRegularFile(relativePath, state.CreatedUtc.UtcDateTime);
-            state.MarkPlaceholder(secureRoot.GetVersion(relativePath));
+            // An empty file is taken for the placeholder whoever made it; only one the agent left
+            // (this entry's own placeholder as it was, the unchanged copy of an empty stored
+            // artifact, or a file it empties here) is its own to remove when the artifact is deleted.
+            var before = secureRoot.GetVersion(relativePath);
+            var own = before is { } found
+                      && (status.Length > 0
+                          || (previousState is { PlaceholderIsOwn: true } && previousState.PlaceholderVersion == found)
+                          || previousState?.IsCopy(found) == true);
+            secureRoot.TruncateRegularFile(relativePath, state.CreatedUtc.UtcDateTime, out var asEmptied);
+            var emptied = secureRoot.GetVersion(relativePath);
+            // Still that file, as it was emptied here: the session may have put another in its
+            // place meanwhile, or opened and written this one (empty again, even). What cannot be
+            // told apart is a write by the session that leaves the file empty again within the
+            // agent's own two steps of emptying and dating it; no bytes are at stake then.
+            state.MarkPlaceholder(emptied, StoredArtifact.Of(state.CatalogArtifact),
+                own && emptied is { } now && now == asEmptied && now.Inode == before?.Inode && IsAsTheAgentLeftIt(now, state));
         }
+
+        /// <summary>
+        /// True when a placeholder still carries the time the agent gave it. A write by the session,
+        /// also one that leaves it empty, moves that time; this tells the two apart even when the
+        /// write falls between the agent's own steps.
+        /// </summary>
+        private static bool IsAsTheAgentLeftIt(SecureFileVersion placeholder, RemoteArtifactState state)
+            => placeholder.Status.Length == 0 && placeholder.Status.LastWriteTimeUtc == state.CreatedUtc.UtcDateTime;
 
         private static bool ShouldKeepExistingArtifactFile(
             RemoteArtifactState state,
@@ -1770,6 +2055,9 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 long bytesWritten = 0;
                 long? expectedSizeBytes = null;
                 string? expectedSha256 = null;
+                // When the control plane stored the artifact it is sending: the time a listing gives
+                // as that artifact's created_utc. The catalog entry may be of an older one.
+                Timestamp? readStoredUtc = null;
                 using var sinkSlot = new SealedReadSinkSlot();
                 await using (var destination = publication.OpenWriteStream())
                 using (var hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA256))
@@ -1783,6 +2071,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                             case RunnerArtifactServiceReadArtifactResponse.PayloadOneofCase.Metadata:
                                 sawMetadata = true;
                                 var metadata = response.Metadata;
+                                readStoredUtc = metadata.ModifiedUtc;
                                 expectedSizeBytes = metadata.SizeBytes;
                                 if (expectedSizeBytes > SealedReadSink.WireLimit(metadata.Envelope, MaxUploadBytes))
                                 {
@@ -1864,6 +2153,10 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     // ignore timestamp failures
                 }
 
+                // The file as written, before it is published: what is recorded as downloaded must be
+                // this file, not one the session put in its place right after.
+                var written = publication.GetVersion();
+
                 // Disposing an uncommitted publication removes its temporary file. The placeholder is
                 // replaced only while no process has it open: a writer that opened it before its
                 // first write would otherwise go on with an inode nobody can reach. The shim asks
@@ -1872,12 +2165,16 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 {
                     // Publish and record together: a queued watcher upload rechecks
                     // under this same gate before it can acquire another upload ID.
-                    if (!(replacing is { } expected ? publication.CommitReplacing(expected, whileUnopened: true) : publication.CommitIfAbsent()))
+                    SecureFileVersion? swappedBack = null;
+                    if (!(replacing is { } expected ? publication.CommitReplacing(expected, whileUnopened: true, out swappedBack) : publication.CommitIfAbsent()))
                     {
                         // Still the placeholder, only open elsewhere: not downloaded, so a later open
                         // asks again.
                         if (replacing is { } placeholder && secureRoot.GetVersion(relativePath) is { } current && current.IsSameFileAs(placeholder))
                         {
+                            // Swapped back unchanged: the attempt moved its change time, and the
+                            // entry goes on recognizing it.
+                            if (swappedBack is { } back) state.RefreshVersion(back);
                             throw new PlaceholderInUseException();
                         }
 
@@ -1888,8 +2185,14 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         return null;
                     }
 
-                    var published = secureRoot.GetVersion(relativePath);
-                    state.MarkDownloaded(published);
+                    // Publishing moved only the file's change time. Read from the publication's own
+                    // file and compared with it as written: a file the session wrote over it or
+                    // put in its place meanwhile is the session's data, never the downloaded copy.
+                    var published = publication.GetVersion() is { } now && written is { } before && now.IsSameFileAs(before)
+                                    && secureRoot.GetVersion(relativePath) == now
+                        ? now
+                        : (SecureFileVersion?)null;
+                    state.MarkDownloaded(published, StoredArtifact.Of(state.Type, state.Subfolder, state.Filename, readStoredUtc));
                     state.MarkServed(DateTimeOffset.UtcNow);
                     return published;
                 }
@@ -2066,7 +2369,14 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                         // Saved means the control plane holds this exact file, or it is the empty
                         // placeholder the agent left for a remote artifact. An empty rewrite by the
                         // editor is neither.
-                        if (!_catalog.TryGetValue(NormalizePath(file), out var state) || !state.AccountsFor(version))
+                        var known = _catalog.TryGetValue(NormalizePath(file), out var state);
+                        if (known && _deletionsAwaited.TryGetValue(state!.LocalPath, out var awaited) && awaited.Equals(StoodFor(state))
+                            && (state.IsCopy(version) || state.PlaceholderVersion == version))
+                        {
+                            continue;
+                        }
+
+                        if (!known || !state!.AccountsFor(version))
                         {
                             // Catalog spelling can leave a second, agent-created
                             // placeholder for one uploaded snapshot. Count that
@@ -2101,7 +2411,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             {
                 foreach (var state in _catalog.Values)
                 {
-                    if ((state.LocalVersion is null && state.PlaceholderVersion is null) ||
+                    if ((state.LocalVersion is null && state.PlaceholderVersion is null && state.CopyVersion is null) ||
                         !TryResolveSecureLocation(state.Type, state.LocalPath, out var root, out var relativePath))
                     {
                         continue;
@@ -2204,15 +2514,30 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     using var placeholder = secureRoot.CreatePublication(relativePath);
                     placeholder.SetModifiedUtc(status.LastWriteTimeUtc);
                     CarryOwnership(placeholder, state.LocalPath);
+                    // The placeholder as the agent made it, before the session can reach it.
+                    var made = placeholder.GetVersion();
                     // Swapped in atomically and kept only if it displaced exactly that version,
                     // which no process had open, mapped or opened meanwhile: one holding it, a
                     // writer above all, would go on with an inode nobody can reach again.
-                    if (!placeholder.CommitReplacing(version, whileUnopened: true))
+                    if (!placeholder.CommitReplacing(version, whileUnopened: true, out var swappedBack))
                     {
+                        // Swapped back for a process that opened it: the same file, with only its
+                        // change time moved by the attempt, so the entry goes on recognizing it.
+                        // Never on a look at the path alone: a rewrite that kept length and
+                        // modification time is what made the replacement fail.
+                        if (swappedBack is { } back)
+                        {
+                            state.RefreshVersion(back);
+                        }
+
                         continue;
                     }
 
-                    state.MarkEvicted(secureRoot.GetVersion(relativePath));
+                    // The agent's own placeholder only while the path still holds the file it
+                    // published, as it made it: the session may put a file of its own there right
+                    // after, or open this one and write it (empty again, even).
+                    var left = secureRoot.GetVersion(relativePath);
+                    state.MarkEvicted(left, own: left is { } there && made is { } asMade && there == placeholder.GetVersion() && there.IsSameFileAs(asMade));
                     released += status.Length;
                     var freed = freeBefore is { } before && ReadSealedFreeBytes() is { } after ? after - before : released;
                     if (freed >= bytesToFree)
@@ -2296,7 +2621,9 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             // Size and mtime can survive an atomic replacement or an in-place
             // rewrite. Only the recorded secure version is the same local file,
             // including when its remote receipt has since disappeared.
-            return version is { } current && knownState.MatchesLocalFile(current);
+            // An unchanged copy of an artifact the control plane stored is not new data either,
+            // also while the catalog lists another artifact under its name.
+            return version is { } current && (knownState.MatchesLocalFile(current) || knownState.IsCopy(current));
         }
 
         private bool RetainCurrentUploadUncertainty(string path, SecureFileVersion? version)
@@ -2484,7 +2811,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     lock (_evictionGate)
                     {
                         if (_catalog.TryGetValue(fullPath, out var known)
-                            && (known.AccountsFor(snapshotVersion) || known.PlaceholderVersion == snapshotVersion)
+                            && (known.AccountsFor(snapshotVersion) || known.PlaceholderVersion == snapshotVersion || known.IsCopy(snapshotVersion))
                             && !RetainCurrentUploadUncertainty(fullPath, snapshotVersion))
                         {
                             // No uncertain receipt remains for this version.
@@ -2687,7 +3014,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                             _uncertainUploads.TryRemove(fullPath, out _);
                             _pending[fullPath].Completed = !changedDuringUpload;
                             // A file that changed while it was sent matches no uploaded version yet.
-                            remote.MarkDownloaded(changedDuringUpload ? null : afterVersion);
+                            remote.MarkDownloaded(changedDuringUpload ? null : afterVersion, StoredArtifact.Of(response.Artifact));
                         }
 
                         _logger.LogInformation("Uploaded artifact session={SessionId} type={Type} path={Relative}", _sessionId, type, relPath);
@@ -2907,6 +3234,46 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             return removed;
         }
 
+        /// <summary>
+        /// One artifact as the control plane stored it: its catalog name, which ignores case, and
+        /// the time it was stored. Another upload under the same name is stored at another time.
+        /// </summary>
+        private readonly record struct StoredArtifact(string Type, string Subfolder, string Filename, long StoredSeconds, int StoredNanos)
+        {
+            public static StoredArtifact? Of(EditorArtifactMetadata? artifact)
+                => artifact is null ? null : Of(artifact.Type, artifact.Subfolder, artifact.Filename, artifact.CreatedUtc);
+
+            public static StoredArtifact? Of(string type, string? subfolder, string filename, Timestamp? storedUtc)
+                => storedUtc is null || (storedUtc.Seconds == 0 && storedUtc.Nanos == 0) || string.IsNullOrEmpty(filename)
+                    ? null
+                    : new(type ?? string.Empty, subfolder ?? string.Empty, filename, storedUtc.Seconds, storedUtc.Nanos);
+
+            public bool Equals(StoredArtifact other)
+                => StoredSeconds == other.StoredSeconds && StoredNanos == other.StoredNanos && ByName.Equals(this, other);
+
+            public override int GetHashCode() => HashCode.Combine(ByName.GetHashCode(this), StoredSeconds, StoredNanos);
+
+            public bool StoredAfter(StoredArtifact other)
+                => StoredSeconds > other.StoredSeconds || (StoredSeconds == other.StoredSeconds && StoredNanos > other.StoredNanos);
+
+            /// <summary>Compares the catalog name alone.</summary>
+            public static IEqualityComparer<StoredArtifact> ByName { get; } = new NameComparer();
+
+            private sealed class NameComparer : IEqualityComparer<StoredArtifact>
+            {
+                public bool Equals(StoredArtifact x, StoredArtifact y)
+                    => string.Equals(x.Type, y.Type, StringComparison.OrdinalIgnoreCase)
+                       && string.Equals(x.Subfolder, y.Subfolder, StringComparison.OrdinalIgnoreCase)
+                       && string.Equals(x.Filename, y.Filename, StringComparison.OrdinalIgnoreCase);
+
+                public int GetHashCode(StoredArtifact artifact)
+                    => HashCode.Combine(
+                        StringComparer.OrdinalIgnoreCase.GetHashCode(artifact.Type),
+                        StringComparer.OrdinalIgnoreCase.GetHashCode(artifact.Subfolder),
+                        StringComparer.OrdinalIgnoreCase.GetHashCode(artifact.Filename));
+            }
+        }
+
         private sealed class RemoteArtifactState
         {
             public RemoteArtifactState(string editorSid, string type, string subfolder, string filename, string localPath, long? sizeBytes, string? sha256, DateTimeOffset createdUtc)
@@ -2948,23 +3315,61 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             /// <summary>The empty placeholder the agent left for the remote artifact, when there is one.</summary>
             public SecureFileVersion? PlaceholderVersion { get; private set; }
 
-            public void MarkDownloaded(SecureFileVersion? localVersion = null)
+            /// <summary>
+            /// The stored artifact that <see cref="LocalVersion"/> is a copy of, or that
+            /// <see cref="PlaceholderVersion"/> was left for, when that is known. It is taken from
+            /// where the bytes came from (an upload's receipt, a read, a digest match), never from
+            /// the catalog entry alone, which may be of another artifact stored under the name.
+            /// </summary>
+            public StoredArtifact? StandsFor { get; private set; }
+
+            /// <summary>
+            /// The file that is a copy of <see cref="StandsFor"/>. It is <see cref="LocalVersion"/>
+            /// while the catalog lists that artifact, and is kept when the catalog lists another
+            /// one under the name: the file is then not what the control plane holds, yet still
+            /// the copy of what it stored.
+            /// </summary>
+            public SecureFileVersion? CopyVersion { get; private set; }
+
+            /// <summary>True when <paramref name="version"/> is the unchanged copy of a stored artifact.</summary>
+            public bool IsCopy(SecureFileVersion version) => StandsFor is not null && CopyVersion == version;
+
+            public void MarkDownloaded(SecureFileVersion? localVersion = null, StoredArtifact? standsFor = null)
             {
                 Downloaded = true;
                 LocalVersion = localVersion;
                 PlaceholderVersion = null;
+                StandsFor = localVersion is null ? null : standsFor;
+                CopyVersion = StandsFor is null ? null : localVersion;
             }
 
-            public void MarkPlaceholder(SecureFileVersion? placeholder)
+            /// <summary>Keeps the record that <paramref name="copy"/> is a copy of <paramref name="standsFor"/> on an entry that does not list it.</summary>
+            public void RememberCopy(SecureFileVersion copy, StoredArtifact standsFor)
+            {
+                CopyVersion = copy;
+                StandsFor = standsFor;
+            }
+
+            /// <summary>
+            /// True when the agent left <see cref="PlaceholderVersion"/> itself; false for an empty
+            /// file the session made, which is treated as the placeholder but is the session's.
+            /// </summary>
+            public bool PlaceholderIsOwn { get; private set; }
+
+            public void MarkPlaceholder(SecureFileVersion? placeholder, StoredArtifact? standsFor, bool own)
             {
                 LocalVersion = null;
+                CopyVersion = null;
                 PlaceholderVersion = placeholder is { Status.Length: 0 } ? placeholder : null;
+                StandsFor = PlaceholderVersion is null ? null : standsFor;
+                PlaceholderIsOwn = PlaceholderVersion is not null && own;
             }
 
-            public void MarkEvicted(SecureFileVersion? placeholder)
+            /// <summary>The placeholder is left for the artifact the evicted file was a copy of.</summary>
+            public void MarkEvicted(SecureFileVersion? placeholder, bool own)
             {
                 Downloaded = false;
-                MarkPlaceholder(placeholder);
+                MarkPlaceholder(placeholder, StandsFor, own);
             }
 
             /// <summary>
@@ -2981,6 +3386,11 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 if (PlaceholderVersion is { } placeholder)
                 {
                     PlaceholderVersion = current is { } now && now.IsSameFileAs(placeholder) ? now : null;
+                }
+
+                if (CopyVersion is { } copy)
+                {
+                    CopyVersion = current is { } now && now.IsSameFileAs(copy) ? now : null;
                 }
             }
 
@@ -3050,6 +3460,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                 StopWatchers();
                 UnsavedUploadCount = CountUnsavedArtifacts();
                 _catalog.Clear();
+                _deletionsAwaited.Clear();
                 _downloadTasks.Clear();
                 _pending.Clear();
                 _uploadBudgets.Clear();

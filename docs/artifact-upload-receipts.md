@@ -24,8 +24,62 @@ catalog refresh/deletion cannot erase that local binding while the exact
 acknowledged local version survives. An evicted placeholder is not that version;
 if its remote artifact disappears, the exact placeholder remains recognizable
 but Stop cannot count it as saved. A retained binding for live local bytes also
-counts as unsaved after remote deletion; retaining identity is not proof that the
-control plane still holds those bytes.
+counts as unsaved once its artifact is no longer listed; retaining identity is not
+proof that the control plane still holds those bytes.
+
+The exception is an artifact the control plane says it deleted. Every listing
+names the output and temporary artifacts deleted since the runner's session
+began, each as it was stored (its catalog name and `created_utc`): the user
+removed it from their files, or a temporary one expired. The runner removes its
+local copy of each one before it applies the rest of the listing, so there is
+nothing left for Stop to count or for a scan to upload again, and nothing to
+remember about the deletion. A copy removed for an artifact that was since
+restored comes back as a placeholder with the next listing and is read back on
+demand. The uploader asks for one listing at a time, each only after the one
+before was applied, so the control plane reads them in the order they are
+applied and an older answer never arrives after a newer one.
+
+A file is removed only when it is, unchanged, the copy of exactly the artifact
+named. Each catalog entry records which stored artifact its local file is a copy
+of, taken from where the bytes came from: an upload's receipt, the time a read
+says its artifact was stored (which may be a later one than the entry was
+listed with), or a digest match with the listed artifact. A caller's seed, which
+gives a name and nothing else, leaves an entry that still knows its file exactly
+as it is: the name says neither which stored artifact the file is nor whether
+the control plane holds it. The record outlives the catalog listing another
+artifact under the name (an older listing answering late, say): the file is then
+not what the control plane holds and is not counted as saved, but it is still the
+copy of what was stored, so it is not uploaded as new data, a deletion of that
+artifact removes it, and a listing of that artifact recognizes it again. A
+download records the version of the file the agent wrote, never of a file the
+session put in its place right after. A listing that gives nothing under the
+name of an output or temporary copy read back by this session (one read before
+the artifact existed, say) keeps the record too, where it used to forget the
+file and let the next scan upload it as new data; such a copy counts as unsaved
+until something lists it or names it deleted. A file the session wrote since, or
+the copy of another artifact stored under the same name, is the session's own
+data and stays. An empty placeholder holds no bytes of any artifact; it goes once
+nothing is listed under its name and the artifact deleted there is its own or one
+stored after it. That is a placeholder the agent left itself; an empty file the
+session made at the path is treated as the placeholder, but it is the session's
+and is not removed. The agent tells its own by the file it created or emptied
+and the time it gave it; a write by the session that leaves the file empty again
+in the very moment the agent empties and dates it cannot be told apart, and no
+bytes are at stake then.
+
+The copy is removed only while no process has it open or mapped, the way an
+evicted file is replaced. One in use stays, with its entry left as it was (so
+it is neither counted nor uploaded as new), and the next listing tries again.
+Stop does not count a file that the latest listing said to remove.
+The same residue remains as for eviction: an open that had already looked the
+name up before the file was moved aside and reaches it only after the last check;
+and, on overlayfs, a writable mapping kept after its descriptor was closed, which
+does not hold a lease off. Inputs are not removed this way; they keep their own rules.
+
+A seed never prunes the catalog. The entries it adds stand beside those of the
+listing that follows, and only that listing decides which artifacts are no longer
+there. An entry that already holds a copy is not shielded by a seed that names
+it: the listing judges it as any other.
 When catalog casing leaves an additional agent-created placeholder, Stop counts
 one lost artifact for the exact retained catalog record shared with its uploaded
 snapshot or evicted placeholder. A rewritten file, replaced placeholder or other

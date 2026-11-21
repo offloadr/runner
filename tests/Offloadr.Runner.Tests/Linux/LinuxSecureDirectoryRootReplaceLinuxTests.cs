@@ -86,10 +86,14 @@ public class LinuxSecureDirectoryRootReplaceLinuxTests
                 Thread.Sleep(300);
             };
 
-            Assert.That(placeholder.CommitReplacing(version, whileUnopened: true), Is.False);
+            Assert.That(placeholder.CommitReplacing(version, whileUnopened: true, out var restored), Is.False);
             Assert.That(opener!.Join(TimeSpan.FromSeconds(10)), Is.True, "the open goes on once the lease is let go");
             Assert.That(File.ReadAllText(path), Is.EqualTo("UPloaded"), "it wrote to the file that stayed");
             Assert.That(secureRoot.GetVersion("a.png")!.Value.Inode, Is.EqualTo(version.Inode));
+            // As it was swapped back, before the writer went on: the same file (a filesystem may
+            // have moved its change time).
+            Assert.That(restored, Is.Not.Null);
+            Assert.That(restored!.Value.IsSameFileAs(version), Is.True);
         }
         finally
         {
@@ -198,7 +202,8 @@ public class LinuxSecureDirectoryRootReplaceLinuxTests
 
             File.SetLastWriteTimeUtc(path, modified);
 
-            Assert.That(placeholder.CommitReplacing(version), Is.False);
+            Assert.That(placeholder.CommitReplacing(version, whileUnopened: true, out var restored), Is.False);
+            Assert.That(restored, Is.Null, "a rewrite is never reported as the expected file put back");
             Assert.That(File.ReadAllText(path), Is.EqualTo("rewrite!"));
         }
         finally
@@ -316,6 +321,251 @@ public class LinuxSecureDirectoryRootReplaceLinuxTests
 
             Assert.That(File.Exists(absent), Is.True);
             Assert.That(Directory.GetFiles(root), Has.Length.EqualTo(2), "no temporary file is left");
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Test]
+    public void DeleteFileUnopened_RemovesOnlyTheExpectedVersionWhileNothingHasItOpen()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = CreateRoot();
+        try
+        {
+            var path = Path.Combine(root, "a.png");
+            File.WriteAllText(path, "uploaded");
+            using var secureRoot = new LinuxSecureDirectoryRoot(root);
+            var version = secureRoot.GetVersion("a.png")!.Value;
+
+            using (new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            {
+                Assert.That(secureRoot.DeleteFileUnopened("a.png", version, out _), Is.False, "a reader still has it");
+            }
+
+            File.WriteAllText(path, "rewritten");
+            Assert.That(secureRoot.DeleteFileUnopened("a.png", version, out _), Is.False, "it is no longer that version");
+            Assert.That(File.ReadAllText(path), Is.EqualTo("rewritten"));
+
+            Assert.That(secureRoot.DeleteFileUnopened("a.png", secureRoot.GetVersion("a.png")!.Value, out _), Is.True);
+            Assert.That(Directory.GetFileSystemEntries(root), Is.Empty, "nothing is left, under any name");
+            Assert.That(secureRoot.DeleteFileUnopened("a.png", version, out _), Is.False, "nothing is there");
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Test]
+    public void DeleteFileUnopened_PutsTheFileBackForAnOpenDuringTheRemoval()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = CreateRoot();
+        try
+        {
+            var path = Path.Combine(root, "a.png");
+            File.WriteAllText(path, "uploaded");
+            using var secureRoot = new LinuxSecureDirectoryRoot(root);
+            var version = secureRoot.GetVersion("a.png")!.Value;
+
+            // A workflow opens it for writing just as it is moved aside: it looked the name up
+            // before the move, and the lease holds its open until the file is back.
+            Thread? opener = null;
+            using var looked = new ManualResetEventSlim();
+            secureRoot.BeforeMoveAside = () =>
+            {
+                opener = new Thread(() =>
+                {
+                    looked.Set();
+                    using var writer = new FileStream(path, FileMode.Open, FileAccess.Write);
+                    writer.Write("UP"u8);
+                });
+                opener.Start();
+                looked.Wait();
+                Thread.Sleep(300);
+            };
+
+            Assert.That(secureRoot.DeleteFileUnopened("a.png", version, out var restored), Is.False);
+            Assert.That(opener!.Join(TimeSpan.FromSeconds(10)), Is.True, "the open goes on once the lease is let go");
+            Assert.That(File.ReadAllText(path), Is.EqualTo("UPloaded"), "it wrote to the file that stayed");
+            Assert.That(secureRoot.GetVersion("a.png")!.Value.Inode, Is.EqualTo(version.Inode));
+            Assert.That(Directory.GetFiles(root), Has.Length.EqualTo(1));
+            // As it was put back, before the writer went on: the same file (a filesystem may have
+            // moved its change time).
+            Assert.That(restored, Is.Not.Null);
+            Assert.That(restored!.Value.IsSameFileAs(version), Is.True);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Test]
+    public void DeleteFileUnopened_KeepsAFileTheSessionPutThereDuringTheRemoval()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = CreateRoot();
+        try
+        {
+            var path = Path.Combine(root, "a.png");
+            File.WriteAllText(path, "uploaded");
+            using var secureRoot = new LinuxSecureDirectoryRoot(root);
+            var version = secureRoot.GetVersion("a.png")!.Value;
+            secureRoot.BeforeMoveAside = () => ReplaceAtomically(root, path, "rewrite");
+
+            Assert.That(secureRoot.DeleteFileUnopened("a.png", version, out var restored), Is.False);
+            Assert.That(restored, Is.Null, "what went back is not the file that was to be removed");
+            Assert.That(File.ReadAllText(path), Is.EqualTo("rewrite"), "the newer file is back under its name");
+            Assert.That(Directory.GetFiles(root), Has.Length.EqualTo(1));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Test]
+    public void DeleteFileUnopened_KeepsBothFilesWhenTheNameIsTakenWhileANewerFileIsAside()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = CreateRoot();
+        try
+        {
+            var path = Path.Combine(root, "a.png");
+            File.WriteAllText(path, "uploaded");
+            using var secureRoot = new LinuxSecureDirectoryRoot(root);
+            var version = secureRoot.GetVersion("a.png")!.Value;
+            // The session replaces the file after the last check, and something creates the name
+            // again in the moment the replacement is aside.
+            secureRoot.BeforeMoveAside = () => ReplaceAtomically(root, path, "rewrite");
+            secureRoot.AfterMoveAside = () => File.WriteAllText(path, "created");
+
+            Assert.That(secureRoot.DeleteFileUnopened("a.png", version, out var restored), Is.False);
+            Assert.That(restored, Is.Null);
+            Assert.That(File.ReadAllText(path), Is.EqualTo("rewrite"), "the session's file is back under its name");
+            var others = Directory.GetFiles(root).Where(file => file != path).ToArray();
+            Assert.That(others, Has.Length.EqualTo(1), "the file created meanwhile is kept, not removed");
+            Assert.That(File.ReadAllText(others[0]), Is.EqualTo("created"));
+            Assert.That(Path.GetFileName(others[0]), Does.StartWith("a.kept-").And.EndsWith(".png"));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Test]
+    public void DeleteFileUnopened_PutsAnOpenedFileBackEvenWhenItsNameWasTakenMeanwhile()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = CreateRoot();
+        try
+        {
+            var path = Path.Combine(root, "a.png");
+            File.WriteAllText(path, "uploaded");
+            using var secureRoot = new LinuxSecureDirectoryRoot(root);
+            var version = secureRoot.GetVersion("a.png")!.Value;
+
+            // A writer opens it just as it is moved aside, and something creates the name again.
+            Thread? opener = null;
+            using var looked = new ManualResetEventSlim();
+            secureRoot.BeforeMoveAside = () =>
+            {
+                opener = new Thread(() =>
+                {
+                    looked.Set();
+                    using var writer = new FileStream(path, FileMode.Open, FileAccess.Write);
+                    writer.Write("UP"u8);
+                });
+                opener.Start();
+                looked.Wait();
+                Thread.Sleep(300);
+            };
+            secureRoot.AfterMoveAside = () => File.WriteAllText(path, "created");
+
+            Assert.That(secureRoot.DeleteFileUnopened("a.png", version, out var restored), Is.False);
+            Assert.That(restored, Is.Not.Null, "the opened file went back under its name");
+            Assert.That(opener!.Join(TimeSpan.FromSeconds(10)), Is.True);
+            Assert.That(File.ReadAllText(path), Is.EqualTo("UPloaded"), "the writer's bytes are in a file that can be reached");
+            var others = Directory.GetFiles(root).Where(file => file != path).ToArray();
+            Assert.That(others, Has.Length.EqualTo(1));
+            Assert.That(File.ReadAllText(others[0]), Is.EqualTo("created"), "the file created meanwhile is kept beside it");
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Test]
+    public void DeleteFileUnopened_KeepsANewcomerBesideAFileWhoseNameIsAsLongAsNamesGet()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = CreateRoot();
+        try
+        {
+            var name = new string('a', 251) + ".png";
+            var path = Path.Combine(root, name);
+            File.WriteAllText(path, "uploaded");
+            using var secureRoot = new LinuxSecureDirectoryRoot(root);
+            var version = secureRoot.GetVersion(name)!.Value;
+            Thread? opener = null;
+            using var looked = new ManualResetEventSlim();
+            secureRoot.BeforeMoveAside = () =>
+            {
+                opener = new Thread(() =>
+                {
+                    looked.Set();
+                    _ = File.ReadAllText(path);
+                });
+                opener.Start();
+                looked.Wait();
+                Thread.Sleep(300);
+            };
+            secureRoot.AfterMoveAside = () => File.WriteAllText(path, "created");
+
+            Assert.That(secureRoot.DeleteFileUnopened(name, version, out var restored), Is.False);
+            Assert.That(opener!.Join(TimeSpan.FromSeconds(10)), Is.True);
+            Assert.That(restored, Is.Not.Null);
+            Assert.That(File.ReadAllText(path), Is.EqualTo("uploaded"));
+            var others = Directory.GetFiles(root).Where(file => file != path).ToArray();
+            Assert.That(others, Has.Length.EqualTo(1));
+            Assert.That(Path.GetFileName(others[0]), Does.Contain(".kept-").And.EndsWith(".png"));
+            Assert.That(File.ReadAllText(others[0]), Is.EqualTo("created"));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Test]
+    public void Publication_ReportsItsOwnFileNotWhateverTookTheDestinationSince()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+        var root = CreateRoot();
+        try
+        {
+            var path = Path.Combine(root, "a.png");
+            using var secureRoot = new LinuxSecureDirectoryRoot(root);
+            using var publication = secureRoot.CreatePublication("a.png");
+            using (var stream = publication.OpenWriteStream())
+            {
+                stream.Write("downloaded"u8);
+            }
+
+            var written = publication.GetVersion()!.Value;
+            Assert.That(publication.CommitIfAbsent(), Is.True);
+            Assert.That(publication.GetVersion()!.Value.IsSameFileAs(written), Is.True, "publishing moves only the change time");
+            Assert.That(secureRoot.GetVersion("a.png"), Is.EqualTo(publication.GetVersion()));
+
+            // The session puts its own file there right after.
+            ReplaceAtomically(root, path, "rewritten!");
+            Assert.That(secureRoot.GetVersion("a.png"), Is.Not.EqualTo(publication.GetVersion()));
         }
         finally
         {
