@@ -48,6 +48,7 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
 
     /// <summary>How long a one-off client message waits for a new bridge to connect.</summary>
     internal static TimeSpan ClientMessageConnectWait { get; set; } = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan ConnectionPollInterval = TimeSpan.FromMilliseconds(50);
     private long _queuedPayloadBytes;
     private long _lastOversizeWarningTicks = long.MinValue / 2;
     internal const int MaxRetainedPromptIdentities = 256;
@@ -63,7 +64,6 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
     private readonly object _sinkLock = new();
     private readonly Func<string, Func<Task>>? _captureSessionArtifactRefresh;
     private readonly Func<string, RuntimeIdentity, bool> _isTrackedRuntime;
-    private readonly string _instanceId;
     private readonly Func<string, SessionSealingStatus?> _getSessionSealing;
     private readonly SemaphoreSlim _bridgeOwnership = new(1, 1);
     internal const int MaxOwnedBridges = 32;
@@ -108,7 +108,6 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
         string runnerId,
         string comfyHost,
         int comfyPort,
-        string instanceId,
         Func<string, SessionSealingStatus?> getSessionSealing,
         Func<string, RuntimeIdentity, bool> isTrackedRuntime,
         Func<string, Func<Task>>? captureSessionArtifactRefresh = null,
@@ -119,7 +118,6 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
         _comfyHost = string.IsNullOrWhiteSpace(comfyHost) ? "127.0.0.1" : comfyHost.Trim();
         _comfyPort = comfyPort;
         _captureSessionArtifactRefresh = captureSessionArtifactRefresh;
-        _instanceId = string.IsNullOrWhiteSpace(instanceId) ? throw new ArgumentException("A registered process identity is required.", nameof(instanceId)) : instanceId;
         _getSessionSealing = getSessionSealing ?? throw new ArgumentNullException(nameof(getSessionSealing));
         _isTrackedRuntime = isTrackedRuntime ?? throw new ArgumentNullException(nameof(isTrackedRuntime));
         if (queueCapacity <= 0)
@@ -222,8 +220,6 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
         ulong runtimeEpoch,
         string runtimeInstanceId,
         byte[] payload,
-        string bridgeConnectionId,
-        ulong bridgeLeaseRevision,
         CancellationToken cancellationToken)
     {
         // A browser-originated message is sent once. It is not the bridge's connection
@@ -235,7 +231,7 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
         if (!bridge.MatchesEditor(editorSid))
             throw new InvalidOperationException("The client message belongs to another editor.");
 
-        await bridge.SendClientMessageAsync(payload, bridgeConnectionId, bridgeLeaseRevision, cancellationToken).ConfigureAwait(false);
+        await bridge.SendClientMessageAsync(payload, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -334,12 +330,6 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
     {
         var key = BuildKey(sessionId, clientId, runtime.Normalized());
         return _bridges.TryGetValue(key, out bridge!);
-    }
-
-    private IRunnerSessionSink BridgeSink()
-    {
-        lock (_sinkLock)
-            return _sink ?? throw new BridgeControlUnavailableException();
     }
 
     // Bridges are keyed by session, client and exact runtime, so a lookup made
@@ -706,26 +696,31 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
         public bool MatchesEditor(string editorSid) => string.Equals(editorSid, _editorSid, StringComparison.Ordinal);
 
         /// <summary>
-        /// Sends a one-off client message on the current connection, waiting briefly for a new
-        /// bridge to connect. It is never retained: if no connection opens in time the send
-        /// fails, so its request is acknowledged as failed rather than replayed later.
+        /// Sends a one-off client message on this runtime's open connection for the client,
+        /// waiting briefly for one to open. It is never retained: if no connection opens in
+        /// time the send fails, so its request is acknowledged as failed rather than replayed.
         /// </summary>
-        public async Task SendClientMessageAsync(byte[] payload, string connectionId, ulong leaseRevision, CancellationToken cancellationToken)
+        public async Task SendClientMessageAsync(byte[] payload, CancellationToken cancellationToken)
         {
             if (payload is not { Length: > 0 }) return;
-            if (!Guid.TryParse(connectionId, out var parsed) || parsed == Guid.Empty || leaseRevision == 0)
-                throw new InvalidOperationException("The client message has no physical connection authority.");
-            PhysicalConnection? connection;
-            lock (_socketGate) connection = _connection;
-            if (connection is null || connection.Id != parsed || connection.Revision != leaseRevision)
-                throw new InvalidOperationException("The client message's physical connection has retired.");
-            // The server may expose Active before its response is installed locally.
-            // Wait only for this captured connection; retirement never selects another.
             using var wait = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _cts.Token);
             wait.CancelAfter(ClientMessageConnectWait);
-            if (!await connection.SendReady.Task.WaitAsync(wait.Token).ConfigureAwait(false))
-                throw new InvalidOperationException("The client message's physical connection retired before activation.");
-            await SendPayloadAsync(connection, payload, wait.Token).ConfigureAwait(false);
+            while (true)
+            {
+                PhysicalConnection? connection;
+                lock (_socketGate) connection = _connection;
+                if (connection is null)
+                {
+                    await Task.Delay(ConnectionPollInterval, wait.Token).ConfigureAwait(false);
+                    continue;
+                }
+                // A connection that closes before its handshake was sent is skipped.
+                if (await connection.SendReady.Task.WaitAsync(wait.Token).ConfigureAwait(false))
+                {
+                    await SendPayloadAsync(connection, payload, wait.Token).ConfigureAwait(false);
+                    return;
+                }
+            }
         }
 
         /// <summary>

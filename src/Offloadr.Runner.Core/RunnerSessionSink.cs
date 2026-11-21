@@ -24,9 +24,6 @@ internal interface IRunnerSessionSink : IAsyncDisposable
     Task ReportSessionLogsAsync(ReportSessionLogsRequest request, CancellationToken cancellationToken);
     Task ReportRunnerLogsAsync(ReportRunnerLogsRequest request, CancellationToken cancellationToken);
     Task ReportRuntimeTelemetryAsync(ReportRuntimeTelemetryRequest request, CancellationToken cancellationToken);
-    Task<ReadEditorRuntimeBridgeCursorResponse> ReadEditorRuntimeBridgeCursorAsync(ReadEditorRuntimeBridgeCursorRequest request, CancellationToken cancellationToken);
-    Task<ReserveEditorRuntimeBridgeResponse> ReserveEditorRuntimeBridgeAsync(ReserveEditorRuntimeBridgeRequest request, CancellationToken cancellationToken);
-    Task<ReportEditorRuntimeBridgeStateResponse> ReportEditorRuntimeBridgeStateAsync(ReportEditorRuntimeBridgeStateRequest request, CancellationToken cancellationToken);
 }
 
 internal sealed class GrpcRunnerControlSink : IRunnerSessionSink
@@ -113,18 +110,6 @@ internal sealed class GrpcRunnerControlSink : IRunnerSessionSink
 
     public async Task ReportRuntimeTelemetryAsync(ReportRuntimeTelemetryRequest request, CancellationToken cancellationToken)
         => await _opsClient.ReportRuntimeTelemetryAsync(request, deadline: GetDeadline(), cancellationToken: cancellationToken)
-            .ResponseAsync.ConfigureAwait(false);
-
-    public async Task<ReadEditorRuntimeBridgeCursorResponse> ReadEditorRuntimeBridgeCursorAsync(ReadEditorRuntimeBridgeCursorRequest request, CancellationToken cancellationToken)
-        => await _sessionEventClient.ReadEditorRuntimeBridgeCursorAsync(request, deadline: GetDeadline(), cancellationToken: cancellationToken)
-            .ResponseAsync.ConfigureAwait(false);
-
-    public async Task<ReserveEditorRuntimeBridgeResponse> ReserveEditorRuntimeBridgeAsync(ReserveEditorRuntimeBridgeRequest request, CancellationToken cancellationToken)
-        => await _sessionEventClient.ReserveEditorRuntimeBridgeAsync(request, deadline: GetDeadline(), cancellationToken: cancellationToken)
-            .ResponseAsync.ConfigureAwait(false);
-
-    public async Task<ReportEditorRuntimeBridgeStateResponse> ReportEditorRuntimeBridgeStateAsync(ReportEditorRuntimeBridgeStateRequest request, CancellationToken cancellationToken)
-        => await _sessionEventClient.ReportEditorRuntimeBridgeStateAsync(request, deadline: GetDeadline(), cancellationToken: cancellationToken)
             .ResponseAsync.ConfigureAwait(false);
 
     private DateTime? GetDeadline()

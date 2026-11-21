@@ -397,6 +397,13 @@ internal static partial class ServiceClientManager
         // relaunch of its runtime keeps it.
         public ConcurrentDictionary<string, RetainedSealing> SessionSealing { get; } = new(StringComparer.Ordinal);
         private TrackedCommandWork? _activeStartup;
+        private RecordedStartupOutcome? _lastStartupOutcome;
+
+        /// <summary>How the last owned startup ended; the heartbeat's runtime status reads it.</summary>
+        public RecordedStartupOutcome? LastStartupOutcome => Volatile.Read(ref _lastStartupOutcome);
+
+        public void RecordStartupOutcome(string sessionId, RuntimeIdentity runtime, StartupOutcome outcome)
+            => Volatile.Write(ref _lastStartupOutcome, new RecordedStartupOutcome(sessionId, runtime.Normalized(), outcome));
 
         public TrackedCommandWork? GetActiveStartup()
         {
@@ -917,7 +924,11 @@ internal static partial class ServiceClientManager
                 runnerId,
                 instanceId,
                 version,
-                logicalSessionState.GetActiveSessionId,
+                () => DescribeRuntimeStatus(
+                    logicalSessionState,
+                    commandWorkState,
+                    sessionManager.IsStopping,
+                    sessionManager.IsTrackedRuntime),
                 resources,
                 supportedEditorTemplates,
                 minBackoff,
@@ -987,7 +998,7 @@ internal static partial class ServiceClientManager
         string runnerId,
         string instanceId,
         string version,
-        Func<string> getActiveSessionId,
+        Func<RuntimeStatus> describeRuntime,
         RunnerResources resources,
         IReadOnlyList<string> supportedEditorTemplates,
         TimeSpan minBackoff,
@@ -1012,7 +1023,7 @@ internal static partial class ServiceClientManager
                 }
 
                 var response = await sessionSink.RegisterRunnerAsync(
-                    BuildStatusUpdateRequest(runnerId, instanceId, version, resources, getActiveSessionId, supportedEditorTemplates, describeSealedStorage),
+                    BuildStatusUpdateRequest(runnerId, instanceId, version, resources, describeRuntime, supportedEditorTemplates, describeSealedStorage),
                     shutdown).ConfigureAwait(false);
 
                 RunnerLog.Info(nameof(ServiceClientManager), $"Status update accepted={response.Accepted} message='{response.Message}' next={response.RefreshSeconds}s");
@@ -2631,13 +2642,13 @@ internal static partial class ServiceClientManager
                 RunnerLog.Warning(
                     nameof(ServiceClientManager),
                     $"Startup {acknowledgementKey} for session {sessionId} asks for other sealing than the one in progress; refusing it.");
-                return AcknowledgeOutcomeAsync(Task.FromResult(new StartupOutcome(false, OtherSealingMessage)));
+                return AcknowledgeOutcomeAsync(Task.FromResult(new StartupOutcome(false, OtherSealingMessage)), owner: false);
             }
 
             RunnerLog.Info(
                 nameof(ServiceClientManager),
                 $"Startup {acknowledgementKey} for session {sessionId} is already in progress; joining it.");
-            return AcknowledgeOutcomeAsync(inProgress);
+            return AcknowledgeOutcomeAsync(inProgress, owner: false);
         }
 
         TrackedCommandWork? previous = null;
@@ -2656,7 +2667,7 @@ internal static partial class ServiceClientManager
         tracked.Outcome = physical;
         previous = deps.WorkState.ReplaceActiveStartup(tracked);
         starter.Start(TaskScheduler.Default);
-        return AcknowledgeOutcomeAsync(physical);
+        return AcknowledgeOutcomeAsync(physical, owner: true);
 
         async Task<StartupOutcome> RunPhysicalAsync()
         {
@@ -2672,9 +2683,13 @@ internal static partial class ServiceClientManager
             }
         }
 
-        async Task AcknowledgeOutcomeAsync(Task<StartupOutcome> outcome)
+        async Task AcknowledgeOutcomeAsync(Task<StartupOutcome> outcome, bool owner)
         {
-            var ack = toAcknowledgement(await outcome.ConfigureAwait(false));
+            var result = await outcome.ConfigureAwait(false);
+            // Only the startup's owner records it: a refused or joined command
+            // says nothing about the runtime the owner is starting.
+            if (owner) deps.WorkState.RecordStartupOutcome(sessionId, runtimeIdentity, result);
+            var ack = toAcknowledgement(result);
             await AcknowledgeRuntimeCommandWithRetryAsync(
                 acknowledge,
                 ack,
@@ -2944,8 +2959,6 @@ internal static partial class ServiceClientManager
                     command.RuntimeEpoch,
                     command.RuntimeInstanceId,
                     command.ClientMessage.ToByteArray(),
-                    command.BridgeConnectionId,
-                    command.BridgeLeaseRevision,
                     cancellationToken).ConfigureAwait(false);
                 response.TransportSucceeded = true;
                 response.StatusCode = 204;
@@ -3944,13 +3957,13 @@ internal static partial class ServiceClientManager
         string instanceId,
         string version,
         RunnerResources resources,
-        Func<string> getActiveSessionId)
+        Func<RuntimeStatus> describeRuntime)
         => BuildStatusUpdateRequest(
             runnerId,
             instanceId,
             version,
             resources,
-            getActiveSessionId,
+            describeRuntime,
             ["comfyui-latest", "comfyui-master"]);
 
     internal static RegisterRunnerRequest BuildStatusUpdateRequest(
@@ -3958,7 +3971,7 @@ internal static partial class ServiceClientManager
         string instanceId,
         string version,
         RunnerResources resources,
-        Func<string> getActiveSessionId,
+        Func<RuntimeStatus> describeRuntime,
         IReadOnlyList<string> supportedEditorTemplates,
         Func<RunnerSealedStorage>? describeSealedStorage = null)
     {
@@ -3969,8 +3982,7 @@ internal static partial class ServiceClientManager
         {
             RunnerId = runnerId,
             InstanceId = instanceId,
-            ActiveSessionReported = true,
-            ActiveSessionId = getActiveSessionId(),
+            Runtime = describeRuntime(),
             Version = version,
             Resources = resources,
             ProtocolVersion = RunnerProtocolVersion.Current,

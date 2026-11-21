@@ -114,7 +114,7 @@ public sealed class RunnerCommandStreamLifetimeTests
             var client = new RunnerControlService.RunnerControlServiceClient(invoker.Object);
             await using var sink = new GrpcRunnerControlSink(client, client, client, client, TimeSpan.FromSeconds(5));
             await using var relay = new ComfySessionEventRelay((_, _) => throw new NotSupportedException(), "runner", "127.0.0.1", 8188,
-                "fixture-process", _ => null, (_, _) => false);
+                _ => null, (_, _) => false);
             await using var artifacts = new ArtifactUploadService(null, new RunnerArtifactService.RunnerArtifactServiceClient(invoker.Object),
                 NullLogger<ArtifactUploadService>.Instance);
             await using var workspace = new WorkspaceMirrorService(new RunnerWorkspaceService.RunnerWorkspaceServiceClient(invoker.Object),

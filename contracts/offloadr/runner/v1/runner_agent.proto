@@ -14,7 +14,7 @@ import "google/protobuf/wrappers.proto";
 // so an outdated runner is told to update instead of misbehaving.
 enum RunnerProtocol {
     RUNNER_PROTOCOL_UNSPECIFIED = 0;
-    RUNNER_PROTOCOL_CURRENT = 3;
+    RUNNER_PROTOCOL_CURRENT = 4;
 }
 
 message RunnerRuntimeTelemetrySnapshot {
@@ -209,6 +209,9 @@ message SubmitPromptCommand {
 }
 
 message RelayEditorRuntimeRequestCommand {
+    reserved 20, 21;
+    reserved "bridge_connection_id", "bridge_lease_revision";
+
     string request_id = 1;
     string delivery_id = 2;
     string runner_id = 3;
@@ -228,8 +231,6 @@ message RelayEditorRuntimeRequestCommand {
     bool urgent = 17;
     uint64 runtime_epoch = 18;
     string runtime_instance_id = 19;
-    string bridge_connection_id = 20;
-    uint64 bridge_lease_revision = 21;
 }
 
 message AcknowledgeEditorRuntimeRequestRequest {
@@ -246,57 +247,6 @@ message AcknowledgeEditorRuntimeRequestRequest {
     offloadr.editor_runtime.v1.EditorRuntimeRequestKind kind = 11;
     uint64 runtime_epoch = 12;
     string runtime_instance_id = 13;
-}
-
-enum EditorRuntimeBridgeState {
-    EDITOR_RUNTIME_BRIDGE_STATE_UNSPECIFIED = 0;
-    EDITOR_RUNTIME_BRIDGE_STATE_ACTIVE = 1;
-    EDITOR_RUNTIME_BRIDGE_STATE_HEARTBEAT = 2;
-    EDITOR_RUNTIME_BRIDGE_STATE_INACTIVE = 3;
-}
-
-message ReadEditorRuntimeBridgeCursorRequest {
-    offloadr.editor_runtime.v1.EditorRuntimeBridgeTarget target = 1;
-}
-
-message ReadEditorRuntimeBridgeCursorResponse {
-    offloadr.editor_runtime.v1.EditorRuntimeBridgeResult result = 1;
-}
-
-// Reserve one immutable UUID before opening the native socket. Exact retries
-// return the original lease and deadline without renewal.
-message ReserveEditorRuntimeBridgeRequest {
-    offloadr.editor_runtime.v1.EditorRuntimeBridgeTarget target = 1;
-    string client_id = 2;
-    string bridge_connection_id = 3;
-    uint64 expected_activation_fence = 4;
-}
-
-message ReserveEditorRuntimeBridgeResponse {
-    offloadr.editor_runtime.v1.EditorRuntimeBridgeResult result = 1;
-}
-
-message ReportEditorRuntimeBridgeStateRequest {
-    reserved 7, 8, 11;
-    reserved "observed_utc", "expires_utc";
-
-    string runner_id = 1;
-    string session_id = 2;
-    string editor_sid = 3;
-    string client_id = 4;
-    uint64 lifecycle_generation = 5;
-    EditorRuntimeBridgeState state = 6;
-    uint64 runtime_epoch = 9;
-    string runtime_instance_id = 10;
-    string bridge_connection_id = 12;
-    string instance_id = 13;
-    uint64 lease_revision = 14;
-    uint64 report_sequence = 15;
-    SessionSealingStatus sealing = 16;
-}
-
-message ReportEditorRuntimeBridgeStateResponse {
-    offloadr.editor_runtime.v1.EditorRuntimeBridgeResult result = 1;
 }
 
 message ModelDownloadRequest {
@@ -364,17 +314,41 @@ message WorkspaceFileMetadata {
     google.protobuf.Timestamp modified_utc = 4;
 }
 
+// Where the runner's editor runtime is. The phase is a report, not a command: the
+// acknowledgements stay the owners of start and launch results.
+enum RuntimePhase {
+    RUNTIME_PHASE_UNSPECIFIED = 0;
+    RUNTIME_PHASE_NONE = 1;     // No session, or a session held with no editor process.
+    RUNTIME_PHASE_STARTING = 2; // A start or launch of the runtime below is running.
+    RUNTIME_PHASE_READY = 3;    // The runtime below finished starting ready.
+    RUNTIME_PHASE_FAILED = 4;   // The runtime below failed to start or exited unexpectedly.
+    RUNTIME_PHASE_STOPPING = 5; // The session is stopping.
+}
+
+// The runner's one logical session and the runtime it runs, sent with every registration.
+message RuntimeStatus {
+    string session_id = 1;           // Empty when the runner holds no session.
+    uint64 lifecycle_generation = 2; // The runtime's identity; zero when the phase has none.
+    uint64 runtime_epoch = 3;
+    string runtime_instance_id = 4;
+    RuntimePhase phase = 5;
+    SessionSealingStatus sealing = 6; // What the runtime got; set only when READY.
+    string message = 7;               // Why it failed; set only when FAILED, at most 512 bytes.
+}
+
 // Request sent by a runner agent when (re)registering with Offloadr API.
 message RegisterRunnerRequest {
+    reserved 5, 6;
+    reserved "active_session_id", "active_session_reported";
+
 	string runner_id = 1;       // Stable unique ID (e.g., UUID) generated client side.
 	string version = 2;         // Runner agent semantic version.
 	RunnerResources resources = 3; // Current resource snapshot.
     string instance_id = 4;    // Process instance id; changes on runner process restart.
-    string active_session_id = 5; // Authoritative active session currently alive on this runner (empty means none).
-    bool active_session_reported = 6; // True when active_session_id is intentionally reported by the runner.
     repeated string supported_editor_templates = 7; // Canonical editor templates this runner can execute.
     RunnerSealedStorage sealed_storage = 8; // What this runner can offer sealed sessions.
     uint32 protocol_version = 9; // RunnerProtocol.RUNNER_PROTOCOL_CURRENT of the runner's build.
+    RuntimeStatus runtime = 10;  // The session this runner holds and its runtime.
 }
 
 // Why registration was refused. Anything other than an outdated protocol is retried.
@@ -570,6 +544,16 @@ message SessionStreamEvent {
     uint64 lifecycle_generation = 11;
     uint64 runtime_epoch = 12;
     string runtime_instance_id = 13;
+    // Set only by the runner, never from editor output: the runner's native socket for
+    // client_id is open under this runtime. An event with it has no payload.
+    BridgeState bridge_state = 14;
+}
+
+// Sent when the runner's native editor socket for a client opens, then every 10 seconds
+// while it stays open. A new connection_id means a new native connection, whose
+// per-client editor state (feature flags, log subscription) must be sent again.
+message BridgeState {
+    string connection_id = 1; // UUID minted by the runner for each native connection.
 }
 
 // A required fact that a managed runtime produced native activity. It carries no
@@ -869,9 +853,6 @@ service RunnerControlService {
     rpc ReportSessionLogs(ReportSessionLogsRequest) returns (ReportSessionLogsResponse);
     rpc ReportRunnerLogs(ReportRunnerLogsRequest) returns (ReportRunnerLogsResponse);
     rpc ReportRuntimeTelemetry(ReportRuntimeTelemetryRequest) returns (ReportRuntimeTelemetryResponse);
-    rpc ReadEditorRuntimeBridgeCursor(ReadEditorRuntimeBridgeCursorRequest) returns (ReadEditorRuntimeBridgeCursorResponse);
-    rpc ReserveEditorRuntimeBridge(ReserveEditorRuntimeBridgeRequest) returns (ReserveEditorRuntimeBridgeResponse);
-    rpc ReportEditorRuntimeBridgeState(ReportEditorRuntimeBridgeStateRequest) returns (ReportEditorRuntimeBridgeStateResponse);
     // Which runner image a local supervisor (for example the desktop app) should run for the key's
     // owner. A catalog query only: it must not count as a heartbeat or change runner liveness,
     // instance identity or registration state.
