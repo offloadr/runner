@@ -397,13 +397,39 @@ internal static partial class ServiceClientManager
         // relaunch of its runtime keeps it.
         public ConcurrentDictionary<string, RetainedSealing> SessionSealing { get; } = new(StringComparer.Ordinal);
         private TrackedCommandWork? _activeStartup;
-        private RecordedStartupOutcome? _lastStartupOutcome;
+        // Outcomes are kept per runtime, so a delayed outcome of an older startup cannot
+        // replace a newer runtime's. Only the newest few runtimes matter to the heartbeat.
+        private const int RetainedStartupOutcomes = 8;
+        private readonly List<RecordedStartupOutcome> _startupOutcomes = [];
 
-        /// <summary>How the last owned startup ended; the heartbeat's runtime status reads it.</summary>
-        public RecordedStartupOutcome? LastStartupOutcome => Volatile.Read(ref _lastStartupOutcome);
+        /// <summary>How the last owned startup of this exact runtime ended, if one did.</summary>
+        public RecordedStartupOutcome? StartupOutcome(string sessionId, RuntimeIdentity runtime)
+        {
+            var normalized = runtime.Normalized();
+            lock (_gate)
+                return _startupOutcomes.LastOrDefault(recorded =>
+                    string.Equals(recorded.SessionId, sessionId, StringComparison.Ordinal) && recorded.Runtime == normalized);
+        }
 
         public void RecordStartupOutcome(string sessionId, RuntimeIdentity runtime, StartupOutcome outcome)
-            => Volatile.Write(ref _lastStartupOutcome, new RecordedStartupOutcome(sessionId, runtime.Normalized(), outcome));
+        {
+            var normalized = runtime.Normalized();
+            lock (_gate)
+            {
+                var index = _startupOutcomes.FindIndex(recorded =>
+                    string.Equals(recorded.SessionId, sessionId, StringComparison.Ordinal) && recorded.Runtime == normalized);
+                if (index >= 0)
+                {
+                    // A runtime that started ready stays ready: a later refused command for the
+                    // same runtime (another sealing, say) leaves the running process as it is.
+                    // Its process exiting is seen through the tracked runtime instead.
+                    if (_startupOutcomes[index].Outcome.Ready && !outcome.Ready) return;
+                    _startupOutcomes.RemoveAt(index);
+                }
+                _startupOutcomes.Add(new RecordedStartupOutcome(sessionId, normalized, outcome));
+                if (_startupOutcomes.Count > RetainedStartupOutcomes) _startupOutcomes.RemoveAt(0);
+            }
+        }
 
         public TrackedCommandWork? GetActiveStartup()
         {

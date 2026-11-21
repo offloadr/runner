@@ -44,9 +44,7 @@ internal static partial class ServiceClientManager
             return status;
         }
 
-        if (!hasRuntime || workState.LastStartupOutcome is not { } recorded ||
-            !string.Equals(recorded.SessionId, sessionId, StringComparison.Ordinal) ||
-            !recorded.Runtime.SameRuntime(runtime))
+        if (!hasRuntime || workState.StartupOutcome(sessionId, runtime) is not { } recorded)
         {
             return status;
         }

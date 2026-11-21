@@ -153,6 +153,44 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
+    public void RuntimeStatus_ADelayedOutcomeOfAnOlderStartupDoesNotReplaceTheCurrentRuntimes()
+    {
+        var harness = RunningHarness(7, 4, InstanceB);
+        harness.WorkState.RecordStartupOutcome(CommandSessionId, new RuntimeIdentity(7, 4, InstanceB),
+            new ServiceClientManager.StartupOutcome(true, "", new SessionSealingStatus()));
+        // The superseded startup's continuation records its result afterwards.
+        harness.WorkState.RecordStartupOutcome(CommandSessionId, new RuntimeIdentity(7, 3, InstanceA),
+            new ServiceClientManager.StartupOutcome(false, "cancelled"));
+
+        var status = Status(harness);
+        Assert.That(status.Phase, Is.EqualTo(RuntimePhase.Ready));
+        AssertRuntime(status, 7, 4, InstanceB);
+    }
+
+    [Test]
+    public void RuntimeStatus_ARefusedCommandForARunningReadyRuntimeKeepsItReady()
+    {
+        var harness = RunningHarness(7, 3, InstanceA);
+        var runtime = new RuntimeIdentity(7, 3, InstanceA);
+        harness.WorkState.RecordStartupOutcome(CommandSessionId, runtime, new ServiceClientManager.StartupOutcome(true, ""));
+        harness.WorkState.RecordStartupOutcome(CommandSessionId, runtime,
+            new ServiceClientManager.StartupOutcome(false, "The session is already running with other sealing."));
+
+        Assert.That(Status(harness).Phase, Is.EqualTo(RuntimePhase.Ready));
+    }
+
+    [Test]
+    public void RuntimeStatus_AnExactRetryAfterAFailureCanBecomeReady()
+    {
+        var harness = RunningHarness(7, 3, InstanceA);
+        var runtime = new RuntimeIdentity(7, 3, InstanceA);
+        harness.WorkState.RecordStartupOutcome(CommandSessionId, runtime, new ServiceClientManager.StartupOutcome(false, "not ready"));
+        Assert.That(Status(harness).Phase, Is.EqualTo(RuntimePhase.Failed));
+        harness.WorkState.RecordStartupOutcome(CommandSessionId, runtime, new ServiceClientManager.StartupOutcome(true, ""));
+        Assert.That(Status(harness).Phase, Is.EqualTo(RuntimePhase.Ready));
+    }
+
+    [Test]
     public void RuntimeStatusMessage_IsCutAtAWholeCharacterWithinItsLimit()
     {
         const string shortMessage = "ééé not ready";
