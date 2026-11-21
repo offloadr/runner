@@ -45,7 +45,7 @@ public class ModelDownloadsDisabledTests
     }
 
     [Test]
-    public async Task Off_RegistersNothingAndReportsEachModelAsFailed()
+    public async Task Off_RegistersNothingAndReportsNothingSoTheSessionStarts()
     {
         var root = CreateTempDirectory();
         try
@@ -54,7 +54,6 @@ public class ModelDownloadsDisabledTests
             var backend = new RecordingBackend();
             await using var service = new ModelDownloadService(backend, DefaultAria2Settings, downloadsEnabled: false);
             var reports = new List<ModelDownloadProgress>();
-            var reported = new TaskCompletionSource();
             service.ProgressReporter = progress =>
             {
                 lock (reports)
@@ -62,22 +61,21 @@ public class ModelDownloadsDisabledTests
                     reports.Add(progress);
                 }
 
-                reported.TrySetResult();
                 return Task.CompletedTask;
             };
 
             service.SetActiveSession("session-1");
             service.SeedDownloads("session-1", [Remote(destinationPath), Local(Path.Combine(root, "loras", "mine.safetensors"))]);
-            await reported.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            service.RegisterDownloads("session-1", [Remote(Path.Combine(root, "loras", "style.safetensors"))]);
+            await Task.Delay(200);
 
             Assert.Multiple(() =>
             {
                 Assert.That(File.Exists(destinationPath), Is.False, "No placeholder: the editor must not list a model it cannot load.");
                 Assert.That(backend.Created, Is.Zero);
-                Assert.That(reports, Has.Count.EqualTo(1), "Only the remote model is refused; a local one is projected elsewhere.");
-                Assert.That(reports[0].State, Is.EqualTo(ModelDownloadState.Failed));
-                Assert.That(reports[0].Filename, Is.EqualTo("flux-dev.safetensors"));
-                Assert.That(reports[0].Message, Does.Contain("turned off"));
+                // A model the owner chose not to download is not a failed download: reporting
+                // one would end the session's start on the control plane.
+                lock (reports) Assert.That(reports, Is.Empty);
             });
         }
         finally

@@ -9,10 +9,6 @@ internal sealed class ModelDownloadsDisabledException(IReadOnlyCollection<string
 {
     public const string DiagnosticCode = "model_downloads_disabled";
 
-    /// <summary>What each refused download is reported with.</summary>
-    public const string ReportMessage =
-        "Model downloads are turned off on this runner. Turn them on in its settings, or put the model in its local models folder.";
-
     public IReadOnlyCollection<string> Filenames { get; } = filenames;
 
     private static string Describe(IReadOnlyCollection<string> filenames)
