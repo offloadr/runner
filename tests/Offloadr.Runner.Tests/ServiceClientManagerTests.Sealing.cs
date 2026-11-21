@@ -477,7 +477,7 @@ public partial class ServiceClientManagerTests
             "process-1",
             "1.0.0",
             new RunnerResources(),
-            () => string.Empty,
+            () => new RuntimeStatus(),
             ["comfyui-latest"],
             () => sealedStorage);
         var failing = ServiceClientManager.BuildStatusUpdateRequest(
@@ -485,7 +485,7 @@ public partial class ServiceClientManagerTests
             "process-1",
             "1.0.0",
             new RunnerResources(),
-            () => string.Empty,
+            () => new RuntimeStatus(),
             ["comfyui-latest"],
             () => throw new IOException("statfs failed"));
 

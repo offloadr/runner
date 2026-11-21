@@ -12,7 +12,7 @@ public class RunnerProtocolHandshakeTests
     public void StatusAndCommandRequestsCarryThisBuildsProtocol()
     {
         var request = ServiceClientManager.BuildStatusUpdateRequest(
-            Guid.NewGuid().ToString("n"), "process-1", "1.0.0", new RunnerResources(), () => string.Empty, ["comfyui-latest"]);
+            Guid.NewGuid().ToString("n"), "process-1", "1.0.0", new RunnerResources(), () => new RuntimeStatus(), ["comfyui-latest"]);
 
         Assert.That(request.ProtocolVersion, Is.EqualTo((uint)RunnerProtocol.Current));
         Assert.That(RunnerProtocolVersion.Current, Is.GreaterThan(0u));
@@ -114,7 +114,7 @@ public class RunnerProtocolHandshakeTests
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
 
         await ServiceClientManager.RunRunnerStatusLoopAsync(
-            sink, timeout.Token, Guid.NewGuid().ToString("n"), "process-1", "1.0.0", () => string.Empty,
+            sink, timeout.Token, Guid.NewGuid().ToString("n"), "process-1", "1.0.0", () => new RuntimeStatus(),
             new RunnerResources(), ["comfyui-latest"], TimeSpan.FromMilliseconds(1), TimeSpan.FromMilliseconds(5),
             new TaskCompletionSource(), onProtocolRejected: response => reported = response);
 
@@ -135,7 +135,7 @@ public class RunnerProtocolHandshakeTests
         var rejected = false;
 
         await ServiceClientManager.RunRunnerStatusLoopAsync(
-            sink, stop.Token, Guid.NewGuid().ToString("n"), "process-1", "1.0.0", () => string.Empty,
+            sink, stop.Token, Guid.NewGuid().ToString("n"), "process-1", "1.0.0", () => new RuntimeStatus(),
             new RunnerResources(), ["comfyui-latest"], TimeSpan.FromMilliseconds(1), TimeSpan.FromMilliseconds(5),
             new TaskCompletionSource(), onProtocolRejected: _ => rejected = true);
 
@@ -164,8 +164,5 @@ public class RunnerProtocolHandshakeTests
         public Task ReportSessionLogsAsync(ReportSessionLogsRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task ReportRunnerLogsAsync(ReportRunnerLogsRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task ReportRuntimeTelemetryAsync(ReportRuntimeTelemetryRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
-        public Task<ReadEditorRuntimeBridgeCursorResponse> ReadEditorRuntimeBridgeCursorAsync(ReadEditorRuntimeBridgeCursorRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
-        public Task<ReserveEditorRuntimeBridgeResponse> ReserveEditorRuntimeBridgeAsync(ReserveEditorRuntimeBridgeRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
-        public Task<ReportEditorRuntimeBridgeStateResponse> ReportEditorRuntimeBridgeStateAsync(ReportEditorRuntimeBridgeStateRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
     }
 }

@@ -368,6 +368,8 @@ internal static partial class ServiceClientManager
         public required Func<string, Func<string, CancellationToken, Task>?, CancellationToken, Task> StopRuntime { get; init; }
         public required Func<string, RuntimeIdentity, Func<string, CancellationToken, Task>?, CancellationToken, Task<bool>> StopRuntimeIfIdentityMatches { get; init; }
         public required Func<string, RuntimeIdentity?> GetTrackedRuntime { get; init; }
+        /// <summary>The token of the running process of exactly this runtime, if one runs.</summary>
+        public required Func<string, RuntimeIdentity, Guid?> GetTrackedProcess { get; init; }
         public required Func<string, Task> StopSessionRelay { get; init; }
         public required Func<string, Task> StopArtifactUploads { get; init; }
         public required Func<string, Task> StopWorkspaceMirrors { get; init; }
@@ -397,6 +399,73 @@ internal static partial class ServiceClientManager
         // relaunch of its runtime keeps it.
         public ConcurrentDictionary<string, RetainedSealing> SessionSealing { get; } = new(StringComparer.Ordinal);
         private TrackedCommandWork? _activeStartup;
+        // Outcomes are kept per runtime, so a delayed outcome of an older startup cannot
+        // replace a newer runtime's. Only the newest few runtimes matter to the heartbeat.
+        private const int RetainedStartupOutcomes = 8;
+        private readonly List<RecordedStartupOutcome> _startupOutcomes = [];
+        // Advances whenever a startup is published, cleared or records its outcome, so a
+        // reader can tell its snapshot was overtaken by a startup that began meanwhile.
+        private long _startupVersion;
+
+        /// <summary>How the last owned startup of this exact runtime ended, if one did.</summary>
+        public RecordedStartupOutcome? StartupOutcome(string sessionId, RuntimeIdentity runtime)
+        {
+            lock (_gate) return FindOutcome(sessionId, runtime.Normalized());
+        }
+
+        /// <summary>The unfinished startup, the runtime's recorded outcome and their version, read together.</summary>
+        public (TrackedCommandWork? Startup, RecordedStartupOutcome? Outcome, long Version) ReadStartupState(
+            string sessionId, RuntimeIdentity? runtime)
+        {
+            lock (_gate)
+            {
+                var startup = _activeStartup?.Task is { IsCompleted: false } ? _activeStartup : null;
+                var outcome = runtime is { } current ? FindOutcome(sessionId, current.Normalized()) : null;
+                return (startup, outcome, _startupVersion);
+            }
+        }
+
+        public long StartupVersion
+        {
+            get { lock (_gate) return _startupVersion; }
+        }
+
+        private RecordedStartupOutcome? FindOutcome(string sessionId, RuntimeIdentity normalized)
+            => _startupOutcomes.LastOrDefault(recorded =>
+                string.Equals(recorded.SessionId, sessionId, StringComparison.Ordinal) && recorded.Runtime == normalized);
+
+        /// <summary>
+        /// Records how an owned startup of this runtime ended. <paramref name="trackedProcess"/>
+        /// names a runtime's running process, if any.
+        /// </summary>
+        public void RecordStartupOutcome(string sessionId, RuntimeIdentity runtime, StartupOutcome outcome,
+            Func<string, RuntimeIdentity, Guid?> trackedProcess)
+        {
+            var normalized = runtime.Normalized();
+            lock (_gate)
+            {
+                _startupVersion++;
+                var process = trackedProcess(sessionId, normalized);
+                var index = _startupOutcomes.FindIndex(recorded =>
+                    string.Equals(recorded.SessionId, sessionId, StringComparison.Ordinal) && recorded.Runtime == normalized);
+                if (index >= 0)
+                {
+                    // A failed command for a process that started ready and still runs (a
+                    // refusal of other sealing, say) left it as it was. Once that process is
+                    // gone the failure is the runtime's own and replaces READY.
+                    var existing = _startupOutcomes[index];
+                    if (existing.Outcome.Ready && !outcome.Ready && process is not null && existing.Process == process) return;
+                    _startupOutcomes.RemoveAt(index);
+                }
+                _startupOutcomes.Add(new RecordedStartupOutcome(sessionId, normalized, outcome, process));
+                if (_startupOutcomes.Count <= RetainedStartupOutcomes) return;
+                // Never evict the outcome of the process still running: the heartbeat
+                // describes it. A runner runs one process, so another entry is found.
+                var evict = _startupOutcomes.FindIndex(recorded =>
+                    recorded.Process is null || trackedProcess(recorded.SessionId, recorded.Runtime) != recorded.Process);
+                _startupOutcomes.RemoveAt(evict >= 0 ? evict : 0);
+            }
+        }
 
         public TrackedCommandWork? GetActiveStartup()
         {
@@ -416,6 +485,7 @@ internal static partial class ServiceClientManager
             {
                 var previous = _activeStartup?.Task is { IsCompleted: false } ? _activeStartup : null;
                 _activeStartup = work;
+                _startupVersion++;
                 return previous;
             }
         }
@@ -427,6 +497,7 @@ internal static partial class ServiceClientManager
                 if (ReferenceEquals(_activeStartup, work))
                 {
                     _activeStartup = null;
+                    _startupVersion++;
                 }
             }
         }
@@ -917,7 +988,11 @@ internal static partial class ServiceClientManager
                 runnerId,
                 instanceId,
                 version,
-                logicalSessionState.GetActiveSessionId,
+                () => DescribeRuntimeStatus(
+                    logicalSessionState,
+                    commandWorkState,
+                    sessionManager.IsStopping,
+                    sessionManager.TrackedProcess),
                 resources,
                 supportedEditorTemplates,
                 minBackoff,
@@ -987,7 +1062,7 @@ internal static partial class ServiceClientManager
         string runnerId,
         string instanceId,
         string version,
-        Func<string> getActiveSessionId,
+        Func<RuntimeStatus> describeRuntime,
         RunnerResources resources,
         IReadOnlyList<string> supportedEditorTemplates,
         TimeSpan minBackoff,
@@ -1012,7 +1087,7 @@ internal static partial class ServiceClientManager
                 }
 
                 var response = await sessionSink.RegisterRunnerAsync(
-                    BuildStatusUpdateRequest(runnerId, instanceId, version, resources, getActiveSessionId, supportedEditorTemplates, describeSealedStorage),
+                    BuildStatusUpdateRequest(runnerId, instanceId, version, resources, describeRuntime, supportedEditorTemplates, describeSealedStorage),
                     shutdown).ConfigureAwait(false);
 
                 RunnerLog.Info(nameof(ServiceClientManager), $"Status update accepted={response.Accepted} message='{response.Message}' next={response.RefreshSeconds}s");
@@ -1293,6 +1368,7 @@ internal static partial class ServiceClientManager
             StopRuntime = sessionManager.StopSessionAsync,
             StopRuntimeIfIdentityMatches = sessionManager.StopSessionIfRuntimeMatchesAsync,
             GetTrackedRuntime = sessionId => sessionManager.TryGetRuntimeIdentity(sessionId, out var tracked) ? tracked : null,
+            GetTrackedProcess = sessionManager.TrackedProcess,
             StopSessionRelay = sessionEventRelay.StopSessionAsync,
             StopArtifactUploads = artifactUploadService.StopSessionAsync,
             StopWorkspaceMirrors = workspaceMirrorService.StopSessionAsync,
@@ -2663,7 +2739,12 @@ internal static partial class ServiceClientManager
             try
             {
                 await CancelTrackedWorkAsync(previous).ConfigureAwait(false);
-                return await startup(tracked.Token).ConfigureAwait(false);
+                var result = await startup(tracked.Token).ConfigureAwait(false);
+                // Recorded while this startup still holds the slot, so a later command for
+                // the same runtime sees either this startup in progress or its outcome. Only
+                // the owner records: a joined or refused command says nothing about it.
+                deps.WorkState.RecordStartupOutcome(sessionId, runtimeIdentity, result, deps.GetTrackedProcess);
+                return result;
             }
             finally
             {
@@ -2674,7 +2755,8 @@ internal static partial class ServiceClientManager
 
         async Task AcknowledgeOutcomeAsync(Task<StartupOutcome> outcome)
         {
-            var ack = toAcknowledgement(await outcome.ConfigureAwait(false));
+            var result = await outcome.ConfigureAwait(false);
+            var ack = toAcknowledgement(result);
             await AcknowledgeRuntimeCommandWithRetryAsync(
                 acknowledge,
                 ack,
@@ -2944,8 +3026,6 @@ internal static partial class ServiceClientManager
                     command.RuntimeEpoch,
                     command.RuntimeInstanceId,
                     command.ClientMessage.ToByteArray(),
-                    command.BridgeConnectionId,
-                    command.BridgeLeaseRevision,
                     cancellationToken).ConfigureAwait(false);
                 response.TransportSucceeded = true;
                 response.StatusCode = 204;
@@ -3944,13 +4024,13 @@ internal static partial class ServiceClientManager
         string instanceId,
         string version,
         RunnerResources resources,
-        Func<string> getActiveSessionId)
+        Func<RuntimeStatus> describeRuntime)
         => BuildStatusUpdateRequest(
             runnerId,
             instanceId,
             version,
             resources,
-            getActiveSessionId,
+            describeRuntime,
             ["comfyui-latest", "comfyui-master"]);
 
     internal static RegisterRunnerRequest BuildStatusUpdateRequest(
@@ -3958,7 +4038,7 @@ internal static partial class ServiceClientManager
         string instanceId,
         string version,
         RunnerResources resources,
-        Func<string> getActiveSessionId,
+        Func<RuntimeStatus> describeRuntime,
         IReadOnlyList<string> supportedEditorTemplates,
         Func<RunnerSealedStorage>? describeSealedStorage = null)
     {
@@ -3969,8 +4049,7 @@ internal static partial class ServiceClientManager
         {
             RunnerId = runnerId,
             InstanceId = instanceId,
-            ActiveSessionReported = true,
-            ActiveSessionId = getActiveSessionId(),
+            Runtime = describeRuntime(),
             Version = version,
             Resources = resources,
             ProtocolVersion = RunnerProtocolVersion.Current,

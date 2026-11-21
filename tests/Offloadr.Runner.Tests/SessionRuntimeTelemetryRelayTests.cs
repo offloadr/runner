@@ -45,9 +45,6 @@ public class SessionRuntimeTelemetryRelayTests
 
     private sealed class DeadlineExceededSink : IRunnerSessionSink
     {
-        public Task<ReadEditorRuntimeBridgeCursorResponse> ReadEditorRuntimeBridgeCursorAsync(ReadEditorRuntimeBridgeCursorRequest request, CancellationToken token) => throw new NotSupportedException();
-        public Task<ReserveEditorRuntimeBridgeResponse> ReserveEditorRuntimeBridgeAsync(ReserveEditorRuntimeBridgeRequest request, CancellationToken token) => throw new NotSupportedException();
-        public Task<ReportEditorRuntimeBridgeStateResponse> ReportEditorRuntimeBridgeStateAsync(ReportEditorRuntimeBridgeStateRequest request, CancellationToken token) => throw new NotSupportedException();
 
         public int CallCount { get; private set; }
 

@@ -15,52 +15,6 @@ enum EditorRuntimeRequestKind {
   EDITOR_RUNTIME_REQUEST_KIND_CLIENT_MESSAGE = 3;
 }
 
-// Current runner process and runtime; the authenticated service resolves ownership.
-message EditorRuntimeBridgeTarget {
-  string runner_id = 1;
-  string session_id = 2;
-  string editor_sid = 3;
-  uint64 lifecycle_generation = 4;
-  uint64 runtime_epoch = 5;
-  string runtime_instance_id = 6;
-  string instance_id = 7;
-}
-
-enum EditorRuntimeBridgeOutcome {
-  EDITOR_RUNTIME_BRIDGE_OUTCOME_UNSPECIFIED = 0;
-  EDITOR_RUNTIME_BRIDGE_OUTCOME_ACCEPTED = 1;
-  EDITOR_RUNTIME_BRIDGE_OUTCOME_DUPLICATE = 2;
-  EDITOR_RUNTIME_BRIDGE_OUTCOME_STALE = 3;
-  EDITOR_RUNTIME_BRIDGE_OUTCOME_FUTURE = 4;
-  EDITOR_RUNTIME_BRIDGE_OUTCOME_CONFLICT = 5;
-  EDITOR_RUNTIME_BRIDGE_OUTCOME_PREEMPTED = 6;
-  EDITOR_RUNTIME_BRIDGE_OUTCOME_CAPACITY = 7;
-  EDITOR_RUNTIME_BRIDGE_OUTCOME_EXHAUSTED = 8;
-  EDITOR_RUNTIME_BRIDGE_OUTCOME_INVALID = 9;
-}
-
-// Server-issued physical-connection identity; no field authorizes a native effect.
-message EditorRuntimeBridgeLease {
-  EditorRuntimeBridgeTarget target = 1;
-  string client_id = 2;
-  string bridge_connection_id = 3;
-  uint64 lease_revision = 4;
-  uint64 observation_revision = 5;
-  uint64 report_sequence = 6;
-  google.protobuf.Timestamp reserved_utc = 7;
-  google.protobuf.Timestamp first_active_utc = 8;
-  google.protobuf.Timestamp last_observed_utc = 9;
-  google.protobuf.Timestamp expires_utc = 10;
-}
-
-message EditorRuntimeBridgeResult {
-  EditorRuntimeBridgeOutcome outcome = 1;
-  uint64 activation_fence = 2;
-  // Subtract the entire local monotonic RPC duration from expires - server_now.
-  google.protobuf.Timestamp server_now_utc = 3;
-  EditorRuntimeBridgeLease lease = 4;
-}
-
 message EditorArtifactMetadata {
   string editor_sid = 1;
   google.protobuf.StringValue prompt_id = 2;

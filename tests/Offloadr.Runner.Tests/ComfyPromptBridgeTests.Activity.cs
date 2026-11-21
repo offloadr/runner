@@ -24,13 +24,13 @@ public sealed partial class ComfyPromptBridgeTests
         var sink = new BridgeSink();
         await using var relay = new ComfySessionEventRelay(
             (session, runtime) => observed.TrySetResult((session, runtime)),
-            RunnerId, "127.0.0.1", port, "test-process", _ => new SessionSealingStatus(), (_, _) => true);
+            RunnerId, "127.0.0.1", port, _ => new SessionSealingStatus(), (_, _) => true);
         relay.AttachSink(sink);
         await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "activity-client", command.LifecycleGeneration,
             command.RuntimeEpoch, command.RuntimeInstanceId, [], CancellationToken.None);
         var context = await listener.GetContextAsync().WaitAsync(TimeSpan.FromSeconds(3));
         using var socket = (await context.AcceptWebSocketAsync(null)).WebSocket;
-        await sink.Authority.Activations.Reader.ReadAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(3));
+        await sink.NextBridgeStateAsync();
         try
         {
             var bytes = Encoding.UTF8.GetBytes(completeSuppressedFrame ? "{\"type\":\"feature_flags\",\"data\":{}}" : "{");

@@ -101,6 +101,13 @@ internal sealed partial class SessionProcessManager
         }
     }
 
+    /// <summary>True while a stop of the session is running.</summary>
+    public bool IsStopping(string sessionId)
+    {
+        if (string.IsNullOrWhiteSpace(sessionId)) return false;
+        lock (_lifetimeGate) return _stoppingSessions.ContainsKey(sessionId.Trim());
+    }
+
     private void PruneCompletedRoots()
     {
         _starts.RemoveAll(start => start.Task.IsCompleted);

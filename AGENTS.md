@@ -55,7 +55,7 @@ The Offloadr runner: the agent that executes GPU work for the Offloadr control p
 
 - Cover duplicate and stale commands, acknowledgement replay, reconnect ordering, cancellation classes, and Stop during startup or restart.
 - Verify failed start/launch and unexpected-exit cleanup clears only the matching logical session and runtime identity.
-- Test runtime-kind gating, bridge connection identity (Active/Heartbeat/Inactive), and idempotent process/download/workspace/artifact cleanup.
+- Test runtime-kind gating, native connection bridge state and reconnects, the heartbeat's runtime status, and idempotent process/download/workspace/artifact cleanup.
 - Linux-native tests call `LinuxTestPrerequisites` and are ignored elsewhere; `RUNNER_NATIVE_TESTS_REQUIRED=1` turns a missing prerequisite into a failure (CI sets it).
 
 ## Validation commands

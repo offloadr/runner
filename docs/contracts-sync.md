@@ -6,7 +6,7 @@
 | --- | --- |
 | `runner/v1/runner_agent.proto` | `RunnerProtocol`, `RunnerControlService`, `RunnerArtifactService`, `RunnerWorkspaceService` and their messages, including the runtime telemetry snapshot |
 | `common/v1/{gpus,models,gpu_control}.proto` | shared enums and GPU control messages |
-| `editor_runtime/v1/editor_proxy.proto` | editor artifact metadata, runtime request kinds and the editor bridge types |
+| `editor_runtime/v1/editor_proxy.proto` | editor artifact metadata and runtime request kinds |
 
 These five files are identical on both sides. The control plane's `common/v1/prompt.proto` describes its own prompt records and is not part of the runner protocol.
 
@@ -29,6 +29,22 @@ The Offloadr control plane implements the server side of these services, so a co
 1. Change the `.proto` files here and the agent code that uses them in one pull request, and raise `RUNNER_PROTOCOL_CURRENT`.
 2. Keep the five shared protobuf definitions identical on both sides and regenerate every affected consumer. Change the current protocol directly, without legacy layouts or compatibility shims: an outdated runner is refused and updated, never served.
 3. Release the coordinated runner and control-plane changes together, in an announced window: a protocol change ends running sessions of runners that have not updated yet. [Image publishing](image-publishing.md#protocol-tags) explains how the images follow. Schema declarations alone do not mean the corresponding behavior is implemented.
+
+## Native connections and runtime status
+
+Protocol 4 leaves native editor sockets to the runner. The control plane no longer reserves or tracks them: the runner reports each new connection with a `bridge_state` session event, and the control plane sends a client's editor state again when the connection id changes ([native connections](bridge-connections.md)). Client messages name only the session, client and runtime.
+
+Every registration carries `RuntimeStatus` instead of the active session id: the session the runner holds, the runtime it runs and that runtime's phase.
+
+| Phase | When |
+| --- | --- |
+| `NONE` | No session, or a session held with no tracked editor process (after Quiesce) |
+| `STARTING` | A start or launch of the named runtime is running |
+| `READY` | The named runtime finished starting ready; `sealing` says what it got. Reported from the moment the startup knows its outcome, before the acknowledgement is sent, so a lost acknowledgement does not hold it back |
+| `FAILED` | The named runtime failed to start and the runner still holds its session; `message` (at most 512 bytes) says why |
+| `STOPPING` | A Stop of the session is running |
+
+The phase is a report: the acknowledgements stay the owners of start and launch results, and the control plane may complete a launch from a `READY` status only for the exact runtime it is launching.
 
 ## Deleted artifacts
 

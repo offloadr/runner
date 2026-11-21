@@ -39,7 +39,7 @@ public sealed partial class ComfyPromptBridgeTests
         Exception? cleanupFailure = null;
         var callbacks = 0;
         await using var relay = new ComfySessionEventRelay(static (_, _) => { }, RunnerId,
-            "127.0.0.1", port, "test-process", _ => new SessionSealingStatus(), isTrackedRuntime: (_, _) => true);
+            "127.0.0.1", port, _ => new SessionSealingStatus(), isTrackedRuntime: (_, _) => true);
         relay.AttachSink(new BridgeSink());
         void Withdraw(ComfySessionEventRelay.PromptTerminalEvent finished)
         {

@@ -231,7 +231,6 @@ static async Task<int> RunAgentAsync(string[] commandLine)
         options.RunnerId,
         sessionManager.ComfyHost,
         sessionManager.ComfyPort,
-        instanceId,
         sessionManager.GetSessionSealingStatus,
         sessionManager.IsTrackedRuntime,
         artifactUploadService.CaptureSessionRefresh);
