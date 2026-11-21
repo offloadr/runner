@@ -13,6 +13,10 @@ internal static class RunnerLog
         _loggerFactory = loggerFactory ?? NullLoggerFactory.Instance;
     }
 
+    /// <summary>A logger for code that takes an <see cref="ILogger"/>, writing where this class writes.</summary>
+    public static ILogger CreateLogger(string category)
+        => _loggerFactory.CreateLogger(string.IsNullOrWhiteSpace(category) ? DefaultCategory : category);
+
     public static void Info<TCategory>(string message)
     {
         _loggerFactory.CreateLogger<TCategory>().LogInformation("{Message}", message);

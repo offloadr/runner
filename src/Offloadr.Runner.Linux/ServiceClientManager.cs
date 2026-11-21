@@ -982,23 +982,25 @@ internal static partial class ServiceClientManager
                     }
                 });
             },
-            status: token => RunRunnerStatusLoopAsync(
-                sessionSink,
-                token,
-                runnerId,
-                instanceId,
-                version,
-                () => DescribeRuntimeStatus(
-                    logicalSessionState,
-                    commandWorkState,
-                    sessionManager.IsStopping,
-                    sessionManager.TrackedProcess),
-                resources,
-                supportedEditorTemplates,
+            status: token => RunnerRegistrationLoop.RunAsync(
+                sessionSink.RegisterRunnerAsync,
+                () => BuildStatusUpdateRequest(
+                    runnerId,
+                    instanceId,
+                    version,
+                    resources,
+                    () => DescribeRuntimeStatus(
+                        logicalSessionState,
+                        commandWorkState,
+                        sessionManager.IsStopping,
+                        sessionManager.TrackedProcess),
+                    supportedEditorTemplates,
+                    sessionManager.DescribeSealedStorage),
                 minBackoff,
                 maxBackoff,
                 initialStatusApplied,
-                sessionManager.DescribeSealedStorage,
+                RunnerLog.CreateLogger(nameof(ServiceClientManager)),
+                token,
                 response =>
                 {
                     // Cancel this lifetime before the required status lane returns;
@@ -1054,75 +1056,6 @@ internal static partial class ServiceClientManager
                 () => runnerLogRelay.DetachSink(sessionSink),
                 () => sessionRuntimeTelemetryRelay.DetachSink(sessionSink)
             ]).ConfigureAwait(false);
-    }
-
-    internal static async Task RunRunnerStatusLoopAsync(
-        IRunnerSessionSink sessionSink,
-        CancellationToken shutdown,
-        string runnerId,
-        string instanceId,
-        string version,
-        Func<RuntimeStatus> describeRuntime,
-        RunnerResources resources,
-        IReadOnlyList<string> supportedEditorTemplates,
-        TimeSpan minBackoff,
-        TimeSpan maxBackoff,
-        TaskCompletionSource initialStatusApplied,
-        Func<RunnerSealedStorage>? describeSealedStorage = null,
-        Action<RegisterRunnerResponse>? onProtocolRejected = null)
-    {
-        ArgumentNullException.ThrowIfNull(sessionSink);
-
-        var attempt = 0;
-        var rng = new Random();
-        var nextDelay = TimeSpan.Zero;
-
-        while (!shutdown.IsCancellationRequested)
-        {
-            try
-            {
-                if (nextDelay > TimeSpan.Zero)
-                {
-                    await Task.Delay(nextDelay, shutdown).ConfigureAwait(false);
-                }
-
-                var response = await sessionSink.RegisterRunnerAsync(
-                    BuildStatusUpdateRequest(runnerId, instanceId, version, resources, describeRuntime, supportedEditorTemplates, describeSealedStorage),
-                    shutdown).ConfigureAwait(false);
-
-                RunnerLog.Info(nameof(ServiceClientManager), $"Status update accepted={response.Accepted} message='{response.Message}' next={response.RefreshSeconds}s");
-                if (RunnerProtocolVersion.IsProtocolRejection(response))
-                {
-                    // Retrying cannot help: this build and Offloadr no longer share a protocol.
-                    RunnerLog.Error(nameof(ServiceClientManager),
-                        $"Offloadr refused this runner's protocol {RunnerProtocolVersion.Current} (Offloadr speaks {response.ServerProtocolVersion}): {response.Message}");
-                    onProtocolRejected?.Invoke(response);
-                    return;
-                }
-
-                if (!response.Accepted)
-                {
-                    throw new RunnerSessionRejectedException(response.Message);
-                }
-
-                initialStatusApplied.TrySetResult();
-                attempt = 0;
-                nextDelay = response.RefreshSeconds > 0
-                    ? TimeSpan.FromSeconds(response.RefreshSeconds)
-                    : TimeSpan.FromMinutes(1);
-            }
-            catch (OperationCanceledException) when (shutdown.IsCancellationRequested)
-            {
-                break;
-            }
-            catch (Exception ex)
-            {
-                attempt++;
-                nextDelay = RegistrationPolicy.ComputeBackoff(attempt, minBackoff, maxBackoff, rng.NextDouble());
-                RunnerLog.Error(nameof(ServiceClientManager), ex, $"Runner status update failed attempt {attempt}: {ex.Message}");
-                RunnerLog.Warning(nameof(ServiceClientManager), $"Retrying runner status update in {nextDelay.TotalSeconds:F1}s");
-            }
-        }
     }
 
     internal static async Task RunLocalModelSyncLoopAsync(
@@ -4019,53 +3952,26 @@ internal static partial class ServiceClientManager
         return $"{gb:F2} GB";
     }
 
+    /// <summary>The agent's heartbeat: the shared request, with this machine's memory read afresh each time.</summary>
     private static RegisterRunnerRequest BuildStatusUpdateRequest(
-        string runnerId,
-        string instanceId,
-        string version,
-        RunnerResources resources,
-        Func<RuntimeStatus> describeRuntime)
-        => BuildStatusUpdateRequest(
-            runnerId,
-            instanceId,
-            version,
-            resources,
-            describeRuntime,
-            ["comfyui-latest", "comfyui-master"]);
-
-    internal static RegisterRunnerRequest BuildStatusUpdateRequest(
         string runnerId,
         string instanceId,
         string version,
         RunnerResources resources,
         Func<RuntimeStatus> describeRuntime,
         IReadOnlyList<string> supportedEditorTemplates,
-        Func<RunnerSealedStorage>? describeSealedStorage = null)
+        Func<RunnerSealedStorage>? describeSealedStorage)
     {
-        // Refresh dynamic metrics each call
         resources.SystemRamBytes = ResourceDetection.GetTotalRamBytes();
-
-        var request = new RegisterRunnerRequest
-        {
-            RunnerId = runnerId,
-            InstanceId = instanceId,
-            Runtime = describeRuntime(),
-            Version = version,
-            Resources = resources,
-            ProtocolVersion = RunnerProtocolVersion.Current,
-        };
-        request.SupportedEditorTemplates.AddRange(supportedEditorTemplates);
-        try
-        {
-            request.SealedStorage = describeSealedStorage?.Invoke();
-        }
-        catch (Exception ex)
-        {
-            // A failed probe must not stop heartbeats; the runner then offers no sealed sessions.
-            RunnerLog.Warning(nameof(ServiceClientManager), $"Could not describe sealed storage: {ex.Message}");
-        }
-
-        return request;
+        return RunnerRegistrationLoop.BuildRequest(
+            runnerId,
+            instanceId,
+            version,
+            resources,
+            describeRuntime,
+            supportedEditorTemplates,
+            RunnerLog.CreateLogger(nameof(ServiceClientManager)),
+            describeSealedStorage);
     }
 
     private static SyncLocalModelsRequest BuildLocalModelsRequest(string runnerId, LocalModelSnapshot snapshot, bool fullSnapshot)
@@ -4082,7 +3988,4 @@ internal static partial class ServiceClientManager
         }
         return request;
     }
-
-    private sealed class RunnerSessionRejectedException(string message)
-        : Exception(string.IsNullOrWhiteSpace(message) ? "Runner session status update was rejected." : message);
 }

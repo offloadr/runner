@@ -1,7 +1,7 @@
 using Grpc.Core;
 using Grpc.Core.Interceptors;
+using Microsoft.Extensions.Logging.Abstractions;
 using Offloadr.Runner.Core;
-using Offloadr.Runner.Linux;
 using Offloadr.Runner.V1;
 
 namespace Offloadr.Runner.Tests;
@@ -11,8 +11,9 @@ public class RunnerProtocolHandshakeTests
     [Test]
     public void StatusAndCommandRequestsCarryThisBuildsProtocol()
     {
-        var request = ServiceClientManager.BuildStatusUpdateRequest(
-            Guid.NewGuid().ToString("n"), "process-1", "1.0.0", new RunnerResources(), () => new RuntimeStatus(), ["comfyui-latest"]);
+        var request = RunnerRegistrationLoop.BuildRequest(
+            Guid.NewGuid().ToString("n"), "process-1", "1.0.0", new RunnerResources(), () => new RuntimeStatus(), ["comfyui-latest"],
+            NullLogger.Instance);
 
         Assert.That(request.ProtocolVersion, Is.EqualTo((uint)RunnerProtocol.Current));
         Assert.That(RunnerProtocolVersion.Current, Is.GreaterThan(0u));
@@ -103,66 +104,119 @@ public class RunnerProtocolHandshakeTests
     [TestCase(RegistrationRejection.ServerOutdated)]
     public async Task AProtocolRejectionStopsTheStatusLoopInsteadOfRetrying(RegistrationRejection rejection)
     {
-        var sink = new RegistrationSink(_ => new RegisterRunnerResponse
-        {
-            Accepted = false,
-            Message = "Update the runner.",
-            Rejection = rejection,
-            ServerProtocolVersion = RunnerProtocolVersion.Current + 1,
-        });
+        var calls = 0;
         RegisterRunnerResponse? reported = null;
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
 
-        await ServiceClientManager.RunRunnerStatusLoopAsync(
-            sink, timeout.Token, Guid.NewGuid().ToString("n"), "process-1", "1.0.0", () => new RuntimeStatus(),
-            new RunnerResources(), ["comfyui-latest"], TimeSpan.FromMilliseconds(1), TimeSpan.FromMilliseconds(5),
-            new TaskCompletionSource(), onProtocolRejected: response => reported = response);
+        await RunLoopAsync(_ =>
+        {
+            calls++;
+            return new RegisterRunnerResponse
+            {
+                Accepted = false,
+                Message = "Update the runner.",
+                Rejection = rejection,
+                ServerProtocolVersion = RunnerProtocolVersion.Current + 1,
+            };
+        }, timeout.Token, response => reported = response);
 
         Assert.That(timeout.IsCancellationRequested, Is.False, "the loop returns by itself");
         Assert.That(reported?.Rejection, Is.EqualTo(rejection));
-        Assert.That(sink.Calls, Is.EqualTo(1));
+        Assert.That(calls, Is.EqualTo(1));
     }
 
     [Test]
     public async Task OtherRefusalsAreStillRetried()
     {
         using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-        var sink = new RegistrationSink(calls =>
-        {
-            if (calls == 3) stop.Cancel();
-            return new RegisterRunnerResponse { Accepted = false, Message = "Account access is not available." };
-        });
+        var calls = 0;
         var rejected = false;
 
-        await ServiceClientManager.RunRunnerStatusLoopAsync(
-            sink, stop.Token, Guid.NewGuid().ToString("n"), "process-1", "1.0.0", () => new RuntimeStatus(),
-            new RunnerResources(), ["comfyui-latest"], TimeSpan.FromMilliseconds(1), TimeSpan.FromMilliseconds(5),
-            new TaskCompletionSource(), onProtocolRejected: _ => rejected = true);
+        await RunLoopAsync(_ =>
+        {
+            if (++calls == 3) stop.Cancel();
+            return new RegisterRunnerResponse { Accepted = false, Message = "Account access is not available." };
+        }, stop.Token, _ => rejected = true);
 
-        Assert.That(sink.Calls, Is.GreaterThanOrEqualTo(3));
+        Assert.That(calls, Is.GreaterThanOrEqualTo(3));
         Assert.That(rejected, Is.False);
     }
 
-    /// <summary>Answers registration; every other call is not part of these tests.</summary>
-    private sealed class RegistrationSink(Func<int, RegisterRunnerResponse> answer) : IRunnerSessionSink
+    [Test]
+    public async Task TheFirstAcceptedRegistrationIsAnnounced_AndRefusalsBeforeItAreNot()
     {
-        public int Calls { get; private set; }
+        using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var initial = new TaskCompletionSource();
+        var calls = 0;
+        var announcedAt = 0;
+        var requests = new List<RegisterRunnerRequest>();
 
-        public Task<RegisterRunnerResponse> RegisterRunnerAsync(RegisterRunnerRequest request, CancellationToken cancellationToken)
-            => Task.FromResult(answer(++Calls));
+        await RunLoopAsync(request =>
+        {
+            requests.Add(request);
+            calls++;
+            if (calls == 3)
+            {
+                announcedAt = initial.Task.IsCompleted ? -1 : 3;
+                return new RegisterRunnerResponse { Accepted = true, RefreshSeconds = 1 };
+            }
 
-        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
-        public Task<SyncLocalModelsResponse> SyncLocalModelsAsync(SyncLocalModelsRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
-        public Task AckStartSessionAsync(AcknowledgeSessionStartRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
-        public Task AckStopSessionAsync(AcknowledgeSessionStopRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
-        public Task<GrantGpuPowerExecutionResponse> GrantGpuPowerExecutionAsync(GrantGpuPowerExecutionRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
-        public Task AckGpuPowerLimitAsync(AcknowledgeGpuPowerLimitRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
-        public Task<GrantPromptExecutionResponse> GrantPromptExecutionAsync(GrantPromptExecutionRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
-        public Task AckSubmitEditorActionAsync(AcknowledgePromptResultRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
-        public Task ReportModelDownloadAsync(ReportModelDownloadRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
-        public Task ReportSessionEventsAsync(ReportSessionEventsRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
-        public Task ReportSessionLogsAsync(ReportSessionLogsRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
-        public Task ReportRunnerLogsAsync(ReportRunnerLogsRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
-        public Task ReportRuntimeTelemetryAsync(ReportRuntimeTelemetryRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
+            if (calls == 4)
+            {
+                stop.Cancel();
+            }
+
+            return new RegisterRunnerResponse { Accepted = calls > 3, Message = "Try again." };
+        }, stop.Token, initialStatusApplied: initial);
+
+        Assert.That(announcedAt, Is.EqualTo(3), "nothing was announced before the first accepted registration");
+        Assert.That(initial.Task.IsCompletedSuccessfully, Is.True);
+        Assert.That(requests, Has.Count.EqualTo(4), "each heartbeat is built afresh");
+        Assert.That(requests.Distinct().Count(), Is.EqualTo(4));
     }
+
+    [Test]
+    public async Task AFailingRequestBuilderIsRetried_NotFatal()
+    {
+        using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var builds = 0;
+        var registered = 0;
+
+        await RunnerRegistrationLoop.RunAsync(
+            (_, _) =>
+            {
+                registered++;
+                stop.Cancel();
+                return Task.FromResult(new RegisterRunnerResponse { Accepted = true });
+            },
+            () => ++builds < 3 ? throw new InvalidOperationException("probe failed") : NewRequest(),
+            TimeSpan.FromMilliseconds(1),
+            TimeSpan.FromMilliseconds(5),
+            new TaskCompletionSource(),
+            NullLogger.Instance,
+            stop.Token);
+
+        Assert.That(builds, Is.EqualTo(3));
+        Assert.That(registered, Is.EqualTo(1));
+    }
+
+    private static RegisterRunnerRequest NewRequest()
+        => RunnerRegistrationLoop.BuildRequest(
+            Guid.NewGuid().ToString("n"), "process-1", "1.0.0", new RunnerResources(), () => new RuntimeStatus(), ["comfyui-latest"],
+            NullLogger.Instance);
+
+    private static Task RunLoopAsync(
+        Func<RegisterRunnerRequest, RegisterRunnerResponse> answer,
+        CancellationToken shutdown,
+        Action<RegisterRunnerResponse>? onProtocolRejected = null,
+        TaskCompletionSource? initialStatusApplied = null)
+        => RunnerRegistrationLoop.RunAsync(
+            (request, _) => Task.FromResult(answer(request)),
+            NewRequest,
+            TimeSpan.FromMilliseconds(1),
+            TimeSpan.FromMilliseconds(5),
+            initialStatusApplied ?? new TaskCompletionSource(),
+            NullLogger.Instance,
+            shutdown,
+            onProtocolRejected);
 }
