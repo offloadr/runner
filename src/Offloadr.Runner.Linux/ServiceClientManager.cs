@@ -364,6 +364,45 @@ internal static partial class ServiceClientManager
         /// published, or a Stop compared and its cutoff recorded, as one step.
         /// </summary>
         public object AdmissionGate { get; } = new();
+
+        // The Stops in progress, by session, each the join of every Stop of the session still
+        // running. Read and written only under AdmissionGate.
+        private readonly Dictionary<string, Task> _stopsInProgress = new(StringComparer.Ordinal);
+
+        /// <summary>
+        /// Registers a Stop of the session as in progress; a newer start of the session waits for
+        /// it before it touches the runtime. A second Stop chains onto the first. Caller holds
+        /// <see cref="AdmissionGate"/>.
+        /// </summary>
+        public void BeginStop(StopInProgress stop)
+        {
+            stop.Joined = _stopsInProgress.TryGetValue(stop.SessionId, out var earlier)
+                ? Task.WhenAll(earlier, stop.Done.Task)
+                : stop.Done.Task;
+            _stopsInProgress[stop.SessionId] = stop.Joined;
+        }
+
+        /// <summary>The Stops of the session still running, if any. Caller holds <see cref="AdmissionGate"/>.</summary>
+        public Task? StopsInProgress(string sessionId)
+            => _stopsInProgress.TryGetValue(sessionId.Trim(), out var stops) ? stops : null;
+
+        /// <summary>Ends a Stop's effect, releasing a start that waits for it. Idempotent.</summary>
+        public void EndStop(StopInProgress stop)
+        {
+            if (stop.Joined is null)
+            {
+                return;
+            }
+
+            stop.Done.TrySetResult();
+            lock (AdmissionGate)
+            {
+                if (_stopsInProgress.TryGetValue(stop.SessionId, out var current) && ReferenceEquals(current, stop.Joined))
+                {
+                    _stopsInProgress.Remove(stop.SessionId);
+                }
+            }
+        }
         public PromptCommandWorkSet Prompts { get; } = new(shutdown);
         // Retain successful Stops for the process lifetime, including reconnects.
         // Evicting a nonce would allow a delayed retry to stop a replacement runtime.
@@ -1939,23 +1978,15 @@ internal static partial class ServiceClientManager
         {
             if (!work.Completed)
             {
-                var outcome = await ExecuteStopSessionCommandAsync(command, deps).ConfigureAwait(false);
-                work.Completed = outcome != StopOutcome.NotCompleted;
-                // Only the Stop that tore the session down performed its cleanup and reports what
-                // the session lost. A superseded Stop did nothing: its saving evidence stays
-                // unknown, and the count stays for the Stop that ends the newer runtime.
-                if (outcome == StopOutcome.Superseded)
+                var inProgress = new StopInProgress(command.SessionId);
+                try
                 {
-                    work.Acknowledgement.CleanupDisposition = RunnerCleanupDisposition.Superseded;
-                    work.Acknowledgement.UnsavedArtifactsUnknown = true;
+                    await ExecuteAndCountStopAsync(command, work, inProgress, deps).ConfigureAwait(false);
                 }
-                else if (outcome == StopOutcome.Stopped)
+                finally
                 {
-                    var unsaved = deps.TakeUnsavedArtifacts?.Invoke(command.SessionId) ?? new UnsavedUploads(0, true);
-                    work.Acknowledgement.UnsavedArtifactCount = (uint)Math.Max(0, unsaved.Count);
-                    work.Acknowledgement.UnsavedArtifactsUnknown |= unsaved.Incomplete;
-                    work.Acknowledgement.CleanupDisposition = RunnerCleanupDisposition.Performed;
-                    work.CountTaken = true;
+                    // Also on failure and shutdown: a start waiting for this Stop goes on.
+                    deps.WorkState.EndStop(inProgress);
                 }
             }
 
@@ -1972,6 +2003,46 @@ internal static partial class ServiceClientManager
         }
     }
 
+    /// <summary>Runs a Stop and fills in its acknowledgement from what it did.</summary>
+    private static async Task ExecuteAndCountStopAsync(
+        StopSessionCommand command,
+        StopCommandWork work,
+        StopInProgress inProgress,
+        RuntimeCommandDependencies deps)
+    {
+        var outcome = await ExecuteStopSessionCommandAsync(command, inProgress, deps).ConfigureAwait(false);
+        work.Completed = outcome != StopOutcome.NotCompleted;
+        // Only the Stop that tore the session down performed its cleanup and reports what
+        // the session lost. A superseded Stop did nothing: its saving evidence stays
+        // unknown, and the count stays for the Stop that ends the newer runtime.
+        if (outcome == StopOutcome.Superseded)
+        {
+            work.Acknowledgement.CleanupDisposition = RunnerCleanupDisposition.Superseded;
+            work.Acknowledgement.UnsavedArtifactsUnknown = true;
+        }
+        else if (outcome == StopOutcome.Stopped)
+        {
+            var unsaved = deps.TakeUnsavedArtifacts?.Invoke(command.SessionId) ?? new UnsavedUploads(0, true);
+            work.Acknowledgement.UnsavedArtifactCount = (uint)Math.Max(0, unsaved.Count);
+            work.Acknowledgement.UnsavedArtifactsUnknown |= unsaved.Incomplete;
+            work.Acknowledgement.CleanupDisposition = RunnerCleanupDisposition.Performed;
+            work.CountTaken = true;
+        }
+    }
+
+    /// <summary>
+    /// A Stop of one session whose effect is not over yet: from the moment it records its cutoff
+    /// until its cleanup, its sealing removal and its count of unsaved artifacts are done.
+    /// </summary>
+    internal sealed class StopInProgress(string sessionId)
+    {
+        public string SessionId { get; } = sessionId.Trim();
+        public TaskCompletionSource Done { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        /// <summary>This Stop joined with the session's earlier ones; set once registered.</summary>
+        public Task? Joined { get; set; }
+    }
+
     private enum StopOutcome
     {
         NotCompleted,
@@ -1979,7 +2050,10 @@ internal static partial class ServiceClientManager
         Stopped,
     }
 
-    private static async Task<StopOutcome> ExecuteStopSessionCommandAsync(StopSessionCommand command, RuntimeCommandDependencies deps)
+    private static async Task<StopOutcome> ExecuteStopSessionCommandAsync(
+        StopSessionCommand command,
+        StopInProgress inProgress,
+        RuntimeCommandDependencies deps)
     {
         deps.Shutdown.ThrowIfCancellationRequested();
         var cutoff = command.UpToRuntimeOrder;
@@ -1995,8 +2069,11 @@ internal static partial class ServiceClientManager
             }
 
             // Recorded before cleanup, so a start at or below the cutoff is refused from now on,
-            // even when this cleanup fails and the Stop is sent again.
+            // even when this cleanup fails and the Stop is sent again. A newer start admitted from
+            // now on waits until this Stop's whole effect is over before it touches the runtime:
+            // the cleanup stops whatever the session runs, and the count covers all of it.
             deps.LogicalSessionState.RecordStopCutoff(command.SessionId, cutoff);
+            deps.WorkState.BeginStop(inProgress);
         }
 
         await deps.WorkState.Prompts.CancelAndWaitAsync(
@@ -2088,7 +2165,7 @@ internal static partial class ServiceClientManager
             outcome = deps.LogicalSessionState.AdmitStart(command.SessionId, runtime) switch
             {
                 StartAdmission.Same => FindAdoptedStartup(command, runtime, deps),
-                StartAdmission.Newer => PublishStartup(command, runtime, deps),
+                StartAdmission.Newer => PublishStartup(command, runtime, deps.WorkState.StopsInProgress(command.SessionId), deps),
                 _ => null,
             };
         }
@@ -2165,12 +2242,17 @@ internal static partial class ServiceClientManager
     /// <summary>
     /// Publishes a newer start's startup in the single startup slot and starts it. The startup
     /// it supersedes is cancelled and awaited before this one touches the runtime, so two
-    /// startups never overlap. The tracked task covers only the physical work; the
-    /// acknowledgement retry runs after it, detached, so Stop never waits for it.
+    /// startups never overlap. It then waits for <paramref name="stopsInProgress"/>, the Stops of
+    /// its session that were running when it was admitted: they stop whatever the session runs
+    /// and count all of its losses, so it touches nothing before they end. A Stop admitted later
+    /// sees this startup and is superseded or cancels it, so the wait never closes a cycle.
+    /// The tracked task covers only the physical work; the acknowledgement retry runs after it,
+    /// detached, so Stop never waits for it.
     /// </summary>
     private static Task<StartupOutcome> PublishStartup(
         StartRuntimeCommand command,
         RuntimeIdentity runtime,
+        Task? stopsInProgress,
         RuntimeCommandDependencies deps)
     {
         var tracked = new TrackedCommandWork(deps.Shutdown)
@@ -2196,7 +2278,9 @@ internal static partial class ServiceClientManager
             try
             {
                 await CancelTrackedWorkAsync(previous).ConfigureAwait(false);
-                var result = await StartRuntimeAsync(command, runtime, deps, tracked.Token).ConfigureAwait(false);
+                var result = await WaitForStopsAsync(stopsInProgress, tracked.Token).ConfigureAwait(false)
+                    ? await StartRuntimeAsync(command, runtime, deps, tracked.Token).ConfigureAwait(false)
+                    : new StartupOutcome(false, "The start was cancelled while a Stop of its session finished.");
                 // Recorded while this startup still holds the slot, so a repeated start sees
                 // either this startup in progress or its outcome.
                 deps.WorkState.RecordStartupOutcome(command.SessionId, runtime, result, deps.GetTrackedProcess, command.Sealing);
@@ -2207,6 +2291,28 @@ internal static partial class ServiceClientManager
                 try { await tracked.CompleteAsync().ConfigureAwait(false); }
                 finally { deps.WorkState.ClearActiveStartup(tracked); }
             }
+        }
+    }
+
+    /// <summary>
+    /// Waits for the Stops a start was admitted behind. False when the start was cancelled
+    /// meanwhile, by a later Stop, a newer start or shutdown; it has touched nothing then.
+    /// </summary>
+    private static async Task<bool> WaitForStopsAsync(Task? stopsInProgress, CancellationToken cancellationToken)
+    {
+        if (stopsInProgress is null)
+        {
+            return true;
+        }
+
+        try
+        {
+            await stopsInProgress.WaitAsync(cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            return false;
         }
     }
 
