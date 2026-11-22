@@ -14,10 +14,8 @@ public partial class ServiceClientManagerTests
     private static Func<string, RuntimeIdentity, Guid?> IsTracked(RuntimeCommandHarness harness)
         => harness.TrackedProcess;
 
-    private static void AssertRuntime(RuntimeStatus status, ulong generation, ulong epoch, string instance)
-        => Assert.That(
-            new RuntimeIdentity(status.LifecycleGeneration, status.RuntimeEpoch, status.RuntimeInstanceId),
-            Is.EqualTo(new RuntimeIdentity(generation, epoch, instance)));
+    private static void AssertRuntime(RuntimeStatus status, string runtimeId, ulong runtimeOrder)
+        => Assert.That(status.Runtime, Is.EqualTo(Rt(runtimeId, runtimeOrder).ToRef()));
 
     [Test]
     public void RuntimeStatus_WithoutASession_IsNone()
@@ -27,12 +25,12 @@ public partial class ServiceClientManagerTests
         {
             Assert.That(status.SessionId, Is.Empty);
             Assert.That(status.Phase, Is.EqualTo(RuntimePhase.None));
-            Assert.That(status.LifecycleGeneration, Is.Zero);
+            Assert.That(status.Runtime, Is.Null);
         });
     }
 
     [Test]
-    public async Task RuntimeStatus_IsStartingDuringALaunchAndReadyOnlyOnceItsOutcomeIsKnown()
+    public async Task RuntimeStatus_IsStartingDuringAStartAndReadyOnlyOnceItsOutcomeIsKnown()
     {
         var harness = new RuntimeCommandHarness { SealingStatus = new SessionSealingStatus { MemoryWorkspace = true } };
         var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -43,7 +41,7 @@ public partial class ServiceClientManagerTests
             await release.Task.WaitAsync(token);
         };
 
-        var launch = ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 3, InstanceA, revision: 1), harness.Deps);
+        var launch = ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceA, 3), harness.Deps);
         await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
         var starting = Status(harness);
         Assert.Multiple(() =>
@@ -52,11 +50,11 @@ public partial class ServiceClientManagerTests
             Assert.That(starting.Phase, Is.EqualTo(RuntimePhase.Starting));
             Assert.That(starting.Sealing, Is.Null);
         });
-        AssertRuntime(starting, 7, 3, InstanceA);
+        AssertRuntime(starting, InstanceA, 3);
 
         release.TrySetResult();
         await launch.WaitAsync(TimeSpan.FromSeconds(5));
-        Assert.That((await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 1)).Ready, Is.True);
+        Assert.That((await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1)).Ready, Is.True);
         var ready = Status(harness);
         Assert.Multiple(() =>
         {
@@ -64,7 +62,7 @@ public partial class ServiceClientManagerTests
             Assert.That(ready.Sealing, Is.EqualTo(new SessionSealingStatus { MemoryWorkspace = true }));
             Assert.That(ready.Message, Is.Empty);
         });
-        AssertRuntime(ready, 7, 3, InstanceA);
+        AssertRuntime(ready, InstanceA, 3);
     }
 
     [Test]
@@ -73,10 +71,10 @@ public partial class ServiceClientManagerTests
         // The heartbeat is the second way a ready runtime reaches the platform, so a
         // lost acknowledgement must not hold READY back.
         var harness = new RuntimeCommandHarness();
-        harness.Sink.FailWhen = request => request is AcknowledgeEditorRuntimeLaunchRequest;
+        harness.Sink.FailWhen = request => request is AcknowledgeRuntimeStartRequest;
 
-        var launch = ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 3, InstanceA, revision: 1), harness.Deps);
-        await WaitUntilAsync(() => harness.Sink.Attempts.OfType<AcknowledgeEditorRuntimeLaunchRequest>().Any());
+        var launch = ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceA, 3), harness.Deps);
+        await WaitUntilAsync(() => harness.Sink.Attempts.OfType<AcknowledgeRuntimeStartRequest>().Any());
 
         Assert.That(Status(harness).Phase, Is.EqualTo(RuntimePhase.Ready));
         await harness.Shutdown.CancelAsync();
@@ -84,7 +82,7 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
-    public async Task RuntimeStatus_AfterAFailedLaunchThatKeepsItsSession_IsFailedWithItsMessage()
+    public async Task RuntimeStatus_AfterAFailedStartThatKeepsItsSession_IsFailedWithItsMessage()
     {
         var harness = new RuntimeCommandHarness
         {
@@ -92,8 +90,8 @@ public partial class ServiceClientManagerTests
             BeforeStop = (_, _) => throw new IOException("signal failed"),
         };
 
-        await ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 3, InstanceA, revision: 1), harness.Deps);
-        var ack = await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 1);
+        await ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceA, 3), harness.Deps);
+        var ack = await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
 
         var status = Status(harness);
         Assert.Multiple(() =>
@@ -103,35 +101,79 @@ public partial class ServiceClientManagerTests
             Assert.That(status.Message, Is.Not.Empty);
             Assert.That(status.Sealing, Is.Null);
         });
-        AssertRuntime(status, 7, 3, InstanceA);
+        AssertRuntime(status, InstanceA, 3);
     }
 
     [Test]
-    public async Task RuntimeStatus_AfterQuiesce_KeepsTheSessionWithNoRuntimePhase()
+    public async Task RuntimeStatus_FollowsARelaunchFromStartingToReadyAndAStopToNoSession()
     {
         var harness = new RuntimeCommandHarness();
-        await ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 3, InstanceA, revision: 1), harness.Deps);
-        await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 1);
+        await ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceA, 3), harness.Deps);
+        await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
         Assert.That(Status(harness).Phase, Is.EqualTo(RuntimePhase.Ready));
 
-        await ServiceClientManager.HandleQuiesceRuntimeCommandAsync(Quiesce(7, 3, InstanceA, revision: 1), harness.Deps);
-        Assert.That((await harness.Sink.WaitForAsync(harness.Sink.QuiesceAcks, 1)).Quiesced, Is.True);
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        harness.BeforeStart = async (_, token) =>
+        {
+            entered.TrySetResult();
+            await release.Task.WaitAsync(token);
+        };
+        var relaunch = ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceB, 4), harness.Deps);
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var starting = Status(harness);
+        Assert.That(starting.Phase, Is.EqualTo(RuntimePhase.Starting));
+        AssertRuntime(starting, InstanceB, 4);
+
+        release.TrySetResult();
+        await relaunch.WaitAsync(TimeSpan.FromSeconds(5));
+        var ready = Status(harness);
+        Assert.That(ready.Phase, Is.EqualTo(RuntimePhase.Ready));
+        AssertRuntime(ready, InstanceB, 4);
+
+        await ServiceClientManager.HandleStopSessionCommandAsync(Stop(4), harness.Deps);
+        var stopped = Status(harness);
+        Assert.Multiple(() =>
+        {
+            Assert.That(stopped.SessionId, Is.Empty);
+            Assert.That(stopped.Phase, Is.EqualTo(RuntimePhase.None));
+            Assert.That(stopped.Runtime, Is.Null);
+        });
+    }
+
+    [Test]
+    public async Task RuntimeStatus_AfterARelaunchThatFailsAndKeepsItsSession_IsFailedForTheNewRuntime()
+    {
+        var harness = new RuntimeCommandHarness();
+        await ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceA, 3), harness.Deps);
+        await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
+        harness.BeforeStart = (_, _) => throw new TimeoutException("not ready");
+        // The failed relaunch's own child cannot be stopped, so the session stays held.
+        harness.BeforeStop = (_, _) => harness.Tracked(CommandSessionId) is { } tracked && tracked.SameRuntime(Rt(InstanceB, 4))
+            ? throw new IOException("signal failed")
+            : Task.CompletedTask;
+        harness.TrackBeforeStart = true;
+
+        await ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceB, 4), harness.Deps);
+        await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 2);
 
         var status = Status(harness);
         Assert.Multiple(() =>
         {
             Assert.That(status.SessionId, Is.EqualTo(CommandSessionId));
-            Assert.That(status.Phase, Is.EqualTo(RuntimePhase.None));
+            Assert.That(status.Phase, Is.EqualTo(RuntimePhase.Failed));
+            Assert.That(status.Message, Is.EqualTo("not ready"));
         });
+        AssertRuntime(status, InstanceB, 4);
     }
 
     [Test]
     public void RuntimeStatus_WhileTheSessionStops_IsStopping()
     {
-        var harness = RunningHarness(7, 3, InstanceA);
+        var harness = RunningHarness(InstanceA, 73);
         var status = Status(harness, stopping: true);
         Assert.That(status.Phase, Is.EqualTo(RuntimePhase.Stopping));
-        AssertRuntime(status, 7, 3, InstanceA);
+        AssertRuntime(status, InstanceA, 73);
     }
 
     [Test]
@@ -139,7 +181,7 @@ public partial class ServiceClientManagerTests
     {
         // A runtime this process did not start (or whose outcome it never decided)
         // is never reported ready.
-        var status = Status(RunningHarness(7, 3, InstanceA));
+        var status = Status(RunningHarness(InstanceA, 73));
         Assert.That(status.Phase, Is.EqualTo(RuntimePhase.None));
     }
 
@@ -147,10 +189,9 @@ public partial class ServiceClientManagerTests
     public async Task RuntimeStatus_ForAnOutcomeOfAnOlderRuntime_IsNone()
     {
         var harness = new RuntimeCommandHarness();
-        await ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 3, InstanceA, revision: 1), harness.Deps);
-        await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 1);
-        harness.Logical.SetActiveRuntime(CommandSessionId, 7, 4, InstanceB);
-        harness.Track(CommandSessionId, new RuntimeIdentity(7, 4, InstanceB));
+        await ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceA, 73), harness.Deps);
+        await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
+        harness.Run(CommandSessionId, new RuntimeIdentity(InstanceB, 74));
 
         Assert.That(Status(harness).Phase, Is.EqualTo(RuntimePhase.None));
     }
@@ -160,11 +201,11 @@ public partial class ServiceClientManagerTests
     {
         // A command arriving between slot release and acknowledgement must see the outcome.
         var harness = new RuntimeCommandHarness();
-        harness.Sink.FailWhen = request => request is AcknowledgeEditorRuntimeLaunchRequest;
-        var launch = ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 3, InstanceA, revision: 1), harness.Deps);
+        harness.Sink.FailWhen = request => request is AcknowledgeRuntimeStartRequest;
+        var launch = ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceA, 73), harness.Deps);
         await WaitUntilAsync(() => harness.WorkState.GetActiveStartup() is null && harness.Calls.Any(call => call.StartsWith("start:", StringComparison.Ordinal)));
 
-        Assert.That(harness.WorkState.StartupOutcome(CommandSessionId, new RuntimeIdentity(7, 3, InstanceA))?.Outcome.Ready, Is.True);
+        Assert.That(harness.WorkState.StartupOutcome(CommandSessionId, new RuntimeIdentity(InstanceA, 73))?.Outcome.Ready, Is.True);
         await harness.Shutdown.CancelAsync();
         await launch.WaitAsync(TimeSpan.FromSeconds(5));
     }
@@ -172,8 +213,8 @@ public partial class ServiceClientManagerTests
     [Test]
     public void RuntimeStatus_AStartupThatBeginsDuringTheProcessCheckIsNeverReportedReady()
     {
-        var harness = RunningHarness(7, 3, InstanceA);
-        var runtime = new RuntimeIdentity(7, 3, InstanceA);
+        var harness = RunningHarness(InstanceA, 73);
+        var runtime = new RuntimeIdentity(InstanceA, 73);
         harness.WorkState.RecordStartupOutcome(CommandSessionId, runtime, new ServiceClientManager.StartupOutcome(true, ""), IsTracked(harness));
         var relaunched = false;
         var status = ServiceClientManager.DescribeRuntimeStatus(harness.Logical, harness.WorkState, _ => false, (session, checkedRuntime) =>
@@ -198,19 +239,19 @@ public partial class ServiceClientManagerTests
     [Test]
     public void RuntimeStatus_ARelaunchedProcessOfTheSameRuntimeIsNotReadyFromTheOldOutcome()
     {
-        var harness = RunningHarness(7, 3, InstanceA);
-        var runtime = new RuntimeIdentity(7, 3, InstanceA);
+        var harness = RunningHarness(InstanceA, 73);
+        var runtime = new RuntimeIdentity(InstanceA, 73);
         harness.WorkState.RecordStartupOutcome(CommandSessionId, runtime, new ServiceClientManager.StartupOutcome(true, ""), IsTracked(harness));
         Assert.That(Status(harness).Phase, Is.EqualTo(RuntimePhase.Ready));
 
-        // Quiesce, then a relaunch of the same runtime starts a new process that is not ready
-        // yet, while the startup slot belongs to another session's start.
+        // A new process of the same runtime is not ready yet, while the startup slot belongs
+        // to another session's start.
         harness.Untrack(CommandSessionId);
         harness.Track(CommandSessionId, runtime);
         harness.WorkState.ReplaceActiveStartup(new ServiceClientManager.TrackedCommandWork(CancellationToken.None)
         {
             SessionId = "33333333333343338333333333333333",
-            RuntimeIdentity = new RuntimeIdentity(1, 1, InstanceB),
+            RuntimeIdentity = new RuntimeIdentity(InstanceB, 11),
             Task = new TaskCompletionSource().Task,
         });
 
@@ -220,23 +261,23 @@ public partial class ServiceClientManagerTests
     [Test]
     public void RuntimeStatus_ADelayedOutcomeOfAnOlderStartupDoesNotReplaceTheCurrentRuntimes()
     {
-        var harness = RunningHarness(7, 4, InstanceB);
-        harness.WorkState.RecordStartupOutcome(CommandSessionId, new RuntimeIdentity(7, 4, InstanceB),
+        var harness = RunningHarness(InstanceB, 74);
+        harness.WorkState.RecordStartupOutcome(CommandSessionId, new RuntimeIdentity(InstanceB, 74),
             new ServiceClientManager.StartupOutcome(true, "", new SessionSealingStatus()), IsTracked(harness));
         // The superseded startup's continuation records its result afterwards.
-        harness.WorkState.RecordStartupOutcome(CommandSessionId, new RuntimeIdentity(7, 3, InstanceA),
+        harness.WorkState.RecordStartupOutcome(CommandSessionId, new RuntimeIdentity(InstanceA, 73),
             new ServiceClientManager.StartupOutcome(false, "cancelled"), IsTracked(harness));
 
         var status = Status(harness);
         Assert.That(status.Phase, Is.EqualTo(RuntimePhase.Ready));
-        AssertRuntime(status, 7, 4, InstanceB);
+        AssertRuntime(status, InstanceB, 74);
     }
 
     [Test]
     public void RuntimeStatus_ARefusedCommandForARunningReadyRuntimeKeepsItReady()
     {
-        var harness = RunningHarness(7, 3, InstanceA);
-        var runtime = new RuntimeIdentity(7, 3, InstanceA);
+        var harness = RunningHarness(InstanceA, 73);
+        var runtime = new RuntimeIdentity(InstanceA, 73);
         harness.WorkState.RecordStartupOutcome(CommandSessionId, runtime, new ServiceClientManager.StartupOutcome(true, ""), IsTracked(harness));
         harness.WorkState.RecordStartupOutcome(CommandSessionId, runtime,
             new ServiceClientManager.StartupOutcome(false, "The session is already running with other sealing."), IsTracked(harness));
@@ -247,10 +288,10 @@ public partial class ServiceClientManagerTests
     [Test]
     public void RuntimeStatus_AFailureAfterTheReadyRuntimesProcessIsGoneIsReported()
     {
-        var harness = RunningHarness(7, 3, InstanceA);
-        var runtime = new RuntimeIdentity(7, 3, InstanceA);
+        var harness = RunningHarness(InstanceA, 73);
+        var runtime = new RuntimeIdentity(InstanceA, 73);
         harness.WorkState.RecordStartupOutcome(CommandSessionId, runtime, new ServiceClientManager.StartupOutcome(true, ""), IsTracked(harness));
-        // A retried launch of the same runtime failed and its cleanup took the process down.
+        // A later failure of the same runtime came after its cleanup took the process down.
         harness.Untrack(CommandSessionId);
         harness.WorkState.RecordStartupOutcome(CommandSessionId, runtime, new ServiceClientManager.StartupOutcome(false, "not ready"), IsTracked(harness));
 
@@ -263,13 +304,13 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
-    public void RuntimeStatus_ManyFailedNewerLaunchesNeverEvictTheRunningRuntimesOutcome()
+    public void RuntimeStatus_ManyFailedNewerStartsNeverEvictTheRunningRuntimesOutcome()
     {
-        var harness = RunningHarness(7, 3, InstanceA);
-        harness.WorkState.RecordStartupOutcome(CommandSessionId, new RuntimeIdentity(7, 3, InstanceA),
+        var harness = RunningHarness(InstanceA, 73);
+        harness.WorkState.RecordStartupOutcome(CommandSessionId, new RuntimeIdentity(InstanceA, 73),
             new ServiceClientManager.StartupOutcome(true, ""), IsTracked(harness));
-        for (ulong epoch = 4; epoch < 20; epoch++)
-            harness.WorkState.RecordStartupOutcome(CommandSessionId, new RuntimeIdentity(7, epoch, Guid.NewGuid().ToString("n")),
+        for (ulong order = 74; order < 90; order++)
+            harness.WorkState.RecordStartupOutcome(CommandSessionId, new RuntimeIdentity(Guid.NewGuid().ToString("n"), order),
                 new ServiceClientManager.StartupOutcome(false, "another runtime is running"), IsTracked(harness));
 
         Assert.That(Status(harness).Phase, Is.EqualTo(RuntimePhase.Ready));
@@ -278,8 +319,8 @@ public partial class ServiceClientManagerTests
     [Test]
     public void RuntimeStatus_AnExactRetryAfterAFailureCanBecomeReady()
     {
-        var harness = RunningHarness(7, 3, InstanceA);
-        var runtime = new RuntimeIdentity(7, 3, InstanceA);
+        var harness = RunningHarness(InstanceA, 73);
+        var runtime = new RuntimeIdentity(InstanceA, 73);
         harness.WorkState.RecordStartupOutcome(CommandSessionId, runtime, new ServiceClientManager.StartupOutcome(false, "not ready"), IsTracked(harness));
         Assert.That(Status(harness).Phase, Is.EqualTo(RuntimePhase.Failed));
         harness.WorkState.RecordStartupOutcome(CommandSessionId, runtime, new ServiceClientManager.StartupOutcome(true, ""), IsTracked(harness));

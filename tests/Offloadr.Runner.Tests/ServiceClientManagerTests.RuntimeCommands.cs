@@ -10,49 +10,36 @@ public partial class ServiceClientManagerTests
     private const string CommandSessionId = "22222222222242228222222222222222";
     private const string InstanceA = "aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaa";
     private const string InstanceB = "bbbbbbbbbbbb4bbb8bbbbbbbbbbbbbbb";
+    private const string InstanceC = "cccccccccccc4ccc8ccccccccccccccc";
 
     [Test]
-    public async Task LaunchRuntime_AcknowledgesReadyAndRetainsIdentity()
+    public async Task Start_AcknowledgesReadyAndRetainsIdentity()
     {
         var harness = new RuntimeCommandHarness();
 
-        await ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 3, InstanceA, revision: 1), harness.Deps);
+        await ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceA, 3), harness.Deps);
 
-        var ack = await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 1);
+        var ack = await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
         Assert.Multiple(() =>
         {
             Assert.That(ack.Ready, Is.True);
-            Assert.That(ack.RuntimeEpoch, Is.EqualTo(3));
-            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(new RuntimeIdentity(7, 3, InstanceA)));
+            Assert.That(ack.Runtime, Is.EqualTo(Rt(InstanceA, 3).ToRef()));
+            Assert.That(ack.InstanceId, Is.EqualTo("process-1"));
+            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(Rt(InstanceA, 3)));
             Assert.That(harness.Logical.GetActiveSessionId(), Is.EqualTo(CommandSessionId));
             Assert.That(harness.Identities.TryGet(CommandSessionId, out var identity), Is.True);
-            Assert.That(identity, Is.EqualTo(new RuntimeIdentity(7, 3, InstanceA)));
-        });
-    }
-
-    [Test]
-    public async Task Quiesce_WhenStopFails_AcknowledgesNotQuiescedAndKeepsState()
-    {
-        var harness = RunningHarness(7, 3, InstanceA);
-        harness.BeforeStop = (_, _) => throw new IOException("signal failed");
-
-        await ServiceClientManager.HandleQuiesceRuntimeCommandAsync(Quiesce(7, 3, InstanceA, revision: 1), harness.Deps);
-
-        var ack = await harness.Sink.WaitForAsync(harness.Sink.QuiesceAcks, 1);
-        Assert.Multiple(() =>
-        {
-            Assert.That(ack.Quiesced, Is.False);
-            Assert.That(harness.Logical.GetActiveSessionId(), Is.EqualTo(CommandSessionId));
-            Assert.That(harness.Identities.TryGet(CommandSessionId, out _), Is.True);
+            Assert.That(identity, Is.EqualTo(Rt(InstanceA, 3)));
+            // Kept only to match GPU power commands to the session.
+            Assert.That(harness.Identities.LifecycleGeneration(CommandSessionId), Is.EqualTo(7));
         });
     }
 
     [Test]
     public async Task Stop_WhenStopFails_KeepsStateAndDoesNotAcknowledge()
     {
-        var harness = RunningHarness(7, 3, InstanceA);
+        var harness = RunningHarness(InstanceA, 3);
         harness.BeforeStop = (_, _) => throw new IOException("signal failed");
-        var stop = Stop(7, 3, InstanceA);
+        var stop = Stop(3);
 
         await ServiceClientManager.HandleStopSessionCommandAsync(stop, harness.Deps);
 
@@ -76,7 +63,20 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
-    public async Task FailedLaunch_WhenCleanupStopFails_KeepsStateUntilTheProcessExits()
+    public async Task FailedStop_StillFencesTheSessionsOlderStarts()
+    {
+        var harness = RunningHarness(InstanceA, 3);
+        harness.BeforeStop = (_, _) => throw new IOException("signal failed");
+
+        await ServiceClientManager.HandleStopSessionCommandAsync(Stop(5), harness.Deps);
+
+        Assert.That(
+            harness.Logical.AdmitStart(CommandSessionId, Rt(InstanceB, 4)),
+            Is.EqualTo(ServiceClientManager.StartAdmission.Stale));
+    }
+
+    [Test]
+    public async Task FailedStart_WhenCleanupStopFails_KeepsStateUntilTheProcessExits()
     {
         var harness = new RuntimeCommandHarness
         {
@@ -84,9 +84,9 @@ public partial class ServiceClientManagerTests
             BeforeStop = (_, _) => throw new IOException("signal failed"),
         };
 
-        await ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 3, InstanceA, revision: 1), harness.Deps);
+        await ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceA, 3), harness.Deps);
 
-        var ack = await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 1);
+        var ack = await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
         Assert.Multiple(() =>
         {
             Assert.That(ack.Ready, Is.False);
@@ -96,35 +96,34 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
-    public async Task ConcurrentLaunches_CancelAndAwaitThePreviousStartupBeforeStarting()
+    public async Task NewerStartDuringAStartup_CancelsAndAwaitsThePreviousStartupBeforeStarting()
     {
         var harness = new RuntimeCommandHarness();
         var firstEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         harness.BeforeStart = async (command, token) =>
         {
-            if (command.RuntimeEpoch == 3)
+            if (command.Runtime.RuntimeOrder == 3)
             {
                 firstEntered.TrySetResult();
                 await Task.Delay(Timeout.Infinite, token);
             }
         };
 
-        var first = ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 3, InstanceA, revision: 1), harness.Deps);
+        var first = ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceA, 3), harness.Deps);
         await firstEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
-        var second = ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 4, InstanceB, revision: 2), harness.Deps);
+        var second = ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceB, 4), harness.Deps);
         await Task.WhenAll(first, second).WaitAsync(TimeSpan.FromSeconds(10));
 
         var calls = harness.Calls.ToList();
         Assert.Multiple(() =>
         {
-            Assert.That(harness.Sink.LaunchAcks.Single(ack => ack.RuntimeEpoch == 3).Ready, Is.False);
-            Assert.That(harness.Sink.LaunchAcks.Single(ack => ack.RuntimeEpoch == 4).Ready, Is.True);
-            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(new RuntimeIdentity(7, 4, InstanceB)));
-            Assert.That(harness.Logical.TryGetRuntime(CommandSessionId, out var logical, out var revision), Is.True);
-            Assert.That(logical, Is.EqualTo(new RuntimeIdentity(7, 4, InstanceB)));
-            Assert.That(revision, Is.EqualTo(2));
+            Assert.That(harness.Sink.StartAcks.Single(ack => ack.Runtime.RuntimeOrder == 3).Ready, Is.False);
+            Assert.That(harness.Sink.StartAcks.Single(ack => ack.Runtime.RuntimeOrder == 4).Ready, Is.True);
+            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(Rt(InstanceB, 4)));
+            Assert.That(harness.Logical.TryGetRuntime(CommandSessionId, out var logical), Is.True);
+            Assert.That(logical, Is.EqualTo(Rt(InstanceB, 4)));
             Assert.That(harness.Identities.TryGet(CommandSessionId, out var identity), Is.True);
-            Assert.That(identity, Is.EqualTo(new RuntimeIdentity(7, 4, InstanceB)));
+            Assert.That(identity, Is.EqualTo(Rt(InstanceB, 4)));
             // The superseded startup finished its cleanup before the newer one started.
             Assert.That(calls.IndexOf("start:4"), Is.GreaterThan(calls.IndexOf("stop:" + CommandSessionId)));
             Assert.That(calls.IndexOf("stop:" + CommandSessionId), Is.GreaterThan(calls.IndexOf("start:3")));
@@ -132,28 +131,119 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
-    public async Task StaleLaunch_DoesNotReplaceTheNewerRuntimeOrItsIdentity()
+    public async Task NewerStartForTheSameSession_StopsTheOldChildThenLaunches()
     {
-        var harness = RunningHarness(7, 4, InstanceB);
+        var harness = RunningHarness(InstanceA, 3);
+        var oldPrompt = harness.StartPrompt(InstanceA, 3);
+        await using var oldRequest = harness.TransientCancellation.Acquire(CommandSessionId, Rt(InstanceA, 3));
 
-        await ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 3, InstanceA, revision: 1), harness.Deps);
-
-        var ack = await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 1);
+        var relaunch = ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceB, 4), harness.Deps);
+        await oldPrompt.WaitAsync(TimeSpan.FromSeconds(5));
+        await WaitUntilAsync(() => oldRequest.Token.IsCancellationRequested);
+        await Task.Delay(50);
         Assert.Multiple(() =>
         {
-            Assert.That(ack.Ready, Is.False);
-            Assert.That(ack.RuntimeEpoch, Is.EqualTo(3));
-            Assert.That(harness.Calls, Is.Empty);
-            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(new RuntimeIdentity(7, 4, InstanceB)));
-            Assert.That(harness.Logical.TryGetRuntime(CommandSessionId, out var logical, out _), Is.True);
-            Assert.That(logical, Is.EqualTo(new RuntimeIdentity(7, 4, InstanceB)));
+            Assert.That(harness.Calls, Is.Empty, "The old child is stopped only once its relayed requests drained.");
+            Assert.That(relaunch.IsCompleted, Is.False);
+        });
+
+        await oldRequest.DisposeAsync();
+        await relaunch.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var calls = harness.Calls.ToList();
+        var ack = await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
+        Assert.Multiple(() =>
+        {
+            Assert.That(ack.Ready, Is.True);
+            Assert.That(ack.Runtime, Is.EqualTo(Rt(InstanceB, 4).ToRef()));
+            Assert.That(calls.IndexOf("stop:" + CommandSessionId), Is.GreaterThanOrEqualTo(0));
+            Assert.That(calls.IndexOf("start:4"), Is.GreaterThan(calls.IndexOf("stop:" + CommandSessionId)));
+            Assert.That(calls, Does.Contain("uploads:" + CommandSessionId), "The old runtime's session is cleaned up.");
+            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(Rt(InstanceB, 4)));
+            Assert.That(harness.Logical.TryGetRuntime(CommandSessionId, out var logical), Is.True);
+            Assert.That(logical, Is.EqualTo(Rt(InstanceB, 4)));
             Assert.That(harness.Identities.TryGet(CommandSessionId, out var identity), Is.True);
-            Assert.That(identity, Is.EqualTo(new RuntimeIdentity(7, 4, InstanceB)));
+            Assert.That(identity, Is.EqualTo(Rt(InstanceB, 4)));
         });
     }
 
     [Test]
-    public async Task StaleLaunch_DoesNotCancelTheNewerStartup()
+    public async Task NewerStartForTheSameSession_KeepsPromptsForItsOwnRuntime()
+    {
+        var harness = RunningHarness(InstanceA, 3);
+        var oldPrompt = harness.StartPrompt(InstanceA, 3);
+        var newPrompt = harness.StartPrompt(InstanceB, 4);
+
+        await ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceB, 4), harness.Deps).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(oldPrompt.IsCompleted, Is.True);
+            Assert.That(newPrompt.IsCompleted, Is.False);
+        });
+        await harness.Shutdown.CancelAsync();
+    }
+
+    [Test]
+    public async Task NewerStart_WhenTheOldChildCannotBeStopped_FailsAndKeepsTheOldRuntime()
+    {
+        var harness = RunningHarness(InstanceA, 3);
+        harness.BeforeStop = (_, _) => throw new IOException("signal failed");
+
+        await ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceB, 4), harness.Deps);
+
+        var ack = await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
+        Assert.Multiple(() =>
+        {
+            Assert.That(ack.Ready, Is.False);
+            Assert.That(harness.Calls.Where(call => call.StartsWith("start:", StringComparison.Ordinal)), Is.Empty);
+            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(Rt(InstanceA, 3)));
+            Assert.That(harness.Logical.TryGetRuntime(CommandSessionId, out var logical), Is.True);
+            Assert.That(logical, Is.EqualTo(Rt(InstanceA, 3)), "The session stays visible under its running identity.");
+            Assert.That(harness.Identities.TryGet(CommandSessionId, out var identity), Is.True);
+            Assert.That(identity, Is.EqualTo(Rt(InstanceA, 3)));
+        });
+    }
+
+    [Test]
+    public async Task StaleStart_DoesNotReplaceTheNewerRuntimeOrItsIdentity()
+    {
+        var harness = RunningHarness(InstanceB, 4);
+
+        await ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceA, 3), harness.Deps);
+
+        var ack = await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
+        Assert.Multiple(() =>
+        {
+            Assert.That(ack.Ready, Is.False);
+            Assert.That(ack.Runtime, Is.EqualTo(Rt(InstanceA, 3).ToRef()));
+            Assert.That(harness.Calls, Is.Empty);
+            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(Rt(InstanceB, 4)));
+            Assert.That(harness.Logical.TryGetRuntime(CommandSessionId, out var logical), Is.True);
+            Assert.That(logical, Is.EqualTo(Rt(InstanceB, 4)));
+            Assert.That(harness.Identities.TryGet(CommandSessionId, out var identity), Is.True);
+            Assert.That(identity, Is.EqualTo(Rt(InstanceB, 4)));
+        });
+    }
+
+    [Test]
+    public async Task StartOfAnotherRuntimeAtTheSameOrder_IsRefusedAsStale()
+    {
+        var harness = RunningHarness(InstanceA, 3);
+
+        await ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceB, 3), harness.Deps);
+
+        var ack = await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
+        Assert.Multiple(() =>
+        {
+            Assert.That(ack.Ready, Is.False);
+            Assert.That(harness.Calls, Is.Empty);
+            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(Rt(InstanceA, 3)));
+        });
+    }
+
+    [Test]
+    public async Task StaleStart_DoesNotCancelTheNewerStartup()
     {
         var harness = new RuntimeCommandHarness();
         var newerEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -164,22 +254,22 @@ public partial class ServiceClientManagerTests
             await releaseNewer.Task.WaitAsync(token);
         };
 
-        var newer = ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 4, InstanceB, revision: 2), harness.Deps);
+        var newer = ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceB, 4), harness.Deps);
         await newerEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
-        await ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 3, InstanceA, revision: 1), harness.Deps);
+        await ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceA, 3), harness.Deps);
         releaseNewer.TrySetResult();
         await newer.WaitAsync(TimeSpan.FromSeconds(5));
 
         Assert.Multiple(() =>
         {
-            Assert.That(harness.Sink.LaunchAcks.Single(ack => ack.RuntimeEpoch == 3).Ready, Is.False);
-            Assert.That(harness.Sink.LaunchAcks.Single(ack => ack.RuntimeEpoch == 4).Ready, Is.True);
-            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(new RuntimeIdentity(7, 4, InstanceB)));
+            Assert.That(harness.Sink.StartAcks.Single(ack => ack.Runtime.RuntimeOrder == 3).Ready, Is.False);
+            Assert.That(harness.Sink.StartAcks.Single(ack => ack.Runtime.RuntimeOrder == 4).Ready, Is.True);
+            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(Rt(InstanceB, 4)));
         });
     }
 
     [Test]
-    public async Task DuplicateLaunchDuringItsStartup_JoinsItInsteadOfRestarting()
+    public async Task RepeatedStartWhileLaunching_LaunchesOnceAndSharesTheOutcome()
     {
         var harness = new RuntimeCommandHarness();
         var starts = 0;
@@ -192,30 +282,28 @@ public partial class ServiceClientManagerTests
             await release.Task.WaitAsync(token);
         };
 
-        var first = Launch(7, 4, InstanceB, revision: 2);
-        var original = ServiceClientManager.HandleLaunchRuntimeCommand(first, harness.Deps);
+        var original = ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceB, 4), harness.Deps);
         await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
-        // The same runtime again under a new command id and attempt, as after a control-plane retry.
-        var retry = Launch(7, 4, InstanceB, revision: 2);
-        retry.Attempt = 2;
-        var duplicate = ServiceClientManager.HandleLaunchRuntimeCommand(retry, harness.Deps);
+        // The same start again, its runtime id spelled another way, as a redelivery may carry it.
+        var redelivery = Start(Guid.Parse(InstanceB).ToString("D"), 4);
+        var duplicate = ServiceClientManager.HandleStartRuntimeCommand(redelivery, harness.Deps);
         release.TrySetResult();
         await Task.WhenAll(original, duplicate).WaitAsync(TimeSpan.FromSeconds(5));
 
         Assert.Multiple(() =>
         {
             Assert.That(starts, Is.EqualTo(1));
-            Assert.That(harness.Sink.LaunchAcks, Has.Count.EqualTo(2));
-            Assert.That(harness.Sink.LaunchAcks, Has.All.Property(nameof(AcknowledgeEditorRuntimeLaunchRequest.Ready)).True);
-            Assert.That(
-                harness.Sink.LaunchAcks.Select(ack => (ack.CommandId, ack.Attempt)),
-                Is.EquivalentTo(new[] { (first.CommandId, 1u), (retry.CommandId, 2u) }));
-            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(new RuntimeIdentity(7, 4, InstanceB)));
+            Assert.That(harness.Sink.StartAcks, Has.Count.EqualTo(2));
+            Assert.That(harness.Sink.StartAcks, Has.All.Property(nameof(AcknowledgeRuntimeStartRequest.Ready)).True);
+            Assert.That(harness.Sink.StartAcks.Select(ack => ack.Message).Distinct(), Has.Exactly(1).Items);
+            Assert.That(harness.Sink.StartAcks.Select(ack => ack.Runtime),
+                Is.EquivalentTo(new[] { Rt(InstanceB, 4).ToRef(), redelivery.Runtime }), "Each delivery is answered as it named its runtime.");
+            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(Rt(InstanceB, 4)));
         });
     }
 
     [Test]
-    public async Task LaunchJoiningAFailedStartup_AcknowledgesTheFailureUnderItsOwnCommand()
+    public async Task RepeatedStartJoiningAFailedStartup_AcknowledgesTheSameFailure()
     {
         var harness = new RuntimeCommandHarness();
         var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -227,63 +315,50 @@ public partial class ServiceClientManagerTests
             throw new InvalidOperationException("editor failed to start");
         };
 
-        var first = Launch(7, 4, InstanceB, revision: 2);
-        var original = ServiceClientManager.HandleLaunchRuntimeCommand(first, harness.Deps);
+        var original = ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceB, 4), harness.Deps);
         await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
-        var retry = Launch(7, 4, InstanceB, revision: 2);
-        var joined = ServiceClientManager.HandleLaunchRuntimeCommand(retry, harness.Deps);
+        var joined = ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceB, 4), harness.Deps);
         release.TrySetResult();
         await Task.WhenAll(original, joined).WaitAsync(TimeSpan.FromSeconds(5));
 
         Assert.Multiple(() =>
         {
-            Assert.That(harness.Sink.LaunchAcks.Select(ack => ack.CommandId), Is.EquivalentTo(new[] { first.CommandId, retry.CommandId }));
-            Assert.That(harness.Sink.LaunchAcks, Has.All.Property(nameof(AcknowledgeEditorRuntimeLaunchRequest.Ready)).False);
-            Assert.That(harness.Sink.LaunchAcks, Has.All.Property(nameof(AcknowledgeEditorRuntimeLaunchRequest.Message)).EqualTo("editor failed to start"));
+            Assert.That(harness.Sink.StartAcks, Has.Count.EqualTo(2));
+            Assert.That(harness.Sink.StartAcks, Has.All.Property(nameof(AcknowledgeRuntimeStartRequest.Ready)).False);
+            Assert.That(harness.Sink.StartAcks, Has.All.Property(nameof(AcknowledgeRuntimeStartRequest.Message)).EqualTo("editor failed to start"));
         });
     }
 
-    [Test]
-    public async Task Launch_ForAnotherRunner_IsRejectedWithoutTouchingState()
+    [TestCase(true)]
+    [TestCase(false)]
+    public async Task RepeatedStartAfterItFinished_ReplaysTheRecordedAcknowledgementWithoutRelaunching(bool ready)
     {
         var harness = new RuntimeCommandHarness();
-        var launch = Launch(7, 3, InstanceA, revision: 1);
-        launch.RunnerId = "99999999999949998999999999999999";
+        if (!ready)
+        {
+            harness.BeforeStart = (_, _) => throw new InvalidOperationException("editor failed to start");
+        }
 
-        await ServiceClientManager.HandleLaunchRuntimeCommand(launch, harness.Deps);
+        await ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceA, 3), harness.Deps).WaitAsync(TimeSpan.FromSeconds(5));
+        var calls = harness.Calls.ToArray();
+        await ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceA, 3), harness.Deps).WaitAsync(TimeSpan.FromSeconds(5));
 
-        var ack = await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 1);
+        var acks = harness.Sink.StartAcks.ToArray();
         Assert.Multiple(() =>
         {
-            Assert.That(ack.Ready, Is.False);
-            Assert.That(harness.Calls, Is.Empty);
-            Assert.That(harness.Logical.GetActiveSessionId(), Is.Empty);
-            Assert.That(harness.Identities.TryGet(CommandSessionId, out _), Is.False);
+            Assert.That(acks, Has.Length.EqualTo(2));
+            Assert.That(acks[1], Is.EqualTo(acks[0]), "The same acknowledgement is sent again.");
+            Assert.That(acks[0].Ready, Is.EqualTo(ready));
+            Assert.That(harness.Calls, Is.EqualTo(calls), "Nothing is launched or cleaned up again.");
         });
     }
 
     [Test]
-    public async Task StaleStart_DoesNotReplaceTheNewerRuntime()
-    {
-        var harness = RunningHarness(8, 1, InstanceB);
-
-        await ServiceClientManager.HandleStartSessionCommand(Start(7, 1, InstanceA), harness.Deps);
-
-        var ack = await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
-        Assert.Multiple(() =>
-        {
-            Assert.That(ack.Ready, Is.False);
-            Assert.That(harness.Calls, Is.Empty);
-            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(new RuntimeIdentity(8, 1, InstanceB)));
-        });
-    }
-
-    [Test]
-    public async Task OlderAssignmentStart_DoesNotCancelTheNewerStartupOrItsPrompts()
+    public async Task StartForAnOlderAssignmentAfterANewerSessionsStart_IsRefusedStale()
     {
         const string olderSessionId = "33333333333343338333333333333333";
         var harness = new RuntimeCommandHarness();
-        var prompt = harness.StartPrompt(8, 1, InstanceB);
+        var prompt = harness.StartPrompt(InstanceB, 10);
         var newerEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var releaseNewer = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         harness.BeforeStart = async (start, token) =>
@@ -294,14 +369,10 @@ public partial class ServiceClientManagerTests
                 await releaseNewer.Task.WaitAsync(token);
             }
         };
-        var newerStart = Start(8, 1, InstanceB);
-        newerStart.AssignmentSequence = 10;
-        var olderStart = Start(1, 1, InstanceA, olderSessionId);
-        olderStart.AssignmentSequence = 9;
 
-        var newer = ServiceClientManager.HandleStartSessionCommand(newerStart, harness.Deps);
+        var newer = ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceB, 10), harness.Deps);
         await newerEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
-        await ServiceClientManager.HandleStartSessionCommand(olderStart, harness.Deps);
+        await ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceA, 9, olderSessionId), harness.Deps);
         var olderAck = await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
 
         Assert.Multiple(() =>
@@ -317,21 +388,260 @@ public partial class ServiceClientManagerTests
         {
             Assert.That(harness.Sink.StartAcks.Single(ack => ack.SessionId == CommandSessionId).Ready, Is.True);
             Assert.That(harness.Tracked(olderSessionId), Is.Null);
+            Assert.That(harness.Logical.GetActiveSessionId(), Is.EqualTo(CommandSessionId));
+        });
+        await harness.Shutdown.CancelAsync();
+    }
+
+    [Test]
+    public async Task NewerStartForAnotherSession_PreemptsTheRunningSession()
+    {
+        const string newerSessionId = "33333333333343338333333333333333";
+        var harness = RunningHarness(InstanceA, 3);
+        var prompt = harness.StartPrompt(InstanceA, 3);
+
+        await ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceB, 4, newerSessionId), harness.Deps).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(harness.Sink.StartAcks.Single().Ready, Is.True);
+            Assert.That(prompt.IsCompleted, Is.True);
+            Assert.That(harness.Calls, Does.Contain("stop:" + CommandSessionId));
+            Assert.That(harness.Tracked(CommandSessionId), Is.Null);
+            Assert.That(harness.Identities.TryGet(CommandSessionId, out _), Is.False);
+            Assert.That(harness.Tracked(newerSessionId), Is.EqualTo(Rt(InstanceB, 4)));
+            Assert.That(harness.Logical.GetActiveSessionId(), Is.EqualTo(newerSessionId));
         });
     }
 
     [Test]
-    public void ObserveAssignment_FencesOlderStartsBeforeTheNewerOneIsAdopted()
+    public async Task StopBeforeAnOlderDelayedStart_RefusesTheStartAfterwards()
     {
-        var state = new ServiceClientManager.LogicalSessionState(string.Empty);
+        var harness = new RuntimeCommandHarness();
 
-        state.ObserveAssignment(10);
+        await ServiceClientManager.HandleStopSessionCommandAsync(Stop(5), harness.Deps);
+        await harness.Sink.WaitForAsync(harness.Sink.StopAcks, 1);
+        var callsAfterStop = harness.Calls.ToArray();
+        await ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceA, 4), harness.Deps);
+
+        var ack = await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
+        Assert.Multiple(() =>
+        {
+            Assert.That(ack.Ready, Is.False);
+            Assert.That(harness.Calls, Is.EqualTo(callsAfterStop), "The delayed start launches nothing.");
+            Assert.That(harness.Tracked(CommandSessionId), Is.Null);
+            Assert.That(harness.Logical.GetActiveSessionId(), Is.Empty);
+        });
+    }
+
+    [Test]
+    public async Task OlderStopAfterANewerStart_LeavesTheNewerRuntimeRunning()
+    {
+        var harness = RunningHarness(InstanceB, 8);
+        var prompt = harness.StartPrompt(InstanceB, 8);
+        var stop = Stop(7);
+
+        await ServiceClientManager.HandleStopSessionCommandAsync(stop, harness.Deps);
+
+        var ack = await harness.Sink.WaitForAsync(harness.Sink.StopAcks, 1);
+        Assert.Multiple(() =>
+        {
+            Assert.That(ack.CommandId, Is.EqualTo(stop.CommandId));
+            Assert.That(ack.UpToRuntimeOrder, Is.EqualTo(7));
+            Assert.That(ack.CleanupDisposition, Is.EqualTo(RunnerCleanupDisposition.Superseded));
+            Assert.That(ack.UnsavedArtifactsUnknown, Is.True);
+            Assert.That(harness.Calls, Is.Empty);
+            Assert.That(prompt.IsCompleted, Is.False);
+            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(Rt(InstanceB, 8)));
+            Assert.That(harness.Logical.GetActiveSessionId(), Is.EqualTo(CommandSessionId));
+            Assert.That(harness.Identities.TryGet(CommandSessionId, out _), Is.True);
+            // A superseded Stop records no cutoff: the newer runtime's own start stays acceptable.
+            Assert.That(harness.Logical.AdmitStart(CommandSessionId, Rt(InstanceB, 8)), Is.EqualTo(ServiceClientManager.StartAdmission.Same));
+        });
+        await harness.Shutdown.CancelAsync();
+    }
+
+    [Test]
+    public async Task RedeliveredStop_DoesNotDropTheNotesOfANewerRuntime()
+    {
+        var harness = RunningHarness(InstanceA, 3);
+        harness.SealedNotes[CommandSessionId] = 0;
+        var stop = Stop(3);
+        await ServiceClientManager.HandleStopSessionCommandAsync(stop, harness.Deps);
+        await harness.Sink.WaitForAsync(harness.Sink.StopAcks, 1);
+        await WaitUntilAsync(() => harness.ForgottenLifecycles.Count == 1);
+        Assert.That(harness.SealedNotes, Is.Empty, "the Stop that performed cleanup drops the session's note");
+
+        // A newer sealed runtime of the session starts and notes its lifecycle.
+        harness.Run(CommandSessionId, Rt(InstanceB, 4));
+        harness.SealedNotes[CommandSessionId] = 0;
+        await ServiceClientManager.HandleStopSessionCommandAsync(stop, harness.Deps);
+        await harness.Sink.WaitForAsync(harness.Sink.StopAcks, 2);
+        await Task.Delay(100);
 
         Assert.Multiple(() =>
         {
-            Assert.That(state.IsStaleStart("session-a", new RuntimeIdentity(1, 1, "a-1"), 9), Is.True);
-            Assert.That(state.IsStaleStart("session-a", new RuntimeIdentity(1, 1, "a-1"), 10), Is.False);
-            Assert.That(state.IsStaleStart("session-a", new RuntimeIdentity(1, 1, "a-1"), 0), Is.False);
+            Assert.That(harness.SealedNotes.ContainsKey(CommandSessionId), Is.True, "the newer runtime's note survives");
+            Assert.That(harness.ForgottenLifecycles, Has.Count.EqualTo(1));
+        });
+        await harness.Shutdown.CancelAsync();
+    }
+
+    [Test]
+    public async Task LateStopAcknowledgement_DoesNotDropTheNotesOfANewerRuntime()
+    {
+        var harness = RunningHarness(InstanceA, 3);
+        var acknowledgementsLost = true;
+        harness.Sink.FailWhen = request => request is AcknowledgeSessionStopRequest && Volatile.Read(ref acknowledgementsLost);
+        await ServiceClientManager.HandleStopSessionCommandAsync(Stop(3), harness.Deps);
+        await WaitUntilAsync(() => harness.Sink.Attempts.OfType<AcknowledgeSessionStopRequest>().Any());
+
+        // While the acknowledgement is still retried, a newer sealed runtime starts.
+        harness.Run(CommandSessionId, Rt(InstanceB, 4));
+        harness.SealedNotes[CommandSessionId] = 0;
+        Volatile.Write(ref acknowledgementsLost, false);
+        await harness.Sink.WaitForAsync(harness.Sink.StopAcks, 1);
+        await Task.Delay(100);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(harness.SealedNotes.ContainsKey(CommandSessionId), Is.True);
+            Assert.That(harness.ForgottenLifecycles, Is.Empty);
+        });
+        await harness.Shutdown.CancelAsync();
+    }
+
+    [TestCase(false)]
+    [TestCase(true)]
+    public async Task LateStopAcknowledgement_KeepsTheNoteOfANewerRuntimeThatIsAlreadyGone(bool preempted)
+    {
+        const string otherSessionId = "33333333333343338333333333333333";
+        var harness = RunningHarness(InstanceA, 3);
+        var acknowledgementsLost = true;
+        harness.Sink.FailWhen = request => request is AcknowledgeSessionStopRequest && Volatile.Read(ref acknowledgementsLost);
+        await ServiceClientManager.HandleStopSessionCommandAsync(Stop(3), harness.Deps);
+        await WaitUntilAsync(() => harness.Sink.Attempts.OfType<AcknowledgeSessionStopRequest>().Any());
+
+        // A newer sealed runtime of the session starts, notes its lifecycle, and is gone again
+        // before the Stop's acknowledgement goes through.
+        harness.Run(CommandSessionId, Rt(InstanceB, 4));
+        harness.SealedNotes[CommandSessionId] = 0;
+        if (preempted)
+        {
+            await ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceC, 5, otherSessionId), harness.Deps)
+                .WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.That(harness.Sink.StartAcks.Single().Ready, Is.True);
+        }
+        else
+        {
+            harness.Untrack(CommandSessionId);
+            await ServiceClientManager.HandleUnexpectedRuntimeExitAsync(
+                CommandSessionId, Rt(InstanceB, 4), harness.Logical, harness.Identities,
+                (_, _) => Task.CompletedTask, CancellationToken.None);
+        }
+
+        Assert.That(harness.Tracked(CommandSessionId), Is.Null);
+        Volatile.Write(ref acknowledgementsLost, false);
+        await harness.Sink.WaitForAsync(harness.Sink.StopAcks, 1);
+        await Task.Delay(100);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(harness.SealedNotes.ContainsKey(CommandSessionId), Is.True, "the Stop's count did not cover runtime 4's losses");
+            Assert.That(harness.ForgottenLifecycles, Is.Empty);
+        });
+        await harness.Shutdown.CancelAsync();
+    }
+
+    [Test]
+    public async Task CancelledStartOfAnotherSession_DoesNotLeaveASupersededSessionWithoutAChild()
+    {
+        const string otherSessionId = "33333333333343338333333333333333";
+        var harness = RunningHarness(InstanceA, 1);
+        var activations = new ConcurrentQueue<string>();
+        harness.BeforeActivate = token =>
+        {
+            activations.Enqueue("activate");
+            return Task.Delay(Timeout.Infinite, token);
+        };
+
+        // S relaunches: R1 is stopped, and R2 waits for GPU activation.
+        var relaunch = ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceB, 2), harness.Deps);
+        await WaitUntilAsync(() => activations.Count == 1);
+        Assert.That(harness.Tracked(CommandSessionId), Is.Null);
+
+        // T's start supersedes R2, then T's Stop cancels it before it adopts its runtime.
+        var other = ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceC, 3, otherSessionId), harness.Deps);
+        await relaunch.WaitAsync(TimeSpan.FromSeconds(5));
+        await WaitUntilAsync(() => activations.Count == 2);
+        var stop = Stop(3);
+        stop.SessionId = otherSessionId;
+        await ServiceClientManager.HandleStopSessionCommandAsync(stop, harness.Deps).WaitAsync(TimeSpan.FromSeconds(5));
+        await other.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var status = Status(harness);
+        Assert.Multiple(() =>
+        {
+            Assert.That(harness.Sink.StartAcks, Has.All.Property(nameof(AcknowledgeRuntimeStartRequest.Ready)).False);
+            Assert.That(status.SessionId, Is.Empty, "the superseded session is no longer reported");
+            Assert.That(status.Phase, Is.EqualTo(RuntimePhase.None));
+            Assert.That(harness.Logical.GetActiveSessionId(), Is.Empty);
+            Assert.That(harness.Identities.TryGet(CommandSessionId, out _), Is.False);
+        });
+    }
+
+    [Test]
+    public async Task RelaunchFailingBeforeItsAdoption_KeepsItsSession()
+    {
+        var harness = RunningHarness(InstanceA, 1);
+        harness.BeforeActivate = _ => throw new IOException("power limit unavailable");
+
+        await ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceB, 2), harness.Deps);
+
+        var ack = await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
+        Assert.Multiple(() =>
+        {
+            Assert.That(ack.Ready, Is.False);
+            Assert.That(harness.Tracked(CommandSessionId), Is.Null, "the old child was stopped first");
+            Assert.That(Status(harness).SessionId, Is.EqualTo(CommandSessionId), "a failed restart keeps its session");
+        });
+    }
+
+    [Test]
+    public async Task FailedStartOfAnotherSession_LeavesASessionWhoseChildStillRuns()
+    {
+        const string otherSessionId = "33333333333343338333333333333333";
+        var harness = RunningHarness(InstanceA, 1);
+        harness.BeforeActivate = _ => throw new IOException("power limit unavailable");
+
+        await ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceC, 3, otherSessionId), harness.Deps);
+
+        Assert.That((await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1)).Ready, Is.False);
+        Assert.Multiple(() =>
+        {
+            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(Rt(InstanceA, 1)));
+            Assert.That(Status(harness).SessionId, Is.EqualTo(CommandSessionId));
+        });
+    }
+
+    [Test]
+    public async Task StopCutoffEvictedFromTheMap_StillRefusesTheSessionsOldStart()
+    {
+        const string otherSessionId = "33333333333343338333333333333333";
+        var harness = new RuntimeCommandHarness(maxStopCutoffs: 1);
+        await ServiceClientManager.HandleStopSessionCommandAsync(Stop(10), harness.Deps);
+        var otherStop = Stop(3);
+        otherStop.SessionId = otherSessionId;
+        await ServiceClientManager.HandleStopSessionCommandAsync(otherStop, harness.Deps);
+        await harness.Sink.WaitForAsync(harness.Sink.StopAcks, 2);
+
+        await ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceA, 9), harness.Deps);
+
+        var ack = await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
+        Assert.Multiple(() =>
+        {
+            Assert.That(ack.Ready, Is.False);
+            Assert.That(harness.Calls.Where(call => call.StartsWith("start:", StringComparison.Ordinal)), Is.Empty);
         });
     }
 
@@ -346,22 +656,52 @@ public partial class ServiceClientManagerTests
             await Task.Delay(Timeout.Infinite, token);
         };
 
-        var launch = ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 3, InstanceA, revision: 1), harness.Deps);
+        var start = ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceA, 3), harness.Deps);
         await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
-        await ServiceClientManager.HandleStopSessionCommandAsync(
-            new StopSessionCommand { SessionId = CommandSessionId, User = "alice", CommandId = Guid.NewGuid().ToString("n") },
-            harness.Deps).WaitAsync(TimeSpan.FromSeconds(5));
-        await launch.WaitAsync(TimeSpan.FromSeconds(5));
+        await ServiceClientManager.HandleStopSessionCommandAsync(Stop(3), harness.Deps).WaitAsync(TimeSpan.FromSeconds(5));
+        await start.WaitAsync(TimeSpan.FromSeconds(5));
         await harness.Sink.WaitForAsync(harness.Sink.StopAcks, 1);
 
         Assert.Multiple(() =>
         {
-            Assert.That(harness.Sink.LaunchAcks.Single().Ready, Is.False);
-            Assert.That(harness.Sink.StopAcks, Has.Count.EqualTo(1));
+            Assert.That(harness.Sink.StartAcks.Single().Ready, Is.False);
+            Assert.That(harness.Sink.StopAcks.Single().CleanupDisposition, Is.EqualTo(RunnerCleanupDisposition.Performed));
             Assert.That(harness.Tracked(CommandSessionId), Is.Null);
             Assert.That(harness.Logical.GetActiveSessionId(), Is.Empty);
             Assert.That(harness.Identities.TryGet(CommandSessionId, out _), Is.False);
             Assert.That(harness.WorkState.GetActiveStartup(), Is.Null);
+        });
+
+        // A redelivery of the stopped start is refused by the Stop's cutoff.
+        await ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceA, 3), harness.Deps);
+        var redelivered = await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 2);
+        Assert.That(redelivered.Ready, Is.False);
+        Assert.That(harness.Tracked(CommandSessionId), Is.Null);
+    }
+
+    [Test]
+    public async Task OlderStop_DoesNotCancelTheNewerStartup()
+    {
+        var harness = new RuntimeCommandHarness();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        harness.BeforeStart = async (_, token) =>
+        {
+            entered.TrySetResult();
+            await release.Task.WaitAsync(token);
+        };
+
+        var start = ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceB, 8), harness.Deps);
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await ServiceClientManager.HandleStopSessionCommandAsync(Stop(7), harness.Deps);
+        release.TrySetResult();
+        await start.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(harness.Sink.StartAcks.Single().Ready, Is.True);
+            Assert.That(harness.Sink.StopAcks.Single().CleanupDisposition, Is.EqualTo(RunnerCleanupDisposition.Superseded));
+            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(Rt(InstanceB, 8)));
         });
     }
 
@@ -369,182 +709,50 @@ public partial class ServiceClientManagerTests
     public async Task Stop_IsNotBlockedByStartupAcknowledgementRetries()
     {
         var harness = new RuntimeCommandHarness();
-        harness.Sink.FailWhen = request => request is AcknowledgeEditorRuntimeLaunchRequest;
+        harness.Sink.FailWhen = request => request is AcknowledgeRuntimeStartRequest;
 
-        var launch = ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 3, InstanceA, revision: 1), harness.Deps);
-        await WaitUntilAsync(() => harness.Sink.Attempts.OfType<AcknowledgeEditorRuntimeLaunchRequest>().Any());
+        var start = ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceA, 3), harness.Deps);
+        await WaitUntilAsync(() => harness.Sink.Attempts.OfType<AcknowledgeRuntimeStartRequest>().Any());
 
-        await ServiceClientManager.HandleStopSessionCommandAsync(
-            new StopSessionCommand { SessionId = CommandSessionId, User = "alice", CommandId = Guid.NewGuid().ToString("n") },
-            harness.Deps).WaitAsync(TimeSpan.FromSeconds(2));
+        await ServiceClientManager.HandleStopSessionCommandAsync(Stop(3), harness.Deps).WaitAsync(TimeSpan.FromSeconds(2));
 
         Assert.Multiple(() =>
         {
-            Assert.That(launch.IsCompleted, Is.False, "The launch acknowledgement keeps retrying independently.");
+            Assert.That(start.IsCompleted, Is.False, "The start acknowledgement keeps retrying independently.");
             Assert.That(harness.Tracked(CommandSessionId), Is.Null);
         });
         await harness.Shutdown.CancelAsync();
-        await launch.WaitAsync(TimeSpan.FromSeconds(5));
+        await start.WaitAsync(TimeSpan.FromSeconds(5));
     }
 
     [Test]
-    public async Task LaunchAcknowledgementRetry_ResendsTheIdenticalResultWithoutRelaunching()
+    public async Task StartAcknowledgementRetry_ResendsTheIdenticalResultWithoutRelaunching()
     {
         var harness = new RuntimeCommandHarness();
         harness.Sink.FailNextAcknowledgements(2);
 
-        await ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 3, InstanceA, revision: 1), harness.Deps)
+        await ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceA, 3), harness.Deps)
             .WaitAsync(TimeSpan.FromSeconds(10));
 
-        var attempts = harness.Sink.Attempts.OfType<AcknowledgeEditorRuntimeLaunchRequest>().ToList();
+        var attempts = harness.Sink.Attempts.OfType<AcknowledgeRuntimeStartRequest>().ToList();
         Assert.Multiple(() =>
         {
             Assert.That(attempts, Has.Count.EqualTo(3));
             Assert.That(attempts.Distinct(), Has.Exactly(1).Items);
             Assert.That(attempts[0].Ready, Is.True);
-            Assert.That(harness.Sink.LaunchAcks, Has.Count.EqualTo(1));
+            Assert.That(harness.Sink.StartAcks, Has.Count.EqualTo(1));
             Assert.That(harness.Calls.Count(call => call.StartsWith("start:", StringComparison.Ordinal)), Is.EqualTo(1));
         });
     }
 
     [Test]
-    public async Task MatchingQuiesce_StopsTheRuntimeAndKeepsTheLogicalSession()
-    {
-        var harness = RunningHarness(7, 3, InstanceA);
-        var prompt = harness.StartPrompt(7, 3, InstanceA);
-
-        await ServiceClientManager.HandleQuiesceRuntimeCommandAsync(Quiesce(7, 3, InstanceA, revision: 1), harness.Deps);
-
-        var ack = await harness.Sink.WaitForAsync(harness.Sink.QuiesceAcks, 1);
-        Assert.Multiple(() =>
-        {
-            Assert.That(ack.Quiesced, Is.True);
-            Assert.That(prompt.IsCompleted, Is.True, "The quiesced runtime's prompt work is cancelled and joined.");
-            Assert.That(harness.Tracked(CommandSessionId), Is.Null);
-            Assert.That(harness.Logical.GetActiveSessionId(), Is.EqualTo(CommandSessionId));
-        });
-    }
-
-    [TestCase(7UL, 2UL, InstanceA, 1U)]
-    [TestCase(6UL, 3UL, InstanceA, 1U)]
-    [TestCase(7UL, 3UL, InstanceB, 1U)]
-    public async Task StaleQuiesce_LeavesTheNewerRuntimeUntouched(ulong generation, ulong epoch, string instance, uint revision)
-    {
-        var harness = RunningHarness(7, 3, InstanceA);
-        var prompt = harness.StartPrompt(7, 3, InstanceA);
-
-        await ServiceClientManager.HandleQuiesceRuntimeCommandAsync(Quiesce(generation, epoch, instance, revision), harness.Deps);
-
-        var ack = await harness.Sink.WaitForAsync(harness.Sink.QuiesceAcks, 1);
-        Assert.Multiple(() =>
-        {
-            Assert.That(ack.Quiesced, Is.False);
-            Assert.That(ack.RuntimeEpoch, Is.EqualTo(epoch), "The acknowledgement echoes the stale identity.");
-            Assert.That(prompt.IsCompleted, Is.False, "The current runtime's prompt keeps running.");
-            Assert.That(harness.Calls, Is.Empty);
-            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(new RuntimeIdentity(7, 3, InstanceA)));
-        });
-        await harness.Shutdown.CancelAsync();
-    }
-
-    [Test]
-    public async Task QuiesceFromAnotherRunner_IsNotApplied()
-    {
-        var harness = RunningHarness(7, 3, InstanceA);
-        var quiesce = Quiesce(7, 3, InstanceA, revision: 1);
-        quiesce.RunnerId = "99999999999949998999999999999999";
-
-        await ServiceClientManager.HandleQuiesceRuntimeCommandAsync(quiesce, harness.Deps);
-
-        Assert.That((await harness.Sink.WaitForAsync(harness.Sink.QuiesceAcks, 1)).Quiesced, Is.False);
-        Assert.That(harness.Tracked(CommandSessionId), Is.Not.Null);
-    }
-
-    [Test]
-    public async Task DelayedQuiesce_DoesNotCancelTheNewerStartup()
-    {
-        var harness = new RuntimeCommandHarness();
-        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        harness.BeforeStart = async (_, token) =>
-        {
-            entered.TrySetResult();
-            await release.Task.WaitAsync(token);
-        };
-
-        var launch = ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 4, InstanceB, revision: 2), harness.Deps);
-        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
-        await ServiceClientManager.HandleQuiesceRuntimeCommandAsync(Quiesce(7, 3, InstanceA, revision: 1), harness.Deps);
-        release.TrySetResult();
-        await launch.WaitAsync(TimeSpan.FromSeconds(5));
-
-        Assert.Multiple(() =>
-        {
-            Assert.That(harness.Sink.QuiesceAcks.Single().Quiesced, Is.False);
-            Assert.That(harness.Sink.LaunchAcks.Single().Ready, Is.True);
-            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(new RuntimeIdentity(7, 4, InstanceB)));
-        });
-    }
-
-    [Test]
-    public async Task DelayedQuiesce_WhileANewerStartupIsPendingAndNothingIsTracked_IsRefused()
-    {
-        var harness = new RuntimeCommandHarness();
-        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        harness.BeforeStart = async (_, token) =>
-        {
-            entered.TrySetResult();
-            await release.Task.WaitAsync(token);
-        };
-
-        var launch = ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 4, InstanceB, revision: 2), harness.Deps);
-        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
-        // The gap: the session identity is cleared and no child is tracked yet.
-        harness.Logical.ClearIfMatches(CommandSessionId);
-        await ServiceClientManager.HandleQuiesceRuntimeCommandAsync(Quiesce(7, 3, InstanceA, revision: 1), harness.Deps);
-        var quiesceAck = await harness.Sink.WaitForAsync(harness.Sink.QuiesceAcks, 1);
-        var callsDuringStartup = harness.Calls.Where(call => !call.StartsWith("start:", StringComparison.Ordinal)).ToArray();
-        release.TrySetResult();
-        await launch.WaitAsync(TimeSpan.FromSeconds(5));
-
-        Assert.Multiple(() =>
-        {
-            Assert.That(quiesceAck.Quiesced, Is.False);
-            Assert.That(callsDuringStartup, Is.Empty, "Nothing was stopped or cleaned up for the newer startup's session.");
-            Assert.That(harness.Sink.LaunchAcks.Single().Ready, Is.True);
-        });
-    }
-
-    [Test]
-    public async Task FailedLaunch_DoesNotStopAValidRuntimeOfAnotherIdentity()
-    {
-        // The runtime at epoch 4 is still tracked, so the launch at epoch 5 fails.
-        var harness = RunningHarness(7, 4, InstanceB);
-
-        await ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 5, InstanceA, revision: 3), harness.Deps);
-
-        var ack = await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 1);
-        Assert.Multiple(() =>
-        {
-            Assert.That(ack.Ready, Is.False);
-            Assert.That(harness.Calls.Where(call => !call.StartsWith("start:", StringComparison.Ordinal)), Is.Empty);
-            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(new RuntimeIdentity(7, 4, InstanceB)));
-            Assert.That(harness.Logical.TryGetRuntime(CommandSessionId, out var logical, out _), Is.True);
-            Assert.That(logical, Is.EqualTo(new RuntimeIdentity(7, 4, InstanceB)), "The session stays visible under its running identity.");
-            Assert.That(harness.Identities.TryGet(CommandSessionId, out var identity), Is.True);
-            Assert.That(identity, Is.EqualTo(new RuntimeIdentity(7, 4, InstanceB)));
-        });
-    }
-
-    [Test]
-    public async Task FailedLaunch_ClearsOnlyItsOwnIdentity()
+    public async Task FailedStart_ClearsOnlyItsOwnIdentity()
     {
         var harness = new RuntimeCommandHarness { BeforeStart = (_, _) => throw new TimeoutException("not ready") };
 
-        await ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 3, InstanceA, revision: 1), harness.Deps);
+        await ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceA, 3), harness.Deps);
 
-        Assert.That((await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 1)).Ready, Is.False);
+        Assert.That((await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1)).Ready, Is.False);
         Assert.Multiple(() =>
         {
             Assert.That(harness.Calls, Does.Contain("stop:" + CommandSessionId));
@@ -553,14 +761,13 @@ public partial class ServiceClientManagerTests
         });
     }
 
-    [TestCase(6UL, 0UL, "")]
-    [TestCase(7UL, 2UL, "")]
-    [TestCase(7UL, 3UL, InstanceB)]
-    public async Task StaleStop_IsAcknowledgedWithoutStoppingTheNewerRuntime(ulong generation, ulong epoch, string instance)
+    [TestCase(0UL)]
+    [TestCase(2UL)]
+    public async Task StaleStop_IsAcknowledgedWithoutStoppingTheNewerRuntime(ulong upToRuntimeOrder)
     {
-        var harness = RunningHarness(7, 3, InstanceA);
-        var prompt = harness.StartPrompt(7, 3, InstanceA);
-        var stop = Stop(generation, epoch, instance);
+        var harness = RunningHarness(InstanceA, 3);
+        var prompt = harness.StartPrompt(InstanceA, 3);
+        var stop = Stop(upToRuntimeOrder);
 
         await ServiceClientManager.HandleStopSessionCommandAsync(stop, harness.Deps);
 
@@ -568,25 +775,23 @@ public partial class ServiceClientManagerTests
         Assert.Multiple(() =>
         {
             Assert.That(ack.CommandId, Is.EqualTo(stop.CommandId));
-            Assert.That(ack.LifecycleGeneration, Is.EqualTo(generation));
-            Assert.That(ack.RuntimeEpoch, Is.EqualTo(epoch));
-            Assert.That(ack.RuntimeInstanceId, Is.EqualTo(instance));
+            Assert.That(ack.UpToRuntimeOrder, Is.EqualTo(upToRuntimeOrder));
+            Assert.That(ack.CleanupDisposition, Is.EqualTo(RunnerCleanupDisposition.Superseded));
             Assert.That(harness.Calls, Is.Empty);
             Assert.That(prompt.IsCompleted, Is.False);
-            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(new RuntimeIdentity(7, 3, InstanceA)));
+            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(Rt(InstanceA, 3)));
             Assert.That(harness.Logical.GetActiveSessionId(), Is.EqualTo(CommandSessionId));
             Assert.That(harness.Identities.TryGet(CommandSessionId, out _), Is.True);
         });
         await harness.Shutdown.CancelAsync();
     }
 
-    [TestCase(7UL, 3UL, InstanceA)]
-    [TestCase(7UL, 0UL, "")]
-    [TestCase(8UL, 1UL, InstanceB)]
-    public async Task CurrentOrNewerStop_StopsTheRuntimeAndEchoesItsIdentity(ulong generation, ulong epoch, string instance)
+    [TestCase(3UL)]
+    [TestCase(9UL)]
+    public async Task CurrentOrNewerStop_StopsTheRuntimeAndEchoesItsCutoff(ulong upToRuntimeOrder)
     {
-        var harness = RunningHarness(7, 3, InstanceA);
-        var stop = Stop(generation, epoch, instance);
+        var harness = RunningHarness(InstanceA, 3);
+        var stop = Stop(upToRuntimeOrder);
 
         await ServiceClientManager.HandleStopSessionCommandAsync(stop, harness.Deps);
 
@@ -594,7 +799,10 @@ public partial class ServiceClientManagerTests
         Assert.Multiple(() =>
         {
             Assert.That(ack.CommandId, Is.EqualTo(stop.CommandId));
-            Assert.That(ack.LifecycleGeneration, Is.EqualTo(generation));
+            Assert.That(ack.SessionId, Is.EqualTo(CommandSessionId));
+            Assert.That(ack.InstanceId, Is.EqualTo("process-1"));
+            Assert.That(ack.UpToRuntimeOrder, Is.EqualTo(upToRuntimeOrder));
+            Assert.That(ack.CleanupDisposition, Is.EqualTo(RunnerCleanupDisposition.Performed));
             Assert.That(harness.Tracked(CommandSessionId), Is.Null);
             Assert.That(harness.Logical.GetActiveSessionId(), Is.Empty);
             Assert.That(harness.Identities.TryGet(CommandSessionId, out _), Is.False);
@@ -602,58 +810,11 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
-    public async Task StopWithoutRuntimeFence_StillRequiresAndAcknowledgesCommandIdentity()
-    {
-        var harness = RunningHarness(7, 3, InstanceA);
-        var commandId = Guid.NewGuid().ToString("n");
-
-        await ServiceClientManager.HandleStopSessionCommandAsync(
-            new StopSessionCommand { SessionId = CommandSessionId, User = "alice", CommandId = commandId },
-            harness.Deps);
-
-        var ack = await harness.Sink.WaitForAsync(harness.Sink.StopAcks, 1);
-        Assert.Multiple(() =>
-        {
-            Assert.That(ack.SessionId, Is.EqualTo(CommandSessionId));
-            Assert.That(ack.CommandId, Is.EqualTo(commandId));
-            Assert.That(ack.InstanceId, Is.EqualTo("process-1"));
-            Assert.That(ack.LifecycleGeneration, Is.Zero);
-            Assert.That(harness.Tracked(CommandSessionId), Is.Null);
-            Assert.That(harness.Logical.GetActiveSessionId(), Is.Empty);
-        });
-    }
-
-    [Test]
-    public async Task StaleStop_DoesNotCancelTheNewerStartup()
-    {
-        var harness = new RuntimeCommandHarness();
-        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        harness.BeforeStart = async (_, token) =>
-        {
-            entered.TrySetResult();
-            await release.Task.WaitAsync(token);
-        };
-
-        var start = ServiceClientManager.HandleStartSessionCommand(Start(8, 1, InstanceB), harness.Deps);
-        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
-        await ServiceClientManager.HandleStopSessionCommandAsync(Stop(7, 3, InstanceA), harness.Deps);
-        release.TrySetResult();
-        await start.WaitAsync(TimeSpan.FromSeconds(5));
-
-        Assert.Multiple(() =>
-        {
-            Assert.That(harness.Sink.StartAcks.Single().Ready, Is.True);
-            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(new RuntimeIdentity(8, 1, InstanceB)));
-        });
-    }
-
-    [Test]
     public async Task StopAcknowledgement_IsRetriedWithTheIdenticalRequest()
     {
-        var harness = RunningHarness(7, 3, InstanceA);
+        var harness = RunningHarness(InstanceA, 3);
         harness.Sink.FailNextAcknowledgements(2);
-        var stop = Stop(7, 3, InstanceA);
+        var stop = Stop(3);
 
         await ServiceClientManager.HandleStopSessionCommandAsync(stop, harness.Deps);
         await harness.Sink.WaitForAsync(harness.Sink.StopAcks, 1);
@@ -673,17 +834,15 @@ public partial class ServiceClientManagerTests
     [TestCase(true)]
     public async Task CompletedStop_RedeliveryReplaysWithoutTouchingReplacementRuntime(bool normalizeRetryId)
     {
-        var harness = RunningHarness(7, 3, InstanceA);
-        var stop = Stop(0, 0, "");
+        var harness = RunningHarness(InstanceA, 3);
+        var stop = Stop(3);
         stop.CommandId = Guid.NewGuid().ToString("D").ToUpperInvariant();
         await ServiceClientManager.HandleStopSessionCommandAsync(stop, harness.Deps);
         var originalAck = await harness.Sink.WaitForAsync(harness.Sink.StopAcks, 1);
         var cleanupCalls = harness.Calls.ToArray();
 
-        harness.Track(CommandSessionId, new RuntimeIdentity(8, 1, InstanceB));
-        harness.Logical.SetActiveRuntime(CommandSessionId, 8, 1, InstanceB);
-        harness.Identities.Set(CommandSessionId, 8, 1, InstanceB);
-        var prompt = harness.StartPrompt(8, 1, InstanceB);
+        harness.Run(CommandSessionId, Rt(InstanceB, 8));
+        var prompt = harness.StartPrompt(InstanceB, 8);
         if (normalizeRetryId)
         {
             stop.CommandId = Guid.Parse(stop.CommandId).ToString("n");
@@ -696,10 +855,10 @@ public partial class ServiceClientManagerTests
             Assert.That(replay, Is.EqualTo(originalAck));
             Assert.That(harness.Calls, Is.EqualTo(cleanupCalls));
             Assert.That(prompt.IsCompleted, Is.False);
-            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(new RuntimeIdentity(8, 1, InstanceB)));
+            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(Rt(InstanceB, 8)));
             Assert.That(harness.Logical.GetActiveSessionId(), Is.EqualTo(CommandSessionId));
             Assert.That(harness.Identities.TryGet(CommandSessionId, out var identity), Is.True);
-            Assert.That(identity, Is.EqualTo(new RuntimeIdentity(8, 1, InstanceB)));
+            Assert.That(identity, Is.EqualTo(Rt(InstanceB, 8)));
         });
         await harness.Shutdown.CancelAsync();
     }
@@ -707,7 +866,7 @@ public partial class ServiceClientManagerTests
     [Test]
     public async Task ConcurrentDuplicateStops_ShareCleanupAndWaitUntilItCompletes()
     {
-        var harness = RunningHarness(7, 3, InstanceA);
+        var harness = RunningHarness(InstanceA, 3);
         var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         harness.BeforeStop = async (_, token) =>
@@ -715,7 +874,7 @@ public partial class ServiceClientManagerTests
             entered.TrySetResult();
             await release.Task.WaitAsync(token);
         };
-        var stop = Stop(7, 3, InstanceA);
+        var stop = Stop(3);
         var first = ServiceClientManager.HandleStopSessionCommandAsync(stop, harness.Deps);
         await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
         var duplicate = ServiceClientManager.HandleStopSessionCommandAsync(stop.Clone(), harness.Deps);
@@ -741,9 +900,9 @@ public partial class ServiceClientManagerTests
     [Test]
     public async Task StopRedelivery_DoesNotStartAnotherAcknowledgementRetryLoop()
     {
-        var harness = RunningHarness(7, 3, InstanceA);
+        var harness = RunningHarness(InstanceA, 3);
         harness.Sink.FailWhen = _ => true;
-        var stop = Stop(0, 0, "");
+        var stop = Stop(3);
         await ServiceClientManager.HandleStopSessionCommandAsync(stop, harness.Deps);
         var work = harness.WorkState.Stops[Guid.Parse(stop.CommandId)];
         var retryLoop = work.AcknowledgementTask;
@@ -761,11 +920,11 @@ public partial class ServiceClientManagerTests
 
     [TestCase("session")]
     [TestCase("process")]
-    [TestCase("runtime")]
+    [TestCase("cutoff")]
     public async Task StopNonceReuse_WithDifferentIdentityDoesNotCleanUpOrAcknowledge(string changedIdentity)
     {
-        var harness = RunningHarness(7, 3, InstanceA);
-        var stop = Stop(7, 3, InstanceA);
+        var harness = RunningHarness(InstanceA, 3);
+        var stop = Stop(3);
         harness.BeforeStop = (_, _) => throw new IOException("signal failed");
         await ServiceClientManager.HandleStopSessionCommandAsync(stop, harness.Deps);
         var cleanupCalls = harness.Calls.ToArray();
@@ -774,7 +933,7 @@ public partial class ServiceClientManagerTests
         {
             case "session": stop.SessionId = "another-session"; break;
             case "process": harness.InstanceId = "another-process"; break;
-            case "runtime": stop.RuntimeInstanceId = InstanceB; break;
+            case "cutoff": stop.UpToRuntimeOrder = 4; break;
         }
 
         await ServiceClientManager.HandleStopSessionCommandAsync(stop, harness.Deps);
@@ -783,7 +942,7 @@ public partial class ServiceClientManagerTests
         {
             Assert.That(harness.Calls, Is.EqualTo(cleanupCalls));
             Assert.That(harness.Sink.StopAcks, Is.Empty);
-            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(new RuntimeIdentity(7, 3, InstanceA)));
+            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(Rt(InstanceA, 3)));
         });
     }
 
@@ -792,9 +951,9 @@ public partial class ServiceClientManagerTests
     [TestCase("00000000-0000-0000-0000-000000000000")]
     public async Task StopWithInvalidCommandIdentity_DoesNotCancelOrCleanUp(string commandId)
     {
-        var harness = RunningHarness(7, 3, InstanceA);
-        var prompt = harness.StartPrompt(7, 3, InstanceA);
-        var stop = Stop(7, 3, InstanceA);
+        var harness = RunningHarness(InstanceA, 3);
+        var prompt = harness.StartPrompt(InstanceA, 3);
+        var stop = Stop(3);
         stop.CommandId = commandId;
 
         await ServiceClientManager.HandleStopSessionCommandAsync(stop, harness.Deps);
@@ -815,9 +974,9 @@ public partial class ServiceClientManagerTests
     [TestCase(CommandSessionId, " ")]
     public async Task StopWithoutSessionOrProcessIdentity_DoesNotCleanUpOrAcknowledge(string sessionId, string instanceId)
     {
-        var harness = RunningHarness(7, 3, InstanceA);
+        var harness = RunningHarness(InstanceA, 3);
         harness.InstanceId = instanceId;
-        var stop = Stop(7, 3, InstanceA);
+        var stop = Stop(3);
         stop.SessionId = sessionId;
 
         await ServiceClientManager.HandleStopSessionCommandAsync(stop, harness.Deps);
@@ -834,7 +993,7 @@ public partial class ServiceClientManagerTests
     [TestCase("D")]
     public async Task StopCapturesIdentityBeforeCleanup_AndAcknowledgesOnlyAfterward(string format)
     {
-        var harness = RunningHarness(7, 3, InstanceA);
+        var harness = RunningHarness(InstanceA, 3);
         harness.InstanceId = " process-1 ";
         var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -843,7 +1002,7 @@ public partial class ServiceClientManagerTests
             entered.TrySetResult();
             await release.Task.WaitAsync(token);
         };
-        var stop = Stop(7, 3, InstanceA);
+        var stop = Stop(3);
         var commandId = Guid.NewGuid();
         var deliveredCommandId = commandId.ToString(format).ToUpperInvariant();
         stop.CommandId = deliveredCommandId;
@@ -855,9 +1014,7 @@ public partial class ServiceClientManagerTests
             stop.SessionId = Guid.NewGuid().ToString("n");
             stop.CommandId = Guid.NewGuid().ToString("n");
             stop.User = "replacement";
-            stop.LifecycleGeneration = 99;
-            stop.RuntimeEpoch = 99;
-            stop.RuntimeInstanceId = InstanceB;
+            stop.UpToRuntimeOrder = 99;
             harness.InstanceId = "replacement-process";
         }
         finally
@@ -873,9 +1030,7 @@ public partial class ServiceClientManagerTests
             Assert.That(ack.CommandId, Is.EqualTo(deliveredCommandId));
             Assert.That(ack.InstanceId, Is.EqualTo("process-1"));
             Assert.That(ack.User, Is.EqualTo("alice"));
-            Assert.That(ack.LifecycleGeneration, Is.EqualTo(7));
-            Assert.That(ack.RuntimeEpoch, Is.EqualTo(3));
-            Assert.That(ack.RuntimeInstanceId, Is.EqualTo(InstanceA));
+            Assert.That(ack.UpToRuntimeOrder, Is.EqualTo(3));
             Assert.That(harness.Logical.GetActiveSessionId(), Is.Empty);
             Assert.That(harness.Identities.TryGet(CommandSessionId, out _), Is.False);
         });
@@ -884,10 +1039,10 @@ public partial class ServiceClientManagerTests
     [Test]
     public async Task StopCancelledDuringCleanup_DoesNotAcknowledgeSuccess()
     {
-        var harness = RunningHarness(7, 3, InstanceA);
+        var harness = RunningHarness(InstanceA, 3);
         harness.BeforeStop = async (_, _) => await harness.Shutdown.CancelAsync();
 
-        await ServiceClientManager.HandleStopSessionCommandAsync(Stop(7, 3, InstanceA), harness.Deps);
+        await ServiceClientManager.HandleStopSessionCommandAsync(Stop(3), harness.Deps);
 
         Assert.That(harness.Sink.StopAcks, Is.Empty);
     }
@@ -895,11 +1050,11 @@ public partial class ServiceClientManagerTests
     [Test]
     public void StopAfterHostShutdown_DoesNotEnterCleanup()
     {
-        var harness = RunningHarness(7, 3, InstanceA);
+        var harness = RunningHarness(InstanceA, 3);
         harness.Shutdown.Cancel();
 
         Assert.ThrowsAsync<OperationCanceledException>(() =>
-            ServiceClientManager.HandleStopSessionCommandAsync(Stop(7, 3, InstanceA), harness.Deps));
+            ServiceClientManager.HandleStopSessionCommandAsync(Stop(3), harness.Deps));
         Assert.Multiple(() =>
         {
             Assert.That(harness.Calls, Is.Empty);
@@ -931,7 +1086,7 @@ public partial class ServiceClientManagerTests
         {
             for (var iteration = 0; iteration < iterations && !stopRacing.IsCancellationRequested; iteration++)
             {
-                var lease = registry.Acquire(CommandSessionId, 7, 3, InstanceA);
+                var lease = registry.Acquire(CommandSessionId, Rt(InstanceA, 3));
                 try
                 {
                     _ = lease.Token.IsCancellationRequested;
@@ -945,7 +1100,7 @@ public partial class ServiceClientManagerTests
             for (var iteration = 0; iteration < iterations && !stopRacing.IsCancellationRequested; iteration++)
             {
                 registry.CancelSession(CommandSessionId);
-                registry.CancelRuntime(CommandSessionId, new RuntimeIdentity(7, 3, InstanceA));
+                registry.CancelRuntime(CommandSessionId, Rt(InstanceA, 3));
             }
         });
 
@@ -970,12 +1125,12 @@ public partial class ServiceClientManagerTests
     {
         using var shutdown = new CancellationTokenSource();
         var registry = new ServiceClientManager.TransientCancellationRegistry(shutdown.Token);
-        await using var oldRuntime = registry.Acquire(CommandSessionId, 7, 3, InstanceA);
-        await using var sameRuntimeOtherSpelling = registry.Acquire(CommandSessionId, 7, 3, Guid.Parse(InstanceA).ToString("D"));
-        await using var newRuntime = registry.Acquire(CommandSessionId, 7, 4, InstanceB);
+        await using var oldRuntime = registry.Acquire(CommandSessionId, Rt(InstanceA, 3));
+        await using var sameRuntimeOtherSpelling = registry.Acquire(CommandSessionId, Rt(Guid.Parse(InstanceA).ToString("D"), 3));
+        await using var newRuntime = registry.Acquire(CommandSessionId, Rt(InstanceB, 4));
         Assert.That(registry.Count, Is.EqualTo(2));
 
-        registry.CancelRuntime(CommandSessionId, new RuntimeIdentity(7, 3, InstanceA));
+        registry.CancelRuntime(CommandSessionId, Rt(InstanceA, 3));
         Assert.Multiple(() =>
         {
             Assert.That(oldRuntime.Token.IsCancellationRequested, Is.True);
@@ -983,7 +1138,7 @@ public partial class ServiceClientManagerTests
             Assert.That(newRuntime.Token.IsCancellationRequested, Is.False);
         });
 
-        await using var later = registry.Acquire(CommandSessionId, 7, 3, InstanceA);
+        await using var later = registry.Acquire(CommandSessionId, Rt(InstanceA, 3));
         Assert.That(later.Token.IsCancellationRequested, Is.False);
 
         registry.CancelSession(CommandSessionId);
@@ -993,21 +1148,6 @@ public partial class ServiceClientManagerTests
             Assert.That(later.Token.IsCancellationRequested, Is.True);
             Assert.That(registry.Count, Is.Zero);
         });
-    }
-
-    [Test]
-    public async Task Quiesce_CancelsOnlyTheQuiescedRuntimesTransientRequests()
-    {
-        var harness = RunningHarness(7, 3, InstanceA);
-        await using var quiesced = harness.TransientCancellation.Acquire(CommandSessionId, 7, 3, InstanceA);
-        await using var other = harness.TransientCancellation.Acquire(CommandSessionId, 7, 4, InstanceB);
-
-        var quiesce = ServiceClientManager.HandleQuiesceRuntimeCommandAsync(Quiesce(7, 3, InstanceA, revision: 1), harness.Deps);
-        Assert.That(quiesced.Token.IsCancellationRequested, Is.True);
-        Assert.That(other.Token.IsCancellationRequested, Is.False);
-        Assert.That(quiesce.IsCompleted, Is.False);
-        await quiesced.DisposeAsync();
-        await quiesce.WaitAsync(TimeSpan.FromSeconds(5));
     }
 
     [Test]
@@ -1114,9 +1254,7 @@ public partial class ServiceClientManagerTests
             DeliveryId = "delivery-1",
             RunnerId = CommandRunnerId,
             SessionId = CommandSessionId,
-            LifecycleGeneration = 7,
-            RuntimeEpoch = 3,
-            RuntimeInstanceId = InstanceA,
+            Runtime = Rt(InstanceA, 3).ToRef(),
             Kind = Offloadr.EditorRuntime.V1.EditorRuntimeRequestKind.Control,
             Method = "POST",
             Path = "interrupt",
@@ -1238,9 +1376,7 @@ public partial class ServiceClientManagerTests
             DeliveryId = deliveryId,
             RunnerId = CommandRunnerId,
             SessionId = CommandSessionId,
-            LifecycleGeneration = 7,
-            RuntimeEpoch = 3,
-            RuntimeInstanceId = InstanceA,
+            Runtime = Rt(InstanceA, 3).ToRef(),
             Kind = Offloadr.EditorRuntime.V1.EditorRuntimeRequestKind.Read,
             ExpiresUtc = Google.Protobuf.WellKnownTypes.Timestamp.FromDateTime(DateTime.UtcNow.AddMinutes(1)),
         };
@@ -1277,14 +1413,14 @@ public partial class ServiceClientManagerTests
     [Test]
     public async Task RevokedReport_ForASupersededRuntime_LeavesTheNewerRuntimeAlone()
     {
-        var harness = RunningHarness(7, 4, InstanceB);
+        var harness = RunningHarness(InstanceB, 4);
 
-        await RevokeAsync(harness, new RuntimeIdentity(7, 3, InstanceA));
+        await RevokeAsync(harness, Rt(InstanceA, 3));
 
         Assert.Multiple(() =>
         {
             Assert.That(harness.Calls, Is.Empty);
-            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(new RuntimeIdentity(7, 4, InstanceB)));
+            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(Rt(InstanceB, 4)));
             Assert.That(harness.Logical.GetActiveSessionId(), Is.EqualTo(CommandSessionId));
             Assert.That(harness.Identities.TryGet(CommandSessionId, out _), Is.True);
         });
@@ -1293,9 +1429,9 @@ public partial class ServiceClientManagerTests
     [Test]
     public async Task RevokedReport_ForTheCurrentRuntime_StopsItAndClearsItsState()
     {
-        var harness = RunningHarness(7, 3, InstanceA);
+        var harness = RunningHarness(InstanceA, 3);
 
-        await RevokeAsync(harness, new RuntimeIdentity(7, 3, InstanceA));
+        await RevokeAsync(harness, Rt(InstanceA, 3));
 
         Assert.Multiple(() =>
         {
@@ -1309,7 +1445,7 @@ public partial class ServiceClientManagerTests
     [Test]
     public async Task RevokedReport_WithoutIdentity_IsIgnoredOnceARuntimeWasAdopted()
     {
-        var harness = RunningHarness(7, 3, InstanceA);
+        var harness = RunningHarness(InstanceA, 3);
 
         await RevokeAsync(harness, reported: null);
 
@@ -1336,15 +1472,22 @@ public partial class ServiceClientManagerTests
             deps.SetDownloadActiveSession);
     }
 
-    private static StopSessionCommand Stop(ulong generation, ulong epoch, string instance)
+    private static RuntimeIdentity Rt(string runtimeId, ulong runtimeOrder) => new(runtimeId, runtimeOrder);
+
+    /// <summary>Makes the runtime the session's own, as a start admitted and adopted here would.</summary>
+    private static void Adopt(ServiceClientManager.LogicalSessionState state, string sessionId, RuntimeIdentity runtime)
+    {
+        state.AdmitStart(sessionId, runtime);
+        Assert.That(state.TryAdoptRuntime(sessionId, runtime), Is.True, "The test runtime must be adoptable.");
+    }
+
+    private static StopSessionCommand Stop(ulong upToRuntimeOrder)
         => new()
         {
             SessionId = CommandSessionId,
             User = "alice",
             CommandId = Guid.NewGuid().ToString("n"),
-            LifecycleGeneration = generation,
-            RuntimeEpoch = epoch,
-            RuntimeInstanceId = instance,
+            UpToRuntimeOrder = upToRuntimeOrder,
         };
 
     private static async Task WaitUntilAsync(Func<bool> condition, TimeSpan? timeout = null)
@@ -1361,56 +1504,22 @@ public partial class ServiceClientManagerTests
         }
     }
 
-    private static RuntimeCommandHarness RunningHarness(ulong generation, ulong epoch, string instance)
+    private static RuntimeCommandHarness RunningHarness(string runtimeId, ulong runtimeOrder)
     {
         var harness = new RuntimeCommandHarness();
-        harness.Logical.SetActiveRuntime(CommandSessionId, generation, epoch, instance);
-        harness.Identities.Set(CommandSessionId, generation, epoch, instance);
-        harness.Track(CommandSessionId, new RuntimeIdentity(generation, epoch, instance));
+        harness.Run(CommandSessionId, Rt(runtimeId, runtimeOrder));
         return harness;
     }
 
-    private static LaunchEditorRuntimeCommand Launch(ulong generation, ulong epoch, string instance, uint revision, string? commandId = null)
-        => new()
-        {
-            CommandId = commandId ?? Guid.NewGuid().ToString("n"),
-            RestartId = "restart-" + revision,
-            RunnerId = CommandRunnerId,
-            SessionId = CommandSessionId,
-            User = "alice",
-            EditorSid = "editor",
-            EditorRuntimeKind = "comfyui",
-            LifecycleGeneration = generation,
-            RuntimeEpoch = epoch,
-            RuntimeInstanceId = instance,
-            RestartRevision = revision,
-            Attempt = 1,
-        };
-
-    private static QuiesceEditorRuntimeCommand Quiesce(ulong generation, ulong epoch, string instance, uint revision, string? commandId = null)
-        => new()
-        {
-            CommandId = commandId ?? Guid.NewGuid().ToString("n"),
-            RestartId = "restart-" + revision,
-            RunnerId = CommandRunnerId,
-            SessionId = CommandSessionId,
-            EditorSid = "editor",
-            LifecycleGeneration = generation,
-            RuntimeEpoch = epoch,
-            RuntimeInstanceId = instance,
-            RestartRevision = revision,
-        };
-
-    private static StartSessionCommand Start(ulong generation, ulong epoch, string instance, string sessionId = CommandSessionId)
+    private static StartRuntimeCommand Start(string runtimeId, ulong runtimeOrder, string sessionId = CommandSessionId)
         => new()
         {
             SessionId = sessionId,
             User = "alice",
             EditorSid = "editor",
             EditorRuntimeKind = "comfyui",
-            LifecycleGeneration = generation,
-            RuntimeEpoch = epoch,
-            RuntimeInstanceId = instance,
+            LifecycleGeneration = 7,
+            Runtime = new RuntimeRef { RuntimeId = runtimeId, RuntimeOrder = runtimeOrder },
         };
 
     /// <summary>
@@ -1422,24 +1531,25 @@ public partial class ServiceClientManagerTests
         private readonly ConcurrentDictionary<string, RuntimeIdentity> _tracked = new(StringComparer.Ordinal);
         private readonly ConcurrentDictionary<string, Guid> _processes = new(StringComparer.Ordinal);
 
-        public RuntimeCommandHarness()
+        public RuntimeCommandHarness(int maxStopCutoffs = 16_384)
         {
             WorkState = new ServiceClientManager.RunnerCommandWorkState(Shutdown.Token);
             TransientCancellation = new ServiceClientManager.TransientCancellationRegistry(Shutdown.Token);
+            Logical = new ServiceClientManager.LogicalSessionState(string.Empty, maxStopCutoffs);
         }
 
         public CancellationTokenSource Shutdown { get; } = new();
         public RuntimeCommandSink Sink { get; } = new();
         public ServiceClientManager.RunnerCommandWorkState WorkState { get; }
-        public ServiceClientManager.LogicalSessionState Logical { get; } = new(string.Empty);
+        public ServiceClientManager.LogicalSessionState Logical { get; }
         public RuntimeIdentityRegistry Identities { get; } = new();
         public ServiceClientManager.TransientCancellationRegistry TransientCancellation { get; }
         public ConcurrentQueue<string> Calls { get; } = new();
-        public ConcurrentQueue<StartSessionCommand> Starts { get; } = new();
+        public ConcurrentQueue<StartRuntimeCommand> Starts { get; } = new();
         public string InstanceId { get; set; } = "process-1";
         public SessionSealingStatus? SealingStatus { get; set; }
 
-        public Func<StartSessionCommand, bool>? SealsStart { get; set; }
+        public Func<StartRuntimeCommand, bool>? SealsStart { get; set; }
 
         /// <summary>Lost artifacts the next completed Stop takes, as the uploader keeps them.</summary>
         public int UnsavedArtifacts
@@ -1450,17 +1560,26 @@ public partial class ServiceClientManagerTests
 
         private int _unsavedArtifacts;
 
-        /// <summary>The lifecycle generation each Stop took the lost artifacts of.</summary>
-        public ConcurrentQueue<ulong> UnsavedTakenFor { get; } = new();
+        /// <summary>The session each Stop took the lost artifacts of.</summary>
+        public ConcurrentQueue<string> UnsavedTakenFor { get; } = new();
 
         /// <summary>Sessions whose durable sealed-lifecycle note was dropped.</summary>
         public ConcurrentQueue<string> ForgottenLifecycles { get; } = new();
 
+        /// <summary>Sessions with a durable sealed-lifecycle note, as a sealed start records it.</summary>
+        public ConcurrentDictionary<string, byte> SealedNotes { get; } = new(StringComparer.Ordinal);
+
+        /// <summary>Runs inside the GPU activation wait of a start, before it adopts its runtime; may block or throw.</summary>
+        public Func<CancellationToken, Task> BeforeActivate { get; set; } = _ => Task.CompletedTask;
+
         /// <summary>Whether the uploader could not count every lost artifact.</summary>
         public bool UnsavedArtifactsIncomplete { get; set; }
 
+        /// <summary>Tracks a start's runtime before <see cref="BeforeStart"/>, as a child that launched and then failed would be.</summary>
+        public bool TrackBeforeStart { get; set; }
+
         /// <summary>Runs before a start registers its runtime; may block or throw.</summary>
-        public Func<StartSessionCommand, CancellationToken, Task> BeforeStart { get; set; } = (_, _) => Task.CompletedTask;
+        public Func<StartRuntimeCommand, CancellationToken, Task> BeforeStart { get; set; } = (_, _) => Task.CompletedTask;
 
         /// <summary>Runs before a stop removes its runtime; may block or throw.</summary>
         public Func<string, CancellationToken, Task> BeforeStop { get; set; } = (_, _) => Task.CompletedTask;
@@ -1475,6 +1594,14 @@ public partial class ServiceClientManagerTests
             _processes[sessionId] = Guid.NewGuid();
         }
 
+        /// <summary>Makes the runtime the session's running one, as a finished start would.</summary>
+        public void Run(string sessionId, RuntimeIdentity runtime)
+        {
+            Adopt(Logical, sessionId, runtime);
+            Identities.Set(sessionId, runtime, lifecycleGeneration: 7);
+            Track(sessionId, runtime);
+        }
+
         public void Untrack(string sessionId)
         {
             _tracked.TryRemove(sessionId, out _);
@@ -1486,16 +1613,14 @@ public partial class ServiceClientManagerTests
                 && _processes.TryGetValue(sessionId, out var process) ? process : null;
 
         /// <summary>Starts prompt work for the runtime that runs until it is cancelled.</summary>
-        public Task StartPrompt(ulong generation, ulong epoch, string instance)
+        public Task StartPrompt(string runtimeId, ulong runtimeOrder)
         {
             var completed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             var prompt = new SubmitPromptCommand
             {
                 HandoffId = Guid.NewGuid().ToString("n"),
                 SessionId = CommandSessionId,
-                LifecycleGeneration = generation,
-                RuntimeEpoch = epoch,
-                RuntimeInstanceId = instance,
+                Runtime = new RuntimeRef { RuntimeId = runtimeId, RuntimeOrder = runtimeOrder },
             };
             WorkState.Prompts.Start(prompt, false, async (_, token) =>
             {
@@ -1542,21 +1667,25 @@ public partial class ServiceClientManagerTests
             CancelSessionDownloads = sessionId => Calls.Enqueue("downloads:" + sessionId),
             GetDownloadActiveSessionId = () => null,
             SetDownloadActiveSession = _ => { },
-            ActivateSession = (activate, token) =>
+            ActivateSession = async (activate, token) =>
             {
+                await BeforeActivate(token).ConfigureAwait(false);
                 token.ThrowIfCancellationRequested();
                 activate();
-                return Task.CompletedTask;
             },
             Shutdown = Shutdown.Token,
             GetSessionSealing = _ => SealingStatus,
             SealsStart = SealsStart,
-            TakeUnsavedArtifacts = (_, generation) =>
+            TakeUnsavedArtifacts = sessionId =>
             {
-                UnsavedTakenFor.Enqueue(generation);
+                UnsavedTakenFor.Enqueue(sessionId);
                 return new UnsavedUploads(Interlocked.Exchange(ref _unsavedArtifacts, 0), UnsavedArtifactsIncomplete);
             },
-            ForgetSealedLifecycle = (sessionId, _) => ForgottenLifecycles.Enqueue(sessionId),
+            ForgetSealedLifecycle = sessionId =>
+            {
+                ForgottenLifecycles.Enqueue(sessionId);
+                SealedNotes.TryRemove(sessionId, out _);
+            },
         };
 
         private Task Record(string call)
@@ -1565,14 +1694,19 @@ public partial class ServiceClientManagerTests
             return Task.CompletedTask;
         }
 
-        private async Task StartAsync(StartSessionCommand command, CancellationToken token)
+        private async Task StartAsync(StartRuntimeCommand command, CancellationToken token)
         {
-            Calls.Enqueue($"start:{command.RuntimeEpoch}");
+            Calls.Enqueue($"start:{command.Runtime.RuntimeOrder}");
             Starts.Enqueue(command.Clone());
-            var identity = new RuntimeIdentity(command.LifecycleGeneration, command.RuntimeEpoch, command.RuntimeInstanceId);
+            var identity = RuntimeIdentity.From(command.Runtime);
             if (_tracked.TryGetValue(command.SessionId, out var existing) && existing != identity)
             {
                 throw new InvalidOperationException("The tracked session is a different runtime.");
+            }
+
+            if (TrackBeforeStart)
+            {
+                Track(command.SessionId, identity);
             }
 
             await BeforeStart(command, token).ConfigureAwait(false);
@@ -1597,10 +1731,8 @@ public partial class ServiceClientManagerTests
 
         private int _failuresRemaining;
 
-        public ConcurrentQueue<AcknowledgeSessionStartRequest> StartAcks { get; } = new();
+        public ConcurrentQueue<AcknowledgeRuntimeStartRequest> StartAcks { get; } = new();
         public ConcurrentQueue<AcknowledgeSessionStopRequest> StopAcks { get; } = new();
-        public ConcurrentQueue<AcknowledgeEditorRuntimeQuiesceRequest> QuiesceAcks { get; } = new();
-        public ConcurrentQueue<AcknowledgeEditorRuntimeLaunchRequest> LaunchAcks { get; } = new();
         public ConcurrentQueue<AcknowledgeEditorRuntimeRequestRequest> RequestAcks { get; } = new();
         public ConcurrentQueue<object> Attempts { get; } = new();
 
@@ -1638,10 +1770,8 @@ public partial class ServiceClientManagerTests
             return Task.CompletedTask;
         }
 
-        public Task AckStartSessionAsync(AcknowledgeSessionStartRequest request, CancellationToken cancellationToken) => Record(StartAcks, request);
+        public Task AckRuntimeStartAsync(AcknowledgeRuntimeStartRequest request, CancellationToken cancellationToken) => Record(StartAcks, request);
         public Task AckStopSessionAsync(AcknowledgeSessionStopRequest request, CancellationToken cancellationToken) => Record(StopAcks, request);
-        public Task AckEditorRuntimeQuiesceAsync(AcknowledgeEditorRuntimeQuiesceRequest request, CancellationToken cancellationToken) => Record(QuiesceAcks, request);
-        public Task AckEditorRuntimeLaunchAsync(AcknowledgeEditorRuntimeLaunchRequest request, CancellationToken cancellationToken) => Record(LaunchAcks, request);
         public Task AckEditorRuntimeRequestAsync(AcknowledgeEditorRuntimeRequestRequest request, CancellationToken cancellationToken) => Record(RequestAcks, request);
 
         public Task<RegisterRunnerResponse> RegisterRunnerAsync(RegisterRunnerRequest request, CancellationToken cancellationToken)

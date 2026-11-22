@@ -110,7 +110,7 @@ public sealed class DiagnosticRelayLifetimeTests
         public Func<ReportRunnerLogsRequest, CancellationToken, Task> Runner { get; init; } = (_, _) => throw new NotSupportedException();
         public Task<RegisterRunnerResponse> RegisterRunnerAsync(RegisterRunnerRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<SyncLocalModelsResponse> SyncLocalModelsAsync(SyncLocalModelsRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
-        public Task AckStartSessionAsync(AcknowledgeSessionStartRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task AckRuntimeStartAsync(AcknowledgeRuntimeStartRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task AckStopSessionAsync(AcknowledgeSessionStopRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<GrantGpuPowerExecutionResponse> GrantGpuPowerExecutionAsync(GrantGpuPowerExecutionRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task AckGpuPowerLimitAsync(AcknowledgeGpuPowerLimitRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();

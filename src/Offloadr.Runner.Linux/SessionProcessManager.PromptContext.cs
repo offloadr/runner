@@ -41,10 +41,7 @@ internal sealed partial class SessionProcessManager
         if (context.Cancellation.IsCancellationRequested || context.StopInProgress
             || !_sessions.TryGetValue(command.SessionId, out var current) || !ReferenceEquals(current, context)
             || context.Process.HasExited || !string.Equals(command.EditorRuntimeKind, _runtimeKind, StringComparison.Ordinal)
-            || context.RuntimeIdentity.LifecycleGeneration != command.LifecycleGeneration
-            || context.RuntimeIdentity.RuntimeEpoch != command.RuntimeEpoch
-            || !Guid.TryParse(context.RuntimeIdentity.RuntimeInstanceId, out var runtimeInstance)
-            || !Guid.TryParse(command.RuntimeInstanceId, out var targetInstance) || runtimeInstance != targetInstance)
+            || ExactRuntime(command.Runtime) is not { IsValid: true } target || !context.RuntimeIdentity.SameRuntime(target))
             throw new InvalidOperationException("The captured prompt runtime is stopped, replaced or mismatched.");
     }
 

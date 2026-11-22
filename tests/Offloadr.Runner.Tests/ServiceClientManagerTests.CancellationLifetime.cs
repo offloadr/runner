@@ -32,7 +32,7 @@ public partial class ServiceClientManagerTests
         harness.BeforeStop = (_, _) => { cleanupEntered.TrySetResult(); return Task.CompletedTask; };
         try
         {
-            launch = ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 3, InstanceA, revision: 1), harness.Deps);
+            launch = ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceA, 3), harness.Deps);
             await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
             var tracked = harness.WorkState.GetActiveStartup()!;
             original = tracked.Task!;
@@ -46,14 +46,14 @@ public partial class ServiceClientManagerTests
                 Assert.That(original.IsCompleted, Is.False, "The original callback still belongs to physical startup.");
                 Assert.That(launch.IsCompleted, Is.False);
                 Assert.That(harness.WorkState.GetActiveStartup(), Is.SameAs(tracked));
-                Assert.That(harness.Sink.LaunchAcks, Is.Empty, "Host shutdown never acknowledges a ready runtime.");
+                Assert.That(harness.Sink.StartAcks, Is.Empty, "Host shutdown never acknowledges a ready runtime.");
             });
             releaseCallback.SetResult();
             await Task.WhenAll(launch, original, shutdown).WaitAsync(TimeSpan.FromSeconds(5));
             Assert.Multiple(() =>
             {
                 Assert.That(harness.WorkState.GetActiveStartup(), Is.Null);
-                Assert.That(harness.Sink.LaunchAcks, Is.Empty);
+                Assert.That(harness.Sink.StartAcks, Is.Empty);
             });
         }
         catch (Exception error) { bodyFailure = error; }
@@ -73,14 +73,14 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
-    public async Task StartupCancellationFailure_CannotAcknowledgeQuiesceBeforeOriginalStartupEnds()
+    public async Task StartupCancellationFailure_CannotLaunchTheReplacementBeforeOriginalStartupEnds()
     {
         var harness = new RuntimeCommandHarness();
         var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         CancellationTokenRegistration registration = default;
         Task? launch = null;
-        Task? quiesce = null;
+        Task? replacement = null;
         Exception? bodyFailure = null;
         Exception? cleanupFailure = null;
         harness.BeforeStart = (_, token) =>
@@ -91,22 +91,23 @@ public partial class ServiceClientManagerTests
         };
         try
         {
-            launch = ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 3, InstanceA, revision: 1), harness.Deps);
+            launch = ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceA, 3), harness.Deps);
             await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
             var original = harness.WorkState.GetActiveStartup()!.Task!;
-            quiesce = ServiceClientManager.HandleQuiesceRuntimeCommandAsync(Quiesce(7, 3, InstanceA, revision: 1), harness.Deps);
+            replacement = ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceB, 4), harness.Deps);
             await Task.Delay(50);
-            TestContext.Out.WriteLine($"Original startup pending={!original.IsCompleted}; producer held={!release.Task.IsCompleted}; quiesce complete={quiesce.IsCompleted}; acknowledgements={harness.Sink.QuiesceAcks.Count}");
+            TestContext.Out.WriteLine($"Original startup pending={!original.IsCompleted}; producer held={!release.Task.IsCompleted}; replacement complete={replacement.IsCompleted}; acknowledgements={harness.Sink.StartAcks.Count}");
             Assert.Multiple(() =>
             {
                 Assert.That(original.IsCompleted, Is.False);
                 Assert.That(release.Task.IsCompleted, Is.False);
-                Assert.That(quiesce.IsCompleted, Is.False, "Cancellation failure must not escape the original startup join.");
-                Assert.That(harness.Sink.QuiesceAcks, Is.Empty);
+                Assert.That(replacement.IsCompleted, Is.False, "Cancellation failure must not escape the original startup join.");
+                Assert.That(harness.Calls, Has.No.Member("start:4"));
+                Assert.That(harness.Sink.StartAcks, Is.Empty);
             });
             release.SetResult();
             await launch.WaitAsync(TimeSpan.FromSeconds(5));
-            await quiesce.WaitAsync(TimeSpan.FromSeconds(5));
+            await replacement.WaitAsync(TimeSpan.FromSeconds(5));
             Assert.That(original.IsCompleted, Is.True);
         }
         catch (Exception error) { bodyFailure = error; }
@@ -116,7 +117,7 @@ public partial class ServiceClientManagerTests
             try
             {
                 if (launch is not null) await launch.WaitAsync(TimeSpan.FromSeconds(5));
-                if (quiesce is not null) await quiesce.WaitAsync(TimeSpan.FromSeconds(5));
+                if (replacement is not null) await replacement.WaitAsync(TimeSpan.FromSeconds(5));
                 await harness.Shutdown.CancelAsync();
             }
             catch (Exception error) { cleanupFailure = error; }

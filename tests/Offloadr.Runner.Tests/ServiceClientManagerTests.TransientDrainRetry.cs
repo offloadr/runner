@@ -6,10 +6,10 @@ public partial class ServiceClientManagerTests
     [TestCase(false, true)]
     [TestCase(true, false)]
     [TestCase(true, true)]
-    public async Task TransientLifetime_FailureIsScopedAndRetryCanReachPhysicalCleanup(bool quiesce, bool completedBeforeDrain)
+    public async Task TransientLifetime_FailureIsScopedAndRetryCanReachPhysicalCleanup(bool relaunch, bool completedBeforeDrain)
     {
-        var harness = RunningHarness(7, 3, InstanceA);
-        var request = harness.TransientCancellation.Acquire(CommandSessionId, 7, 3, InstanceA);
+        var harness = RunningHarness(InstanceA, 73);
+        var request = harness.TransientCancellation.Acquire(CommandSessionId, Rt(InstanceA, 73));
         var cancelled = TransientLifetimeGate();
         var physicalCleanup = 0;
         using var registration = request.Token.Register(() =>
@@ -18,7 +18,7 @@ public partial class ServiceClientManagerTests
             throw new InvalidOperationException("synthetic callback detail");
         });
         harness.BeforeStop = (_, _) => { physicalCleanup++; return Task.CompletedTask; };
-        var stop = Stop(7, 3, InstanceA);
+        var stop = Stop(73);
         Task? first = null;
         try
         {
@@ -31,15 +31,15 @@ public partial class ServiceClientManagerTests
                 Assert.DoesNotThrowAsync(() => unrelated.Completion.WaitAsync(TimeSpan.FromSeconds(5)),
                     "A completed failure belongs to its captured session/runtime.");
             }
-            first = quiesce
-                ? ServiceClientManager.HandleQuiesceRuntimeCommandAsync(Quiesce(7, 3, InstanceA, revision: 1), harness.Deps)
+            first = relaunch
+                ? ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceB, 74), harness.Deps)
                 : ServiceClientManager.HandleStopSessionCommandAsync(stop, harness.Deps);
             await cancelled.Task.WaitAsync(TimeSpan.FromSeconds(5));
             await request.DisposeAsync();
-            if (quiesce)
+            if (relaunch)
             {
                 await first.WaitAsync(TimeSpan.FromSeconds(5));
-                Assert.That(harness.Sink.QuiesceAcks.Single().Quiesced, Is.False);
+                Assert.That(harness.Sink.StartAcks.Single().Ready, Is.False);
             }
             else
                 Assert.ThrowsAsync<InvalidOperationException>(() => first.WaitAsync(TimeSpan.FromSeconds(5)));

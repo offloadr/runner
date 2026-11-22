@@ -166,17 +166,29 @@ internal sealed partial class SessionProcessManager : IAsyncDisposable
     private static void LogSessionWarning(string sessionId, string message)
         => RunnerLog.Warning<SessionProcessManager>($"[session:{sessionId}] {message}");
 
-    public Task StartSessionAsync(StartSessionCommand command, CancellationToken cancellationToken)
+    /// <summary>
+    /// The runtime a command names, with its id in canonical spelling, when the id is a
+    /// nonempty UUID and the order is valid; otherwise the default, invalid identity.
+    /// </summary>
+    internal static RuntimeIdentity ExactRuntime(RuntimeRef? runtime)
+    {
+        var identity = RuntimeIdentity.From(runtime);
+        return identity.IsValid && Guid.TryParse(identity.RuntimeId, out var id) && id != Guid.Empty
+            ? identity.Normalized()
+            : default;
+    }
+
+    public Task StartSessionAsync(StartRuntimeCommand command, CancellationToken cancellationToken)
         => StartSessionAsync(command, initializer: null, cancellationToken);
 
     public Task StartSessionAsync(
-        StartSessionCommand command,
+        StartRuntimeCommand command,
         Func<SessionPaths, CancellationToken, Task>? initializer,
         CancellationToken cancellationToken)
         => StartSessionAsync(command, initializer, afterWorkspaceRootsPrepared: null, cancellationToken);
 
     private async Task StartSessionCoreAsync(
-        StartSessionCommand command,
+        StartRuntimeCommand command,
         Func<SessionPaths, CancellationToken, Task>? initializer,
         Func<SessionPaths, CancellationToken, Task>? afterWorkspaceRootsPrepared,
         CancellationToken cancellationToken)
@@ -186,10 +198,9 @@ internal sealed partial class SessionProcessManager : IAsyncDisposable
 
         var sessionId = command.SessionId.Trim();
 
-        var runtimeIdentity = new RuntimeIdentity(command.LifecycleGeneration, command.RuntimeEpoch,
-            Guid.TryParse(command.RuntimeInstanceId, out var instance) && instance != Guid.Empty ? instance.ToString("n") : string.Empty);
+        var runtimeIdentity = ExactRuntime(command.Runtime);
         if (!runtimeIdentity.IsValid)
-            throw new ArgumentException("An exact lifecycle generation, runtime epoch and instance are required.", nameof(command));
+            throw new ArgumentException("An exact runtime id and order are required.", nameof(command));
         // The image runs one editor; a start for another must fail before anything is provisioned.
         var requestedRuntimeKind = command.EditorRuntimeKind?.Trim().ToLowerInvariant();
         if (!string.IsNullOrEmpty(requestedRuntimeKind) && requestedRuntimeKind != _runtimeKind)
@@ -879,8 +890,7 @@ internal sealed partial class SessionProcessManager : IAsyncDisposable
             throw new InvalidOperationException($"Session '{sessionId}' is not running.");
         }
 
-        var expected = new RuntimeIdentity(command.LifecycleGeneration, command.RuntimeEpoch,
-            Guid.TryParse(command.RuntimeInstanceId, out var instance) && instance != Guid.Empty ? instance.ToString("n") : string.Empty);
+        var expected = ExactRuntime(command.Runtime);
         if (!expected.IsValid) throw new ArgumentException("The relay requires an exact runtime identity.", nameof(command));
         using var runtimeCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, context.Cancellation.Token);
         cancellationToken = runtimeCancellation.Token;
@@ -1302,7 +1312,7 @@ internal sealed partial class SessionProcessManager : IAsyncDisposable
     /// required mode, and when the start requires the sealed-session profile. Throws when it
     /// requires the profile and sealing is off.
     /// </summary>
-    internal bool ShouldSeal(StartSessionCommand command)
+    internal bool ShouldSeal(StartRuntimeCommand command)
     {
         if (command.Sealing?.Required == true)
         {

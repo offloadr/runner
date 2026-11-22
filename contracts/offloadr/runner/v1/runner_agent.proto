@@ -14,7 +14,7 @@ import "google/protobuf/wrappers.proto";
 // so an outdated runner is told to update instead of misbehaving.
 enum RunnerProtocol {
     RUNNER_PROTOCOL_UNSPECIFIED = 0;
-    RUNNER_PROTOCOL_CURRENT = 4;
+    RUNNER_PROTOCOL_CURRENT = 5;
 }
 
 message RunnerRuntimeTelemetrySnapshot {
@@ -95,9 +95,25 @@ message SessionSealingStatus {
     bool encrypted_reads_required = 3; // A read answered without an envelope fails.
 }
 
-// Command from Offloadr API instructing a runner to start a session for a user.
-message StartSessionCommand {
-    reserved 12;
+// One launch of a session's editor runtime. The control plane mints a new runtime_id for every
+// StartRuntimeCommand and takes its runtime_order from one sequence shared by every session and
+// runner, so any two orders compare: higher is newer. Everything the runner sends about a runtime
+// names it with this, and the control plane accepts it only for the runtime that serves the
+// session or the one whose start is pending.
+message RuntimeRef {
+    string runtime_id = 1;    // UUID, no dashes.
+    uint64 runtime_order = 2;
+}
+
+// Starts a session's editor runtime: the session's first runtime and every relaunch of it.
+// The runner refuses a start whose order is not above the session's Stop cutoff, or is below the
+// newest start it adopted (any session), so a delayed start cannot replace newer work. A start
+// for the runtime it already adopted joins that startup or sends its recorded acknowledgement
+// again. A newer start for the same session stops the session's current child first; one for
+// another session pre-empts that session.
+message StartRuntimeCommand {
+    reserved 10, 11, 12, 13;
+    reserved "runtime_epoch", "runtime_instance_id", "assignment_sequence";
 
     string session_id = 1;     // Session id (uuid, no dashes)
     string user = 2;           // Username/owner for the session
@@ -107,64 +123,29 @@ message StartSessionCommand {
     repeated WorkspaceFileMetadata initial_workspace_files = 6;
     string editor_template = 7;
     string editor_runtime_kind = 8;
+    // The session's GPU lifecycle generation. Not a runtime identity: it only matches the
+    // targets of GPU power commands for the session.
     uint64 lifecycle_generation = 9;
-    uint64 runtime_epoch = 10;
-    string runtime_instance_id = 11;
-    // Optional. Increases each time the control plane assigns a session to this runner,
-    // across sessions. When set, the runner refuses a start older than the newest
-    // assignment it has seen, so a delayed start cannot replace a newer session.
-    uint64 assignment_sequence = 13;
-    // Optional. Absent means an unsealed session, unless the runner seals every session.
+    // Optional. Absent means an unsealed session, unless the runner seals every session. A
+    // relaunch carries the session's sealing too and may not weaken it.
     SessionSealing sealing = 14;
+    RuntimeRef runtime = 15;
 }
 
 // Command instructing runner to stop a session (graceful cleanup + release).
 message StopSessionCommand {
+    reserved 4, 5, 6;
+    reserved "lifecycle_generation", "runtime_epoch", "runtime_instance_id";
+
 	string session_id = 1;
 	string user = 2;
 	string command_id = 3;
-	// Runtime identity of the Stop. When lifecycle_generation is set the
-	// runner ignores a Stop that is older than the session's current runtime;
-	// unset fields leave the Stop unfenced.
-	uint64 lifecycle_generation = 4;
-	uint64 runtime_epoch = 5;
-	string runtime_instance_id = 6;
-}
-
-message QuiesceEditorRuntimeCommand {
-    string command_id = 1;
-    string restart_id = 2;
-    string runner_id = 3;
-    string session_id = 4;
-    string editor_sid = 5;
-    uint64 lifecycle_generation = 6;
-    uint64 runtime_epoch = 7;
-    string runtime_instance_id = 8;
-    uint32 restart_revision = 9;
-}
-
-message LaunchEditorRuntimeCommand {
-    reserved 17;
-
-    string command_id = 1;
-    string restart_id = 2;
-    string runner_id = 3;
-    string session_id = 4;
-    string user = 5;
-    string editor_sid = 6;
-    string editor_template = 7;
-    string editor_runtime_kind = 8;
-    uint64 lifecycle_generation = 9;
-    uint64 runtime_epoch = 10;
-    string runtime_instance_id = 11;
-    uint32 restart_revision = 12;
-    uint32 attempt = 13;
-    repeated ModelDownloadRequest initial_models = 14;
-    repeated offloadr.editor_runtime.v1.EditorArtifactMetadata initial_artifacts = 15;
-    repeated WorkspaceFileMetadata initial_workspace_files = 16;
-    // The session's sealing, as on its StartSessionCommand. The runner also keeps the start's,
-    // but a runner that restarted since has only this.
-    SessionSealing sealing = 18;
+	// The Stop's cutoff, taken from the same sequence as RuntimeRef.runtime_order. The Stop
+	// covers the session's runtimes up to this order; if the runner holds a runtime, a child or
+	// a startup of the session with a higher order, the Stop is acknowledged as superseded and
+	// does nothing. The runner keeps the cutoff and refuses any start of the session at or
+	// below it.
+	uint64 up_to_runtime_order = 7;
 }
 
 // One HTTP request to the editor runtime, as the browser sent it.
@@ -188,15 +169,16 @@ message PromptArtifact {
 // until expires_utc; the runner runs it at most once, and only after GrantPromptExecution
 // answers GRANTED. Redelivery of the same handoff_id is normal until then.
 message SubmitPromptCommand {
+    reserved 6, 7, 8;
+    reserved "lifecycle_generation", "runtime_epoch", "runtime_instance_id";
+
     string handoff_id = 1;
     string session_id = 2;
     string editor_sid = 3;
     string owner = 4;
     string editor_runtime_kind = 5;
     // The runtime the handoff was accepted for; the runner refuses it for any other.
-    uint64 lifecycle_generation = 6;
-    uint64 runtime_epoch = 7;
-    string runtime_instance_id = 8;
+    RuntimeRef runtime = 16;
     PromptRequest request = 9;
     // Editor state requests replayed, in order, before the request itself.
     repeated PromptRequest preflight_requests = 10;
@@ -209,15 +191,14 @@ message SubmitPromptCommand {
 }
 
 message RelayEditorRuntimeRequestCommand {
-    reserved 20, 21;
-    reserved "bridge_connection_id", "bridge_lease_revision";
+    reserved 6, 18, 19, 20, 21;
+    reserved "lifecycle_generation", "runtime_epoch", "runtime_instance_id", "bridge_connection_id", "bridge_lease_revision";
 
     string request_id = 1;
     string delivery_id = 2;
     string runner_id = 3;
     string session_id = 4;
     string editor_sid = 5;
-    uint64 lifecycle_generation = 6;
     offloadr.editor_runtime.v1.EditorRuntimeRequestKind kind = 7;
     string method = 8;
     string path = 9;
@@ -227,26 +208,26 @@ message RelayEditorRuntimeRequestCommand {
     string client_id = 13;
     bytes client_message = 14;
     google.protobuf.Timestamp expires_utc = 15;
-    uint32 attempt = 16;
+    uint32 attempt = 16; // Delivery attempt of this request, not a runtime identity.
     bool urgent = 17;
-    uint64 runtime_epoch = 18;
-    string runtime_instance_id = 19;
+    RuntimeRef runtime = 22;
 }
 
 message AcknowledgeEditorRuntimeRequestRequest {
+    reserved 5, 12, 13;
+    reserved "lifecycle_generation", "runtime_epoch", "runtime_instance_id";
+
     string request_id = 1;
     string delivery_id = 2;
     string runner_id = 3;
     string session_id = 4;
-    uint64 lifecycle_generation = 5;
     bool transport_succeeded = 6;
     int32 status_code = 7;
     bytes body = 8;
     string content_type = 9;
     string error_message = 10;
     offloadr.editor_runtime.v1.EditorRuntimeRequestKind kind = 11;
-    uint64 runtime_epoch = 12;
-    string runtime_instance_id = 13;
+    RuntimeRef runtime = 14;
 }
 
 message ModelDownloadRequest {
@@ -270,6 +251,9 @@ enum ModelDownloadState {
 }
 
 message ReportModelDownloadRequest {
+    reserved 13, 14, 15;
+    reserved "runtime_epoch", "runtime_instance_id", "lifecycle_generation";
+
     string runner_id = 1;
     string session_id = 2;
     string model_id = 3;
@@ -282,9 +266,7 @@ message ReportModelDownloadRequest {
     string message = 10;
     int64 bytes_per_second = 11;
     int64 average_bytes_per_second = 12;
-    uint64 runtime_epoch = 13;
-    string runtime_instance_id = 14;
-    uint64 lifecycle_generation = 15;
+    RuntimeRef runtime = 16;
 }
 
 message ReportModelDownloadResponse {}
@@ -315,11 +297,11 @@ message WorkspaceFileMetadata {
 }
 
 // Where the runner's editor runtime is. The phase is a report, not a command: the
-// acknowledgements stay the owners of start and launch results.
+// start acknowledgement stays the owner of a start's result.
 enum RuntimePhase {
     RUNTIME_PHASE_UNSPECIFIED = 0;
     RUNTIME_PHASE_NONE = 1;     // No session, or a session held with no editor process.
-    RUNTIME_PHASE_STARTING = 2; // A start or launch of the runtime below is running.
+    RUNTIME_PHASE_STARTING = 2; // A start of the runtime below is running.
     RUNTIME_PHASE_READY = 3;    // The runtime below finished starting ready.
     RUNTIME_PHASE_FAILED = 4;   // The runtime below failed to start and the runner still holds its session.
                                 // A runtime that exits unexpectedly ends the session: NONE.
@@ -327,11 +309,13 @@ enum RuntimePhase {
 }
 
 // The runner's one logical session and the runtime it runs, sent with every registration.
+// Reported by a runner that runs sessions only.
 message RuntimeStatus {
+    reserved 2, 3, 4;
+    reserved "lifecycle_generation", "runtime_epoch", "runtime_instance_id";
+
     string session_id = 1;           // Empty when the runner holds no session.
-    uint64 lifecycle_generation = 2; // The runtime's identity; zero when the phase has none.
-    uint64 runtime_epoch = 3;
-    string runtime_instance_id = 4;
+    RuntimeRef runtime = 8;          // Unset when the phase has no runtime.
     RuntimePhase phase = 5;
     SessionSealingStatus sealing = 6; // What the runtime got; set only when READY.
     string message = 7;               // Why it failed; set only when FAILED, at most 512 bytes.
@@ -369,48 +353,19 @@ message RegisterRunnerResponse {
 	RegistrationRejection rejection = 5;
 }
 
-// Unary ack request message for start-session.
-message AcknowledgeSessionStartRequest {
+// The outcome of one StartRuntimeCommand, named by its runtime. A repeated start of the same
+// runtime is answered with the same acknowledgement.
+message AcknowledgeRuntimeStartRequest {
+    reserved 5, 6, 7;
+    reserved "lifecycle_generation", "runtime_epoch", "runtime_instance_id";
+
     string session_id = 1;
     string user = 2;
     bool ready = 3;
     string message = 4;
-    uint64 lifecycle_generation = 5;
-    uint64 runtime_epoch = 6;
-    string runtime_instance_id = 7;
-    SessionSealingStatus sealing = 8; // What the started session got; unset when it did not start.
-    string instance_id = 9; // Registered process that executed the assignment.
-}
-
-message AcknowledgeEditorRuntimeQuiesceRequest {
-    string command_id = 1;
-    string restart_id = 2;
-    string runner_id = 3;
-    string session_id = 4;
-    uint64 lifecycle_generation = 5;
-    uint64 runtime_epoch = 6;
-    string runtime_instance_id = 7;
-    uint32 restart_revision = 8;
-    bool quiesced = 9;
-    string message = 10;
-}
-
-message AcknowledgeEditorRuntimeLaunchRequest {
-    reserved 11, 13;
-
-    string command_id = 1;
-    string restart_id = 2;
-    string runner_id = 3;
-    string session_id = 4;
-    uint64 lifecycle_generation = 5;
-    uint64 runtime_epoch = 6;
-    string runtime_instance_id = 7;
-    uint32 restart_revision = 8;
-    uint32 attempt = 9;
-    bool ready = 10;
-    string message = 12;
-    SessionSealingStatus sealing = 14; // What the launched runtime got; unset when it did not launch.
-    string instance_id = 15; // Registered process that executed the assignment.
+    SessionSealingStatus sealing = 8; // What the started runtime got; unset when it did not start.
+    string instance_id = 9; // Registered process that executed the start.
+    RuntimeRef runtime = 10;
 }
 
 // Unary ack request message for stop-session.
@@ -421,15 +376,16 @@ enum RunnerCleanupDisposition {
 }
 
 message AcknowledgeSessionStopRequest {
+    reserved 5, 6, 7;
+    reserved "lifecycle_generation", "runtime_epoch", "runtime_instance_id";
+
     string session_id = 1;
     string user = 2;
     string command_id = 3;
     // Registered runner process acknowledging the captured command.
     string instance_id = 4;
-    // Echo of the Stop command's runtime identity, unset when not supplied.
-    uint64 lifecycle_generation = 5;
-    uint64 runtime_epoch = 6;
-    string runtime_instance_id = 7;
+    // Echo of the Stop command's cutoff.
+    uint64 up_to_runtime_order = 11;
     // Artifacts that failed or were still uploading when the session's data was removed. They
     // are lost; the session must not be reported as fully saved when this is not zero.
     uint32 unsaved_artifact_count = 8;
@@ -467,13 +423,14 @@ message AcknowledgePromptResultRequest {
 }
 
 message GrantPromptExecutionRequest {
+    reserved 5, 6, 7;
+    reserved "lifecycle_generation", "runtime_epoch", "runtime_instance_id";
+
     string runner_id = 1;
     string session_id = 2;
     string handoff_id = 3;
     string instance_id = 4;
-    uint64 lifecycle_generation = 5;
-    uint64 runtime_epoch = 6;
-    string runtime_instance_id = 7;
+    RuntimeRef runtime = 8;
 }
 
 enum PromptGrantOutcome {
@@ -532,6 +489,9 @@ enum SessionStreamFrameType {
 }
 
 message SessionStreamEvent {
+    reserved 11, 12, 13;
+    reserved "lifecycle_generation", "runtime_epoch", "runtime_instance_id";
+
     string runner_id = 1;
     string session_id = 2;
     string editor_sid = 3;
@@ -542,9 +502,7 @@ message SessionStreamEvent {
     SessionStreamFrameType frame_type = 8;
     bytes payload = 9;
     google.protobuf.Timestamp created_utc = 10;
-    uint64 lifecycle_generation = 11;
-    uint64 runtime_epoch = 12;
-    string runtime_instance_id = 13;
+    RuntimeRef runtime = 15;
     // Set only by the runner, never from editor output: the runner's native socket for
     // client_id is open under this runtime. An event with it has no payload.
     BridgeState bridge_state = 14;
@@ -561,13 +519,14 @@ message BridgeState {
 // log, prompt, result, exception text or producer timestamp. Physical readiness
 // and optional diagnostic delivery remain independent.
 message ReportRuntimeActivityRequest {
+    reserved 4, 5, 6;
+    reserved "lifecycle_generation", "runtime_epoch", "runtime_instance_id";
+
     string runner_id = 1;
     string session_id = 2;
     string instance_id = 3;
-    uint64 lifecycle_generation = 4;
-    uint64 runtime_epoch = 5;
-    string runtime_instance_id = 6;
     SessionSealingStatus sealing = 7;
+    RuntimeRef runtime = 8;
 }
 
 enum RuntimeActivityOutcome {
@@ -598,15 +557,16 @@ enum SessionProcessLogStream {
 }
 
 message SessionProcessLogEntry {
+    reserved 7, 8, 9;
+    reserved "lifecycle_generation", "runtime_epoch", "runtime_instance_id";
+
     string runner_id = 1;
     string session_id = 2;
     SessionProcessLogStream stream = 3;
     string message = 4;
     google.protobuf.Timestamp created_utc = 5;
     uint64 sequence = 6;
-    uint64 lifecycle_generation = 7;
-    uint64 runtime_epoch = 8;
-    string runtime_instance_id = 9;
+    RuntimeRef runtime = 10;
 }
 
 message ReportSessionLogsRequest {
@@ -632,12 +592,13 @@ message ReportRunnerLogsRequest {
 message ReportRunnerLogsResponse {}
 
 message SessionRuntimeTelemetryEntry {
+    reserved 4, 5, 6;
+    reserved "lifecycle_generation", "runtime_epoch", "runtime_instance_id";
+
     string runner_id = 1;
     string session_id = 2;
     offloadr.runner.v1.RunnerRuntimeTelemetrySnapshot telemetry = 3;
-    uint64 lifecycle_generation = 4;
-    uint64 runtime_epoch = 5;
-    string runtime_instance_id = 6;
+    RuntimeRef runtime = 7;
 }
 
 message ReportRuntimeTelemetryRequest {
@@ -656,25 +617,24 @@ message CommandStreamRequest {
 }
 
 message CommandStreamResponse {
+    reserved 7, 8;
+    reserved "quiesce_editor_runtime", "launch_editor_runtime";
+
     oneof payload {
-        StartSessionCommand start_session = 1;
+        StartRuntimeCommand start_runtime = 1;
         StopSessionCommand stop_session = 2;
         SubmitPromptCommand submit_prompt = 3;
         CommandStreamKeepAlive keepalive = 4;
         SetGpuPowerLimitCommand set_gpu_power_limit = 5;
         RelayEditorRuntimeRequestCommand relay_editor_runtime_request = 6;
-        QuiesceEditorRuntimeCommand quiesce_editor_runtime = 7;
-        LaunchEditorRuntimeCommand launch_editor_runtime = 8;
     }
 }
 
-message AcknowledgeSessionStartResponse {}
+message AcknowledgeRuntimeStartResponse {}
 message AcknowledgeSessionStopResponse {}
 message AcknowledgePromptResultResponse {}
 message AcknowledgeGpuPowerLimitResponse {}
 message AcknowledgeEditorRuntimeRequestResponse {}
-message AcknowledgeEditorRuntimeQuiesceResponse {}
-message AcknowledgeEditorRuntimeLaunchResponse {}
 
 message RunnerArtifactServiceListArtifactsRequest {
     string editor_sid = 1;
@@ -705,12 +665,13 @@ message RunnerReadStreamMetadata {
 // reads before it is ready) and refuses one for a retired process or runtime. A sealed response's
 // envelope identity takes session_id from here.
 message RunnerReadRequester {
+    reserved 4, 5, 6;
+    reserved "lifecycle_generation", "runtime_epoch", "runtime_instance_id";
+
     string runner_id = 1;
     string instance_id = 2;           // The registered runner process (RegisterRunnerRequest.instance_id).
     string session_id = 3;
-    uint64 lifecycle_generation = 4;  // The session runtime the read is for; unset when unknown.
-    uint64 runtime_epoch = 5;
-    string runtime_instance_id = 6;
+    RuntimeRef runtime = 7; // The session runtime the read is for; unset when unknown.
 }
 
 message RunnerArtifactServiceReadArtifactRequest {
@@ -732,6 +693,9 @@ message RunnerArtifactServiceReadArtifactResponse {
 }
 
 message RunnerArtifactUploadMetadata {
+    reserved 11, 12, 13;
+    reserved "lifecycle_generation", "runtime_epoch", "runtime_instance_id";
+
     string editor_sid = 1;
     google.protobuf.StringValue prompt_id = 2;
     string filename = 3;
@@ -742,9 +706,6 @@ message RunnerArtifactUploadMetadata {
     google.protobuf.StringValue sha256 = 8;
     google.protobuf.StringValue owner = 9;
     google.protobuf.StringValue session_id = 10;
-    uint64 lifecycle_generation = 11;
-    uint64 runtime_epoch = 12;
-    string runtime_instance_id = 13;
     string runner_id = 14;
     // Set when the chunks carry a payload sealed to the session's output recipient. size_bytes is
     // then the plaintext size the header declares, and sha256 is not sent: a plaintext digest
@@ -754,6 +715,7 @@ message RunnerArtifactUploadMetadata {
     // Server-issued ID bound to one producer file snapshot across retries and rescans.
     // A changed file/target obtains a new ID. Not a plaintext digest or authorization.
     string upload_id = 17;
+    RuntimeRef runtime = 18;
 }
 
 message RunnerArtifactServiceUploadArtifactRequest {
@@ -838,15 +800,13 @@ message GetRunnerLaunchPlanResponse {
 service RunnerControlService {
     rpc RegisterRunner(RegisterRunnerRequest) returns (RegisterRunnerResponse);
     rpc CommandStream(CommandStreamRequest) returns (stream CommandStreamResponse);
-    rpc AcknowledgeSessionStart(AcknowledgeSessionStartRequest) returns (AcknowledgeSessionStartResponse);
+    rpc AcknowledgeRuntimeStart(AcknowledgeRuntimeStartRequest) returns (AcknowledgeRuntimeStartResponse);
     rpc AcknowledgeSessionStop(AcknowledgeSessionStopRequest) returns (AcknowledgeSessionStopResponse);
     rpc AcknowledgePromptResult(AcknowledgePromptResultRequest) returns (AcknowledgePromptResultResponse);
     rpc GrantPromptExecution(GrantPromptExecutionRequest) returns (GrantPromptExecutionResponse);
     rpc AcknowledgeGpuPowerLimit(AcknowledgeGpuPowerLimitRequest) returns (AcknowledgeGpuPowerLimitResponse);
     rpc GrantGpuPowerExecution(GrantGpuPowerExecutionRequest) returns (GrantGpuPowerExecutionResponse);
     rpc AcknowledgeEditorRuntimeRequest(AcknowledgeEditorRuntimeRequestRequest) returns (AcknowledgeEditorRuntimeRequestResponse);
-    rpc AcknowledgeEditorRuntimeQuiesce(AcknowledgeEditorRuntimeQuiesceRequest) returns (AcknowledgeEditorRuntimeQuiesceResponse);
-    rpc AcknowledgeEditorRuntimeLaunch(AcknowledgeEditorRuntimeLaunchRequest) returns (AcknowledgeEditorRuntimeLaunchResponse);
     rpc ReportModelDownload(ReportModelDownloadRequest) returns (ReportModelDownloadResponse);
     rpc SyncLocalModels(SyncLocalModelsRequest) returns (SyncLocalModelsResponse);
     rpc ReportRuntimeActivity(ReportRuntimeActivityRequest) returns (ReportRuntimeActivityResponse);

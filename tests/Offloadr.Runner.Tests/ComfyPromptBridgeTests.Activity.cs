@@ -26,8 +26,7 @@ public sealed partial class ComfyPromptBridgeTests
             (session, runtime) => observed.TrySetResult((session, runtime)),
             RunnerId, "127.0.0.1", port, _ => new SessionSealingStatus(), (_, _) => true);
         relay.AttachSink(sink);
-        await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "activity-client", command.LifecycleGeneration,
-            command.RuntimeEpoch, command.RuntimeInstanceId, [], CancellationToken.None);
+        await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "activity-client", RuntimeIdentity.From(command.Runtime), [], CancellationToken.None);
         var context = await listener.GetContextAsync().WaitAsync(TimeSpan.FromSeconds(3));
         using var socket = (await context.AcceptWebSocketAsync(null)).WebSocket;
         await sink.NextBridgeStateAsync();
@@ -39,8 +38,7 @@ public sealed partial class ComfyPromptBridgeTests
             Assert.Multiple(() =>
             {
                 Assert.That(activity.Session, Is.EqualTo(command.SessionId));
-                Assert.That(activity.Runtime, Is.EqualTo(new RuntimeIdentity(command.LifecycleGeneration,
-                    command.RuntimeEpoch, command.RuntimeInstanceId).Normalized()));
+                Assert.That(activity.Runtime, Is.EqualTo(RuntimeIdentity.From(command.Runtime).Normalized()));
             });
         }
         finally

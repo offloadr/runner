@@ -27,7 +27,7 @@ internal sealed partial class ComfySessionEventRelay
 
         private bool RuntimeIsCurrent()
             => !_cts.IsCancellationRequested && _owner._isTrackedRuntime(_sessionId,
-                new RuntimeIdentity(_lifecycleGeneration, _runtimeEpoch, _runtimeInstanceId));
+                _runtime);
 
         private async Task RunAsync()
         {
@@ -134,9 +134,7 @@ internal sealed partial class ComfySessionEventRelay
                 EditorSid = _editorSid,
                 ClientId = _clientId,
                 CreatedUtc = Timestamp.FromDateTime(DateTime.UtcNow),
-                LifecycleGeneration = _lifecycleGeneration,
-                RuntimeEpoch = _runtimeEpoch,
-                RuntimeInstanceId = _runtimeInstanceId,
+                Runtime = _runtime.ToRef(),
                 BridgeState = new BridgeState { ConnectionId = connection.Id.ToString("n") },
             });
         }

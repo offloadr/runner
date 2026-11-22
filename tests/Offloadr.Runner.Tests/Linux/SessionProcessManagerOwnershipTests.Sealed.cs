@@ -1263,15 +1263,14 @@ public partial class SessionProcessManagerOwnershipTests
         Assert.That(result.StillWritable, Is.EqualTo(new[] { "/fuse", "/refuses" }));
     }
 
-    private static StartSessionCommand SealedStart(string sessionId, string runtimeKind = "comfyui")
+    private static StartRuntimeCommand SealedStart(string sessionId, string runtimeKind = "comfyui")
         => new()
         {
             SessionId = sessionId,
             User = "user-1",
             EditorRuntimeKind = runtimeKind,
             LifecycleGeneration = 1,
-            RuntimeEpoch = 1,
-            RuntimeInstanceId = "44444444444444448444444444444444",
+            Runtime = new RuntimeRef { RuntimeId = "44444444444444448444444444444444", RuntimeOrder = 11 },
         };
 
     private static (string TempRoot, string SealedRoot, SessionProcessOptions Options) CreateSealedOptions(string runtimeKind)

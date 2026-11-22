@@ -22,7 +22,7 @@ public partial class SessionProcessManagerOwnershipTests
             var command = ActivityStartCommand();
             await manager.StartSessionAsync(command, CancellationToken.None);
             command.SessionId = "changed-after-start";
-            command.RuntimeEpoch = 99;
+            command.Runtime.RuntimeOrder = 99;
             await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
             Assert.That(sink.Observations.Single(), Is.EqualTo(new RuntimeActivityObservation(
                 ActivitySessionId, ActivityRuntime(1), false, false, false)));
@@ -45,7 +45,7 @@ public partial class SessionProcessManagerOwnershipTests
         var release = new TaskCompletionSource<RuntimeActivityOutcome>(TaskCreationOptions.RunContinuationsAsynchronously);
         var sink = new ActivitySink(async (observation, token) =>
         {
-            if (observation.Runtime.RuntimeEpoch == 2)
+            if (observation.Runtime.RuntimeOrder == 2)
             {
                 replacementAccepted.TrySetResult();
                 return RuntimeActivityOutcome.Applied;
@@ -196,14 +196,14 @@ public partial class SessionProcessManagerOwnershipTests
     }
 
     private const string ActivitySessionId = "ac719111-0000-4000-8000-000000000001";
-    private static RuntimeIdentity ActivityRuntime(ulong epoch) => new(1, epoch, "33333333333343338333333333333333");
-    private static StartSessionCommand ActivityStartCommand(ulong epoch = 1)
+    // One runtime per order, each with its own id.
+    private static RuntimeIdentity ActivityRuntime(ulong order) => new($"3333333333334333833333333333333{order}", order);
+    private static StartRuntimeCommand ActivityStartCommand(ulong epoch = 1)
         => new()
         {
             SessionId = ActivitySessionId,
             LifecycleGeneration = 1,
-            RuntimeEpoch = epoch,
-            RuntimeInstanceId = ActivityRuntime(epoch).RuntimeInstanceId,
+            Runtime = ActivityRuntime(epoch).ToRef(),
             EditorRuntimeKind = "forge-neo"
         };
 

@@ -36,8 +36,7 @@ public sealed partial class ComfyPromptBridgeTests
             _ => new SessionSealingStatus(), (_, _) => true);
         var sink = new BridgeSink();
         relay.AttachSink(sink);
-        await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", command.LifecycleGeneration,
-            command.RuntimeEpoch, command.RuntimeInstanceId, "features"u8.ToArray(), CancellationToken.None);
+        await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", RuntimeIdentity.From(command.Runtime), "features"u8.ToArray(), CancellationToken.None);
 
         var first = await listener.GetContextAsync().WaitAsync(TimeSpan.FromSeconds(3));
         var firstSocket = (await first.AcceptWebSocketAsync(null)).WebSocket;
@@ -51,9 +50,7 @@ public sealed partial class ComfyPromptBridgeTests
             Assert.That(firstState.ClientId, Is.EqualTo("client"));
             Assert.That(firstState.SessionId, Is.EqualTo(command.SessionId));
             Assert.That(firstState.EditorSid, Is.EqualTo(command.EditorSid));
-            Assert.That(firstState.LifecycleGeneration, Is.EqualTo(command.LifecycleGeneration));
-            Assert.That(firstState.RuntimeEpoch, Is.EqualTo(command.RuntimeEpoch));
-            Assert.That(firstState.RuntimeInstanceId, Is.EqualTo(command.RuntimeInstanceId));
+            Assert.That(firstState.Runtime, Is.EqualTo(command.Runtime));
         });
 
         // A reconnect is a new native connection: the handshake again, under a new id.
@@ -83,8 +80,7 @@ public sealed partial class ComfyPromptBridgeTests
                 _ => new SessionSealingStatus(), (_, _) => true);
             var sink = new BridgeSink();
             relay.AttachSink(sink);
-            await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", command.LifecycleGeneration,
-                command.RuntimeEpoch, command.RuntimeInstanceId, [], CancellationToken.None);
+            await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", RuntimeIdentity.From(command.Runtime), [], CancellationToken.None);
             var context = await listener.GetContextAsync().WaitAsync(TimeSpan.FromSeconds(3));
             using var socket = (await context.AcceptWebSocketAsync(null)).WebSocket;
             var first = await sink.NextBridgeStateAsync();
@@ -109,8 +105,7 @@ public sealed partial class ComfyPromptBridgeTests
             return Task.CompletedTask;
         });
         relay.AttachSink(sink);
-        await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", command.LifecycleGeneration,
-            command.RuntimeEpoch, command.RuntimeInstanceId, [], CancellationToken.None);
+        await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", RuntimeIdentity.From(command.Runtime), [], CancellationToken.None);
         var context = await listener.GetContextAsync().WaitAsync(TimeSpan.FromSeconds(3));
         using var socket = (await context.AcceptWebSocketAsync(null)).WebSocket;
         await sink.NextBridgeStateAsync();
@@ -136,8 +131,7 @@ public sealed partial class ComfyPromptBridgeTests
             _ => null, (_, _) => true);
         var sink = new BridgeSink();
         relay.AttachSink(sink);
-        await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", command.LifecycleGeneration,
-            command.RuntimeEpoch, command.RuntimeInstanceId, [], CancellationToken.None);
+        await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", RuntimeIdentity.From(command.Runtime), [], CancellationToken.None);
         var connect = listener.GetContextAsync();
         await Task.Delay(1500);
         Assert.Multiple(() =>
@@ -167,12 +161,10 @@ public sealed partial class ComfyPromptBridgeTests
         Task? send = null;
         try
         {
-            await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", command.LifecycleGeneration,
-                command.RuntimeEpoch, command.RuntimeInstanceId, "initial features"u8.ToArray(), CancellationToken.None);
+            await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", RuntimeIdentity.From(command.Runtime), "initial features"u8.ToArray(), CancellationToken.None);
             // The native peer has not accepted yet: the message waits for the connection.
             var connect = listener.GetContextAsync();
-            send = relay.SendClientMessageAsync(command.SessionId, command.EditorSid, "client", command.LifecycleGeneration,
-                command.RuntimeEpoch, command.RuntimeInstanceId, "one client message"u8.ToArray(), cancelSend.Token);
+            send = relay.SendClientMessageAsync(command.SessionId, command.EditorSid, "client", RuntimeIdentity.From(command.Runtime), "one client message"u8.ToArray(), cancelSend.Token);
             await Task.Delay(100);
             Assert.That(send.IsCompleted, Is.False);
             if (outcome == "accept")
@@ -223,15 +215,14 @@ public sealed partial class ComfyPromptBridgeTests
             _ => new SessionSealingStatus(), (_, _) => Volatile.Read(ref current));
         var sink = new BridgeSink();
         relay.AttachSink(sink);
-        await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", command.LifecycleGeneration,
-            command.RuntimeEpoch, command.RuntimeInstanceId, [], CancellationToken.None);
+        await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", RuntimeIdentity.From(command.Runtime), [], CancellationToken.None);
         var context = await listener.GetContextAsync().WaitAsync(TimeSpan.FromSeconds(3));
         using var socket = (await context.AcceptWebSocketAsync(null)).WebSocket;
         await sink.NextBridgeStateAsync();
 
         Volatile.Write(ref current, false);
         Assert.That(async () => await relay.SendClientMessageAsync(command.SessionId, command.EditorSid, "client",
-                command.LifecycleGeneration, command.RuntimeEpoch, command.RuntimeInstanceId, "late"u8.ToArray(), CancellationToken.None),
+                RuntimeIdentity.From(command.Runtime), "late"u8.ToArray(), CancellationToken.None),
             Throws.InstanceOf<InvalidOperationException>().Or.InstanceOf<OperationCanceledException>());
         var buffer = new byte[64];
         try
@@ -250,8 +241,7 @@ public sealed partial class ComfyPromptBridgeTests
         await using var relay = new ComfySessionEventRelay(static (_, _) => { }, RunnerId, "127.0.0.1", 1,
             _ => new SessionSealingStatus(), (_, _) => true);
         foreach (var client in new[] { "client", "client|nested" })
-            await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, client, command.LifecycleGeneration,
-                command.RuntimeEpoch, command.RuntimeInstanceId, [], CancellationToken.None);
+            await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, client, RuntimeIdentity.From(command.Runtime), [], CancellationToken.None);
         Assert.That(BridgeCount(relay), Is.EqualTo(2));
         await relay.StopSessionAsync(command.SessionId).WaitAsync(TimeSpan.FromSeconds(3));
     }
@@ -268,7 +258,7 @@ public sealed partial class ComfyPromptBridgeTests
             try
             {
                 await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client|" + index,
-                    command.LifecycleGeneration, command.RuntimeEpoch, command.RuntimeInstanceId, [], CancellationToken.None);
+                    RuntimeIdentity.From(command.Runtime), [], CancellationToken.None);
                 return true;
             }
             catch (InvalidOperationException) { return false; }

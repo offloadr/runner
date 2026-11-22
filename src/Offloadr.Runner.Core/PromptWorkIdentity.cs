@@ -18,16 +18,15 @@ internal static class PromptHandoff
 {
     /// <summary>The runtime the handoff was accepted for.</summary>
     internal static RuntimeIdentity Runtime(SubmitPromptCommand command)
-        => new(command.LifecycleGeneration, command.RuntimeEpoch, command.RuntimeInstanceId);
+        => RuntimeIdentity.From(command.Runtime);
 
     /// <summary>
-    /// True when the handoff, session and runtime instance are nonempty UUIDs and the
-    /// lifecycle generation and runtime epoch are positive database values.
+    /// True when the handoff, session and runtime id are nonempty UUIDs and the runtime
+    /// order is a positive database value.
     /// </summary>
     internal static bool HasValidIdentity(SubmitPromptCommand command)
-        => IsUuid(command.HandoffId) && IsUuid(command.SessionId) && IsUuid(command.RuntimeInstanceId)
-           && command.LifecycleGeneration is > 0 and <= long.MaxValue
-           && command.RuntimeEpoch is > 0 and <= long.MaxValue;
+        => IsUuid(command.HandoffId) && IsUuid(command.SessionId)
+           && command.Runtime is { RuntimeOrder: > 0 and <= long.MaxValue } runtime && IsUuid(runtime.RuntimeId);
 
     private static bool IsUuid(string value) => Guid.TryParse(value, out var id) && id != Guid.Empty;
 }

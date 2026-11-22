@@ -96,15 +96,11 @@ internal sealed class SessionProcessLogRelay : IAsyncDisposable
         };
         if (runtimeIdentity is { IsValid: true } writer)
         {
-            entry.LifecycleGeneration = writer.LifecycleGeneration;
-            entry.RuntimeEpoch = writer.RuntimeEpoch;
-            entry.RuntimeInstanceId = writer.RuntimeInstanceId;
+            entry.Runtime = writer.ToRef();
         }
         else if (_runtimeIdentities?.TryGet(sessionId, out var identity) == true)
         {
-            entry.LifecycleGeneration = identity.LifecycleGeneration;
-            entry.RuntimeEpoch = identity.RuntimeEpoch;
-            entry.RuntimeInstanceId = identity.RuntimeInstanceId;
+            entry.Runtime = identity.ToRef();
         }
 
         _queue.Writer.TryWrite(new(entry, deadline));

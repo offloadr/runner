@@ -17,8 +17,7 @@ internal readonly record struct RuntimeActivityObservation(
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(sessionId);
         ArgumentNullException.ThrowIfNull(profile);
-        if (!runtime.IsValid || runtime.LifecycleGeneration > long.MaxValue || runtime.RuntimeEpoch > long.MaxValue ||
-            !Guid.TryParse(runtime.RuntimeInstanceId, out var instance) || instance == Guid.Empty)
+        if (!runtime.IsValid || !Guid.TryParse(runtime.RuntimeId, out var id) || id == Guid.Empty)
             throw new ArgumentException("An exact runtime identity is required.", nameof(runtime));
         return new(sessionId, runtime.Normalized(), profile.MemoryWorkspace, profile.EncryptedUploads, profile.EncryptedReadsRequired);
     }

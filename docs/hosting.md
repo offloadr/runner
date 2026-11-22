@@ -308,10 +308,10 @@ Runtime telemetry notes:
 
 Runtime restart notes:
 
-- An authenticated CPU ComfyUI-Manager v2 reboot can cause Offloadr to issue durable `QUIESCE` and `LAUNCH` commands without restarting the runner container or releasing its GPU.
-- `QUIESCE` cancels startup, prompt preparation, transient work, downloads, artifact work, workspace mirrors, native editor sockets, and the managed child, then removes the session's ephemeral runtime home while retaining runner caches and logical registration.
-- `LAUNCH` uses control-plane-generated command/runtime identities and fresh CPU `user` and `custom_nodes` archives. Retries are separate durable commands; RunnerAgent does not mint retry identities.
-- Every child-originated event, log, download update, telemetry sample and artifact carries lifecycle generation, runtime epoch, and runtime instance. Native editor sockets are described in [native connections](bridge-connections.md).
+- An authenticated CPU ComfyUI-Manager v2 reboot can cause Offloadr to send a newer `StartRuntimeCommand` for the session, without restarting the runner container or releasing its GPU.
+- The newer start first stops the session's current child: it cancels startup, prompt preparation, transient work, downloads, artifact work, workspace mirrors, native editor sockets, and the managed child, then removes the session's ephemeral runtime home while retaining runner caches and the logical session.
+- It then launches the new runtime with fresh CPU `user` and `custom_nodes` archives. The control plane mints every runtime identity (`RuntimeRef`); a retry is another start with a new id and a higher order. RunnerAgent does not mint identities.
+- Every child-originated event, log, download update, telemetry sample and artifact carries the runtime's `RuntimeRef`. Native editor sockets are described in [native connections](bridge-connections.md).
 - A failed child remains unavailable while the runner and allocation stay active. Another Manager reboot retries; allocation Stop always wins.
 
 ## Sealed Storage

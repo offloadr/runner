@@ -161,17 +161,15 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
         string sessionId,
         string editorSid,
         string clientId,
-        ulong lifecycleGeneration,
-        ulong runtimeEpoch,
-        string runtimeInstanceId,
+        RuntimeIdentity runtime,
         byte[] clientMessage,
         CancellationToken cancellationToken)
     {
         if (!Guid.TryParse(sessionId, out var session) || session == Guid.Empty || !ValidClientId(clientId) || string.IsNullOrWhiteSpace(editorSid)
-            || lifecycleGeneration == 0 || runtimeEpoch == 0 || !Guid.TryParse(runtimeInstanceId, out var instance) || instance == Guid.Empty)
+            || !runtime.IsValid || !Guid.TryParse(runtime.RuntimeId, out var runtimeId) || runtimeId == Guid.Empty)
             throw new ArgumentException("A complete captured bridge identity is required.");
 
-        var runtime = new RuntimeIdentity(lifecycleGeneration, runtimeEpoch, runtimeInstanceId).Normalized();
+        runtime = runtime.Normalized();
 
         // Only the session's tracked child may receive a bridge: a delayed relay
         // for an old runtime would otherwise reconnect to its replacement.
@@ -202,11 +200,10 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
             {
                 if (_bridges.Count >= MaxOwnedBridges)
                     throw new InvalidOperationException("The runner WebSocket bridge capacity is exhausted.");
-                bridge = new SessionBridge(this, _runnerId, sessionId, editorSid, clientId, lifecycleGeneration,
-                    runtimeEpoch, runtimeInstanceId, BuildWsUri(clientId));
+                bridge = new SessionBridge(this, _runnerId, sessionId, editorSid, clientId, runtime, BuildWsUri(clientId));
                 if (!_bridges.TryAdd(key, bridge)) throw new InvalidOperationException("Bridge ownership changed while locked.");
             }
-            bridge.UpdateConnectionData(editorSid, lifecycleGeneration, runtimeEpoch, runtimeInstanceId, clientMessage);
+            bridge.UpdateConnectionData(editorSid, runtime, clientMessage);
             await bridge.StartAsync(cancellationToken).ConfigureAwait(false);
         }
         finally { _bridgeOwnership.Release(); }
@@ -216,15 +213,13 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
         string sessionId,
         string editorSid,
         string clientId,
-        ulong lifecycleGeneration,
-        ulong runtimeEpoch,
-        string runtimeInstanceId,
+        RuntimeIdentity runtime,
         byte[] payload,
         CancellationToken cancellationToken)
     {
         // A browser-originated message is sent once. It is not the bridge's connection
         // handshake, so it must not be retained and replayed on later reconnects.
-        if (!TryGetBridge(sessionId, clientId, new RuntimeIdentity(lifecycleGeneration, runtimeEpoch, runtimeInstanceId), out var bridge))
+        if (!TryGetBridge(sessionId, clientId, runtime, out var bridge))
         {
             throw new InvalidOperationException("The editor WebSocket bridge for this client is not available.");
         }
@@ -337,9 +332,7 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
     private static string BuildKey(string sessionId, string clientId, RuntimeIdentity runtime)
         => string.Concat(
             BuildClientPrefix(sessionId, clientId),
-            runtime.LifecycleGeneration.ToString(System.Globalization.CultureInfo.InvariantCulture), "|",
-            runtime.RuntimeEpoch.ToString(System.Globalization.CultureInfo.InvariantCulture), "|",
-            runtime.RuntimeInstanceId);
+            RuntimeIdentity.NormalizeRuntimeId(runtime.RuntimeId));
 
     private static string BuildClientPrefix(string sessionId, string clientId)
         => string.Concat(Guid.Parse(sessionId).ToString("n"), "|", Convert.ToBase64String(ClientIdEncoding.GetBytes(clientId)), "|");
@@ -645,9 +638,7 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
         private readonly string _editorSid;
         private readonly string _clientId;
         private readonly Uri _uri;
-        private readonly ulong _lifecycleGeneration;
-        private readonly ulong _runtimeEpoch;
-        private readonly string _runtimeInstanceId;
+        private readonly RuntimeIdentity _runtime;
         private PhysicalConnection? _connection;
         private byte[] _clientMessage = [];
         private readonly CancellationTokenSource _cts = new();
@@ -666,9 +657,7 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
             string sessionId,
             string editorSid,
             string clientId,
-            ulong lifecycleGeneration,
-            ulong runtimeEpoch,
-            string runtimeInstanceId,
+            RuntimeIdentity runtime,
             Uri uri)
         {
             _owner = owner;
@@ -676,16 +665,13 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
             _sessionId = sessionId.Trim();
             _editorSid = editorSid?.Trim() ?? string.Empty;
             _clientId = clientId;
-            _lifecycleGeneration = lifecycleGeneration;
-            _runtimeEpoch = runtimeEpoch;
-            _runtimeInstanceId = Guid.Parse(runtimeInstanceId).ToString("n");
+            _runtime = runtime.Normalized();
             _uri = uri;
         }
 
-        public void UpdateConnectionData(string editorSid, ulong lifecycleGeneration, ulong runtimeEpoch, string runtimeInstanceId, byte[] clientMessage)
+        public void UpdateConnectionData(string editorSid, RuntimeIdentity runtime, byte[] clientMessage)
         {
-            if (editorSid != _editorSid || lifecycleGeneration != _lifecycleGeneration || runtimeEpoch != _runtimeEpoch
-                || !Guid.TryParse(runtimeInstanceId, out var instance) || instance != Guid.Parse(_runtimeInstanceId))
+            if (editorSid != _editorSid || !runtime.SameRuntime(_runtime))
                 throw new InvalidOperationException("An existing bridge cannot be rebound to another runtime.");
             if (clientMessage is { Length: > 0 })
             {
@@ -784,7 +770,7 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
                         }
 
                         if (result.Count > 0)
-                            _owner._observeRuntimeActivity(_sessionId, new RuntimeIdentity(_lifecycleGeneration, _runtimeEpoch, _runtimeInstanceId));
+                            _owner._observeRuntimeActivity(_sessionId, _runtime);
 
                         // Session code controls message size: past the cap the rest of the
                         // message is read and discarded instead of buffered.
@@ -834,9 +820,7 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
                         FrameType = frameType,
                         Payload = ByteString.CopyFrom(payload),
                         CreatedUtc = Timestamp.FromDateTime(DateTime.UtcNow),
-                        LifecycleGeneration = _lifecycleGeneration,
-                        RuntimeEpoch = _runtimeEpoch,
-                        RuntimeInstanceId = _runtimeInstanceId,
+                        Runtime = _runtime.ToRef(),
                     };
 
                     if (!string.IsNullOrWhiteSpace(eventType))
@@ -867,7 +851,7 @@ internal sealed partial class ComfySessionEventRelay : IAsyncDisposable
                     {
                         _owner.OnPromptFinished(new(
                             _sessionId,
-                            new RuntimeIdentity(_lifecycleGeneration, _runtimeEpoch, _runtimeInstanceId),
+                            _runtime,
                             promptId,
                             string.IsNullOrWhiteSpace(evt.HandoffId) ? null : evt.HandoffId));
                     }

@@ -455,7 +455,7 @@ public partial class ArtifactUploadServiceTests
             File.WriteAllBytes(Path.Combine(paths.OutputDirectory, "first.png"), [1, 2, 3]);
             File.WriteAllBytes(Path.Combine(paths.OutputDirectory, "second.png"), [4, 5, 6]);
             var identities = new RuntimeIdentityRegistry();
-            identities.Set("session-1", 7, 3, "aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaa");
+            identities.Set("session-1", new RuntimeIdentity("aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaa", 73));
             var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse())
             {
                 UploadGate = gate.Task
@@ -470,15 +470,14 @@ public partial class ArtifactUploadServiceTests
 
             // Both files are queued; the session is replaced while the first upload stalls.
             var first = await artifactClient.WaitForUploadAsync(TimeSpan.FromSeconds(10));
-            identities.Set("session-1", 7, 4, "bbbbbbbbbbbb4bbb8bbbbbbbbbbbbbbb");
+            identities.Set("session-1", new RuntimeIdentity("bbbbbbbbbbbb4bbb8bbbbbbbbbbbbbbb", 74));
             gate.TrySetResult();
             var second = await artifactClient.WaitForUploadAsync(TimeSpan.FromSeconds(10));
 
             Assert.Multiple(() =>
             {
-                Assert.That(first.Metadata!.RuntimeEpoch, Is.EqualTo(3));
-                Assert.That(second.Metadata!.RuntimeEpoch, Is.EqualTo(3));
-                Assert.That(second.Metadata.RuntimeInstanceId, Is.EqualTo("aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaa"));
+                Assert.That(first.Metadata!.Runtime.RuntimeOrder, Is.EqualTo(73));
+                Assert.That(second.Metadata!.Runtime, Is.EqualTo(new RuntimeRef { RuntimeId = "aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaa", RuntimeOrder = 73 }));
             });
         }
         finally

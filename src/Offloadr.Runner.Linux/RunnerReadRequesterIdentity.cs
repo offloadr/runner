@@ -27,9 +27,7 @@ internal sealed class RunnerReadRequesterIdentity(string? runnerId, string? inst
         };
         if (runtimeIdentities?.TryGet(sessionId, out var runtime) == true && runtime.IsValid)
         {
-            requester.LifecycleGeneration = runtime.LifecycleGeneration;
-            requester.RuntimeEpoch = runtime.RuntimeEpoch;
-            requester.RuntimeInstanceId = runtime.RuntimeInstanceId;
+            requester.Runtime = runtime.ToRef();
         }
 
         return requester;

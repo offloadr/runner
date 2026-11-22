@@ -152,7 +152,7 @@ public sealed class DiagnosticRelayClockAndJoinTests
         }
         var sink = new DiagnosticSink
         {
-            Session = (request, _) => { var entry = request.Entries.Single(); return Send(entry.CreatedUtc, entry.Sequence, entry.RuntimeInstanceId); },
+            Session = (request, _) => { var entry = request.Entries.Single(); return Send(entry.CreatedUtc, entry.Sequence, entry.Runtime?.RuntimeId ?? string.Empty); },
             Runner = (request, _) => { var entry = request.Entries.Single(); return Send(entry.CreatedUtc, entry.Sequence, entry.RelayInstanceId); }
         };
         await using var probe = new RelayProbe(runner, clock, sink);
@@ -217,7 +217,7 @@ public sealed class DiagnosticRelayClockAndJoinTests
         public void Enqueue(string message)
         {
             if (_runner is not null) _runner.Enqueue("RunnerAgent", message);
-            else _session!.Enqueue("session", SessionProcessLogStream.Stdout, message, new RuntimeIdentity(7, 1, "ddc2e6472be94ee0b9dd211119b30a45"));
+            else _session!.Enqueue("session", SessionProcessLogStream.Stdout, message, new RuntimeIdentity("ddc2e6472be94ee0b9dd211119b30a45", 71));
         }
         public async ValueTask DisposeAsync()
         {
@@ -249,7 +249,7 @@ public sealed class DiagnosticRelayClockAndJoinTests
         public Func<ReportRunnerLogsRequest, CancellationToken, Task> Runner { get; init; } = (_, _) => throw new NotSupportedException();
         public Task<RegisterRunnerResponse> RegisterRunnerAsync(RegisterRunnerRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<SyncLocalModelsResponse> SyncLocalModelsAsync(SyncLocalModelsRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
-        public Task AckStartSessionAsync(AcknowledgeSessionStartRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task AckRuntimeStartAsync(AcknowledgeRuntimeStartRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task AckStopSessionAsync(AcknowledgeSessionStopRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<GrantGpuPowerExecutionResponse> GrantGpuPowerExecutionAsync(GrantGpuPowerExecutionRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task AckGpuPowerLimitAsync(AcknowledgeGpuPowerLimitRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();

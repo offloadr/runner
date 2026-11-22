@@ -26,9 +26,7 @@ public partial class ServiceClientManagerTests
             DeliveryId = request.DeliveryId,
             RunnerId = request.RunnerId,
             SessionId = request.SessionId,
-            LifecycleGeneration = request.LifecycleGeneration,
-            RuntimeEpoch = request.RuntimeEpoch,
-            RuntimeInstanceId = request.RuntimeInstanceId,
+            Runtime = request.Runtime.Clone(),
             Kind = request.Kind,
             TransportSucceeded = true,
             StatusCode = 200

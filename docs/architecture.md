@@ -27,12 +27,12 @@ callbacks and cancellation callbacks must finish before detachment completes.
 
 Startup publishes its original physical task before execution and keeps the
 active slot until both execution and its original cancellation callbacks end.
-Host shutdown, Stop, Quiesce and replacement share that callback ownership.
+Host shutdown, Stop and a newer start share that callback ownership.
 Joining never uses a cancelled waiting wrapper. A callback failure is reported
 by class after the join and cannot skip runtime cleanup or enter an acknowledgement
 message. Startup acknowledgement retries remain independent of that physical join.
 
-Each command stream also owns its admitted start, launch, quiesce, GPU and
+Each command stream also owns its admitted start, GPU and
 transient-request tasks, and the detached Stop and prompt acknowledgement tasks.
 Stop's physical handler remains awaited in stream order. Stream reconnects keep
 these owners; shutdown closes admission and joins original descendants before
@@ -173,9 +173,9 @@ A prompt reaches the runner as a transient handoff (`SubmitPromptCommand`) that
 the control plane keeps only until its `expires_utc`. The runner runs a handoff at
 most once and nothing is recovered or replayed:
 
-1. It checks the handoff's identity and that its lifecycle generation, runtime
-   epoch and runtime instance are the session's current runtime. A handoff for
-   any other runtime is dropped before it is granted.
+1. It checks the handoff's identity and that its runtime (`RuntimeRef`) is the
+   session's current runtime. A handoff for any other runtime is dropped before it
+   is granted.
 2. It asks `GrantPromptExecution` with its registered process `instance_id`,
    retrying transient failures with the same request. Only `GRANTED` lets it
    prepare downloads, artifacts and preflights and call the editor. Any other
@@ -259,12 +259,67 @@ The same container images run on users' own GPUs (personal runners) and on GPUs 
 The agent is the container's entry point and runs as root. It:
 
 1. Sends `RegisterRunner` heartbeats with its resources, the editor templates the image supports, and its `RuntimeStatus`: the session it holds, that session's runtime and the runtime's phase. Heartbeats are the only liveness signal.
-2. Holds a `CommandStream` open and executes start, stop, prompt, restart, relay and GPU power commands with exact identities, acknowledging each one idempotently.
+2. Holds a `CommandStream` open and executes start, stop, prompt, relay and GPU power commands with exact identities, acknowledging each one idempotently.
 3. Starts the editor (ComfyUI or Forge Neo) per session as a child process under a dedicated Linux user, with a private virtualenv layered on the image's root-owned one.
 4. Relays editor HTTP requests and websocket frames over the command and event lanes, uploads outputs, and mirrors workspace files (`user`, `custom_nodes`, inputs) from the control plane.
 5. Downloads models with aria2, which runs as an unprivileged account and writes only to directories prepared for it; downloads into a session home are staged outside it and moved in by the agent. Forge Neo's models live in a runner-wide cache that sessions cannot write, linked file by file into each session's own models folder. For ComfyUI, model files start as sparse placeholders; `liboffloadr_model_vfs.so` is preloaded into the editor and blocks each read until aria2 has the bytes it needs (demand-aware hydration).
 6. Writes `/run/offloadr/status.json` so a local supervisor can tell whether a session is active.
 7. In sealed mode, keeps each session's user data under a root-owned directory on a memory-backed root (`/dev/shm/offloadr` by default), stages workspace seeds there, keeps editor output off the container log, makes session processes non-dumpable and evicts uploaded artifacts when the root runs low. Code, models and compiled caches stay in the disk-backed home. Transfers are sealed with per-session reader keys and the control plane's output recipient key (`docs/sealed-envelope.md`, `Offloadr.Runner.Core/Sealing`). See "Sealed Storage" in `hosting.md`.
+
+### Runtime starts and Stop
+
+Protocol 5 names every runtime with a `RuntimeRef`: a `runtime_id` minted for one
+`StartRuntimeCommand`, and a `runtime_order` from one sequence the control plane
+shares across sessions and runners. Two runtimes are the same when their ids are.
+The higher order is the newer one, in any session. `lifecycle_generation` stays on
+the start only to match GPU power commands.
+
+The runner keeps this state in memory for the process lifetime; it survives a
+reconnect:
+
+- the session it holds, that session's runtime and the runtime's phase;
+- the newest start it adopted, of any session;
+- a Stop cutoff per session, in a bounded map (16,384 sessions). Evicting one
+  raises a runner-wide floor to its cutoff, so the evicted session's old start is
+  still refused;
+- the recorded outcome of each recent startup, by runtime.
+
+A start is classified and its startup published in one step, before the next
+command is read:
+
+1. **Older work is refused.** A start at or below its session's Stop cutoff or the
+   floor, below the newest start adopted, or at that start's order with another
+   id, is acknowledged `ready = false`. It touches nothing.
+2. **The same runtime replays.** A repeated start of the runtime adopted joins its
+   startup in flight, or is answered with its recorded acknowledgement. Nothing is
+   launched again. One asking for other sealing is refused.
+3. **Newer work replaces.** The startup in flight is cancelled and awaited. Prompts
+   of every other runtime are cancelled. The session's older child is stopped as a
+   restart's quiesce did: its relayed requests are cancelled and drained, then it
+   is stopped and the session cleaned up. Another session's child is pre-empted.
+   Then the runtime is adopted, launched and acknowledged.
+
+A relaunch keeps the session's sealing, whatever its lifecycle generation. One that omits sealing gets the session's;
+one that would weaken it, or change or drop its output recipient, is refused after
+the older child stopped. The runner adds no timer for a fenced child that waits for
+its replacement: the platform's timeouts, Stop and session expiry cover it.
+
+Stop makes one comparison. When the session has a runtime, child or startup with
+an order above `up_to_runtime_order`, the Stop is acknowledged `Superseded` and does
+nothing. Otherwise the runner records the cutoff, cancels the session's prompts and
+startup, drains its relayed requests, stops and cleans up, and acknowledges
+`Performed` with the session's count of unsaved artifacts. The acknowledgement is
+stored and replayed for a redelivered Stop. The session's sealed-lifecycle notes
+are dropped once, after the first acknowledgement goes through, and only while every
+runtime the session adopted here is at or below the cutoff, including one that has
+since exited or been pre-empted. The highest order each session adopted is kept in
+the same bound as the cutoffs, with a floor for evicted sessions; an evicted session
+keeps its notes when in doubt. Starts and Stops are checked against
+each other under one gate, so a Stop either sees a startup or has fenced it.
+
+A start that fails or is cancelled drops another session the runner still holds
+with no child and no startup: a newer start superseded it, so the heartbeat stops
+reporting it. A failed relaunch keeps its own session.
 
 ### gRPC channel lifetime
 
@@ -299,13 +354,13 @@ callback task until its physical execution and asynchronous lease completion
 finish. Cancellation retires matching active entries without dropping these
 owners. A failed or held callback cannot skip cancellation of other requests;
 the affected request retains callback failure after completion, so its capturing
-drain makes Stop fail and quiesce report failure. A completed failed request stays
+drain makes Stop fail and a relaunch fail. A completed failed request stays
 owned until a matching drain observes it. That drain joins and consumes only its
 captured roots; unrelated sessions and later teardown attempts remain usable.
 Callback failures are observed with class-only diagnostics. Registry shutdown
 closes admission and joins current and retired original completion roots.
 
-Stop and Quiesce keep matching admission closed while joining requests and
+Stop and a relaunch keep matching admission closed while joining requests and
 performing physical runtime cleanup. Their fence remains in place after the
 request drain finishes, until cleanup ends; unrelated sessions remain independent.
 These rules cover runner-local ownership. Controlled dispatch and handler tests

@@ -1,92 +1,113 @@
 using System.Collections.Concurrent;
+using Offloadr.Runner.V1;
 
 namespace Offloadr.Runner.Core;
 
-public readonly record struct RuntimeIdentity(ulong LifecycleGeneration, ulong RuntimeEpoch, string RuntimeInstanceId)
+/// <summary>
+/// One runtime of a session, as the control plane names it (<see cref="RuntimeRef"/>). Two
+/// identities are the same runtime when their runtime ids are, however the id is spelled; the
+/// order only says which of two runtimes is newer.
+/// </summary>
+public readonly record struct RuntimeIdentity(string RuntimeId, ulong RuntimeOrder)
 {
-    public bool IsValid => LifecycleGeneration > 0 && RuntimeEpoch > 0 && !string.IsNullOrWhiteSpace(RuntimeInstanceId);
+    public bool IsValid => RuntimeOrder is > 0 and <= long.MaxValue && !string.IsNullOrWhiteSpace(RuntimeId);
 
     /// <summary>
-    /// The same identity with a GUID instance id in one canonical spelling, so that
-    /// identities captured from different messages compare equal.
+    /// The same identity with a GUID runtime id in one canonical spelling, so that
+    /// identities captured from different messages print alike.
     /// </summary>
     public RuntimeIdentity Normalized()
-        => this with { RuntimeInstanceId = NormalizeInstanceId(RuntimeInstanceId) };
+        => this with { RuntimeId = NormalizeRuntimeId(RuntimeId) };
 
-    /// <summary>True when both identities name the same runtime, however the instance id is spelled.</summary>
+    /// <summary>True when both identities name the same runtime, however the runtime id is spelled.</summary>
     public bool SameRuntime(RuntimeIdentity other)
-        => Normalized() == other.Normalized();
+        => string.Equals(NormalizeRuntimeId(RuntimeId), NormalizeRuntimeId(other.RuntimeId), StringComparison.Ordinal);
 
-    public static string NormalizeInstanceId(string? runtimeInstanceId)
-        => Guid.TryParse(runtimeInstanceId, out var instance)
-            ? instance.ToString("n")
-            : runtimeInstanceId?.Trim() ?? string.Empty;
+    public bool Equals(RuntimeIdentity other) => SameRuntime(other);
+
+    public override int GetHashCode() => StringComparer.Ordinal.GetHashCode(NormalizeRuntimeId(RuntimeId));
+
+    /// <summary>The identity a message names; an unset reference is the default, invalid identity.</summary>
+    public static RuntimeIdentity From(RuntimeRef? runtime)
+        => runtime is null ? default : new RuntimeIdentity(runtime.RuntimeId?.Trim() ?? string.Empty, runtime.RuntimeOrder);
+
+    /// <summary>The wire form of this identity, as it was captured.</summary>
+    public RuntimeRef ToRef() => new() { RuntimeId = RuntimeId ?? string.Empty, RuntimeOrder = RuntimeOrder };
+
+    public static string NormalizeRuntimeId(string? runtimeId)
+        => Guid.TryParse(runtimeId, out var id)
+            ? id.ToString("n")
+            : runtimeId?.Trim() ?? string.Empty;
 }
 
+/// <summary>
+/// The runtime each session runs now, and the session's lifecycle generation from the start
+/// that launched it. The generation is not a runtime identity: only GPU power commands use it.
+/// </summary>
 public sealed class RuntimeIdentityRegistry
 {
-    private readonly ConcurrentDictionary<string, RuntimeIdentity> _identities = new(StringComparer.Ordinal);
+    private sealed record Entry(RuntimeIdentity Runtime, ulong LifecycleGeneration);
 
-    public void Set(string sessionId, ulong lifecycleGeneration, ulong runtimeEpoch, string? runtimeInstanceId)
+    private readonly ConcurrentDictionary<string, Entry> _entries = new(StringComparer.Ordinal);
+
+    public void Set(string sessionId, RuntimeIdentity runtime, ulong lifecycleGeneration = 0)
     {
         if (string.IsNullOrWhiteSpace(sessionId))
         {
             return;
         }
 
-        var identity = new RuntimeIdentity(lifecycleGeneration, runtimeEpoch, runtimeInstanceId?.Trim() ?? string.Empty);
-        if (identity.IsValid)
+        runtime = runtime with { RuntimeId = runtime.RuntimeId?.Trim() ?? string.Empty };
+        if (runtime.IsValid)
         {
-            _identities[sessionId.Trim()] = identity;
+            _entries[sessionId.Trim()] = new Entry(runtime, lifecycleGeneration);
         }
     }
 
     public bool TryGet(string? sessionId, out RuntimeIdentity identity)
     {
+        if (!string.IsNullOrWhiteSpace(sessionId) && _entries.TryGetValue(sessionId.Trim(), out var entry))
+        {
+            identity = entry.Runtime;
+            return true;
+        }
+
         identity = default;
-        return !string.IsNullOrWhiteSpace(sessionId) &&
-            _identities.TryGetValue(sessionId.Trim(), out identity);
+        return false;
     }
+
+    /// <summary>The lifecycle generation the session's current runtime started with; zero when it has none.</summary>
+    public ulong LifecycleGeneration(string? sessionId)
+        => !string.IsNullOrWhiteSpace(sessionId) && _entries.TryGetValue(sessionId.Trim(), out var entry)
+            ? entry.LifecycleGeneration
+            : 0;
 
     public void Remove(string? sessionId)
     {
         if (!string.IsNullOrWhiteSpace(sessionId))
         {
-            _identities.TryRemove(sessionId.Trim(), out _);
+            _entries.TryRemove(sessionId.Trim(), out _);
         }
     }
 
-    public bool RemoveIfMatches(
-        string? sessionId,
-        ulong lifecycleGeneration,
-        ulong runtimeEpoch,
-        string? runtimeInstanceId)
+    public bool RemoveIfMatches(string? sessionId, RuntimeIdentity expected)
     {
-        if (string.IsNullOrWhiteSpace(sessionId))
+        if (string.IsNullOrWhiteSpace(sessionId) || !expected.IsValid)
         {
             return false;
         }
 
-        var expected = new RuntimeIdentity(
-            lifecycleGeneration,
-            runtimeEpoch,
-            runtimeInstanceId?.Trim() ?? string.Empty);
-        if (!expected.IsValid)
-        {
-            return false;
-        }
-
-        // Instance ids can be spelled differently (hyphenated or compact GUIDs), so match
-        // on the normalized runtime, then remove exactly the stored entry.
+        // Runtime ids can be spelled differently (hyphenated or compact GUIDs), so match
+        // on the runtime, then remove exactly the stored entry.
         var key = sessionId.Trim();
-        while (_identities.TryGetValue(key, out var current))
+        while (_entries.TryGetValue(key, out var current))
         {
-            if (!current.SameRuntime(expected))
+            if (!current.Runtime.SameRuntime(expected))
             {
                 return false;
             }
 
-            if (_identities.TryRemove(new KeyValuePair<string, RuntimeIdentity>(key, current)))
+            if (_entries.TryRemove(new KeyValuePair<string, Entry>(key, current)))
             {
                 return true;
             }
