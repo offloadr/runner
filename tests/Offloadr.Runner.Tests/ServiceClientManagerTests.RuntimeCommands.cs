@@ -462,6 +462,127 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
+    public async Task RedeliveredStop_DoesNotDropTheNotesOfANewerRuntime()
+    {
+        var harness = RunningHarness(InstanceA, 3);
+        harness.SealedNotes[CommandSessionId] = 0;
+        var stop = Stop(3);
+        await ServiceClientManager.HandleStopSessionCommandAsync(stop, harness.Deps);
+        await harness.Sink.WaitForAsync(harness.Sink.StopAcks, 1);
+        await WaitUntilAsync(() => harness.ForgottenLifecycles.Count == 1);
+        Assert.That(harness.SealedNotes, Is.Empty, "the Stop that performed cleanup drops the session's note");
+
+        // A newer sealed runtime of the session starts and notes its lifecycle.
+        harness.Run(CommandSessionId, Rt(InstanceB, 4));
+        harness.SealedNotes[CommandSessionId] = 0;
+        await ServiceClientManager.HandleStopSessionCommandAsync(stop, harness.Deps);
+        await harness.Sink.WaitForAsync(harness.Sink.StopAcks, 2);
+        await Task.Delay(100);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(harness.SealedNotes.ContainsKey(CommandSessionId), Is.True, "the newer runtime's note survives");
+            Assert.That(harness.ForgottenLifecycles, Has.Count.EqualTo(1));
+        });
+        await harness.Shutdown.CancelAsync();
+    }
+
+    [Test]
+    public async Task LateStopAcknowledgement_DoesNotDropTheNotesOfANewerRuntime()
+    {
+        var harness = RunningHarness(InstanceA, 3);
+        var acknowledgementsLost = true;
+        harness.Sink.FailWhen = request => request is AcknowledgeSessionStopRequest && Volatile.Read(ref acknowledgementsLost);
+        await ServiceClientManager.HandleStopSessionCommandAsync(Stop(3), harness.Deps);
+        await WaitUntilAsync(() => harness.Sink.Attempts.OfType<AcknowledgeSessionStopRequest>().Any());
+
+        // While the acknowledgement is still retried, a newer sealed runtime starts.
+        harness.Run(CommandSessionId, Rt(InstanceB, 4));
+        harness.SealedNotes[CommandSessionId] = 0;
+        Volatile.Write(ref acknowledgementsLost, false);
+        await harness.Sink.WaitForAsync(harness.Sink.StopAcks, 1);
+        await Task.Delay(100);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(harness.SealedNotes.ContainsKey(CommandSessionId), Is.True);
+            Assert.That(harness.ForgottenLifecycles, Is.Empty);
+        });
+        await harness.Shutdown.CancelAsync();
+    }
+
+    [Test]
+    public async Task CancelledStartOfAnotherSession_DoesNotLeaveASupersededSessionWithoutAChild()
+    {
+        const string otherSessionId = "33333333333343338333333333333333";
+        var harness = RunningHarness(InstanceA, 1);
+        var activations = new ConcurrentQueue<string>();
+        harness.BeforeActivate = token =>
+        {
+            activations.Enqueue("activate");
+            return Task.Delay(Timeout.Infinite, token);
+        };
+
+        // S relaunches: R1 is stopped, and R2 waits for GPU activation.
+        var relaunch = ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceB, 2), harness.Deps);
+        await WaitUntilAsync(() => activations.Count == 1);
+        Assert.That(harness.Tracked(CommandSessionId), Is.Null);
+
+        // T's start supersedes R2, then T's Stop cancels it before it adopts its runtime.
+        var other = ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceC, 3, otherSessionId), harness.Deps);
+        await relaunch.WaitAsync(TimeSpan.FromSeconds(5));
+        await WaitUntilAsync(() => activations.Count == 2);
+        var stop = Stop(3);
+        stop.SessionId = otherSessionId;
+        await ServiceClientManager.HandleStopSessionCommandAsync(stop, harness.Deps).WaitAsync(TimeSpan.FromSeconds(5));
+        await other.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var status = Status(harness);
+        Assert.Multiple(() =>
+        {
+            Assert.That(harness.Sink.StartAcks, Has.All.Property(nameof(AcknowledgeRuntimeStartRequest.Ready)).False);
+            Assert.That(status.SessionId, Is.Empty, "the superseded session is no longer reported");
+            Assert.That(status.Phase, Is.EqualTo(RuntimePhase.None));
+            Assert.That(harness.Logical.GetActiveSessionId(), Is.Empty);
+            Assert.That(harness.Identities.TryGet(CommandSessionId, out _), Is.False);
+        });
+    }
+
+    [Test]
+    public async Task RelaunchFailingBeforeItsAdoption_KeepsItsSession()
+    {
+        var harness = RunningHarness(InstanceA, 1);
+        harness.BeforeActivate = _ => throw new IOException("power limit unavailable");
+
+        await ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceB, 2), harness.Deps);
+
+        var ack = await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
+        Assert.Multiple(() =>
+        {
+            Assert.That(ack.Ready, Is.False);
+            Assert.That(harness.Tracked(CommandSessionId), Is.Null, "the old child was stopped first");
+            Assert.That(Status(harness).SessionId, Is.EqualTo(CommandSessionId), "a failed restart keeps its session");
+        });
+    }
+
+    [Test]
+    public async Task FailedStartOfAnotherSession_LeavesASessionWhoseChildStillRuns()
+    {
+        const string otherSessionId = "33333333333343338333333333333333";
+        var harness = RunningHarness(InstanceA, 1);
+        harness.BeforeActivate = _ => throw new IOException("power limit unavailable");
+
+        await ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceC, 3, otherSessionId), harness.Deps);
+
+        Assert.That((await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1)).Ready, Is.False);
+        Assert.Multiple(() =>
+        {
+            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(Rt(InstanceA, 1)));
+            Assert.That(Status(harness).SessionId, Is.EqualTo(CommandSessionId));
+        });
+    }
+
+    [Test]
     public async Task StopCutoffEvictedFromTheMap_StillRefusesTheSessionsOldStart()
     {
         const string otherSessionId = "33333333333343338333333333333333";
@@ -1403,6 +1524,12 @@ public partial class ServiceClientManagerTests
         /// <summary>Sessions whose durable sealed-lifecycle note was dropped.</summary>
         public ConcurrentQueue<string> ForgottenLifecycles { get; } = new();
 
+        /// <summary>Sessions with a durable sealed-lifecycle note, as a sealed start records it.</summary>
+        public ConcurrentDictionary<string, byte> SealedNotes { get; } = new(StringComparer.Ordinal);
+
+        /// <summary>Runs inside the GPU activation wait of a start, before it adopts its runtime; may block or throw.</summary>
+        public Func<CancellationToken, Task> BeforeActivate { get; set; } = _ => Task.CompletedTask;
+
         /// <summary>Whether the uploader could not count every lost artifact.</summary>
         public bool UnsavedArtifactsIncomplete { get; set; }
 
@@ -1498,11 +1625,11 @@ public partial class ServiceClientManagerTests
             CancelSessionDownloads = sessionId => Calls.Enqueue("downloads:" + sessionId),
             GetDownloadActiveSessionId = () => null,
             SetDownloadActiveSession = _ => { },
-            ActivateSession = (activate, token) =>
+            ActivateSession = async (activate, token) =>
             {
+                await BeforeActivate(token).ConfigureAwait(false);
                 token.ThrowIfCancellationRequested();
                 activate();
-                return Task.CompletedTask;
             },
             Shutdown = Shutdown.Token,
             GetSessionSealing = _ => SealingStatus,
@@ -1512,7 +1639,11 @@ public partial class ServiceClientManagerTests
                 UnsavedTakenFor.Enqueue(sessionId);
                 return new UnsavedUploads(Interlocked.Exchange(ref _unsavedArtifacts, 0), UnsavedArtifactsIncomplete);
             },
-            ForgetSealedLifecycle = ForgottenLifecycles.Enqueue,
+            ForgetSealedLifecycle = sessionId =>
+            {
+                ForgottenLifecycles.Enqueue(sessionId);
+                SealedNotes.TryRemove(sessionId, out _);
+            },
         };
 
         private Task Record(string call)

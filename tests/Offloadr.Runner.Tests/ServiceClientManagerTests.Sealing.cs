@@ -85,19 +85,33 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
-    public async Task StartOfANewerLifecycle_DoesNotInheritAnOlderLifecyclesSealing()
+    public async Task StartAtAnotherLifecycleGeneration_KeepsTheSessionsSealing()
     {
         var harness = new RuntimeCommandHarness();
-        await ServiceClientManager.HandleStartRuntimeCommand(SealedStart(InstanceA, 3), harness.Deps);
+        var start = SealedStart(InstanceA, 3);
+        await ServiceClientManager.HandleStartRuntimeCommand(start, harness.Deps);
         await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
 
-        // Generation 8 began without this runner seeing generation 7 stop.
-        var newer = Start(InstanceB, 4);
-        newer.LifecycleGeneration = 8;
-        await ServiceClientManager.HandleStartRuntimeCommand(newer, harness.Deps);
+        // The generation only matches GPU power commands: the sealing belongs to the session.
+        var unsealed = Start(InstanceB, 4);
+        unsealed.LifecycleGeneration = 8;
+        await ServiceClientManager.HandleStartRuntimeCommand(unsealed, harness.Deps);
         Assert.That((await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 2)).Ready, Is.True);
+        Assert.That(harness.Starts.Last().Sealing, Is.EqualTo(start.Sealing), "it still launches sealed");
+        var startsBefore = harness.Starts.Count;
 
-        Assert.That(harness.Starts.Last().Sealing, Is.Null);
+        var weaker = Start(InstanceC, 5);
+        weaker.LifecycleGeneration = 9;
+        weaker.Sealing = new SessionSealing { Required = false };
+        await ServiceClientManager.HandleStartRuntimeCommand(weaker, harness.Deps);
+        var refused = await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 3);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(refused.Ready, Is.False);
+            Assert.That(refused.Message, Does.Contain("cannot run it with less sealing"));
+            Assert.That(harness.Starts, Has.Count.EqualTo(startsBefore));
+        });
     }
 
     [Test]

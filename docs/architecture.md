@@ -299,7 +299,7 @@ command is read:
    is stopped and the session cleaned up. Another session's child is pre-empted.
    Then the runtime is adopted, launched and acknowledged.
 
-A relaunch keeps the session's sealing. One that omits sealing gets the session's;
+A relaunch keeps the session's sealing, whatever its lifecycle generation. One that omits sealing gets the session's;
 one that would weaken it, or change or drop its output recipient, is refused after
 the older child stopped. The runner adds no timer for a fenced child that waits for
 its replacement: the platform's timeouts, Stop and session expiry cover it.
@@ -309,8 +309,14 @@ an order above `up_to_runtime_order`, the Stop is acknowledged `Superseded` and 
 nothing. Otherwise the runner records the cutoff, cancels the session's prompts and
 startup, drains its relayed requests, stops and cleans up, and acknowledges
 `Performed` with the session's count of unsaved artifacts. The acknowledgement is
-stored and replayed for a redelivered Stop. Starts and Stops are checked against
+stored and replayed for a redelivered Stop. The session's sealed-lifecycle notes
+are dropped once, after the first acknowledgement goes through, and only while the
+session holds nothing newer than the cutoff. Starts and Stops are checked against
 each other under one gate, so a Stop either sees a startup or has fenced it.
+
+A start that fails or is cancelled drops another session the runner still holds
+with no child and no startup: a newer start superseded it, so the heartbeat stops
+reporting it. A failed relaunch keeps its own session.
 
 ### gRPC channel lifetime
 

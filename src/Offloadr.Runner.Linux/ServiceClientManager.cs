@@ -483,6 +483,11 @@ internal static partial class ServiceClientManager
         public bool Completed { get; set; }
         /// <summary>Whether this Stop took the session's count of lost artifacts.</summary>
         public bool CountTaken { get; set; }
+
+        private int _notesClaimed;
+
+        /// <summary>True for the first caller only: a Stop drops the session's notes at most once.</summary>
+        public bool TryClaimForgetNotes() => Interlocked.Exchange(ref _notesClaimed, 1) == 0;
         public Task? AcknowledgementTask { get; set; }
 
         public bool Matches(AcknowledgeSessionStopRequest delivery)
@@ -1797,10 +1802,10 @@ internal static partial class ServiceClientManager
             cancellationToken);
 
     /// <summary>
-    /// A session's start sealing, the runtime of the start that set it and that start's
-    /// lifecycle generation: only a relaunch of the same lifecycle keeps it.
+    /// A session's start sealing and the runtime of the start that set it. Every later start of
+    /// the session keeps it, whatever its lifecycle generation.
     /// </summary>
-    internal sealed record RetainedSealing(RuntimeIdentity StartRuntime, SessionSealing Sealing, ulong LifecycleGeneration);
+    internal sealed record RetainedSealing(RuntimeIdentity StartRuntime, SessionSealing Sealing);
 
     /// <summary>
     /// Cleans up after a failed start of exactly <paramref name="failedRuntime"/>.
@@ -2170,13 +2175,9 @@ internal static partial class ServiceClientManager
         CancellationToken cancellationToken)
     {
         var sessionId = command.SessionId;
-        // The session's sealing from its earlier start: a relaunch carries it, and may not weaken it.
-        // Only the same lifecycle's start counts: a newer one may have begun without this runner
-        // seeing the older one stop.
-        var retained = deps.WorkState.SessionSealing.TryGetValue(sessionId, out var kept) &&
-                       kept.LifecycleGeneration == command.LifecycleGeneration
-            ? kept
-            : null;
+        // The session's sealing from its earlier start: a relaunch carries it, and may not weaken
+        // it. It belongs to the session: the lifecycle generation only matches GPU power commands.
+        var retained = deps.WorkState.SessionSealing.TryGetValue(sessionId, out var kept) ? kept : null;
         var launch = command.Clone();
         launch.Sealing = command.Sealing?.Clone() ?? retained?.Sealing.Clone();
         var weakensSealing = retained is not null && command.Sealing is { } requested && WeakensSealing(retained.Sealing, requested);
@@ -2202,11 +2203,7 @@ internal static partial class ServiceClientManager
                 // once it ran with it.
                 if (retained is null && command.Sealing is { } sealing)
                 {
-                    deps.WorkState.SessionSealing[sessionId] = new RetainedSealing(runtime, sealing.Clone(), command.LifecycleGeneration);
-                }
-                else if (retained is null)
-                {
-                    deps.WorkState.SessionSealing.TryRemove(sessionId, out _);
+                    deps.WorkState.SessionSealing[sessionId] = new RetainedSealing(runtime, sealing.Clone());
                 }
             }, cancellationToken).ConfigureAwait(false);
 
@@ -2236,10 +2233,8 @@ internal static partial class ServiceClientManager
                 // stays, so only that start failing drops it.
                 deps.WorkState.SessionSealing.AddOrUpdate(
                     sessionId,
-                    new RetainedSealing(runtime, learned.Clone(), command.LifecycleGeneration),
-                    (_, existing) => existing.LifecycleGeneration == command.LifecycleGeneration
-                        ? existing with { Sealing = learned.Clone() }
-                        : existing);
+                    new RetainedSealing(runtime, learned.Clone()),
+                    (_, existing) => existing with { Sealing = learned.Clone() });
             }
 
             return new StartupOutcome(
@@ -2259,7 +2254,39 @@ internal static partial class ServiceClientManager
             // Clean up only this start's runtime, never a valid runtime of another
             // identity that happens to share the session id.
             await CleanUpFailedStartupAsync(sessionId, runtime, deps).ConfigureAwait(false);
+            ClearSupersededSession(sessionId, deps);
             return new StartupOutcome(false, ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// After a start of <paramref name="failedSessionId"/> failed or was cancelled, drops another
+    /// session the runner still holds with no child: that start superseded it on the control
+    /// plane and its child is gone, so the heartbeat must not keep reporting it. The failed
+    /// session itself is kept, as is one whose child still runs or whose own startup is running.
+    /// </summary>
+    private static void ClearSupersededSession(string failedSessionId, RuntimeCommandDependencies deps)
+    {
+        lock (deps.WorkState.AdmissionGate)
+        {
+            var held = deps.LogicalSessionState.GetActiveSessionId();
+            if (held.Length == 0 ||
+                string.Equals(held, failedSessionId?.Trim(), StringComparison.Ordinal) ||
+                deps.GetTrackedRuntime(held) is not null ||
+                deps.WorkState.GetActiveStartup() is { } startup && string.Equals(startup.SessionId?.Trim(), held, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            RunnerLog.Info(nameof(ServiceClientManager), $"Dropping session {held}: a newer start superseded it and it has no child.");
+            if (deps.LogicalSessionState.TryGetRuntime(held, out var runtime))
+            {
+                ClearRuntimeSessionStateIfIdentityMatches(deps.LogicalSessionState, deps.RuntimeIdentities, held, runtime);
+            }
+            else
+            {
+                ClearRuntimeSessionState(deps.LogicalSessionState, deps.RuntimeIdentities, held);
+            }
         }
     }
 
@@ -2724,13 +2751,26 @@ internal static partial class ServiceClientManager
 
     /// <summary>
     /// Acknowledges a Stop, then, once the control plane has its count of lost artifacts, drops
-    /// the lifecycle's durable note: until then a restart must still report the count unknown.
+    /// the session's durable notes: until then a restart must still report the count unknown.
+    /// The notes go at most once per Stop, and not at all once the session holds a runtime newer
+    /// than the Stop's cutoff: a replay or a late retry must not drop a newer runtime's notes.
     /// </summary>
     private static async Task AcknowledgeStopAsync(StopCommandWork work, string acknowledgementKey, StopSessionCommand command, RuntimeCommandDependencies deps)
     {
-        if (await AcknowledgeRuntimeCommandWithRetryAsync(deps.Sink.AckStopSessionAsync, work.Acknowledgement, acknowledgementKey, deps.Shutdown).ConfigureAwait(false) &&
-            work.CountTaken)
+        if (!await AcknowledgeRuntimeCommandWithRetryAsync(deps.Sink.AckStopSessionAsync, work.Acknowledgement, acknowledgementKey, deps.Shutdown).ConfigureAwait(false) ||
+            !work.CountTaken || !work.TryClaimForgetNotes())
         {
+            return;
+        }
+
+        lock (deps.WorkState.AdmissionGate)
+        {
+            if (FindRuntimeNewerThanStop(command, deps) is not null)
+            {
+                RunnerLog.Info(nameof(ServiceClientManager), $"Keeping the sealed notes of session {command.SessionId}: a newer runtime started since its Stop.");
+                return;
+            }
+
             deps.ForgetSealedLifecycle?.Invoke(command.SessionId);
         }
     }
