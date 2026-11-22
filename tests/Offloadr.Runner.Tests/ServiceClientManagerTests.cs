@@ -1020,6 +1020,30 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
+    public void AdoptedAbove_RemembersAdoptedRuntimesAfterTheyAreGoneAndEvicted()
+    {
+        var state = new ServiceClientManager.LogicalSessionState(string.Empty, maxStopCutoffs: 1);
+        Adopt(state, "session-a", new RuntimeIdentity("a-1", 5));
+        state.ClearIfMatches("session-a");
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(state.AdoptedAbove("session-a", 4), Is.True, "a runtime that already ended still counts");
+            Assert.That(state.AdoptedAbove("session-a", 5), Is.False);
+            Assert.That(state.AdoptedAbove("session-b", 4), Is.False, "nothing was adopted for it");
+        });
+
+        // Another session's adoption evicts session a: its order becomes the floor.
+        Adopt(state, "session-b", new RuntimeIdentity("b-1", 6));
+        Assert.Multiple(() =>
+        {
+            Assert.That(state.AdoptedAbove("session-a", 4), Is.True);
+            Assert.That(state.AdoptedAbove("session-c", 4), Is.True, "an evicted session cannot be told apart");
+            Assert.That(state.AdoptedAbove("session-c", 5), Is.False);
+        });
+    }
+
+    [Test]
     public void ClearAfterStop_KeepsARuntimeNewerThanTheStop()
     {
         var state = new ServiceClientManager.LogicalSessionState(string.Empty);

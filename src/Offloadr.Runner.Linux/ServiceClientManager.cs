@@ -629,6 +629,7 @@ internal static partial class ServiceClientManager
                 }
 
                 Volatile.Write(ref _state, new State(normalizedSessionId, candidate));
+                RecordAdopted(normalizedSessionId, candidate.RuntimeOrder);
                 return true;
             }
         }
@@ -740,6 +741,48 @@ internal static partial class ServiceClientManager
         private readonly Dictionary<string, ulong> _stopCutoffs = new(StringComparer.Ordinal);
         private readonly Queue<string> _stopOrder = new();
         private ulong _stopFloor;
+
+        // The highest order each session adopted here, in the same bound. Evicting one raises a
+        // floor to its order, so an evicted session still counts as having adopted that much.
+        private readonly Dictionary<string, ulong> _highestAdopted = new(StringComparer.Ordinal);
+        private readonly Queue<string> _adoptedOrder = new();
+        private ulong _adoptedFloor;
+
+        /// <summary>
+        /// True when the session adopted a runtime above <paramref name="upToRuntimeOrder"/> here,
+        /// even one that has since exited or been pre-empted; for an evicted session, when that
+        /// is possible. A Stop with this cutoff then does not cover all of the session's runtimes.
+        /// </summary>
+        public bool AdoptedAbove(string? sessionId, ulong upToRuntimeOrder)
+        {
+            var normalizedSessionId = sessionId?.Trim() ?? string.Empty;
+            lock (_fenceGate)
+            {
+                return _highestAdopted.TryGetValue(normalizedSessionId, out var highest)
+                    ? highest > upToRuntimeOrder
+                    : _adoptedFloor > upToRuntimeOrder;
+            }
+        }
+
+        // Caller holds _fenceGate.
+        private void RecordAdopted(string sessionId, ulong runtimeOrder)
+        {
+            if (_highestAdopted.TryGetValue(sessionId, out var known))
+            {
+                _highestAdopted[sessionId] = Math.Max(known, runtimeOrder);
+                return;
+            }
+
+            _highestAdopted[sessionId] = runtimeOrder;
+            _adoptedOrder.Enqueue(sessionId);
+            while (_adoptedOrder.Count > Math.Max(1, maxStopCutoffs))
+            {
+                if (_highestAdopted.Remove(_adoptedOrder.Dequeue(), out var evicted))
+                {
+                    _adoptedFloor = Math.Max(_adoptedFloor, evicted);
+                }
+            }
+        }
 
         // The newest start adopted on this runner, of any session.
         private (string SessionId, RuntimeIdentity Runtime)? _newestStart;
@@ -2752,8 +2795,10 @@ internal static partial class ServiceClientManager
     /// <summary>
     /// Acknowledges a Stop, then, once the control plane has its count of lost artifacts, drops
     /// the session's durable notes: until then a restart must still report the count unknown.
-    /// The notes go at most once per Stop, and not at all once the session holds a runtime newer
-    /// than the Stop's cutoff: a replay or a late retry must not drop a newer runtime's notes.
+    /// The notes go at most once per Stop, and only while every runtime the session adopted here is
+    /// at or below the Stop's cutoff: a replay or a late retry must not drop the notes of a newer
+    /// runtime, even one that has since exited or been pre-empted, whose losses this Stop's count
+    /// does not cover.
     /// </summary>
     private static async Task AcknowledgeStopAsync(StopCommandWork work, string acknowledgementKey, StopSessionCommand command, RuntimeCommandDependencies deps)
     {
@@ -2765,7 +2810,8 @@ internal static partial class ServiceClientManager
 
         lock (deps.WorkState.AdmissionGate)
         {
-            if (FindRuntimeNewerThanStop(command, deps) is not null)
+            if (FindRuntimeNewerThanStop(command, deps) is not null ||
+                deps.LogicalSessionState.AdoptedAbove(command.SessionId, command.UpToRuntimeOrder))
             {
                 RunnerLog.Info(nameof(ServiceClientManager), $"Keeping the sealed notes of session {command.SessionId}: a newer runtime started since its Stop.");
                 return;

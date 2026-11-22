@@ -310,8 +310,11 @@ nothing. Otherwise the runner records the cutoff, cancels the session's prompts 
 startup, drains its relayed requests, stops and cleans up, and acknowledges
 `Performed` with the session's count of unsaved artifacts. The acknowledgement is
 stored and replayed for a redelivered Stop. The session's sealed-lifecycle notes
-are dropped once, after the first acknowledgement goes through, and only while the
-session holds nothing newer than the cutoff. Starts and Stops are checked against
+are dropped once, after the first acknowledgement goes through, and only while every
+runtime the session adopted here is at or below the cutoff, including one that has
+since exited or been pre-empted. The highest order each session adopted is kept in
+the same bound as the cutoffs, with a floor for evicted sessions; an evicted session
+keeps its notes when in doubt. Starts and Stops are checked against
 each other under one gate, so a Stop either sees a startup or has fenced it.
 
 A start that fails or is cancelled drops another session the runner still holds

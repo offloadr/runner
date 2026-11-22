@@ -511,6 +511,48 @@ public partial class ServiceClientManagerTests
         await harness.Shutdown.CancelAsync();
     }
 
+    [TestCase(false)]
+    [TestCase(true)]
+    public async Task LateStopAcknowledgement_KeepsTheNoteOfANewerRuntimeThatIsAlreadyGone(bool preempted)
+    {
+        const string otherSessionId = "33333333333343338333333333333333";
+        var harness = RunningHarness(InstanceA, 3);
+        var acknowledgementsLost = true;
+        harness.Sink.FailWhen = request => request is AcknowledgeSessionStopRequest && Volatile.Read(ref acknowledgementsLost);
+        await ServiceClientManager.HandleStopSessionCommandAsync(Stop(3), harness.Deps);
+        await WaitUntilAsync(() => harness.Sink.Attempts.OfType<AcknowledgeSessionStopRequest>().Any());
+
+        // A newer sealed runtime of the session starts, notes its lifecycle, and is gone again
+        // before the Stop's acknowledgement goes through.
+        harness.Run(CommandSessionId, Rt(InstanceB, 4));
+        harness.SealedNotes[CommandSessionId] = 0;
+        if (preempted)
+        {
+            await ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceC, 5, otherSessionId), harness.Deps)
+                .WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.That(harness.Sink.StartAcks.Single().Ready, Is.True);
+        }
+        else
+        {
+            harness.Untrack(CommandSessionId);
+            await ServiceClientManager.HandleUnexpectedRuntimeExitAsync(
+                CommandSessionId, Rt(InstanceB, 4), harness.Logical, harness.Identities,
+                (_, _) => Task.CompletedTask, CancellationToken.None);
+        }
+
+        Assert.That(harness.Tracked(CommandSessionId), Is.Null);
+        Volatile.Write(ref acknowledgementsLost, false);
+        await harness.Sink.WaitForAsync(harness.Sink.StopAcks, 1);
+        await Task.Delay(100);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(harness.SealedNotes.ContainsKey(CommandSessionId), Is.True, "the Stop's count did not cover runtime 4's losses");
+            Assert.That(harness.ForgottenLifecycles, Is.Empty);
+        });
+        await harness.Shutdown.CancelAsync();
+    }
+
     [Test]
     public async Task CancelledStartOfAnotherSession_DoesNotLeaveASupersededSessionWithoutAChild()
     {
