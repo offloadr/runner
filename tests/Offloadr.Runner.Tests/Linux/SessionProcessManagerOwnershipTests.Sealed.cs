@@ -1269,6 +1269,7 @@ public partial class SessionProcessManagerOwnershipTests
             SessionId = sessionId,
             User = "user-1",
             EditorRuntimeKind = runtimeKind,
+            LifecycleGeneration = 1,
             Runtime = new RuntimeRef { RuntimeId = "44444444444444448444444444444444", RuntimeOrder = 11 },
         };
 
