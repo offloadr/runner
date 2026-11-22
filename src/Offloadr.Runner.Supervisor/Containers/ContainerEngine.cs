@@ -87,6 +87,12 @@ public sealed record ContainerEngineInfo(
     /// <summary>Why no engine is available, when <see cref="Error"/> is set.</summary>
     public FaultKind ErrorKind { get; init; }
 
+    /// <summary>
+    /// The memory the engine's containers can use (Docker Desktop: its WSL virtual machine's), as the
+    /// engine reports it; null when it did not.
+    /// </summary>
+    public long? MemoryBytes { get; init; }
+
     public static ContainerEngineInfo Unavailable(
         string error,
         string? executable = null,

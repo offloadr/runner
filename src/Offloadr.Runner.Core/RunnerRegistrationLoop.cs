@@ -60,6 +60,34 @@ internal static class RunnerRegistrationLoop
     }
 
     /// <summary>
+    /// One launcher heartbeat: the desktop app that starts runner containers on request. It names the
+    /// host GPU it launches on and the editors it can start; it reports no runtime, sealed storage or
+    /// launch, and protects no session.
+    /// </summary>
+    internal static RegisterRunnerRequest BuildLauncherRequest(
+        string runnerId,
+        string instanceId,
+        string version,
+        RunnerResources resources,
+        IReadOnlyList<string> launchableEditorTemplates)
+    {
+        ArgumentNullException.ThrowIfNull(resources);
+        ArgumentNullException.ThrowIfNull(launchableEditorTemplates);
+
+        var request = new RegisterRunnerRequest
+        {
+            RunnerId = runnerId,
+            InstanceId = instanceId,
+            Version = version,
+            Resources = resources,
+            ProtocolVersion = RunnerProtocolVersion.Current,
+            Role = RunnerRole.Launcher,
+        };
+        request.SupportedEditorTemplates.AddRange(launchableEditorTemplates);
+        return request;
+    }
+
+    /// <summary>
     /// Registers until <paramref name="shutdown"/>, at the interval Offloadr names, retrying failures
     /// and refusals with jittered backoff. <paramref name="initialStatusApplied"/> completes with the
     /// first accepted registration. A final refusal (<see cref="RunnerProtocolVersion.IsFinalRejection"/>)

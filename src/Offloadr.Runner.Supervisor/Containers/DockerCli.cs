@@ -114,6 +114,29 @@ internal static class DockerCliJson
             nvidia);
     }
 
+    /// <summary>The memory the engine reports in `info` (Docker's <c>MemTotal</c>, Podman's <c>host.memTotal</c>), or null.</summary>
+    public static long? MemoryBytes(string json)
+    {
+        using var document = Parse(json);
+        if (document is null || document.RootElement.ValueKind != JsonValueKind.Object)
+        {
+            return null;
+        }
+
+        var root = document.RootElement;
+        if (root.TryGetProperty("MemTotal", out var docker) && docker.ValueKind == JsonValueKind.Number &&
+            docker.TryGetInt64(out var dockerBytes) && dockerBytes > 0)
+        {
+            return dockerBytes;
+        }
+
+        return root.TryGetProperty("host", out var host) && host.ValueKind == JsonValueKind.Object &&
+               host.TryGetProperty("memTotal", out var podman) && podman.ValueKind == JsonValueKind.Number &&
+               podman.TryGetInt64(out var podmanBytes) && podmanBytes > 0
+            ? podmanBytes
+            : null;
+    }
+
     /// <summary>The name of Podman's default connection in `system connection list --format json`, or null.</summary>
     public static string? DefaultConnection(string json)
     {

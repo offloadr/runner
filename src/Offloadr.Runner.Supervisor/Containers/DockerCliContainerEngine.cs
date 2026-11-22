@@ -102,7 +102,10 @@ public sealed class DockerCliContainerEngine(IProcessRunner processes, Func<stri
             };
         }
 
-        return new ContainerEngineInfo(true, engine.Kind, engine.Executable, serverVersion, serverOs, operatingSystem, nvidia, null);
+        return new ContainerEngineInfo(true, engine.Kind, engine.Executable, serverVersion, serverOs, operatingSystem, nvidia, null)
+        {
+            MemoryBytes = DockerCliJson.MemoryBytes(info.StandardOutput),
+        };
     }
 
     public async Task PullAsync(string image, Action<string> onProgress, CancellationToken cancellationToken)
