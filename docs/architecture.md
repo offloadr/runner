@@ -320,7 +320,8 @@ newer start admitted while a Stop of its session runs waits, after cancelling th
 startup it replaces, until that Stop has cleaned up, dropped the session's sealing
 and taken its count; it touches nothing before. The wait ends on failure and
 shutdown too, and a later Stop or start can still cancel the waiting start. Two
-Stops of one session chain, and a Stop never waits for a startup above its cutoff.
+Stops of one session chain: a start waits until both have ended, in either order.
+A Stop never waits for a startup above its cutoff.
 
 A start that fails or is cancelled drops another session the runner still holds
 with no child and no startup: a newer start superseded it, so the heartbeat stops

@@ -371,38 +371,42 @@ internal static partial class ServiceClientManager
 
         /// <summary>
         /// Registers a Stop of the session as in progress; a newer start of the session waits for
-        /// it before it touches the runtime. A second Stop chains onto the first. Caller holds
+        /// it before it touches the runtime. A second Stop chains onto the first. The entry stays
+        /// until every Stop it joins has ended, whichever ends first. Caller holds
         /// <see cref="AdmissionGate"/>.
         /// </summary>
         public void BeginStop(StopInProgress stop)
         {
-            stop.Joined = _stopsInProgress.TryGetValue(stop.SessionId, out var earlier)
+            var joined = _stopsInProgress.TryGetValue(stop.SessionId, out var earlier)
                 ? Task.WhenAll(earlier, stop.Done.Task)
                 : stop.Done.Task;
-            _stopsInProgress[stop.SessionId] = stop.Joined;
+            stop.Joined = joined;
+            _stopsInProgress[stop.SessionId] = joined;
+            _ = joined.ContinueWith(
+                _ =>
+                {
+                    lock (AdmissionGate)
+                    {
+                        if (_stopsInProgress.TryGetValue(stop.SessionId, out var current) && ReferenceEquals(current, joined))
+                        {
+                            _stopsInProgress.Remove(stop.SessionId);
+                        }
+                    }
+                },
+                CancellationToken.None,
+                TaskContinuationOptions.RunContinuationsAsynchronously,
+                TaskScheduler.Default);
         }
 
         /// <summary>The Stops of the session still running, if any. Caller holds <see cref="AdmissionGate"/>.</summary>
         public Task? StopsInProgress(string sessionId)
             => _stopsInProgress.TryGetValue(sessionId.Trim(), out var stops) ? stops : null;
 
-        /// <summary>Ends a Stop's effect, releasing a start that waits for it. Idempotent.</summary>
-        public void EndStop(StopInProgress stop)
-        {
-            if (stop.Joined is null)
-            {
-                return;
-            }
-
-            stop.Done.TrySetResult();
-            lock (AdmissionGate)
-            {
-                if (_stopsInProgress.TryGetValue(stop.SessionId, out var current) && ReferenceEquals(current, stop.Joined))
-                {
-                    _stopsInProgress.Remove(stop.SessionId);
-                }
-            }
-        }
+        /// <summary>
+        /// Ends a Stop's effect. A start waiting for it goes on once every Stop of the session it
+        /// waits for has ended. Idempotent.
+        /// </summary>
+        public void EndStop(StopInProgress stop) => stop.Done.TrySetResult();
         public PromptCommandWorkSet Prompts { get; } = new(shutdown);
         // Retain successful Stops for the process lifetime, including reconnects.
         // Evicting a nonce would allow a delayed retry to stop a replacement runtime.
@@ -2278,9 +2282,19 @@ internal static partial class ServiceClientManager
             try
             {
                 await CancelTrackedWorkAsync(previous).ConfigureAwait(false);
-                var result = await WaitForStopsAsync(stopsInProgress, tracked.Token).ConfigureAwait(false)
-                    ? await StartRuntimeAsync(command, runtime, deps, tracked.Token).ConfigureAwait(false)
-                    : new StartupOutcome(false, "The start was cancelled while a Stop of its session finished.");
+                StartupOutcome result;
+                if (await WaitForStopsAsync(stopsInProgress, tracked.Token).ConfigureAwait(false))
+                {
+                    result = await StartRuntimeAsync(command, runtime, deps, tracked.Token).ConfigureAwait(false);
+                }
+                else
+                {
+                    // It touched nothing, but it may have replaced another session's startup
+                    // whose child was already gone: that session must not stay held.
+                    result = new StartupOutcome(false, "The start was cancelled while a Stop of its session finished.");
+                    ClearSupersededSession(command.SessionId, deps);
+                }
+
                 // Recorded while this startup still holds the slot, so a repeated start sees
                 // either this startup in progress or its outcome.
                 deps.WorkState.RecordStartupOutcome(command.SessionId, runtime, result, deps.GetTrackedProcess, command.Sealing);

@@ -732,12 +732,108 @@ public partial class ServiceClientManagerTests
 
         releaseStop.TrySetResult();
         await Task.WhenAll(first, second).WaitAsync(TimeSpan.FromSeconds(5));
+        await WaitUntilAsync(() => harness.WorkState.StopsInProgress(CommandSessionId) is null);
         Assert.Multiple(() =>
         {
             Assert.That(harness.Starts, Is.Empty, "the cancelled start never launched");
             Assert.That(harness.Tracked(CommandSessionId), Is.Null);
             Assert.That(harness.WorkState.StopsInProgress(CommandSessionId), Is.Null);
         });
+    }
+
+    [TestCase(true)]
+    [TestCase(false)]
+    public async Task StartBetweenTwoStopsOfItsSession_WaitsForBoth(bool secondEndsFirst)
+    {
+        var harness = RunningHarness(InstanceA, 2);
+        var gates = new ConcurrentQueue<TaskCompletionSource>();
+        var held = new[] { new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously), new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously) };
+        foreach (var gate in held) gates.Enqueue(gate);
+        var entered = 0;
+        harness.BeforeStop = async (_, token) =>
+        {
+            Interlocked.Increment(ref entered);
+            if (gates.TryDequeue(out var gate)) await gate.Task.WaitAsync(token);
+        };
+
+        var first = ServiceClientManager.HandleStopSessionCommandAsync(Stop(3), harness.Deps);
+        await WaitUntilAsync(() => Volatile.Read(ref entered) == 1);
+        var second = ServiceClientManager.HandleStopSessionCommandAsync(Stop(4), harness.Deps);
+        await WaitUntilAsync(() => Volatile.Read(ref entered) == 2);
+
+        // One of the two Stops ends; the other is still running.
+        var (ended, running, release) = secondEndsFirst ? (second, first, held[0]) : (first, second, held[1]);
+        (secondEndsFirst ? held[1] : held[0]).TrySetResult();
+        await ended.WaitAsync(TimeSpan.FromSeconds(5));
+        await Task.Delay(50);
+
+        var start = ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceB, 5), harness.Deps);
+        await Task.Delay(100);
+        Assert.Multiple(() =>
+        {
+            Assert.That(start.IsCompleted, Is.False);
+            Assert.That(harness.Starts, Is.Empty, "the start waits for the Stop still running");
+        });
+
+        release.TrySetResult();
+        await Task.WhenAll(running, start).WaitAsync(TimeSpan.FromSeconds(5));
+        var ack = await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
+        Assert.Multiple(() =>
+        {
+            Assert.That(ack.Ready, Is.True);
+            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(Rt(InstanceB, 5)), "no Stop stopped the newer child");
+        });
+    }
+
+    [Test]
+    public async Task CancelledStartWaitingForAStop_DoesNotLeaveASupersededSessionWithoutAChild()
+    {
+        const string otherSessionId = "33333333333343338333333333333333";
+        var harness = RunningHarness(InstanceA, 1);
+        var activations = 0;
+        harness.BeforeActivate = token =>
+        {
+            Interlocked.Increment(ref activations);
+            return Task.Delay(Timeout.Infinite, token);
+        };
+        var releaseOtherStops = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var otherStopsEntered = 0;
+        harness.BeforeStop = (sessionId, token) =>
+        {
+            if (sessionId != otherSessionId) return Task.CompletedTask;
+            Interlocked.Increment(ref otherStopsEntered);
+            return releaseOtherStops.Task.WaitAsync(token);
+        };
+
+        // A relaunches: its old child is stopped and the relaunch waits for activation.
+        var relaunch = ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceB, 2), harness.Deps);
+        await WaitUntilAsync(() => Volatile.Read(ref activations) == 1);
+        // A Stop of B is under way.
+        var otherStop = Stop(3);
+        otherStop.SessionId = otherSessionId;
+        var firstOtherStop = ServiceClientManager.HandleStopSessionCommandAsync(otherStop, harness.Deps);
+        await WaitUntilAsync(() => Volatile.Read(ref otherStopsEntered) == 1);
+
+        // B's start replaces A's relaunch and waits behind that Stop; a later Stop cancels it.
+        var otherStart = ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceC, 4, otherSessionId), harness.Deps);
+        await relaunch.WaitAsync(TimeSpan.FromSeconds(5));
+        var laterStop = Stop(4);
+        laterStop.SessionId = otherSessionId;
+        var secondOtherStop = ServiceClientManager.HandleStopSessionCommandAsync(laterStop, harness.Deps);
+        await otherStart.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var status = Status(harness);
+        Assert.Multiple(() =>
+        {
+            Assert.That(harness.Sink.StartAcks, Has.All.Property(nameof(AcknowledgeRuntimeStartRequest.Ready)).False);
+            Assert.That(harness.Starts, Is.Empty);
+            Assert.That(status.SessionId, Is.Empty, "A is no longer reported");
+            Assert.That(harness.Logical.GetActiveSessionId(), Is.Empty);
+            Assert.That(harness.Identities.TryGet(CommandSessionId, out _), Is.False);
+        });
+
+        releaseOtherStops.TrySetResult();
+        await Task.WhenAll(firstOtherStop, secondOtherStop).WaitAsync(TimeSpan.FromSeconds(5));
     }
 
     [Test]
