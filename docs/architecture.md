@@ -258,7 +258,7 @@ The same container images run on users' own GPUs (personal runners) and on GPUs 
 
 The agent is the container's entry point and runs as root. It:
 
-1. Sends `RegisterRunner` heartbeats with its resources, the editor templates the image supports, and its `RuntimeStatus`: the session it holds, that session's runtime and the runtime's phase. Heartbeats are the only liveness signal.
+1. Sends `RegisterRunner` heartbeats as an executor, with its resources, the editor templates the image supports, its `RuntimeStatus` (the session it holds, that session's runtime and the runtime's phase), and the launch it was started for, if any (`RUNNER_LAUNCH_ID`). Heartbeats are the only liveness signal.
 2. Holds a `CommandStream` open and executes start, stop, prompt, relay and GPU power commands with exact identities, acknowledging each one idempotently.
 3. Starts the editor (ComfyUI or Forge Neo) per session as a child process under a dedicated Linux user, with a private virtualenv layered on the image's root-owned one.
 4. Relays editor HTTP requests and websocket frames over the command and event lanes, uploads outputs, and mirrors workspace files (`user`, `custom_nodes`, inputs) from the control plane.

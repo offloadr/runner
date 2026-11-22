@@ -873,7 +873,8 @@ internal static partial class ServiceClientManager
         TimeSpan localModelsScanInterval,
         RuntimeIdentityRegistry runtimeIdentities,
         CancellationToken shutdown,
-        Action<RegisterRunnerResponse>? onProtocolRejected = null)
+        Action<RegisterRunnerResponse>? onProtocolRejected = null,
+        string launchId = "")
     {
         ArgumentNullException.ThrowIfNull(commandClient);
         ArgumentNullException.ThrowIfNull(sessionSink);
@@ -975,7 +976,8 @@ internal static partial class ServiceClientManager
                         sessionManager.IsStopping,
                         sessionManager.TrackedProcess),
                     supportedEditorTemplates,
-                    sessionManager.DescribeSealedStorage),
+                    sessionManager.DescribeSealedStorage,
+                    launchId),
                 minBackoff,
                 maxBackoff,
                 initialStatusApplied,
@@ -3819,10 +3821,11 @@ internal static partial class ServiceClientManager
         RunnerResources resources,
         Func<RuntimeStatus> describeRuntime,
         IReadOnlyList<string> supportedEditorTemplates,
-        Func<RunnerSealedStorage>? describeSealedStorage)
+        Func<RunnerSealedStorage>? describeSealedStorage,
+        string launchId)
     {
         resources.SystemRamBytes = ResourceDetection.GetTotalRamBytes();
-        return RunnerRegistrationLoop.BuildRequest(
+        return RunnerRegistrationLoop.BuildExecutorRequest(
             runnerId,
             instanceId,
             version,
@@ -3830,7 +3833,8 @@ internal static partial class ServiceClientManager
             describeRuntime,
             supportedEditorTemplates,
             RunnerLog.CreateLogger(nameof(ServiceClientManager)),
-            describeSealedStorage);
+            describeSealedStorage,
+            launchId);
     }
 
     private static SyncLocalModelsRequest BuildLocalModelsRequest(string runnerId, LocalModelSnapshot snapshot, bool fullSnapshot)

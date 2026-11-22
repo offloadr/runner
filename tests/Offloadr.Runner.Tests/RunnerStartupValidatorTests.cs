@@ -393,6 +393,38 @@ public partial class RunnerStartupValidatorTests
     }
 
     [Test]
+    public void ValidateOrThrow_ThrowsWhenTheLaunchIdIsNotUuid_AndAcceptsOneThatIsOrNone()
+    {
+        LinuxTestPrerequisites.RequireLinux();
+
+        // One folder per case: building the options creates read-only seed files there.
+        var malformedRoot = Path.Combine(Path.GetTempPath(), $"runner-validator-{Guid.NewGuid():N}");
+        var blankRoot = Path.Combine(Path.GetTempPath(), $"runner-validator-{Guid.NewGuid():N}");
+        var validRoot = Path.Combine(Path.GetTempPath(), $"runner-validator-{Guid.NewGuid():N}");
+        var noneRoot = Path.Combine(Path.GetTempPath(), $"runner-validator-{Guid.NewGuid():N}");
+        try
+        {
+            var validator = new RunnerStartupValidator(new NoopIsolationStrategy());
+
+            var ex = Assert.Throws<InvalidOperationException>(
+                () => validator.ValidateOrThrow(BuildOptions(malformedRoot, "/bin/sh", launchId: "launch-1")));
+            Assert.That(ex!.Message, Does.Contain("RUNNER_LAUNCH_ID must be a UUID"));
+            var blank = Assert.Throws<InvalidOperationException>(
+                () => validator.ValidateOrThrow(BuildOptions(blankRoot, "/bin/sh", launchId: string.Empty)));
+            Assert.That(blank!.Message, Does.Contain("RUNNER_LAUNCH_ID must be a UUID"), "set but blank is not 'started by hand'");
+            Assert.DoesNotThrow(() => validator.ValidateOrThrow(BuildOptions(validRoot, "/bin/sh", launchId: Guid.NewGuid().ToString())));
+            Assert.DoesNotThrow(() => validator.ValidateOrThrow(BuildOptions(noneRoot, "/bin/sh")));
+        }
+        finally
+        {
+            TryDelete(malformedRoot);
+            TryDelete(blankRoot);
+            TryDelete(validRoot);
+            TryDelete(noneRoot);
+        }
+    }
+
+    [Test]
     public void ValidateOrThrow_ThrowsWhenConfiguredLocalModelDirectoryMissing()
     {
         if (!OperatingSystem.IsLinux())
@@ -666,7 +698,8 @@ public partial class RunnerStartupValidatorTests
         ConsoleLogOptions? consoleLogs = null,
         ModelDownloadOptions? modelDownloads = null,
         string? modelLibraryDirectory = null,
-        string? editorArgumentsProblem = null)
+        string? editorArgumentsProblem = null,
+        string? launchId = null)
     {
         var sessionRoot = Path.Combine(tempRoot, "sessions");
         var workingDirectory = Path.Combine(tempRoot, "comfy");
@@ -692,6 +725,7 @@ public partial class RunnerStartupValidatorTests
             OffloadrApiUrl = offloadrApiUrl,
             TraceGrpcHttp = false,
             RunnerId = runnerId ?? Guid.NewGuid().ToString(),
+            LaunchId = launchId,
             RegistrationMinBackoff = TimeSpan.FromSeconds(1),
             RegistrationMaxBackoff = TimeSpan.FromSeconds(2),
             RegistrationRpcTimeout = TimeSpan.FromSeconds(10),

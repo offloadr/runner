@@ -452,7 +452,7 @@ public partial class ServiceClientManagerTests
             Algorithms = { Offloadr.Runner.Core.Sealing.SealedEnvelopeFormat.AlgorithmId },
         };
 
-        var request = RunnerRegistrationLoop.BuildRequest(
+        var request = RunnerRegistrationLoop.BuildExecutorRequest(
             CommandRunnerId,
             "process-1",
             "1.0.0",
@@ -461,7 +461,7 @@ public partial class ServiceClientManagerTests
             ["comfyui-latest"],
             NullLogger.Instance,
             () => sealedStorage);
-        var failing = RunnerRegistrationLoop.BuildRequest(
+        var failing = RunnerRegistrationLoop.BuildExecutorRequest(
             CommandRunnerId,
             "process-1",
             "1.0.0",

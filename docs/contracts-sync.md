@@ -14,13 +14,13 @@ C# is generated at build time by `Grpc.Tools` in `src/Offloadr.Runner.Contracts`
 
 ## Protocol version
 
-`RunnerProtocol.RUNNER_PROTOCOL_CURRENT` in `runner_agent.proto` is the one protocol this build speaks. The agent sends it in `RegisterRunnerRequest.protocol_version`, `CommandStreamRequest.protocol_version` and the `x-offloadr-runner-protocol` header of every call.
+`RunnerProtocol.RUNNER_PROTOCOL_CURRENT` in `runner_agent.proto` is the one protocol this build speaks. The agent sends it in `RegisterRunnerRequest.protocol_version`, `CommandStreamRequest.protocol_version` and the `x-offloadr-runner-protocol` header of every call. A desktop app registering as a launcher sends it the same way, in `LauncherStreamRequest.protocol_version` too, so a protocol change needs a desktop app release as well as new images.
 
 The control plane accepts exactly its own version:
 
 - **Registration** answers any other version with `accepted = false`, a `RegistrationRejection` (`RUNNER_OUTDATED` or `SERVER_OUTDATED`), its own `server_protocol_version` and a message. Fields 1–3 of `RegisterRunnerResponse` never change, so every past runner can read the refusal.
 - **Every other call** without the current header is refused with `FAILED_PRECONDITION`. Only `RegisterRunner` and `GetRunnerLaunchPlan` are ungated.
-- **The agent** stops on a protocol rejection instead of retrying: it cleans up its sessions as for a shutdown and exits with code 3. The desktop supervisor then restarts it, which asks Offloadr's launch plan for the image to run and downloads it. Any other refusal is still retried.
+- **The agent** stops on a protocol rejection instead of retrying: it cleans up its sessions as for a shutdown and exits with code 3. The desktop supervisor then restarts it, which asks Offloadr's launch plan for the image to run and downloads it. On `REGISTRATION_REJECTION_EXECUTOR_FENCED` ([Launchers](#launchers)) it also stops and cleans up, but exits with code 4: only a new container can register. Any other refusal is still retried.
 
 ## Changing the protocol
 
@@ -41,6 +41,55 @@ Protocol 5 names every runtime with a `RuntimeRef`: a `runtime_id` the control p
 - **Stop is always fenced.** `StopSessionCommand.up_to_runtime_order` is the Stop's cutoff, from the same sequence. When the session has a runtime, child or startup above it, the Stop is acknowledged `Superseded` and does nothing. Otherwise the runner records the cutoff, stops and cleans up. A newer start of the session that arrives meanwhile waits until that Stop is done, so the Stop never stops it or counts its losses. `AcknowledgeSessionStopRequest.up_to_runtime_order` (11) echoes it.
 
 The runner keeps this state in memory for its process lifetime, through reconnects. A new process registers a new `instance_id` and starts with none: the control plane fences stale work for a fresh executor itself.
+
+## Launchers
+
+Protocol 6 lets a personal runner be available with no runner container running. The desktop app registers under the runner's id as a **launcher**; the agent in a container registers as an **executor**, as before. `RegisterRunnerRequest.role` says which, and the control plane refuses `RUNNER_ROLE_UNSPECIFIED`.
+
+| | Launcher (desktop app) | Executor (agent in the container) |
+| --- | --- | --- |
+| Registers while | the app is open, availability is switched on, and its Docker and GPU checks pass | its container runs |
+| `supported_editor_templates` | the editors it can start | the editors this image runs |
+| `runtime`, `sealed_storage` | unset | as before |
+| Liveness | its own: availability to launch only. It refreshes no executor liveness and protects no session | unchanged |
+
+Both keep their own `instance_id`. A launcher's registration never supersedes the executor's instance, never ends a session, and never runs the executor's report handling.
+
+When a session needs an editor on a runner that has no eligible executor for it but has a fresh launcher listing it, the control plane names a launch in the `LauncherState` it sends on `LauncherStream`. The app starts that image with `RUNNER_LAUNCH_ID` set to `launch_id`, and the agent echoes it in `RegisterRunnerRequest.launch_id`. Everything from the first executor registration on is unchanged.
+
+**Launch rules**
+
+- A runner has at most one current launch, and it belongs to one waiting allocation. The allocation keeps waiting on that launch after `STARTED`; retries never create a second launch while the first is unresolved.
+- A runner has one launcher at a time, and the newest instance wins. When another launcher instance registers (the app restarted, or the same key is used on another computer), the superseded instance's registrations are refused with `REGISTRATION_REJECTION_LAUNCHER_SUPERSEDED` and its stream is closed. That launcher stops registering and stays offline until the person starts it again, so two computers do not keep taking the runner from each other.
+- A launch also belongs to the launcher instance it was issued to. On a takeover the control plane retires that launch, if no executor has matched it yet (see below), and issues the waiting allocation a new one, with a new `launch_id` and a higher `launch_sequence`. A container the old instance still starts then echoes a retired `launch_id` and is refused. A launch already matched is kept, and its executor serves the allocation as usual.
+- `LauncherState` is authoritative, not a command log. The control plane sends it first on every stream and again whenever the current launch changes. A launch in flight that the latest state does not name is withdrawn: `SUPERSEDED` when the state names a launch with a higher `launch_sequence`, `CANCELLED` when it names none. So a cancellation missed while the stream was down is applied on reconnect.
+- The control plane sends `LauncherStreamKeepAlive` at least every 15 seconds while it sends nothing else. A launcher that has received nothing for 45 seconds treats its stream as broken and reconnects.
+- The launcher may download while its stream is down, but starts a container only while its stream is live (a message within the last 45 seconds) and the state that stream sent last still names the launch. After a reconnect it waits for the new stream's first state.
+- `STARTED` means the container was started, not that an executor is ready. The control plane then waits a bounded time for an executor that echoes this `launch_id` and is eligible. An executor with the right template but another `launch_id`, or none, does not complete the launch.
+- The eligible executor registration that matches the launch is what completes it, whether or not `STARTED` has arrived yet: the two travel on separate calls, and the launcher that owes the report may have been superseded meanwhile. A `STARTED` that arrives later is accepted as a repeat.
+- A cancelled, timed-out or replaced allocation retires its launch, and the next state no longer names it. So does an accepted `FAILED` for a launch no executor has matched, in the same transaction, so a container that started after all is fenced. A late report never revives a retired launch.
+- Only a launch no executor has matched yet can be retired. The first accepted executor registration that echoes a launch's `launch_id` and is eligible for its allocation (for one, it supports the launch's `editor_template`) matches it; a refused or ineligible one matches nothing, under the lock allocation takes, so either that registration finds the launch retired and is refused, or the launch is matched and is never retired afterwards. The executor of a matched launch is an ordinary executor: if its allocation went away meanwhile, it is simply idle, and the launcher keeps it warm and releases it as any other.
+- A launched executor never replaces a busy one. While another executor instance of the runner holds an open session or a pending Start or Stop, a registration echoing a launch is refused without a rejection reason (so the agent retries) and matches nothing; the launch then completes once that executor is idle or gone, or times out and is retired, after which the container's next registration is fenced.
+- A matched launch stays the current launch, named in every `LauncherState`, until the launcher it was issued to reports a terminal phase for it (`STARTED`, or `FAILED` when it lost track of the container it started) or is superseded; a launcher that took over is never sent it. Only then does the state stop naming it, so a launcher never sees a launch that succeeded as withdrawn, and never reports `CANCELLED` for a container that is serving. A terminal report for a matched launch never retires it or touches its executor.
+- An executor registration carrying a retired or released `launch_id`, or a released `instance_id`, is refused with `REGISTRATION_REJECTION_EXECUTOR_FENCED` before anything else is touched. It never replaces the current executor instance, refreshes liveness or ends a session, so a late container cannot displace one that is serving. The agent exits on that refusal, so such a container ends by itself even when no launcher is left to stop it.
+- A terminal phase (`STARTED`, `FAILED`, `SUPERSEDED`, `CANCELLED`) is the acknowledgement. The launcher resends it with the same content until it is accepted, and the control plane accepts a repeat. Host shutdown never reports `STARTED`.
+- While a launch is in flight the launcher reports at least every 30 seconds, in whatever phase it is in. Silence therefore means the launcher is gone, not that a download is slow.
+- A state naming a launch whose container already runs, after `STARTED`, changes nothing. A container left from another launch is released and stopped first; if the release is refused (it holds a session), the launch reports `FAILED`.
+
+**Release rules**
+
+- Before stopping a container it started, for any reason, the launcher asks `ReleaseRunner`, naming the container's `launch_id`, which is required, and, if it could read the agent's status file, its executor instance. The launch is what names the container: an agent restarted inside it keeps its `launch_id` but gets a new instance, so a release by instance alone could miss it.
+- The control plane decides atomically, under the lock allocation takes. A release without a `launch_id` is refused. Each identity that is set is looked up among registered executors. If they find different executors, or the instance finds an executor registered with another `launch_id`, the release is refused.
+- If either finds a registered executor, the release is granted only while it is the current executor instance with no open session and no pending Start or Stop. Granting makes that executor unavailable in the same transaction, before the answer is sent, so nothing is assigned to it while the launcher stops it.
+- If neither does (the agent failed to start, or wrote its status file but has not registered yet), the release is granted. So a launch whose agent never comes up does not block the next one.
+- A container without a `launch_id` is never stopped automatically: a launch that would replace it reports `FAILED`, and the app asks the person to stop it, with the usual warning about a running session. Such a container can only come from an app version before protocol 6 running a protocol 6 image: an agent on an older protocol is refused at registration and exits by itself.
+- A granted release fences every identity it names, `launch_id` and `executor_instance_id`, for good: a registration carrying a fenced one is refused, as above, whenever it arrives. A replacement container always has new identities, so it is unaffected. Repeating a granted release is granted again.
+- The launcher stops the container by itself (idle, replaced, settings changed) only after `released = true`. When Offloadr cannot be reached it keeps the container and asks again. When the person stops the runner or quits the app, it stops the container anyway, after warning that a running session would end.
+- If the app stops after a release is granted but before the container is stopped, the next app start repeats the release and stops it; it never reuses that container.
+
+Hosted runners and runners started by hand have no launcher. With no fresh launcher for a runner, the control plane behaves as without this section.
+
+Two executors registering for one runner (the same key in two containers, for example on two computers) still replace each other, as they do without launchers, except that a launched executor waits for a busy one as above: this section fences only launches that were retired or released.
 
 ## Native connections and runtime status
 
@@ -97,6 +146,8 @@ These declarations are shared, but the server behavior below remains pending. Th
 
 | Change | What the control plane does | What the runner does |
 | --- | --- | --- |
+| `RegisterRunnerRequest.role` (11), `launch_id` (12) | Refuses an unspecified role; keeps launcher registrations apart from the executor's instance, liveness and report handling ([Launchers](#launchers)); completes a launch only with the executor that echoes its `launch_id` | The agent registers as `EXECUTOR` and echoes `RUNNER_LAUNCH_ID`, which must be a UUID when set; it exits with code 4 on `REGISTRATION_REJECTION_EXECUTOR_FENCED` |
+| `LauncherStream`, `ReportRunnerLaunch`, `ReleaseRunner` | Offers a runner with a fresh launcher for the editors it lists; names one launch per waiting allocation in `LauncherState`, first on every stream and on every change, and stops naming it with the allocation; grants a release only under the rules in [Launchers](#launchers) | The desktop app's launcher is not built yet; until it is, no runner registers as `LAUNCHER` |
 | `RegisterRunnerRequest.sealed_storage` (8) | Offers sealed sessions only to runners that report `memory_workspace_available` and the sealing algorithm; launches hosted runners with `RUNNER_SEALED_STORAGE=required`, which also keeps their console to metadata, and enough `/dev/shm` (see "Sealed Storage" and "Console Logs" in `hosting.md`) | Reports its mode, whether its memory-backed root can take a session, the budget, and the algorithm ids it accepts |
 | `StartRuntimeCommand.sealing` (14), `AcknowledgeRuntimeStartRequest.sealing` (8) | Sends `required` with an `output_recipient` whose private key it holds, for every sealed session, on its first start and on every relaunch; treats a start acknowledged without the expected sealing as failed | Refuses a start that requires sealing unless its memory workspace is available and the recipient is valid; a later start of the session without sealing keeps the session's (that of its first start, or of a later one that ran with stronger sealing), whatever its lifecycle generation; it may not weaken it or change its recipient; acknowledges what the runtime got |
 | `reader_key` on `ReadArtifact` (5), `ReadWorkspaceFile` (4) and `ReadWorkspaceSeedArchive` (3) requests, `RunnerReadStreamMetadata.envelope` (5) | Authorizes every read exactly as without a key: the reader key is an encryption destination, never authorization, so a retired runner credential with a fresh key recovers nothing. Then freshly seals the authorized plaintext response to it, and inside a sealed session always answers sealed | Sends its per-session reader key on every read and decrypts sealed responses into a temporary file it publishes only after the whole payload validates; inside a sealed session a response without an envelope fails the read |
