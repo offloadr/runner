@@ -20,9 +20,7 @@ internal sealed class GrpcRuntimeActivitySink(
             RunnerId = _runnerId,
             SessionId = observation.SessionId,
             InstanceId = _instanceId,
-            LifecycleGeneration = observation.Runtime.LifecycleGeneration,
-            RuntimeEpoch = observation.Runtime.RuntimeEpoch,
-            RuntimeInstanceId = observation.Runtime.RuntimeInstanceId,
+            Runtime = observation.Runtime.ToRef(),
             Sealing = new()
             {
                 MemoryWorkspace = observation.MemoryWorkspace,

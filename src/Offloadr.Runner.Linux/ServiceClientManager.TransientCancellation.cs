@@ -97,10 +97,9 @@ internal static partial class ServiceClientManager
 
         public int Count { get { lock (_gate) return _entries.Count; } }
 
-        public Lease Acquire(string? sessionId, ulong lifecycleGeneration, ulong runtimeEpoch, string? runtimeInstanceId)
+        public Lease Acquire(string? sessionId, RuntimeIdentity runtime)
         {
-            var key = new Key(sessionId?.Trim() ?? string.Empty,
-                new RuntimeIdentity(lifecycleGeneration, runtimeEpoch, runtimeInstanceId ?? string.Empty).Normalized());
+            var key = new Key(sessionId?.Trim() ?? string.Empty, runtime.Normalized());
             lock (_gate)
             {
                 // Retain original completion roots until they actually finish,

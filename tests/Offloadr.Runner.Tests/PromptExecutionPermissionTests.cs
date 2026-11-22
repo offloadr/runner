@@ -75,9 +75,7 @@ public sealed class PromptExecutionPermissionTests
                 SessionId = command.SessionId,
                 HandoffId = command.HandoffId,
                 InstanceId = InstanceId,
-                LifecycleGeneration = command.LifecycleGeneration,
-                RuntimeEpoch = command.RuntimeEpoch,
-                RuntimeInstanceId = command.RuntimeInstanceId,
+                Runtime = command.Runtime.Clone(),
             }));
             var ack = acknowledgements.Single();
             Assert.That(ack.RunnerId, Is.EqualTo(RunnerId));
@@ -140,17 +138,17 @@ public sealed class PromptExecutionPermissionTests
 
     [TestCase("handoff")]
     [TestCase("session")]
-    [TestCase("generation")]
-    [TestCase("epoch")]
-    [TestCase("instance")]
+    [TestCase("order")]
+    [TestCase("runtime")]
+    [TestCase("unset")]
     public void AMissingOrMalformedIdentityCannotReachTheGrant(string field)
     {
         var command = Command();
         if (field == "handoff") command.HandoffId = "";
         else if (field == "session") command.SessionId = "not-a-session";
-        else if (field == "generation") command.LifecycleGeneration = 0;
-        else if (field == "epoch") command.RuntimeEpoch = 0;
-        else command.RuntimeInstanceId = Guid.Empty.ToString("n");
+        else if (field == "order") command.Runtime.RuntimeOrder = 0;
+        else if (field == "runtime") command.Runtime.RuntimeId = Guid.Empty.ToString("n");
+        else command.Runtime = null;
         Assert.ThrowsAsync<ArgumentException>(() => Execute(command,
             (_, _) => throw new AssertionException("Invalid identity reached the grant"),
             (_, _) => throw new AssertionException("Invalid identity invoked the runtime")));
@@ -455,13 +453,10 @@ public sealed class PromptExecutionPermissionTests
         var interrupt = new RelayEditorRuntimeRequestCommand
         {
             SessionId = command.SessionId,
-            LifecycleGeneration = command.LifecycleGeneration,
-            RuntimeEpoch = command.RuntimeEpoch,
-            RuntimeInstanceId = command.RuntimeInstanceId,
+            Runtime = command.Runtime.Clone(),
         };
         Assert.That(ServiceClientManager.TargetsPromptRuntime(interrupt, PromptWorkIdentity.Capture(command, false)), Is.True);
-        command.RuntimeEpoch++;
-        command.RuntimeInstanceId = Guid.NewGuid().ToString("n");
+        command.Runtime = new RuntimeRef { RuntimeId = Guid.NewGuid().ToString("n"), RuntimeOrder = command.Runtime.RuntimeOrder + 1 };
         Assert.That(ServiceClientManager.TargetsPromptRuntime(interrupt, PromptWorkIdentity.Capture(command, false)), Is.False);
     }
 
@@ -496,9 +491,7 @@ public sealed class PromptExecutionPermissionTests
         EditorSid = "editor-1",
         Owner = "alice",
         EditorRuntimeKind = "comfyui",
-        LifecycleGeneration = 1,
-        RuntimeEpoch = 1,
-        RuntimeInstanceId = "44444444444444448444444444444444",
+        Runtime = new RuntimeRef { RuntimeId = "44444444444444448444444444444444", RuntimeOrder = 11 },
         Request = new() { Method = "POST", Path = "api/prompt", Body = "{}" },
     };
 

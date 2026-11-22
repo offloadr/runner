@@ -601,7 +601,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
             _paths = paths;
             _logger = logger;
             _runtimeIdentities = runtimeIdentities;
-            LifecycleGeneration = _readRequester.LifecycleGeneration;
+            LifecycleGeneration = runtimeIdentities?.LifecycleGeneration(sessionId) ?? 0;
             _runnerId = runnerId?.Trim() ?? string.Empty;
             _uploadPolicy = uploadPolicy ?? new ArtifactUploadPolicy();
             ArgumentOutOfRangeException.ThrowIfNegativeOrZero(_uploadPolicy.MaximumUnacknowledgedSnapshots);
@@ -2862,9 +2862,7 @@ internal sealed class ArtifactUploadService : IAsyncDisposable
                     // current one: that may since have exited or been replaced.
                     if (runtime is { IsValid: true } queuedFor)
                     {
-                        metadata.LifecycleGeneration = queuedFor.LifecycleGeneration;
-                        metadata.RuntimeEpoch = queuedFor.RuntimeEpoch;
-                        metadata.RuntimeInstanceId = queuedFor.RuntimeInstanceId;
+                        metadata.Runtime = queuedFor.ToRef();
                     }
 
                     var snapshot = await GetUploadSnapshotIdentityAsync(metadata, snapshotVersion,

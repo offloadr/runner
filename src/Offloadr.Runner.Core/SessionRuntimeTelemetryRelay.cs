@@ -85,15 +85,11 @@ internal sealed class SessionRuntimeTelemetryRelay : IAsyncDisposable
         };
         if (runtimeIdentity is { IsValid: true } sampled)
         {
-            entry.LifecycleGeneration = sampled.LifecycleGeneration;
-            entry.RuntimeEpoch = sampled.RuntimeEpoch;
-            entry.RuntimeInstanceId = sampled.RuntimeInstanceId;
+            entry.Runtime = sampled.ToRef();
         }
         else if (_runtimeIdentities?.TryGet(sessionId, out var identity) == true)
         {
-            entry.LifecycleGeneration = identity.LifecycleGeneration;
-            entry.RuntimeEpoch = identity.RuntimeEpoch;
-            entry.RuntimeInstanceId = identity.RuntimeInstanceId;
+            entry.Runtime = identity.ToRef();
         }
         _queue.Writer.TryWrite(entry);
     }

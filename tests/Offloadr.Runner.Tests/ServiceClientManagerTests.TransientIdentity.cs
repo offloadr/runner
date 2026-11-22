@@ -56,9 +56,8 @@ public partial class ServiceClientManagerTests
             ("client message", command => command.ClientMessage = ByteString.CopyFromUtf8("other message")),
             ("editor", command => command.EditorSid = "other-editor"),
             ("session", command => command.SessionId = "33333333333343338333333333333333"),
-            ("generation", command => command.LifecycleGeneration++),
-            ("epoch", command => command.RuntimeEpoch++),
-            ("instance", command => command.RuntimeInstanceId = InstanceB),
+            ("runtime order", command => command.Runtime.RuntimeOrder++),
+            ("runtime id", command => command.Runtime.RuntimeId = InstanceB),
             ("kind", command => command.Kind = EditorRuntimeRequestKind.Control),
             ("urgency", command => command.Urgent = true),
             ("deadline", command => command.ExpiresUtc.Seconds++),
@@ -106,7 +105,7 @@ public partial class ServiceClientManagerTests
                 Assert.That(rejection.Body.IsEmpty, Is.True, "Never return another command's response body.");
                 Assert.That(rejection.RunnerId, Is.EqualTo(conflict.RunnerId));
                 Assert.That(rejection.SessionId, Is.EqualTo(conflict.SessionId));
-                Assert.That(rejection.RuntimeInstanceId, Is.EqualTo(conflict.RuntimeInstanceId));
+                Assert.That(rejection.Runtime, Is.EqualTo(conflict.Runtime));
                 Assert.That(harness.Executions, Is.EqualTo(1));
             });
         }

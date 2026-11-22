@@ -45,7 +45,7 @@ public partial class SessionProcessManagerOwnershipTests
             try
             {
                 await manager.StartSessionAsync(
-                    new StartSessionCommand { SessionId = sessionId, User = "user-1", LifecycleGeneration = 1, RuntimeEpoch = 1, RuntimeInstanceId = "33333333333343338333333333333333" },
+                    new StartRuntimeCommand { SessionId = sessionId, User = "user-1", LifecycleGeneration = 1, Runtime = new RuntimeRef { RuntimeId = "33333333333343338333333333333333", RuntimeOrder = 1 } },
                     (paths, _) =>
                     {
                         using var placeholder = File.Create(Path.Combine(paths.InputDirectory, "uploaded-placeholder.png"));
@@ -113,7 +113,7 @@ public partial class SessionProcessManagerOwnershipTests
             try
             {
                 await manager.StartSessionAsync(
-                    new StartSessionCommand { SessionId = sessionId, User = "user-1", LifecycleGeneration = 1, RuntimeEpoch = 1, RuntimeInstanceId = "33333333333343338333333333333333" },
+                    new StartRuntimeCommand { SessionId = sessionId, User = "user-1", LifecycleGeneration = 1, Runtime = new RuntimeRef { RuntimeId = "33333333333343338333333333333333", RuntimeOrder = 1 } },
                     (paths, _) =>
                     {
                         sawLeftBehindFile = File.Exists(Path.Combine(paths.HomeDirectory, "left-behind.txt"));
@@ -178,7 +178,7 @@ public partial class SessionProcessManagerOwnershipTests
             try
             {
                 await manager.StartSessionAsync(
-                    new StartSessionCommand { SessionId = sessionId, User = "user-1", LifecycleGeneration = 1, RuntimeEpoch = 1, RuntimeInstanceId = "33333333333343338333333333333333" },
+                    new StartRuntimeCommand { SessionId = sessionId, User = "user-1", LifecycleGeneration = 1, Runtime = new RuntimeRef { RuntimeId = "33333333333343338333333333333333", RuntimeOrder = 1 } },
                     (paths, _) =>
                     {
                         File.WriteAllText(Path.Combine(paths.CustomNodesDirectory, "owner-node.py"), "owner");
@@ -251,7 +251,7 @@ public partial class SessionProcessManagerOwnershipTests
             try
             {
                 await manager.StartSessionAsync(
-                    new StartSessionCommand { SessionId = sessionId, User = "user-1", LifecycleGeneration = 1, RuntimeEpoch = 1, RuntimeInstanceId = "33333333333343338333333333333333" },
+                    new StartRuntimeCommand { SessionId = sessionId, User = "user-1", LifecycleGeneration = 1, Runtime = new RuntimeRef { RuntimeId = "33333333333343338333333333333333", RuntimeOrder = 1 } },
                     async (paths, _) =>
                     {
                         var seededDirectory = Path.Combine(paths.OutputDirectory, "seeded");
@@ -320,7 +320,7 @@ public partial class SessionProcessManagerOwnershipTests
             try
             {
                 await manager.StartSessionAsync(
-                    new StartSessionCommand { SessionId = "session-outside", User = "user-1", LifecycleGeneration = 1, RuntimeEpoch = 1, RuntimeInstanceId = "33333333333343338333333333333333" },
+                    new StartRuntimeCommand { SessionId = "session-outside", User = "user-1", LifecycleGeneration = 1, Runtime = new RuntimeRef { RuntimeId = "33333333333343338333333333333333", RuntimeOrder = 1 } },
                     CancellationToken.None);
             }
             catch (Exception ex)
@@ -379,7 +379,7 @@ public partial class SessionProcessManagerOwnershipTests
             try
             {
                 await manager.StartSessionAsync(
-                    new StartSessionCommand { SessionId = sessionId, User = "user-1", LifecycleGeneration = 1, RuntimeEpoch = 1, RuntimeInstanceId = "33333333333343338333333333333333" },
+                    new StartRuntimeCommand { SessionId = sessionId, User = "user-1", LifecycleGeneration = 1, Runtime = new RuntimeRef { RuntimeId = "33333333333343338333333333333333", RuntimeOrder = 1 } },
                     (_, _) =>
                     {
                         var modelsDirectory = Path.Combine(homeDirectory, "models");
@@ -446,7 +446,7 @@ public partial class SessionProcessManagerOwnershipTests
             try
             {
                 await manager.StartSessionAsync(
-                    new StartSessionCommand { SessionId = sessionId, User = "user-1", LifecycleGeneration = 1, RuntimeEpoch = 1, RuntimeInstanceId = "33333333333343338333333333333333" },
+                    new StartRuntimeCommand { SessionId = sessionId, User = "user-1", LifecycleGeneration = 1, Runtime = new RuntimeRef { RuntimeId = "33333333333343338333333333333333", RuntimeOrder = 1 } },
                     (paths, _) =>
                     {
                         sessionModelsLinkTarget = Directory.ResolveLinkTarget(paths.ModelsDirectory, returnFinalTarget: false)?.FullName;
@@ -573,7 +573,7 @@ public partial class SessionProcessManagerOwnershipTests
             try
             {
                 await manager.StartSessionAsync(
-                    new StartSessionCommand { SessionId = sessionId, User = "user-1", LifecycleGeneration = 1, RuntimeEpoch = 1, RuntimeInstanceId = "33333333333343338333333333333333" },
+                    new StartRuntimeCommand { SessionId = sessionId, User = "user-1", LifecycleGeneration = 1, Runtime = new RuntimeRef { RuntimeId = "33333333333343338333333333333333", RuntimeOrder = 1 } },
                     (paths, _) =>
                     {
                         comfyTempDirectory = paths.TempDirectory;
@@ -673,7 +673,7 @@ public partial class SessionProcessManagerOwnershipTests
             try
             {
                 await manager.StartSessionAsync(
-                    new StartSessionCommand { SessionId = sessionId, User = "user-1", LifecycleGeneration = 1, RuntimeEpoch = 1, RuntimeInstanceId = "33333333333343338333333333333333" },
+                    new StartRuntimeCommand { SessionId = sessionId, User = "user-1", LifecycleGeneration = 1, Runtime = new RuntimeRef { RuntimeId = "33333333333343338333333333333333", RuntimeOrder = 1 } },
                     (paths, _) =>
                     {
                         var sessionSitePackages = Path.Combine(paths.VirtualEnvDirectory, "lib", "python3.12", "site-packages");
@@ -1448,7 +1448,7 @@ public partial class SessionProcessManagerOwnershipTests
             try
             {
                 await manager.StartSessionAsync(
-                    new StartSessionCommand { SessionId = sessionId, User = "user-1", LifecycleGeneration = 1, RuntimeEpoch = 1, RuntimeInstanceId = "33333333333343338333333333333333" },
+                    new StartRuntimeCommand { SessionId = sessionId, User = "user-1", LifecycleGeneration = 1, Runtime = new RuntimeRef { RuntimeId = "33333333333343338333333333333333", RuntimeOrder = 1 } },
                     (_, _) =>
                     {
                         webDirectoryExistedDuringStartup = Directory.Exists(Path.Combine(homeDirectory, "web"));
@@ -1511,7 +1511,7 @@ public partial class SessionProcessManagerOwnershipTests
             using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
 
             var startTask = manager.StartSessionAsync(
-                new StartSessionCommand { SessionId = sessionId, User = "user-1", LifecycleGeneration = 1, RuntimeEpoch = 1, RuntimeInstanceId = "33333333333343338333333333333333" },
+                new StartRuntimeCommand { SessionId = sessionId, User = "user-1", LifecycleGeneration = 1, Runtime = new RuntimeRef { RuntimeId = "33333333333343338333333333333333", RuntimeOrder = 1 } },
                 (paths, _) =>
                 {
                     var pythonPath = Path.Combine(paths.VirtualEnvDirectory, "bin", "python");
@@ -1609,7 +1609,7 @@ public partial class SessionProcessManagerOwnershipTests
             try
             {
                 await manager.StartSessionAsync(
-                    new StartSessionCommand { SessionId = sessionId, User = "user-1", LifecycleGeneration = 1, RuntimeEpoch = 1, RuntimeInstanceId = "33333333333343338333333333333333" },
+                    new StartRuntimeCommand { SessionId = sessionId, User = "user-1", LifecycleGeneration = 1, Runtime = new RuntimeRef { RuntimeId = "33333333333343338333333333333333", RuntimeOrder = 1 } },
                     (_, _) => Task.CompletedTask,
                     CancellationToken.None);
             }

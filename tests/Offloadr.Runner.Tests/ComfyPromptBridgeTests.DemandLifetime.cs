@@ -23,8 +23,7 @@ public sealed partial class ComfyPromptBridgeTests
         var command = Command();
         var replacement = command.Clone();
         replacement.HandoffId = Guid.NewGuid().ToString("n");
-        replacement.RuntimeEpoch++;
-        replacement.RuntimeInstanceId = Guid.NewGuid().ToString("n");
+        replacement.Runtime = new RuntimeRef { RuntimeId = Guid.NewGuid().ToString("n"), RuntimeOrder = replacement.Runtime.RuntimeOrder + 1 };
         var work = new PromptCommandWorkSet(CancellationToken.None);
         var originalDemand = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var otherDemand = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -69,8 +68,7 @@ public sealed partial class ComfyPromptBridgeTests
                 work.HoldDemand(replacement.HandoffId, ServiceClientManager.SettlePromptDemandAsync(otherDemand.Task, true, lifetime));
                 return Task.CompletedTask;
             }), Is.True);
-            await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", command.LifecycleGeneration,
-                command.RuntimeEpoch, command.RuntimeInstanceId, [], CancellationToken.None);
+            await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", RuntimeIdentity.From(command.Runtime), [], CancellationToken.None);
             var context = await listener.GetContextAsync().WaitAsync(TimeSpan.FromSeconds(5));
             using var socket = (await context.AcceptWebSocketAsync(null)).WebSocket;
             relay.MapPrompt(command.SessionId, "client", command, NativePromptId(command));

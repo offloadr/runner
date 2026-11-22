@@ -290,41 +290,8 @@ internal static partial class ServiceClientManager
         }
     }
 
-    internal sealed class RuntimeCommandDeduplicationCache(int maxEntries = 16_384)
-    {
-        private readonly object _gate = new();
-        private readonly HashSet<string> _commandIds = new(StringComparer.Ordinal);
-        private readonly Queue<string> _insertionOrder = new();
-        private readonly int _maxEntries = maxEntries > 0 ? maxEntries : throw new ArgumentOutOfRangeException(nameof(maxEntries));
-
-        public int Count
-        {
-            get { lock (_gate) return _commandIds.Count; }
-        }
-
-        public bool TryAdd(string commandId)
-        {
-            ArgumentException.ThrowIfNullOrWhiteSpace(commandId);
-            lock (_gate)
-            {
-                if (!_commandIds.Add(commandId))
-                {
-                    return false;
-                }
-
-                _insertionOrder.Enqueue(commandId);
-                while (_commandIds.Count > _maxEntries)
-                {
-                    _commandIds.Remove(_insertionOrder.Dequeue());
-                }
-
-                return true;
-            }
-        }
-    }
-
-    /// <summary>The shared result of one physical startup, acknowledged by every command that joined it.</summary>
     /// <summary>
+    /// The shared result of one physical startup, acknowledged by every delivery of its start.
     /// How a startup ended. <paramref name="Sealing"/> is captured inside the startup, which a Stop
     /// or replacement waits for, so it always describes the runtime this command started.
     /// </summary>
@@ -336,13 +303,13 @@ internal static partial class ServiceClientManager
 
         public Task? Task { get; set; }
 
-        /// <summary>The startup's result, set only for startup work so other commands can join it.</summary>
+        /// <summary>The startup's result, set only for startup work so a repeated start can join it.</summary>
         public Task<StartupOutcome>? Outcome { get; set; }
         public CancellationToken Token => _cancellation.Token;
         public required string SessionId { get; init; }
         public RuntimeIdentity RuntimeIdentity { get; init; }
 
-        /// <summary>The sealing a startup runs with; only a command asking for the same joins it.</summary>
+        /// <summary>The sealing its start asked for; only a repeated start asking for the same joins it.</summary>
         public SessionSealing? Sealing { get; init; }
 
         public Task CancelAsync() => _cancellation.RequestAsync();
@@ -364,7 +331,7 @@ internal static partial class ServiceClientManager
         public required RuntimeIdentityRegistry RuntimeIdentities { get; init; }
         public required TransientCancellationRegistry TransientCancellation { get; init; }
         public required Func<string> GetActiveRuntimeSessionId { get; init; }
-        public required Func<StartSessionCommand, CancellationToken, Task> StartRuntimeAndWaitForReady { get; init; }
+        public required Func<StartRuntimeCommand, CancellationToken, Task> StartRuntimeAndWaitForReady { get; init; }
         public required Func<string, Func<string, CancellationToken, Task>?, CancellationToken, Task> StopRuntime { get; init; }
         public required Func<string, RuntimeIdentity, Func<string, CancellationToken, Task>?, CancellationToken, Task<bool>> StopRuntimeIfIdentityMatches { get; init; }
         public required Func<string, RuntimeIdentity?> GetTrackedRuntime { get; init; }
@@ -381,22 +348,28 @@ internal static partial class ServiceClientManager
         /// <summary>What a started session's runtime got, for its start acknowledgement.</summary>
         public Func<string, SessionSealingStatus?>? GetSessionSealing { get; init; }
         /// <summary>Whether this runner seals a start that does not ask for it (required mode).</summary>
-        public Func<StartSessionCommand, bool>? SealsStart { get; init; }
+        public Func<StartRuntimeCommand, bool>? SealsStart { get; init; }
         /// <summary>Takes the artifacts the session lost when its runtimes' data was removed, for its stop acknowledgement.</summary>
-        public Func<string, ulong, UnsavedUploads>? TakeUnsavedArtifacts { get; init; }
-        /// <summary>Drops the durable note of a sealed lifecycle once its Stop is acknowledged with the count.</summary>
-        public Action<string, ulong>? ForgetSealedLifecycle { get; init; }
+        public Func<string, UnsavedUploads>? TakeUnsavedArtifacts { get; init; }
+        /// <summary>Drops the session's durable sealed-lifecycle notes once its Stop is acknowledged with the count.</summary>
+        public Action<string>? ForgetSealedLifecycle { get; init; }
     }
 
     internal sealed class RunnerCommandWorkState(CancellationToken shutdown)
     {
         private readonly object _gate = new();
+
+        /// <summary>
+        /// Orders start admission against Stop's fence: a start is classified and its startup
+        /// published, or a Stop compared and its cutoff recorded, as one step.
+        /// </summary>
+        public object AdmissionGate { get; } = new();
         public PromptCommandWorkSet Prompts { get; } = new(shutdown);
         // Retain successful Stops for the process lifetime, including reconnects.
         // Evicting a nonce would allow a delayed retry to stop a replacement runtime.
         public ConcurrentDictionary<Guid, StopCommandWork> Stops { get; } = new();
-        // The sealing each logical session was started with, by the lifecycle that started it; a
-        // relaunch of its runtime keeps it.
+        // The sealing each logical session was started with, by the runtime that started it; a
+        // relaunch of the session keeps it and may not weaken it.
         public ConcurrentDictionary<string, RetainedSealing> SessionSealing { get; } = new(StringComparer.Ordinal);
         private TrackedCommandWork? _activeStartup;
         // Outcomes are kept per runtime, so a delayed outcome of an older startup cannot
@@ -439,7 +412,7 @@ internal static partial class ServiceClientManager
         /// names a runtime's running process, if any.
         /// </summary>
         public void RecordStartupOutcome(string sessionId, RuntimeIdentity runtime, StartupOutcome outcome,
-            Func<string, RuntimeIdentity, Guid?> trackedProcess)
+            Func<string, RuntimeIdentity, Guid?> trackedProcess, SessionSealing? requested = null)
         {
             var normalized = runtime.Normalized();
             lock (_gate)
@@ -457,7 +430,7 @@ internal static partial class ServiceClientManager
                     if (existing.Outcome.Ready && !outcome.Ready && process is not null && existing.Process == process) return;
                     _startupOutcomes.RemoveAt(index);
                 }
-                _startupOutcomes.Add(new RecordedStartupOutcome(sessionId, normalized, outcome, process));
+                _startupOutcomes.Add(new RecordedStartupOutcome(sessionId, normalized, outcome, process, requested?.Clone()));
                 if (_startupOutcomes.Count <= RetainedStartupOutcomes) return;
                 // Never evict the outcome of the process still running: the heartbeat
                 // describes it. A runner runs one process, so another entry is found.
@@ -526,58 +499,39 @@ internal static partial class ServiceClientManager
         }
     }
 
-    internal enum RuntimeOrder
+    /// <summary>How a delivered start relates to the work this runner already has.</summary>
+    internal enum StartAdmission
     {
-        Older,
+        /// <summary>Older work: at or below a Stop cutoff or the eviction floor, or older than the newest start adopted.</summary>
+        Stale,
+
+        /// <summary>The runtime of the newest start adopted: join its startup or replay its acknowledgement.</summary>
         Same,
+
+        /// <summary>Newer than every start adopted: it replaces whatever runs.</summary>
         Newer,
     }
 
-    internal sealed class LogicalSessionState(string initialSessionId)
+    internal sealed class LogicalSessionState(string initialSessionId, int maxStopCutoffs = 16_384)
     {
-        private sealed record State(string SessionId, RuntimeIdentity? RuntimeIdentity, uint RestartRevision = 0);
+        private sealed record State(string SessionId, RuntimeIdentity? RuntimeIdentity);
 
         private State _state = new(initialSessionId?.Trim() ?? string.Empty, null);
 
         public string GetActiveSessionId() => Volatile.Read(ref _state).SessionId;
 
-        public bool TryGetRuntime(string? sessionId, out RuntimeIdentity runtimeIdentity, out uint restartRevision)
+        public bool TryGetRuntime(string? sessionId, out RuntimeIdentity runtimeIdentity)
         {
             var current = Volatile.Read(ref _state);
             if (current.RuntimeIdentity is { } identity &&
                 string.Equals(current.SessionId, sessionId?.Trim() ?? string.Empty, StringComparison.Ordinal))
             {
                 runtimeIdentity = identity;
-                restartRevision = current.RestartRevision;
                 return true;
             }
 
             runtimeIdentity = default;
-            restartRevision = 0;
             return false;
-        }
-
-        /// <summary>
-        /// Orders a candidate runtime against an existing one by lifecycle generation,
-        /// then runtime epoch, then restart revision. An equal position is the same
-        /// runtime only when the instance matches; otherwise it is a conflicting,
-        /// therefore older, delivery.
-        /// </summary>
-        public static RuntimeOrder Compare(
-            RuntimeIdentity candidate,
-            uint candidateRevision,
-            RuntimeIdentity existing,
-            uint existingRevision)
-        {
-            var order = candidate.LifecycleGeneration.CompareTo(existing.LifecycleGeneration);
-            if (order == 0) order = candidate.RuntimeEpoch.CompareTo(existing.RuntimeEpoch);
-            if (order == 0) order = candidateRevision.CompareTo(existingRevision);
-            return order switch
-            {
-                > 0 => RuntimeOrder.Newer,
-                < 0 => RuntimeOrder.Older,
-                _ => candidate.SameRuntime(existing) ? RuntimeOrder.Same : RuntimeOrder.Older,
-            };
         }
 
         /// <summary>
@@ -605,104 +559,73 @@ internal static partial class ServiceClientManager
             }
         }
 
-        /// <summary>True when the same session already holds a runtime newer than the candidate.</summary>
-        public bool IsSuperseded(string? sessionId, RuntimeIdentity candidate, uint restartRevision)
-            => TryGetRuntime(sessionId, out var current, out var currentRevision) &&
-               Compare(candidate, restartRevision, current, currentRevision) == RuntimeOrder.Older;
-
         /// <summary>
-        /// True when a start is for a session that already ended here at that generation, or
-        /// is older than the newest assignment seen. Changes nothing, so it can run before any
-        /// tracked work is cancelled.
+        /// Classifies a delivered start against the Stop cutoffs and the newest start adopted,
+        /// and adopts it as the newest when it is newer. Older work is refused; the runtime of
+        /// the newest start is the same work again; anything else must be newer. Orders come from
+        /// one sequence for every session, so this also orders starts of different sessions.
         /// </summary>
-        public bool IsStaleStart(string? sessionId, RuntimeIdentity candidate, ulong assignmentSequence)
-            => IsRetired(sessionId?.Trim() ?? string.Empty, candidate) || IsOlderAssignment(assignmentSequence);
-
-        /// <summary>
-        /// Records an assignment as soon as its start arrives, so an older start delivered
-        /// afterwards is refused even while this one is still starting.
-        /// </summary>
-        public void ObserveAssignment(ulong assignmentSequence) => RecordAssignment(assignmentSequence);
-
-        /// <summary>
-        /// Adopts the runtime only when it is the same as or newer than the current
-        /// runtime of the same session. Another active session is replaced only when
-        /// <paramref name="replaceOtherSession"/> is set.
-        /// </summary>
-        public bool TryAdoptRuntime(
-            string? sessionId,
-            RuntimeIdentity candidate,
-            uint restartRevision,
-            bool replaceOtherSession,
-            ulong assignmentSequence = 0)
+        public StartAdmission AdmitStart(string? sessionId, RuntimeIdentity candidate)
         {
             var normalizedSessionId = sessionId?.Trim() ?? string.Empty;
-            candidate = candidate with { RuntimeInstanceId = candidate.RuntimeInstanceId?.Trim() ?? string.Empty };
-            if (normalizedSessionId.Length == 0 || !candidate.IsValid || IsRetired(normalizedSessionId, candidate) ||
-                IsOlderAssignment(assignmentSequence))
+            if (normalizedSessionId.Length == 0 || !candidate.IsValid)
+            {
+                return StartAdmission.Stale;
+            }
+
+            lock (_fenceGate)
+            {
+                if (IsFencedByStop(normalizedSessionId, candidate.RuntimeOrder))
+                {
+                    return StartAdmission.Stale;
+                }
+
+                if (_newestStart is { } newest)
+                {
+                    if (newest.Runtime.SameRuntime(candidate))
+                    {
+                        // A runtime id names one start of one session at one order.
+                        return string.Equals(newest.SessionId, normalizedSessionId, StringComparison.Ordinal) &&
+                               newest.Runtime.RuntimeOrder == candidate.RuntimeOrder
+                            ? StartAdmission.Same
+                            : StartAdmission.Stale;
+                    }
+
+                    if (candidate.RuntimeOrder <= newest.Runtime.RuntimeOrder)
+                    {
+                        return StartAdmission.Stale;
+                    }
+                }
+
+                _newestStart = (normalizedSessionId, candidate);
+                return StartAdmission.Newer;
+            }
+        }
+
+        /// <summary>
+        /// Makes <paramref name="candidate"/> the session's runtime, replacing another session's.
+        /// Refused when a newer start was adopted or a Stop fenced it since it was admitted.
+        /// </summary>
+        public bool TryAdoptRuntime(string? sessionId, RuntimeIdentity candidate)
+        {
+            var normalizedSessionId = sessionId?.Trim() ?? string.Empty;
+            candidate = candidate with { RuntimeId = candidate.RuntimeId?.Trim() ?? string.Empty };
+            if (normalizedSessionId.Length == 0 || !candidate.IsValid)
             {
                 return false;
             }
 
-            while (true)
+            lock (_fenceGate)
             {
-                var current = Volatile.Read(ref _state);
-                var next = new State(normalizedSessionId, candidate, restartRevision);
-                if (current.SessionId.Length > 0 &&
-                    !string.Equals(current.SessionId, normalizedSessionId, StringComparison.Ordinal))
+                if (IsFencedByStop(normalizedSessionId, candidate.RuntimeOrder) ||
+                    _newestStart is not { } newest || !newest.Runtime.SameRuntime(candidate))
                 {
-                    if (!replaceOtherSession)
-                    {
-                        return false;
-                    }
-
-                    if (ReferenceEquals(Interlocked.CompareExchange(ref _state, next, current), current))
-                    {
-                        // The replaced session has ended here; a late start for it must not return.
-                        Retire(current);
-                        RecordAssignment(assignmentSequence);
-                        return true;
-                    }
-
-                    continue;
-                }
-                else if (current.RuntimeIdentity is { } existing)
-                {
-                    var order = Compare(candidate, restartRevision, existing, current.RestartRevision);
-                    if (order == RuntimeOrder.Older)
-                    {
-                        return false;
-                    }
-
-                    if (order == RuntimeOrder.Same)
-                    {
-                        RecordAssignment(assignmentSequence);
-                        return true;
-                    }
+                    return false;
                 }
 
-                if (ReferenceEquals(Interlocked.CompareExchange(ref _state, next, current), current))
-                {
-                    RecordAssignment(assignmentSequence);
-                    return true;
-                }
+                Volatile.Write(ref _state, new State(normalizedSessionId, candidate));
+                return true;
             }
-        }
-
-        public void SetActiveRuntime(
-            string? sessionId,
-            ulong lifecycleGeneration,
-            ulong runtimeEpoch,
-            string? runtimeInstanceId)
-        {
-            var normalizedSessionId = sessionId?.Trim() ?? string.Empty;
-            var runtimeIdentity = new RuntimeIdentity(
-                lifecycleGeneration,
-                runtimeEpoch,
-                runtimeInstanceId?.Trim() ?? string.Empty);
-            Volatile.Write(
-                ref _state,
-                new State(normalizedSessionId, runtimeIdentity.IsValid ? runtimeIdentity : null));
         }
 
         public void ClearIfMatches(string? sessionId)
@@ -725,22 +648,14 @@ internal static partial class ServiceClientManager
             }
         }
 
-        public void ClearIfMatches(
-            string? sessionId,
-            ulong lifecycleGeneration,
-            ulong runtimeEpoch,
-            string? runtimeInstanceId)
+        public void ClearIfMatches(string? sessionId, RuntimeIdentity expectedRuntime)
         {
             var expectedSessionId = sessionId?.Trim() ?? string.Empty;
-            var expectedRuntimeIdentity = new RuntimeIdentity(
-                lifecycleGeneration,
-                runtimeEpoch,
-                runtimeInstanceId?.Trim() ?? string.Empty);
             while (true)
             {
                 var current = Volatile.Read(ref _state);
                 if (!string.Equals(current.SessionId, expectedSessionId, StringComparison.Ordinal) ||
-                    current.RuntimeIdentity is not { } currentRuntime || !currentRuntime.SameRuntime(expectedRuntimeIdentity))
+                    current.RuntimeIdentity is not { } currentRuntime || !currentRuntime.SameRuntime(expectedRuntime))
                 {
                     return;
                 }
@@ -755,22 +670,52 @@ internal static partial class ServiceClientManager
         }
 
         /// <summary>
-        /// Clears the session after a Stop and remembers it as ended, so a delayed or
-        /// redelivered start for the same lifecycle generation cannot bring it back.
+        /// Records a Stop's cutoff, so a delayed or redelivered start of the session at or below
+        /// it cannot bring the session back. The Stop may arrive before the session's start.
         /// </summary>
-        public void ClearAndRetire(string? sessionId, ulong stoppedGeneration = 0)
+        public void RecordStopCutoff(string? sessionId, ulong upToRuntimeOrder)
         {
-            var expected = sessionId?.Trim() ?? string.Empty;
-            if (expected.Length > 0 && stoppedGeneration > 0)
+            var normalizedSessionId = sessionId?.Trim() ?? string.Empty;
+            if (normalizedSessionId.Length == 0)
             {
-                // The Stop may arrive before its session's start was adopted here.
-                Retire(new State(expected, new RuntimeIdentity(stoppedGeneration, 1, "stopped")));
+                return;
             }
 
+            lock (_fenceGate)
+            {
+                if (_stopCutoffs.TryGetValue(normalizedSessionId, out var known))
+                {
+                    _stopCutoffs[normalizedSessionId] = Math.Max(known, upToRuntimeOrder);
+                    return;
+                }
+
+                _stopCutoffs[normalizedSessionId] = upToRuntimeOrder;
+                _stopOrder.Enqueue(normalizedSessionId);
+                while (_stopOrder.Count > Math.Max(1, maxStopCutoffs))
+                {
+                    // An evicted session's old start must still be refused, so the floor rises
+                    // to its cutoff. Orders are shared by every session: the floor only refuses
+                    // starts minted before a Stop that many Stops ago.
+                    if (_stopCutoffs.Remove(_stopOrder.Dequeue(), out var evicted))
+                    {
+                        _stopFloor = Math.Max(_stopFloor, evicted);
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Clears the session after its Stop, unless it holds a runtime newer than the Stop's
+        /// cutoff: a start adopted while the Stop ran is not the Stop's to clear.
+        /// </summary>
+        public void ClearAfterStop(string? sessionId, ulong upToRuntimeOrder)
+        {
+            var expected = sessionId?.Trim() ?? string.Empty;
             while (true)
             {
                 var current = Volatile.Read(ref _state);
-                if (!string.Equals(current.SessionId, expected, StringComparison.Ordinal))
+                if (!string.Equals(current.SessionId, expected, StringComparison.Ordinal) ||
+                    current.RuntimeIdentity is { } runtime && runtime.RuntimeOrder > upToRuntimeOrder)
                 {
                     return;
                 }
@@ -779,76 +724,24 @@ internal static partial class ServiceClientManager
                     Interlocked.CompareExchange(ref _state, new State(string.Empty, null), current),
                     current))
                 {
-                    Retire(current);
                     return;
                 }
             }
         }
 
-        // Sessions that ended on this runner, by the highest lifecycle generation they ran
-        // at. A start is only fenced against its own session's generations: ordering across
-        // different sessions needs an allocation order only the control plane has.
-        // Bounded memory; once the control plane sends assignment sequences those fence every
-        // start regardless of how many sessions ended here.
-        private const int MaxRetiredSessions = 16_384;
-        private readonly object _retiredGate = new();
-        private readonly Dictionary<string, ulong> _retiredGenerations = new(StringComparer.Ordinal);
-        private readonly Queue<string> _retiredOrder = new();
+        // Stop cutoffs by session, in bounded memory. Evicting one raises the floor to its
+        // cutoff, so nothing it refused becomes acceptable.
+        private readonly object _fenceGate = new();
+        private readonly Dictionary<string, ulong> _stopCutoffs = new(StringComparer.Ordinal);
+        private readonly Queue<string> _stopOrder = new();
+        private ulong _stopFloor;
 
-        private void Retire(State ended)
-        {
-            if (ended.SessionId.Length == 0 || ended.RuntimeIdentity is not { } runtime)
-            {
-                return;
-            }
+        // The newest start adopted on this runner, of any session.
+        private (string SessionId, RuntimeIdentity Runtime)? _newestStart;
 
-            lock (_retiredGate)
-            {
-                if (_retiredGenerations.TryGetValue(ended.SessionId, out var known))
-                {
-                    _retiredGenerations[ended.SessionId] = Math.Max(known, runtime.LifecycleGeneration);
-                    return;
-                }
-
-                _retiredGenerations[ended.SessionId] = runtime.LifecycleGeneration;
-                _retiredOrder.Enqueue(ended.SessionId);
-                while (_retiredOrder.Count > MaxRetiredSessions)
-                {
-                    _retiredGenerations.Remove(_retiredOrder.Dequeue());
-                }
-            }
-        }
-
-        // Newest session assignment seen on this runner. Zero until the control plane sends
-        // assignment sequences; starts without one are not ordered across sessions.
-        private ulong _newestAssignment;
-
-        private bool IsOlderAssignment(ulong assignmentSequence)
-            => assignmentSequence > 0 && assignmentSequence < Interlocked.Read(ref _newestAssignment);
-
-        private void RecordAssignment(ulong assignmentSequence)
-        {
-            var newest = Interlocked.Read(ref _newestAssignment);
-            while (assignmentSequence > newest)
-            {
-                var observed = Interlocked.CompareExchange(ref _newestAssignment, assignmentSequence, newest);
-                if (observed == newest)
-                {
-                    return;
-                }
-
-                newest = observed;
-            }
-        }
-
-        private bool IsRetired(string sessionId, RuntimeIdentity candidate)
-        {
-            lock (_retiredGate)
-            {
-                return _retiredGenerations.TryGetValue(sessionId, out var retired) &&
-                       candidate.LifecycleGeneration <= retired;
-            }
-        }
+        private bool IsFencedByStop(string sessionId, ulong runtimeOrder)
+            => runtimeOrder <= _stopFloor ||
+               (_stopCutoffs.TryGetValue(sessionId, out var cutoff) && runtimeOrder <= cutoff);
     }
 
     internal static TimeSpan CommandStreamKeepAliveInterval { get; set; } = TimeSpan.FromSeconds(20);
@@ -940,18 +833,14 @@ internal static partial class ServiceClientManager
                         // may be treated as revoked: the session may since have a replacement runtime.
                         if (progress.Runtime is { IsValid: true } registeredRuntime)
                         {
-                            request.LifecycleGeneration = registeredRuntime.LifecycleGeneration;
-                            request.RuntimeEpoch = registeredRuntime.RuntimeEpoch;
-                            request.RuntimeInstanceId = registeredRuntime.RuntimeInstanceId;
+                            request.Runtime = registeredRuntime.ToRef();
                             reportedRuntime = registeredRuntime;
                         }
                         else if (runtimeIdentities.TryGet(progress.SessionId, out var currentRuntime))
                         {
                             // Registered before the session had a runtime: label it with the current
                             // one so it is accepted, but never revoke a runtime on its rejection.
-                            request.LifecycleGeneration = currentRuntime.LifecycleGeneration;
-                            request.RuntimeEpoch = currentRuntime.RuntimeEpoch;
-                            request.RuntimeInstanceId = currentRuntime.RuntimeInstanceId;
+                            request.Runtime = currentRuntime.ToRef();
                         }
                         await sessionSink.ReportModelDownloadAsync(request, progressCancellation).ConfigureAwait(false);
                     }
@@ -1273,7 +1162,6 @@ internal static partial class ServiceClientManager
         var attempt = 0;
         var rng = new Random();
         var transientDeliveries = new TransientRequestDeliveries(new TransientAcknowledgementCache());
-        var runtimeCommandDeduplication = new RuntimeCommandDeduplicationCache();
         using var ordinaryControlGate = new SemaphoreSlim(1, 1);
         using var readGate = new SemaphoreSlim(4, 4);
         await using var commandTasks = new RunnerCommandLifetime(shutdown, requestParentShutdown);
@@ -1312,8 +1200,10 @@ internal static partial class ServiceClientManager
             Shutdown = shutdown,
             GetSessionSealing = sessionManager.GetSessionSealingStatus,
             SealsStart = start => start.Sealing?.Required != true && sessionManager.ShouldSeal(start),
-            TakeUnsavedArtifacts = artifactUploadService.TakeUnsavedUploads,
-            ForgetSealedLifecycle = sessionManager.ForgetSealedLifecycle,
+            // A Stop covers every runtime of its session up to its cutoff, and a session keeps one
+            // lifecycle generation: it takes the whole session's count and notes.
+            TakeUnsavedArtifacts = sessionId => artifactUploadService.TakeUnsavedUploads(sessionId),
+            ForgetSealedLifecycle = sessionId => sessionManager.ForgetSealedLifecycle(sessionId, 0),
         };
 
         while (!shutdown.IsCancellationRequested)
@@ -1340,38 +1230,13 @@ internal static partial class ServiceClientManager
                         continue;
                     }
 
-                    if (evt.StartSession != null && !string.IsNullOrWhiteSpace(evt.StartSession.SessionId))
+                    if (evt.StartRuntime != null && !string.IsNullOrWhiteSpace(evt.StartRuntime.SessionId))
                     {
-                        var startCommandKey = $"start:{evt.StartSession.SessionId}:{evt.StartSession.LifecycleGeneration}:{evt.StartSession.RuntimeEpoch}:{evt.StartSession.RuntimeInstanceId}";
-                        if (!runtimeCommandDeduplication.TryAdd(startCommandKey))
-                        {
-                            continue;
-                        }
-
-                        RunnerLog.Info(nameof(ServiceClientManager), $"StartSession event: session={evt.StartSession.SessionId} user={evt.StartSession.User}");
-                        _ = commandTasks.Start(() => HandleStartSessionCommand(evt.StartSession, runtimeCommands));
-                        continue;
-                    }
-
-                    if (evt.QuiesceEditorRuntime != null && !string.IsNullOrWhiteSpace(evt.QuiesceEditorRuntime.CommandId))
-                    {
-                        if (!runtimeCommandDeduplication.TryAdd(evt.QuiesceEditorRuntime.CommandId))
-                        {
-                            continue;
-                        }
-
-                        _ = commandTasks.Start(() => HandleQuiesceRuntimeCommandAsync(evt.QuiesceEditorRuntime, runtimeCommands));
-                        continue;
-                    }
-
-                    if (evt.LaunchEditorRuntime != null && !string.IsNullOrWhiteSpace(evt.LaunchEditorRuntime.CommandId))
-                    {
-                        if (!runtimeCommandDeduplication.TryAdd(evt.LaunchEditorRuntime.CommandId))
-                        {
-                            continue;
-                        }
-
-                        _ = commandTasks.Start(() => HandleLaunchRuntimeCommand(evt.LaunchEditorRuntime, runtimeCommands));
+                        // Admission runs here, before the next command is read: a repeated start
+                        // joins or replays the first, and a Stop read after it sees its startup.
+                        RunnerLog.Info(nameof(ServiceClientManager), $"StartRuntime event: session={evt.StartRuntime.SessionId} user={evt.StartRuntime.User}");
+                        var start = evt.StartRuntime;
+                        _ = commandTasks.Start(() => HandleStartRuntimeCommand(start, runtimeCommands));
                         continue;
                     }
 
@@ -1387,7 +1252,7 @@ internal static partial class ServiceClientManager
                         // Physical work and acknowledgement retry must not block Stop delivery.
                         _ = commandTasks.Start(() => gpuPowerLimitService.HandleAsync(
                             evt.SetGpuPowerLimit, runnerId, logicalSessionState.GetActiveSessionId,
-                            () => runtimeIdentities.TryGet(evt.SetGpuPowerLimit.SessionId, out var identity) ? identity.LifecycleGeneration : 0,
+                            () => runtimeIdentities.LifecycleGeneration(evt.SetGpuPowerLimit.SessionId),
                             sessionSink.GrantGpuPowerExecutionAsync, sessionSink.AckGpuPowerLimitAsync, shutdown));
                         continue;
                     }
@@ -1448,9 +1313,7 @@ internal static partial class ServiceClientManager
                                 sessionId,
                                 editorSid,
                                 clientId,
-                                runtime.LifecycleGeneration,
-                                runtime.RuntimeEpoch,
-                                runtime.RuntimeInstanceId,
+                                runtime,
                                 captured.WebsocketClientMessage.ToByteArray(),
                                 token),
                             downloadService.SetActiveSession,
@@ -1653,9 +1516,7 @@ internal static partial class ServiceClientManager
                     logicalSessionState,
                     runtimeIdentities,
                     normalizedSessionId,
-                    revoked.LifecycleGeneration,
-                    revoked.RuntimeEpoch,
-                    revoked.RuntimeInstanceId);
+                    revoked);
             }
             else
             {
@@ -1805,13 +1666,13 @@ internal static partial class ServiceClientManager
 
         var supersededInRegistry = runtimeIdentities.TryGet(sessionId, out var registered) &&
                                    !registered.SameRuntime(exitedRuntime);
-        var supersededInSession = logicalSessionState.TryGetRuntime(sessionId, out var logical, out _) &&
+        var supersededInSession = logicalSessionState.TryGetRuntime(sessionId, out var logical) &&
                                   !logical.SameRuntime(exitedRuntime);
         if (supersededInRegistry || supersededInSession)
         {
             RunnerLog.Warning(
                 nameof(ServiceClientManager),
-                $"Exited runtime {exitedRuntime.RuntimeInstanceId} of session '{sessionId}' was already replaced; leaving the newer runtime's state and sidecars.");
+                $"Exited runtime {exitedRuntime.RuntimeId} of session '{sessionId}' was already replaced; leaving the newer runtime's state and sidecars.");
             return;
         }
 
@@ -1819,9 +1680,7 @@ internal static partial class ServiceClientManager
             logicalSessionState,
             runtimeIdentities,
             sessionId,
-            exitedRuntime.LifecycleGeneration,
-            exitedRuntime.RuntimeEpoch,
-            exitedRuntime.RuntimeInstanceId);
+            exitedRuntime);
         await cleanupSidecars(sessionId, cancellationToken).ConfigureAwait(false);
     }
 
@@ -1880,20 +1739,10 @@ internal static partial class ServiceClientManager
         LogicalSessionState logicalSessionState,
         RuntimeIdentityRegistry runtimeIdentities,
         string? sessionId,
-        ulong lifecycleGeneration,
-        ulong runtimeEpoch,
-        string? runtimeInstanceId)
+        RuntimeIdentity runtime)
     {
-        logicalSessionState.ClearIfMatches(
-            sessionId,
-            lifecycleGeneration,
-            runtimeEpoch,
-            runtimeInstanceId);
-        runtimeIdentities.RemoveIfMatches(
-            sessionId,
-            lifecycleGeneration,
-            runtimeEpoch,
-            runtimeInstanceId);
+        logicalSessionState.ClearIfMatches(sessionId, runtime);
+        runtimeIdentities.RemoveIfMatches(sessionId, runtime);
     }
 
     internal static async Task StopArtifactAndWorkspaceMirrorsAsync(
@@ -1948,14 +1797,17 @@ internal static partial class ServiceClientManager
             cancellationToken);
 
     /// <summary>
-    /// Cleans up after a failed start or launch of exactly <paramref name="failedRuntime"/>.
+    /// A session's start sealing, the runtime of the start that set it and that start's
+    /// lifecycle generation: only a relaunch of the same lifecycle keeps it.
+    /// </summary>
+    internal sealed record RetainedSealing(RuntimeIdentity StartRuntime, SessionSealing Sealing, ulong LifecycleGeneration);
+
+    /// <summary>
+    /// Cleans up after a failed start of exactly <paramref name="failedRuntime"/>.
     /// A different runtime of the session that is still tracked is left running and
     /// remains the session's identity; a cleanup that could not stop the child keeps
     /// the state until the process exits.
     /// </summary>
-    /// <summary>A session's start sealing and the runtime of the start that set it.</summary>
-    internal sealed record RetainedSealing(RuntimeIdentity StartRuntime, SessionSealing Sealing);
-
     private static async Task CleanUpFailedStartupAsync(
         string sessionId,
         RuntimeIdentity failedRuntime,
@@ -1978,12 +1830,10 @@ internal static partial class ServiceClientManager
                 deps.LogicalSessionState,
                 deps.RuntimeIdentities,
                 sessionId,
-                failedRuntime.LifecycleGeneration,
-                failedRuntime.RuntimeEpoch,
-                failedRuntime.RuntimeInstanceId);
-            // A failed start's sealing goes with it: a later launch that omits its own must not
-            // inherit that recipient. A failed or refused relaunch keeps it: the session still
-            // started sealed, and its next launch must be too.
+                failedRuntime);
+            // A failed first start's sealing goes with it: a later start that omits its own must
+            // not inherit that recipient. A failed or refused relaunch keeps it: the session still
+            // started sealed, and its next relaunch must be too.
             if (deps.WorkState.SessionSealing.TryGetValue(sessionId, out var retained) &&
                 retained.StartRuntime.SameRuntime(failedRuntime))
             {
@@ -1993,15 +1843,12 @@ internal static partial class ServiceClientManager
             return;
         }
 
+        var lifecycleGeneration = deps.RuntimeIdentities.LifecycleGeneration(sessionId);
         if (deps.GetTrackedRuntime(sessionId) is { } running &&
             deps.LogicalSessionState.ReplaceRuntimeIfMatches(sessionId, failedRuntime, running) &&
-            deps.RuntimeIdentities.RemoveIfMatches(
-                sessionId,
-                failedRuntime.LifecycleGeneration,
-                failedRuntime.RuntimeEpoch,
-                failedRuntime.RuntimeInstanceId))
+            deps.RuntimeIdentities.RemoveIfMatches(sessionId, failedRuntime))
         {
-            deps.RuntimeIdentities.Set(sessionId, running.LifecycleGeneration, running.RuntimeEpoch, running.RuntimeInstanceId);
+            deps.RuntimeIdentities.Set(sessionId, running, lifecycleGeneration);
         }
     }
 
@@ -2029,9 +1876,7 @@ internal static partial class ServiceClientManager
             User = command.User,
             CommandId = command.CommandId,
             InstanceId = deps.InstanceId.Trim(),
-            LifecycleGeneration = command.LifecycleGeneration,
-            RuntimeEpoch = command.RuntimeEpoch,
-            RuntimeInstanceId = command.RuntimeInstanceId,
+            UpToRuntimeOrder = command.UpToRuntimeOrder,
         };
         var acknowledgementKey = commandId.ToString("n");
         var work = deps.WorkState.Stops.GetOrAdd(commandId, _ => new StopCommandWork(ack));
@@ -2048,28 +1893,21 @@ internal static partial class ServiceClientManager
             {
                 var outcome = await ExecuteStopSessionCommandAsync(command, deps).ConfigureAwait(false);
                 work.Completed = outcome != StopOutcome.NotCompleted;
-                // The Stop that tore the session down reports what its lifecycle lost, and so
-                // does an older lifecycle's Stop that came after a newer lifecycle began: the
-                // counts are kept by lifecycle, so it takes none of the current one's. A Stop
-                // for an older runtime of the current lifecycle leaves the count for that
-                // lifecycle's own Stop. Only the Stop that tore the session down performed its
-                // cleanup; any other is superseded, and its saving evidence stays unknown.
-                if (outcome is StopOutcome.Superseded or StopOutcome.SupersededLifecycle)
+                // Only the Stop that tore the session down performed its cleanup and reports what
+                // the session lost. A superseded Stop did nothing: its saving evidence stays
+                // unknown, and the count stays for the Stop that ends the newer runtime.
+                if (outcome == StopOutcome.Superseded)
                 {
                     work.Acknowledgement.CleanupDisposition = RunnerCleanupDisposition.Superseded;
                     work.Acknowledgement.UnsavedArtifactsUnknown = true;
                 }
-
-                if (outcome is StopOutcome.Stopped or StopOutcome.SupersededLifecycle)
+                else if (outcome == StopOutcome.Stopped)
                 {
-                    var unsaved = deps.TakeUnsavedArtifacts?.Invoke(command.SessionId, command.LifecycleGeneration) ?? new UnsavedUploads(0, true);
+                    var unsaved = deps.TakeUnsavedArtifacts?.Invoke(command.SessionId) ?? new UnsavedUploads(0, true);
                     work.Acknowledgement.UnsavedArtifactCount = (uint)Math.Max(0, unsaved.Count);
                     work.Acknowledgement.UnsavedArtifactsUnknown |= unsaved.Incomplete;
+                    work.Acknowledgement.CleanupDisposition = RunnerCleanupDisposition.Performed;
                     work.CountTaken = true;
-                    if (outcome == StopOutcome.Stopped)
-                    {
-                        work.Acknowledgement.CleanupDisposition = RunnerCleanupDisposition.Performed;
-                    }
                 }
             }
 
@@ -2090,22 +1928,27 @@ internal static partial class ServiceClientManager
     {
         NotCompleted,
         Superseded,
-        // Superseded by a newer lifecycle, not only a newer runtime of the same one.
-        SupersededLifecycle,
         Stopped,
     }
 
     private static async Task<StopOutcome> ExecuteStopSessionCommandAsync(StopSessionCommand command, RuntimeCommandDependencies deps)
     {
         deps.Shutdown.ThrowIfCancellationRequested();
-        if (FindRuntimeNewerThanStop(command, deps) is { } newer)
+        var cutoff = command.UpToRuntimeOrder;
+        lock (deps.WorkState.AdmissionGate)
         {
-            // A delayed or redelivered Stop for an older runtime must not stop the
-            // newer one. The runtime it names is no longer running here.
-            RunnerLog.Warning(
-                nameof(ServiceClientManager),
-                $"Ignoring stale stop for session {command.SessionId}; a newer runtime is current.");
-            return newer.LifecycleGeneration > command.LifecycleGeneration ? StopOutcome.SupersededLifecycle : StopOutcome.Superseded;
+            if (FindRuntimeNewerThanStop(command, deps) is not null)
+            {
+                // A delayed or redelivered Stop must not stop a runtime started after it.
+                RunnerLog.Warning(
+                    nameof(ServiceClientManager),
+                    $"Ignoring stale stop for session {command.SessionId}; a newer runtime is current.");
+                return StopOutcome.Superseded;
+            }
+
+            // Recorded before cleanup, so a start at or below the cutoff is refused from now on,
+            // even when this cleanup fails and the Stop is sent again.
+            deps.LogicalSessionState.RecordStopCutoff(command.SessionId, cutoff);
         }
 
         await deps.WorkState.Prompts.CancelAndWaitAsync(
@@ -2113,7 +1956,8 @@ internal static partial class ServiceClientManager
 
         var activeStartup = deps.WorkState.GetActiveStartup();
         if (activeStartup is not null &&
-            string.Equals(activeStartup.SessionId, command.SessionId, StringComparison.Ordinal))
+            string.Equals(activeStartup.SessionId, command.SessionId, StringComparison.Ordinal) &&
+            activeStartup.RuntimeIdentity.RuntimeOrder <= cutoff)
         {
             await CancelTrackedWorkAsync(activeStartup).ConfigureAwait(false);
         }
@@ -2134,192 +1978,341 @@ internal static partial class ServiceClientManager
             return StopOutcome.NotCompleted;
         }
 
-        deps.LogicalSessionState.ClearAndRetire(command.SessionId, command.LifecycleGeneration);
-        deps.RuntimeIdentities.Remove(command.SessionId);
+        deps.LogicalSessionState.ClearAfterStop(command.SessionId, cutoff);
+        if (deps.RuntimeIdentities.TryGet(command.SessionId, out var registered) && registered.RuntimeOrder <= cutoff)
+        {
+            deps.RuntimeIdentities.RemoveIfMatches(command.SessionId, registered);
+        }
+
         deps.WorkState.SessionSealing.TryRemove(command.SessionId, out _);
         return StopOutcome.Stopped;
     }
 
     /// <summary>
-    /// A Stop that carries a lifecycle generation is fenced: it is superseded when
-    /// the session's current runtime, tracked child or active startup is newer.
-    /// A Stop without one is not runtime-fenced; its command identity still deduplicates retries.
+    /// The one comparison a Stop makes: a runtime, child or startup of its session with an
+    /// order above the Stop's cutoff, if any. Such a Stop is superseded and does nothing.
     /// </summary>
-    /// <summary>A runtime of the session newer than the one a fenced Stop names, if any.</summary>
     private static RuntimeIdentity? FindRuntimeNewerThanStop(StopSessionCommand command, RuntimeCommandDependencies deps)
     {
-        if (command.LifecycleGeneration == 0)
-        {
-            return null;
-        }
-
-        if (deps.LogicalSessionState.TryGetRuntime(command.SessionId, out var logical, out _) &&
-            IsNewerThanStop(logical, command))
+        var cutoff = command.UpToRuntimeOrder;
+        if (deps.LogicalSessionState.TryGetRuntime(command.SessionId, out var logical) && logical.RuntimeOrder > cutoff)
         {
             return logical;
         }
 
-        if (deps.GetTrackedRuntime(command.SessionId) is { } tracked && IsNewerThanStop(tracked, command))
+        if (deps.GetTrackedRuntime(command.SessionId) is { } tracked && tracked.RuntimeOrder > cutoff)
         {
             return tracked;
         }
 
         return deps.WorkState.GetActiveStartup() is { } startup &&
                string.Equals(startup.SessionId, command.SessionId, StringComparison.Ordinal) &&
-               IsNewerThanStop(startup.RuntimeIdentity, command)
+               startup.RuntimeIdentity.RuntimeOrder > cutoff
             ? startup.RuntimeIdentity
             : null;
     }
 
-    private static bool IsNewerThanStop(RuntimeIdentity current, StopSessionCommand stop)
+    /// <summary>
+    /// Handles one delivery of a start. Older work is refused. A repeated start of the runtime
+    /// adopted joins its startup in flight, or is answered with its recorded acknowledgement.
+    /// Newer work replaces what runs: the startup in flight is cancelled, the session's older
+    /// child stopped or another session pre-empted, and the runtime launched and acknowledged.
+    /// </summary>
+    internal static Task HandleStartRuntimeCommand(StartRuntimeCommand command, RuntimeCommandDependencies deps)
     {
-        if (!current.IsValid)
-        {
-            return false;
-        }
-
-        if (current.LifecycleGeneration != stop.LifecycleGeneration)
-        {
-            return current.LifecycleGeneration > stop.LifecycleGeneration;
-        }
-
-        if (stop.RuntimeEpoch == 0)
-        {
-            return false;
-        }
-
-        if (current.RuntimeEpoch != stop.RuntimeEpoch)
-        {
-            return current.RuntimeEpoch > stop.RuntimeEpoch;
-        }
-
-        // Same position, different instance: the Stop names a runtime that is
-        // not this one, so it must not stop it.
-        return !string.IsNullOrWhiteSpace(stop.RuntimeInstanceId) &&
-               !current.SameRuntime(new RuntimeIdentity(stop.LifecycleGeneration, stop.RuntimeEpoch, stop.RuntimeInstanceId));
-    }
-
-    internal static Task HandleStartSessionCommand(StartSessionCommand command, RuntimeCommandDependencies deps)
-    {
-        var runtimeIdentity = new RuntimeIdentity(command.LifecycleGeneration, command.RuntimeEpoch, command.RuntimeInstanceId.Trim());
-        var ack = new AcknowledgeSessionStartRequest
+        // The startup and the acknowledgement keep the delivered command, even if the caller
+        // changes its message meanwhile.
+        command = command.Clone();
+        var runtime = RuntimeIdentity.From(command.Runtime);
+        var ack = new AcknowledgeRuntimeStartRequest
         {
             InstanceId = deps.InstanceId.Trim(),
             SessionId = command.SessionId,
             User = command.User,
-            LifecycleGeneration = command.LifecycleGeneration,
-            RuntimeEpoch = command.RuntimeEpoch,
-            RuntimeInstanceId = command.RuntimeInstanceId,
+            Runtime = command.Runtime?.Clone(),
         };
 
-        // A delayed start for an older runtime of this session, for a session that already
-        // ended here, or from an older assignment must not cancel or replace newer work.
-        // These checks run before any tracked startup or prompt is cancelled.
-        if (deps.LogicalSessionState.IsSuperseded(command.SessionId, runtimeIdentity, restartRevision: 0) ||
-            deps.LogicalSessionState.IsStaleStart(command.SessionId, runtimeIdentity, command.AssignmentSequence))
+        // Classifying the start and publishing its startup are one step against Stop's fence,
+        // so a Stop either sees this startup or has already fenced it.
+        Task<StartupOutcome>? outcome;
+        lock (deps.WorkState.AdmissionGate)
         {
-            RunnerLog.Warning(nameof(ServiceClientManager), $"Rejecting stale start for session {command.SessionId}.");
-            ack.Ready = false;
-            ack.Message = StaleRuntimeCommandMessage;
-            return AcknowledgeRuntimeCommandWithRetryAsync(
-                deps.Sink.AckStartSessionAsync,
-                ack,
-                command.SessionId,
-                deps.Shutdown);
+            outcome = deps.LogicalSessionState.AdmitStart(command.SessionId, runtime) switch
+            {
+                StartAdmission.Same => FindAdoptedStartup(command, runtime, deps),
+                StartAdmission.Newer => PublishStartup(command, runtime, deps),
+                _ => null,
+            };
         }
 
-        deps.LogicalSessionState.ObserveAssignment(command.AssignmentSequence);
+        if (outcome is null)
+        {
+            RunnerLog.Warning(nameof(ServiceClientManager), $"Rejecting stale start for session {command.SessionId}.");
+            outcome = Task.FromResult(new StartupOutcome(false, StaleRuntimeCommandMessage));
+        }
 
-        return RunTrackedStartupAsync(
-            deps,
-            command.SessionId,
-            runtimeIdentity,
-            async cancellationToken =>
-            {
-                try
-                {
-                    await deps.WorkState.Prompts.CancelAndWaitAsync(
-                        prompt => prompt.SessionId != command.SessionId).ConfigureAwait(false);
+        return AcknowledgeStartAsync(outcome, ack, deps);
+    }
 
-                    // This wait belongs to cancellable startup work, never the
-                    // command stream: Stop must still preempt a queued replacement.
-                    await deps.ActivateSession(() =>
-                    {
-                        if (!deps.LogicalSessionState.TryAdoptRuntime(
-                                command.SessionId,
-                                runtimeIdentity,
-                                restartRevision: 0,
-                                replaceOtherSession: true,
-                                command.AssignmentSequence))
-                        {
-                            throw new InvalidOperationException(StaleRuntimeCommandMessage);
-                        }
-
-                        deps.RuntimeIdentities.Set(command.SessionId, command.LifecycleGeneration,
-                            command.RuntimeEpoch, command.RuntimeInstanceId);
-                        // Retained for relaunches only by the start that was admitted, never by a
-                        // delivery that joined it, nor by a duplicate of a runtime already running.
-                        var duplicateOfRunning = deps.GetTrackedRuntime(command.SessionId) is { } tracked &&
-                            tracked.SameRuntime(runtimeIdentity);
-                        if (!duplicateOfRunning && command.Sealing is { } sealing)
-                        {
-                            deps.WorkState.SessionSealing[command.SessionId] = new RetainedSealing(runtimeIdentity, sealing.Clone());
-                        }
-                        else if (!duplicateOfRunning)
-                        {
-                            deps.WorkState.SessionSealing.TryRemove(command.SessionId, out _);
-                        }
-                    }, cancellationToken).ConfigureAwait(false);
-
-                    var preemptedSessionId = await PreemptActiveSessionIfNeededAsync(
-                        command.SessionId,
-                        deps.GetActiveRuntimeSessionId,
-                        deps.StopRuntime,
-                        deps.StopSessionRelay,
-                        deps.StopArtifactUploads,
-                        deps.StopWorkspaceMirrors,
-                        deps.CancelSessionDownloads,
-                        deps.GetDownloadActiveSessionId,
-                        deps.SetDownloadActiveSession,
-                        cancellationToken).ConfigureAwait(false);
-                    deps.RuntimeIdentities.Remove(preemptedSessionId);
-                    await deps.StartRuntimeAndWaitForReady(command, cancellationToken).ConfigureAwait(false);
-                    return new StartupOutcome(
-                        true,
-                        IsComfyRuntime(command.EditorRuntimeKind) ? "ComfyUI ready" : "GPU runtime ready",
-                        deps.GetSessionSealing?.Invoke(command.SessionId));
-                }
-                catch (SessionAlreadyRunningException ex)
-                {
-                    // That runtime runs on, as it was admitted: only this command is refused.
-                    LogStartFailure(command, deps, ex, $"Refused a start of session {command.SessionId}");
-                    return new StartupOutcome(false, ex.Message);
-                }
-                catch (Exception ex)
-                {
-                    LogStartFailure(command, deps, ex, $"Failed to start session {command.SessionId}");
-                    await CleanUpFailedStartupAsync(command.SessionId, runtimeIdentity, deps).ConfigureAwait(false);
-                    return new StartupOutcome(false, ex.Message);
-                }
-            },
-            outcome =>
-            {
-                ack.Ready = outcome.Ready;
-                ack.Message = outcome.Message;
-                ack.Sealing = outcome.Ready ? outcome.Sealing : null;
-                return ack;
-            },
-            deps.Sink.AckStartSessionAsync,
-            command.SessionId,
-            command.Sealing);
+    private static async Task AcknowledgeStartAsync(
+        Task<StartupOutcome> outcome,
+        AcknowledgeRuntimeStartRequest ack,
+        RuntimeCommandDependencies deps)
+    {
+        var result = await outcome.ConfigureAwait(false);
+        ack.Ready = result.Ready;
+        ack.Message = result.Message;
+        ack.Sealing = result.Ready ? result.Sealing?.Clone() : null;
+        await AcknowledgeRuntimeCommandWithRetryAsync(
+            deps.Sink.AckRuntimeStartAsync,
+            ack,
+            ack.SessionId,
+            deps.Shutdown).ConfigureAwait(false);
     }
 
     /// <summary>
-    /// Logs why a start or launch failed. For a sealed one only the exception's type is logged: its
+    /// The outcome a repeated start of the adopted runtime shares: its startup in flight, or how
+    /// it ended. One asking for other sealing is refused instead: that startup never checked it,
+    /// and it may be running on disk. Null when neither is known any more.
+    /// </summary>
+    private static Task<StartupOutcome>? FindAdoptedStartup(
+        StartRuntimeCommand command,
+        RuntimeIdentity runtime,
+        RuntimeCommandDependencies deps)
+    {
+        var (startup, recorded, _) = deps.WorkState.ReadStartupState(command.SessionId, runtime);
+        if (startup is { Outcome: { } inProgress } &&
+            string.Equals(startup.SessionId, command.SessionId, StringComparison.Ordinal) &&
+            startup.RuntimeIdentity.SameRuntime(runtime))
+        {
+            if (!Equals(startup.Sealing, command.Sealing))
+            {
+                RunnerLog.Warning(
+                    nameof(ServiceClientManager),
+                    $"A repeated start of session {command.SessionId} asks for other sealing than the one in progress; refusing it.");
+                return Task.FromResult(new StartupOutcome(false, OtherSealingMessage));
+            }
+
+            RunnerLog.Info(nameof(ServiceClientManager), $"The start of session {command.SessionId} is already in progress; joining it.");
+            return inProgress;
+        }
+
+        if (recorded is null)
+        {
+            return null;
+        }
+
+        if (!Equals(recorded.Requested, command.Sealing))
+        {
+            RunnerLog.Warning(
+                nameof(ServiceClientManager),
+                $"A repeated start of session {command.SessionId} asks for other sealing than it ran with; refusing it.");
+            return Task.FromResult(new StartupOutcome(false, OtherSealingMessage));
+        }
+
+        RunnerLog.Info(nameof(ServiceClientManager), $"The start of session {command.SessionId} already finished; sending its acknowledgement again.");
+        return Task.FromResult(recorded.Outcome);
+    }
+
+    /// <summary>
+    /// Publishes a newer start's startup in the single startup slot and starts it. The startup
+    /// it supersedes is cancelled and awaited before this one touches the runtime, so two
+    /// startups never overlap. The tracked task covers only the physical work; the
+    /// acknowledgement retry runs after it, detached, so Stop never waits for it.
+    /// </summary>
+    private static Task<StartupOutcome> PublishStartup(
+        StartRuntimeCommand command,
+        RuntimeIdentity runtime,
+        RuntimeCommandDependencies deps)
+    {
+        var tracked = new TrackedCommandWork(deps.Shutdown)
+        {
+            SessionId = command.SessionId,
+            RuntimeIdentity = runtime,
+            Sealing = command.Sealing?.Clone(),
+        };
+
+        // Publish a joinable task before it starts, so a Stop or a repeated start can never
+        // observe the slot without the work that owns it.
+        TrackedCommandWork? previous = null;
+        var starter = new Task<Task<StartupOutcome>>(RunPhysicalAsync);
+        var physical = starter.Unwrap();
+        tracked.Task = physical;
+        tracked.Outcome = physical;
+        previous = deps.WorkState.ReplaceActiveStartup(tracked);
+        starter.Start(TaskScheduler.Default);
+        return physical;
+
+        async Task<StartupOutcome> RunPhysicalAsync()
+        {
+            try
+            {
+                await CancelTrackedWorkAsync(previous).ConfigureAwait(false);
+                var result = await StartRuntimeAsync(command, runtime, deps, tracked.Token).ConfigureAwait(false);
+                // Recorded while this startup still holds the slot, so a repeated start sees
+                // either this startup in progress or its outcome.
+                deps.WorkState.RecordStartupOutcome(command.SessionId, runtime, result, deps.GetTrackedProcess, command.Sealing);
+                return result;
+            }
+            finally
+            {
+                try { await tracked.CompleteAsync().ConfigureAwait(false); }
+                finally { deps.WorkState.ClearActiveStartup(tracked); }
+            }
+        }
+    }
+
+    /// <summary>The physical work of a newer start, ending in the outcome its acknowledgement reports.</summary>
+    private static async Task<StartupOutcome> StartRuntimeAsync(
+        StartRuntimeCommand command,
+        RuntimeIdentity runtime,
+        RuntimeCommandDependencies deps,
+        CancellationToken cancellationToken)
+    {
+        var sessionId = command.SessionId;
+        // The session's sealing from its earlier start: a relaunch carries it, and may not weaken it.
+        // Only the same lifecycle's start counts: a newer one may have begun without this runner
+        // seeing the older one stop.
+        var retained = deps.WorkState.SessionSealing.TryGetValue(sessionId, out var kept) &&
+                       kept.LifecycleGeneration == command.LifecycleGeneration
+            ? kept
+            : null;
+        var launch = command.Clone();
+        launch.Sealing = command.Sealing?.Clone() ?? retained?.Sealing.Clone();
+        var weakensSealing = retained is not null && command.Sealing is { } requested && WeakensSealing(retained.Sealing, requested);
+        try
+        {
+            // Prompts of every other runtime end now: other sessions', and this session's older ones.
+            await deps.WorkState.Prompts.CancelAndWaitAsync(
+                prompt => !PromptTargetsRuntime(prompt, sessionId, runtime)).ConfigureAwait(false);
+
+            await StopReplacedRuntimeAsync(sessionId, runtime, deps, cancellationToken).ConfigureAwait(false);
+
+            // This wait belongs to cancellable startup work, never the
+            // command stream: Stop must still preempt a queued replacement.
+            await deps.ActivateSession(() =>
+            {
+                if (!deps.LogicalSessionState.TryAdoptRuntime(sessionId, runtime))
+                {
+                    throw new InvalidOperationException(StaleRuntimeCommandMessage);
+                }
+
+                deps.RuntimeIdentities.Set(sessionId, runtime, command.LifecycleGeneration);
+                // A first start's sealing stands for the session; a relaunch replaces it only
+                // once it ran with it.
+                if (retained is null && command.Sealing is { } sealing)
+                {
+                    deps.WorkState.SessionSealing[sessionId] = new RetainedSealing(runtime, sealing.Clone(), command.LifecycleGeneration);
+                }
+                else if (retained is null)
+                {
+                    deps.WorkState.SessionSealing.TryRemove(sessionId, out _);
+                }
+            }, cancellationToken).ConfigureAwait(false);
+
+            var preemptedSessionId = await PreemptActiveSessionIfNeededAsync(
+                sessionId,
+                deps.GetActiveRuntimeSessionId,
+                deps.StopRuntime,
+                deps.StopSessionRelay,
+                deps.StopArtifactUploads,
+                deps.StopWorkspaceMirrors,
+                deps.CancelSessionDownloads,
+                deps.GetDownloadActiveSessionId,
+                deps.SetDownloadActiveSession,
+                cancellationToken).ConfigureAwait(false);
+            deps.RuntimeIdentities.Remove(preemptedSessionId);
+
+            if (weakensSealing)
+            {
+                throw new InvalidOperationException("The session started sealed; a relaunch cannot run it with less sealing.");
+            }
+
+            await deps.StartRuntimeAndWaitForReady(launch, cancellationToken).ConfigureAwait(false);
+            if (retained is not null && command.Sealing is { } learned)
+            {
+                // What this relaunch ran with stands for the session from now on: it is never
+                // weaker than what it replaces, and may be stronger. The first start's runtime
+                // stays, so only that start failing drops it.
+                deps.WorkState.SessionSealing.AddOrUpdate(
+                    sessionId,
+                    new RetainedSealing(runtime, learned.Clone(), command.LifecycleGeneration),
+                    (_, existing) => existing.LifecycleGeneration == command.LifecycleGeneration
+                        ? existing with { Sealing = learned.Clone() }
+                        : existing);
+            }
+
+            return new StartupOutcome(
+                true,
+                IsComfyRuntime(command.EditorRuntimeKind) ? "ComfyUI ready" : "GPU runtime ready",
+                deps.GetSessionSealing?.Invoke(sessionId));
+        }
+        catch (SessionAlreadyRunningException ex)
+        {
+            // That runtime runs on, as it was admitted: only this command is refused.
+            LogStartFailure(launch, deps, ex, $"Refused a start of session {sessionId}");
+            return new StartupOutcome(false, ex.Message);
+        }
+        catch (Exception ex)
+        {
+            LogStartFailure(launch, deps, ex, $"Failed to start session {sessionId}");
+            // Clean up only this start's runtime, never a valid runtime of another
+            // identity that happens to share the session id.
+            await CleanUpFailedStartupAsync(sessionId, runtime, deps).ConfigureAwait(false);
+            return new StartupOutcome(false, ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// A relaunch keeps the logical session: it never runs it with less sealing than it started
+    /// with, neither unsealed nor encrypting its uploads to another recipient, or to none.
+    /// </summary>
+    private static bool WeakensSealing(SessionSealing started, SessionSealing relaunch)
+        => (started.Required && !relaunch.Required) ||
+           (started.OutputRecipient is not null && !started.OutputRecipient.Equals(relaunch.OutputRecipient));
+
+    /// <summary>
+    /// Before a relaunch, stops the session's older runtime as a restart's quiesce did: its
+    /// relayed requests are cancelled and drained, then its child is stopped and the session
+    /// cleaned up. Nothing happens when the session runs no older runtime here.
+    /// </summary>
+    private static async Task StopReplacedRuntimeAsync(
+        string sessionId,
+        RuntimeIdentity replacement,
+        RuntimeCommandDependencies deps,
+        CancellationToken cancellationToken)
+    {
+        var tracked = deps.GetTrackedRuntime(sessionId) is { } child && !child.SameRuntime(replacement) ? child : (RuntimeIdentity?)null;
+        var logical = deps.LogicalSessionState.TryGetRuntime(sessionId, out var current) && !current.SameRuntime(replacement)
+            ? current
+            : (RuntimeIdentity?)null;
+        if (tracked is null && logical is null)
+        {
+            return;
+        }
+
+        RunnerLog.Info(nameof(ServiceClientManager), $"Stopping the older runtime of session {sessionId} before its relaunch.");
+        using (var transientDrain = deps.TransientCancellation.BeginSessionDrain(sessionId))
+        {
+            await transientDrain.Completion.ConfigureAwait(false);
+            await StopSessionAndCleanupAsync(sessionId, deps, cancellationToken).ConfigureAwait(false);
+        }
+
+        foreach (var stopped in new[] { tracked, logical })
+        {
+            if (stopped is { } runtime)
+            {
+                deps.RuntimeIdentities.RemoveIfMatches(sessionId, runtime);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Logs why a start failed. For a sealed one only the exception's type is logged: its
     /// message can name session files (a workspace seed's entries, say), and the console reaches
     /// the host's disk. The acknowledgement still carries the message to the control plane.
     /// </summary>
-    private static void LogStartFailure(StartSessionCommand start, RuntimeCommandDependencies deps, Exception ex, string context)
+    private static void LogStartFailure(StartRuntimeCommand start, RuntimeCommandDependencies deps, Exception ex, string context)
     {
         if (start.Sealing?.Required == true || deps.SealsStart?.Invoke(start) == true)
         {
@@ -2328,103 +2321,6 @@ internal static partial class ServiceClientManager
         }
 
         RunnerLog.Error(nameof(ServiceClientManager), ex, $"{context}: {ex.Message}");
-    }
-
-    internal static async Task HandleQuiesceRuntimeCommandAsync(
-        QuiesceEditorRuntimeCommand command,
-        RuntimeCommandDependencies deps)
-    {
-        var ack = new AcknowledgeEditorRuntimeQuiesceRequest
-        {
-            CommandId = command.CommandId,
-            RestartId = command.RestartId,
-            RunnerId = deps.RunnerId,
-            SessionId = command.SessionId,
-            LifecycleGeneration = command.LifecycleGeneration,
-            RuntimeEpoch = command.RuntimeEpoch,
-            RuntimeInstanceId = command.RuntimeInstanceId,
-            RestartRevision = command.RestartRevision,
-        };
-        var target = new RuntimeIdentity(command.LifecycleGeneration, command.RuntimeEpoch, command.RuntimeInstanceId.Trim());
-        if (!RunnerIdMatches(command.RunnerId, deps.RunnerId) || !IsQuiesceTargetCurrent(command, target, deps))
-        {
-            // A delayed quiesce for an older runtime must not touch a newer one.
-            RunnerLog.Warning(
-                nameof(ServiceClientManager),
-                $"Rejecting stale or foreign quiesce {command.CommandId} for session {command.SessionId}.");
-            ack.Quiesced = false;
-            ack.Message = StaleRuntimeCommandMessage;
-        }
-        else
-        {
-            try
-            {
-                var activeStartup = deps.WorkState.GetActiveStartup();
-                if (activeStartup is not null &&
-                    string.Equals(activeStartup.SessionId, command.SessionId, StringComparison.Ordinal) &&
-                    activeStartup.RuntimeIdentity.SameRuntime(target))
-                {
-                    await CancelTrackedWorkAsync(activeStartup).ConfigureAwait(false);
-                }
-
-                await deps.WorkState.Prompts.CancelAndWaitAsync(
-                    prompt => PromptTargetsRuntime(prompt, command.SessionId, target)).ConfigureAwait(false);
-                using var transientDrain = deps.TransientCancellation.BeginRuntimeDrain(command.SessionId, target);
-                await transientDrain.Completion.ConfigureAwait(false);
-
-                if (!await StopRuntimeAndCleanupIfCurrentAsync(command.SessionId, target, deps, deps.Shutdown).ConfigureAwait(false))
-                {
-                    throw new InvalidOperationException(StaleRuntimeCommandMessage);
-                }
-
-                ack.Quiesced = true;
-                ack.Message = "GPU child runtime quiesced";
-            }
-            catch (Exception ex)
-            {
-                ack.Quiesced = false;
-                ack.Message = ex.Message;
-                RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed quiescing runtime for restart {command.RestartId}: {ex.Message}");
-            }
-        }
-
-        await AcknowledgeRuntimeCommandWithRetryAsync(
-            deps.Sink.AckEditorRuntimeQuiesceAsync,
-            ack,
-            command.CommandId,
-            deps.Shutdown).ConfigureAwait(false);
-    }
-
-    /// <summary>
-    /// A quiesce applies only to the session's current runtime: the logical
-    /// identity when one is held, otherwise the tracked child, if any.
-    /// </summary>
-    private static bool IsQuiesceTargetCurrent(
-        QuiesceEditorRuntimeCommand command,
-        RuntimeIdentity target,
-        RuntimeCommandDependencies deps)
-    {
-        if (!target.IsValid)
-        {
-            return false;
-        }
-
-        // Only starts admitted as newer reach the startup slot, so a pending startup for a
-        // different runtime of this session means the quiesce is stale, even while that
-        // startup has not adopted its identity yet and no child is tracked.
-        if (deps.WorkState.GetActiveStartup() is { } pending &&
-            string.Equals(pending.SessionId, command.SessionId, StringComparison.Ordinal) &&
-            !pending.RuntimeIdentity.SameRuntime(target))
-        {
-            return false;
-        }
-
-        if (deps.LogicalSessionState.TryGetRuntime(command.SessionId, out var current, out var currentRevision))
-        {
-            return current.SameRuntime(target) && command.RestartRevision >= currentRevision;
-        }
-
-        return deps.GetTrackedRuntime(command.SessionId) is not { } tracked || tracked.SameRuntime(target);
     }
 
     private static bool PromptTargetsRuntime(PromptWorkIdentity prompt, string sessionId, RuntimeIdentity runtimeIdentity)
@@ -2464,144 +2360,6 @@ internal static partial class ServiceClientManager
         return stopped;
     }
 
-    internal static Task HandleLaunchRuntimeCommand(
-        LaunchEditorRuntimeCommand command,
-        RuntimeCommandDependencies deps)
-    {
-        var runtimeIdentity = new RuntimeIdentity(command.LifecycleGeneration, command.RuntimeEpoch, command.RuntimeInstanceId.Trim());
-        var ack = new AcknowledgeEditorRuntimeLaunchRequest
-        {
-            InstanceId = deps.InstanceId.Trim(),
-            CommandId = command.CommandId,
-            RestartId = command.RestartId,
-            RunnerId = deps.RunnerId,
-            SessionId = command.SessionId,
-            LifecycleGeneration = command.LifecycleGeneration,
-            RuntimeEpoch = command.RuntimeEpoch,
-            RuntimeInstanceId = command.RuntimeInstanceId,
-            RestartRevision = command.RestartRevision,
-            Attempt = command.Attempt,
-        };
-
-        // Adopt the identity on receipt, but only for this runner and only when
-        // it is not older than the session's current runtime. A delayed launch
-        // must neither replace the heartbeat identity nor cancel newer startup.
-        if (!RunnerIdMatches(command.RunnerId, deps.RunnerId) ||
-            !deps.LogicalSessionState.TryAdoptRuntime(
-                command.SessionId,
-                runtimeIdentity,
-                command.RestartRevision,
-                replaceOtherSession: false))
-        {
-            RunnerLog.Warning(
-                nameof(ServiceClientManager),
-                $"Rejecting stale or foreign launch {command.CommandId} for session {command.SessionId}.");
-            ack.Ready = false;
-            ack.Message = StaleRuntimeCommandMessage;
-            return AcknowledgeRuntimeCommandWithRetryAsync(
-                deps.Sink.AckEditorRuntimeLaunchAsync,
-                ack,
-                command.CommandId,
-                deps.Shutdown);
-        }
-
-        deps.RuntimeIdentities.Set(
-            command.SessionId,
-            command.LifecycleGeneration,
-            command.RuntimeEpoch,
-            command.RuntimeInstanceId);
-        // Only the current lifecycle's start counts: a newer lifecycle may have begun without
-        // this runner seeing the older one stop.
-        var startSealing = deps.WorkState.SessionSealing.TryGetValue(command.SessionId, out var retained) &&
-            retained.StartRuntime.LifecycleGeneration == command.LifecycleGeneration
-                ? retained.Sealing
-                : null;
-        var start = new StartSessionCommand
-        {
-            SessionId = command.SessionId,
-            User = command.User,
-            EditorSid = command.EditorSid,
-            EditorTemplate = command.EditorTemplate,
-            EditorRuntimeKind = command.EditorRuntimeKind,
-            LifecycleGeneration = command.LifecycleGeneration,
-            RuntimeEpoch = command.RuntimeEpoch,
-            RuntimeInstanceId = command.RuntimeInstanceId,
-            // The launch's own sealing wins; the start's covers a control plane that omits it.
-            Sealing = command.Sealing?.Clone() ?? startSealing?.Clone(),
-        };
-        // A restart keeps the logical session: it never runs it with less sealing than it started
-        // with, neither unsealed nor encrypting its uploads to another recipient, or to none.
-        var weakensSealing = command.Sealing is { } launchSealing && startSealing is not null &&
-            ((startSealing.Required && !launchSealing.Required) ||
-             (startSealing.OutputRecipient is not null && !startSealing.OutputRecipient.Equals(launchSealing.OutputRecipient)));
-        start.InitialModels.AddRange(command.InitialModels);
-        start.InitialArtifacts.AddRange(command.InitialArtifacts);
-        start.InitialWorkspaceFiles.AddRange(command.InitialWorkspaceFiles);
-
-        return RunTrackedStartupAsync(
-            deps,
-            command.SessionId,
-            runtimeIdentity,
-            async cancellationToken =>
-            {
-                try
-                {
-                    if (weakensSealing)
-                    {
-                        throw new InvalidOperationException("The session started sealed; a runtime launch cannot run it with less sealing.");
-                    }
-
-                    await deps.StartRuntimeAndWaitForReady(start, cancellationToken).ConfigureAwait(false);
-                    if (command.Sealing is { } learned)
-                    {
-                        // What this launch ran with stands for the lifecycle from now on: it is
-                        // never weaker than what it replaces, and may be stronger (the Start was
-                        // unsealed, or this runner never saw it), so a later launch that omits
-                        // sealing keeps it. A Start's identity stays, so only that Start failing
-                        // drops it; a newer lifecycle's sealing is never replaced.
-                        var retainedFromLaunch = new RetainedSealing(runtimeIdentity, learned.Clone());
-                        deps.WorkState.SessionSealing.AddOrUpdate(
-                            command.SessionId,
-                            retainedFromLaunch,
-                            (_, existing) => existing.StartRuntime.LifecycleGeneration < command.LifecycleGeneration
-                                ? retainedFromLaunch
-                                : existing.StartRuntime.LifecycleGeneration == command.LifecycleGeneration
-                                    ? existing with { Sealing = learned.Clone() }
-                                    : existing);
-                    }
-
-                    return new StartupOutcome(
-                        true,
-                        IsComfyRuntime(command.EditorRuntimeKind) ? "ComfyUI ready" : "GPU runtime ready",
-                        deps.GetSessionSealing?.Invoke(command.SessionId));
-                }
-                catch (SessionAlreadyRunningException ex)
-                {
-                    // That runtime runs on, as it was admitted: only this command is refused.
-                    LogStartFailure(start, deps, ex, $"Refused a launch for restart {command.RestartId}");
-                    return new StartupOutcome(false, ex.Message);
-                }
-                catch (Exception ex)
-                {
-                    LogStartFailure(start, deps, ex, $"Failed launching runtime for restart {command.RestartId}");
-                    // Clean up only this launch's runtime, never a valid runtime of
-                    // another identity that happens to share the session id.
-                    await CleanUpFailedStartupAsync(command.SessionId, runtimeIdentity, deps).ConfigureAwait(false);
-                    return new StartupOutcome(false, ex.Message);
-                }
-            },
-            outcome =>
-            {
-                ack.Ready = outcome.Ready;
-                ack.Message = outcome.Message;
-                ack.Sealing = outcome.Ready ? outcome.Sealing : null;
-                return ack;
-            },
-            deps.Sink.AckEditorRuntimeLaunchAsync,
-            command.CommandId,
-            start.Sealing);
-    }
-
     private const string StaleRuntimeCommandMessage = "The command targets a superseded runtime or another runner.";
 
     internal static bool RunnerIdMatches(string? commandRunnerId, string runnerId)
@@ -2610,94 +2368,6 @@ internal static partial class ServiceClientManager
             : !string.IsNullOrWhiteSpace(commandRunnerId) &&
               string.Equals(commandRunnerId.Trim(), runnerId?.Trim(), StringComparison.Ordinal);
 
-    /// <summary>
-    /// Runs one startup in the single startup slot. The superseded startup is
-    /// cancelled and awaited before this one touches the runtime, so two startups
-    /// never overlap. The tracked task covers only the physical work; the
-    /// acknowledgement retry runs after it, detached, so Stop never waits for it.
-    /// </summary>
-    private static Task RunTrackedStartupAsync<TAck>(
-        RuntimeCommandDependencies deps,
-        string sessionId,
-        RuntimeIdentity runtimeIdentity,
-        Func<CancellationToken, Task<StartupOutcome>> startup,
-        Func<StartupOutcome, TAck> toAcknowledgement,
-        Func<TAck, CancellationToken, Task> acknowledge,
-        string acknowledgementKey,
-        SessionSealing? sealing)
-    {
-        // Another command for the runtime already starting joins that startup: replacing it
-        // would cancel the work starting this very runtime, and that work's failure cleanup
-        // would stop it. The joined command still acknowledges under its own command id and
-        // attempt, with the shared startup's result. One asking for other sealing is refused
-        // instead: that startup never checked it, and it may be running on disk.
-        if (deps.WorkState.GetActiveStartup() is { Outcome: { } inProgress } active &&
-            string.Equals(active.SessionId, sessionId, StringComparison.Ordinal) &&
-            active.RuntimeIdentity.SameRuntime(runtimeIdentity))
-        {
-            if (!Equals(active.Sealing, sealing))
-            {
-                RunnerLog.Warning(
-                    nameof(ServiceClientManager),
-                    $"Startup {acknowledgementKey} for session {sessionId} asks for other sealing than the one in progress; refusing it.");
-                return AcknowledgeOutcomeAsync(Task.FromResult(new StartupOutcome(false, OtherSealingMessage)));
-            }
-
-            RunnerLog.Info(
-                nameof(ServiceClientManager),
-                $"Startup {acknowledgementKey} for session {sessionId} is already in progress; joining it.");
-            return AcknowledgeOutcomeAsync(inProgress);
-        }
-
-        TrackedCommandWork? previous = null;
-        var tracked = new TrackedCommandWork(deps.Shutdown)
-        {
-            SessionId = sessionId,
-            RuntimeIdentity = runtimeIdentity,
-            Sealing = sealing?.Clone(),
-        };
-
-        // Publish a joinable task before it starts, so Stop and Quiesce can never
-        // observe the slot without the work that owns it.
-        var starter = new Task<Task<StartupOutcome>>(RunPhysicalAsync);
-        var physical = starter.Unwrap();
-        tracked.Task = physical;
-        tracked.Outcome = physical;
-        previous = deps.WorkState.ReplaceActiveStartup(tracked);
-        starter.Start(TaskScheduler.Default);
-        return AcknowledgeOutcomeAsync(physical);
-
-        async Task<StartupOutcome> RunPhysicalAsync()
-        {
-            try
-            {
-                await CancelTrackedWorkAsync(previous).ConfigureAwait(false);
-                var result = await startup(tracked.Token).ConfigureAwait(false);
-                // Recorded while this startup still holds the slot, so a later command for
-                // the same runtime sees either this startup in progress or its outcome. Only
-                // the owner records: a joined or refused command says nothing about it.
-                deps.WorkState.RecordStartupOutcome(sessionId, runtimeIdentity, result, deps.GetTrackedProcess);
-                return result;
-            }
-            finally
-            {
-                try { await tracked.CompleteAsync().ConfigureAwait(false); }
-                finally { deps.WorkState.ClearActiveStartup(tracked); }
-            }
-        }
-
-        async Task AcknowledgeOutcomeAsync(Task<StartupOutcome> outcome)
-        {
-            var result = await outcome.ConfigureAwait(false);
-            var ack = toAcknowledgement(result);
-            await AcknowledgeRuntimeCommandWithRetryAsync(
-                acknowledge,
-                ack,
-                acknowledgementKey,
-                deps.Shutdown).ConfigureAwait(false);
-        }
-    }
-
     internal const string OtherSealingMessage = "This runtime is already starting with other sealing than this command asks for.";
 
     private static bool IsComfyRuntime(string? runtimeKind)
@@ -2705,7 +2375,7 @@ internal static partial class ServiceClientManager
            string.Equals(runtimeKind.Trim(), "comfyui", StringComparison.OrdinalIgnoreCase);
 
     private static async Task StartSessionAndWaitForReadyAsync(
-        StartSessionCommand command,
+        StartRuntimeCommand command,
         SessionProcessManager sessionManager,
         ArtifactUploadService artifactUploadService,
         WorkspaceMirrorService workspaceMirrorService,
@@ -2849,11 +2519,7 @@ internal static partial class ServiceClientManager
         AcknowledgeEditorRuntimeRequestRequest response;
         try
         {
-            await using var lease = cancellation.Acquire(
-                request.SessionId,
-                request.LifecycleGeneration,
-                request.RuntimeEpoch,
-                request.RuntimeInstanceId);
+            await using var lease = cancellation.Acquire(request.SessionId, RuntimeIdentity.From(request.Runtime));
             response = await execute(request, lease.Token).ConfigureAwait(false);
         }
         catch (Exception ex)
@@ -2865,9 +2531,7 @@ internal static partial class ServiceClientManager
                 DeliveryId = request.DeliveryId,
                 RunnerId = request.RunnerId,
                 SessionId = request.SessionId,
-                LifecycleGeneration = request.LifecycleGeneration,
-                RuntimeEpoch = request.RuntimeEpoch,
-                RuntimeInstanceId = request.RuntimeInstanceId,
+                Runtime = request.Runtime?.Clone(),
                 Kind = request.Kind,
                 TransportSucceeded = false,
                 StatusCode = 502,
@@ -2889,9 +2553,7 @@ internal static partial class ServiceClientManager
             DeliveryId = request.DeliveryId,
             RunnerId = request.RunnerId,
             SessionId = request.SessionId,
-            LifecycleGeneration = request.LifecycleGeneration,
-            RuntimeEpoch = request.RuntimeEpoch,
-            RuntimeInstanceId = request.RuntimeInstanceId,
+            Runtime = request.Runtime?.Clone(),
             Kind = request.Kind,
             TransportSucceeded = false,
             StatusCode = statusCode,
@@ -2915,9 +2577,7 @@ internal static partial class ServiceClientManager
             DeliveryId = command.DeliveryId,
             RunnerId = runnerId,
             SessionId = command.SessionId,
-            LifecycleGeneration = command.LifecycleGeneration,
-            RuntimeEpoch = command.RuntimeEpoch,
-            RuntimeInstanceId = command.RuntimeInstanceId,
+            Runtime = command.Runtime?.Clone(),
             Kind = command.Kind
         };
         SemaphoreSlim? gate = command.Kind switch
@@ -2955,9 +2615,7 @@ internal static partial class ServiceClientManager
                     command.SessionId,
                     command.EditorSid,
                     command.ClientId,
-                    command.LifecycleGeneration,
-                    command.RuntimeEpoch,
-                    command.RuntimeInstanceId,
+                    RuntimeIdentity.From(command.Runtime),
                     command.ClientMessage.ToByteArray(),
                     cancellationToken).ConfigureAwait(false);
                 response.TransportSucceeded = true;
@@ -3073,7 +2731,7 @@ internal static partial class ServiceClientManager
         if (await AcknowledgeRuntimeCommandWithRetryAsync(deps.Sink.AckStopSessionAsync, work.Acknowledgement, acknowledgementKey, deps.Shutdown).ConfigureAwait(false) &&
             work.CountTaken)
         {
-            deps.ForgetSealedLifecycle?.Invoke(command.SessionId, command.LifecycleGeneration);
+            deps.ForgetSealedLifecycle?.Invoke(command.SessionId);
         }
     }
 
@@ -3272,9 +2930,7 @@ internal static partial class ServiceClientManager
             SessionId = prompt.SessionId,
             HandoffId = prompt.HandoffId,
             InstanceId = instanceId,
-            LifecycleGeneration = prompt.LifecycleGeneration,
-            RuntimeEpoch = prompt.RuntimeEpoch,
-            RuntimeInstanceId = prompt.RuntimeInstanceId,
+            Runtime = prompt.Runtime?.Clone(),
         };
         // Nothing has been asked yet, so an interrupt or Stop here leaves nothing behind.
         if (cancellationToken.IsCancellationRequested) return;
@@ -3643,7 +3299,7 @@ internal static partial class ServiceClientManager
 
         var queue = await readQueue(
             request.SessionId,
-            new RuntimeIdentity(request.LifecycleGeneration, request.RuntimeEpoch, request.RuntimeInstanceId),
+            RuntimeIdentity.From(request.Runtime),
             cancellationToken).ConfigureAwait(false);
         if (queue is not null && (global ? queue.Running.Count > 0 : targets.Any(queue.Running.Contains)))
         {
@@ -3661,12 +3317,11 @@ internal static partial class ServiceClientManager
            && string.Equals(prompt.HandoffId, finished.HandoffId, StringComparison.Ordinal);
 
     internal static bool TargetsPromptRuntime(RelayEditorRuntimeRequestCommand request, PromptWorkIdentity prompt)
-        => request.LifecycleGeneration > 0 && request.RuntimeEpoch > 0
+        => request.Runtime is { RuntimeOrder: > 0 } runtime
             && Guid.TryParse(request.SessionId, out var session) && session != Guid.Empty
             && Guid.TryParse(prompt.SessionId, out var promptSession) && session == promptSession
-            && request.LifecycleGeneration == prompt.Runtime.LifecycleGeneration && request.RuntimeEpoch == prompt.Runtime.RuntimeEpoch
-            && Guid.TryParse(request.RuntimeInstanceId, out var instance) && instance != Guid.Empty
-            && Guid.TryParse(prompt.Runtime.RuntimeInstanceId, out var promptInstance) && instance == promptInstance;
+            && Guid.TryParse(runtime.RuntimeId, out var runtimeId) && runtimeId != Guid.Empty
+            && Guid.TryParse(prompt.Runtime.RuntimeId, out var promptRuntimeId) && runtimeId == promptRuntimeId;
 
     private static bool ShouldStreamHttpResponse(SubmitPromptCommand prompt)
         => string.Equals(prompt.EditorRuntimeKind, "forge-neo", StringComparison.OrdinalIgnoreCase)
@@ -3868,9 +3523,7 @@ internal static partial class ServiceClientManager
             FrameType = SessionStreamFrameType.Binary,
             Payload = ByteString.CopyFrom(chunk.ToArray()),
             CreatedUtc = Timestamp.FromDateTime(DateTime.UtcNow),
-            LifecycleGeneration = prompt.LifecycleGeneration,
-            RuntimeEpoch = prompt.RuntimeEpoch,
-            RuntimeInstanceId = prompt.RuntimeInstanceId,
+            Runtime = prompt.Runtime?.Clone(),
         });
 
         await reportSessionEvents(request, cancellationToken).ConfigureAwait(false);

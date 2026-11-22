@@ -20,7 +20,7 @@ public partial class ArtifactUploadServiceTests
         {
             var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse());
             var identities = new RuntimeIdentityRegistry();
-            identities.Set("session-1", 5, 2, "runtime-a");
+            identities.Set("session-1", new RuntimeIdentity("runtime-a", 52));
             await using var service = new ArtifactUploadService("runner-secret", artifactClient,
                 NullLogger<ArtifactUploadService>.Instance, identities, "runner-1", "process-1");
             var paths = new SessionProcessManager.SessionPaths
@@ -40,7 +40,7 @@ public partial class ArtifactUploadServiceTests
             await service.SeedSessionAsync("session-1", "editor-1", "owner-1", [], CancellationToken.None);
             var initialCalls = artifactClient.ListCallCount;
             Assert.That(initialCalls, Is.GreaterThan(0));
-            identities.Set("session-1", 6, 1, "runtime-b");
+            identities.Set("session-1", new RuntimeIdentity("runtime-b", 61));
             await service.RefreshSessionAsync("session-1");
             Assert.That(artifactClient.ListCallCount, Is.GreaterThan(initialCalls));
             Assert.That(artifactClient.LastListRequest!.Requester, Is.EqualTo(new RunnerReadRequester
@@ -48,9 +48,7 @@ public partial class ArtifactUploadServiceTests
                 RunnerId = "runner-1",
                 InstanceId = "process-1",
                 SessionId = "session-1",
-                LifecycleGeneration = 5,
-                RuntimeEpoch = 2,
-                RuntimeInstanceId = "runtime-a"
+                Runtime = new RuntimeRef { RuntimeId = "runtime-a", RuntimeOrder = 52 }
             }));
         }
         finally
@@ -264,7 +262,7 @@ public partial class ArtifactUploadServiceTests
             var outputPath = Path.Combine(outputDirectory, filename);
             var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse());
             var identities = new RuntimeIdentityRegistry();
-            identities.Set("session-1", 5, 2, "instance-a");
+            identities.Set("session-1", new RuntimeIdentity("instance-a", 52));
             await using var service = new ArtifactUploadService(
                 runnerSecret: "runner-secret-value",
                 artifactClient,
@@ -303,7 +301,7 @@ public partial class ArtifactUploadServiceTests
                 CancellationToken.None);
 
             // A newer start for the session is admitted while this runtime still reads.
-            identities.Set("session-1", 6, 1, "instance-b");
+            identities.Set("session-1", new RuntimeIdentity("instance-b", 61));
             var available = await service.TryEnsureArtifactAvailableAsync(outputPath, highPriority: false, CancellationToken.None);
 
             Assert.That(available, Is.True);
@@ -314,17 +312,13 @@ public partial class ArtifactUploadServiceTests
                 RunnerId = "runner-1",
                 InstanceId = "process-1",
                 SessionId = "session-1",
-                LifecycleGeneration = 5,
-                RuntimeEpoch = 2,
-                RuntimeInstanceId = "instance-a",
+                Runtime = new RuntimeRef { RuntimeId = "instance-a", RuntimeOrder = 52 },
             }));
             Assert.That(new FileInfo(outputPath).Length, Is.EqualTo(4));
             var queuedAfterReplacement = Path.Combine(outputDirectory, "queued-after-replacement.png");
             await File.WriteAllBytesAsync(queuedAfterReplacement, [9, 8, 7]);
             var captured = await artifactClient.WaitForUploadAsync(TimeSpan.FromSeconds(10));
-            Assert.That(captured.Metadata!.LifecycleGeneration, Is.EqualTo(5));
-            Assert.That(captured.Metadata.RuntimeEpoch, Is.EqualTo(2));
-            Assert.That(captured.Metadata.RuntimeInstanceId, Is.EqualTo("instance-a"));
+            Assert.That(captured.Metadata!.Runtime, Is.EqualTo(new RuntimeRef { RuntimeId = "instance-a", RuntimeOrder = 52 }));
             Assert.That(captured.Metadata.InstanceId, Is.EqualTo("process-1"));
 
         }
@@ -344,7 +338,7 @@ public partial class ArtifactUploadServiceTests
             Directory.CreateDirectory(outputDirectory);
             var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse());
             var identities = new RuntimeIdentityRegistry();
-            identities.Set("session-1", 5, 2, "instance-a");
+            identities.Set("session-1", new RuntimeIdentity("instance-a", 52));
             await using var service = new ArtifactUploadService("runner-secret-value", artifactClient, NullLogger<ArtifactUploadService>.Instance, identities, "runner-1", "process-1");
             var paths = new SessionProcessManager.SessionPaths
             {
@@ -360,12 +354,11 @@ public partial class ArtifactUploadServiceTests
             await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
 
             // A replacement runtime is registered while this one still writes output.
-            identities.Set("session-1", 5, 3, "instance-b");
+            identities.Set("session-1", new RuntimeIdentity("instance-b", 53));
             await File.WriteAllBytesAsync(Path.Combine(outputDirectory, "late.png"), [1, 2, 3]);
             var upload = await artifactClient.WaitForUploadAsync(TimeSpan.FromSeconds(5));
 
-            Assert.That(upload.Metadata!.RuntimeEpoch, Is.EqualTo(2));
-            Assert.That(upload.Metadata.RuntimeInstanceId, Is.EqualTo("instance-a"));
+            Assert.That(upload.Metadata!.Runtime, Is.EqualTo(new RuntimeRef { RuntimeId = "instance-a", RuntimeOrder = 52 }));
         }
         finally
         {
@@ -384,7 +377,7 @@ public partial class ArtifactUploadServiceTests
             const string filename = "ComfyUI_00008_.png";
             var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse());
             var identities = new RuntimeIdentityRegistry();
-            identities.Set("session-1", 5, 2, "instance-a");
+            identities.Set("session-1", new RuntimeIdentity("instance-a", 52));
             await using var service = new ArtifactUploadService("runner-secret-value", artifactClient, NullLogger<ArtifactUploadService>.Instance, identities, "runner-1", "process-1");
             var paths = new SessionProcessManager.SessionPaths
             {
@@ -400,7 +393,7 @@ public partial class ArtifactUploadServiceTests
 
             // A relaunch at epoch 3 was admitted, then the epoch-2 child exited on its own: nothing
             // stopped its uploader before the new runtime starts.
-            identities.Set("session-1", 5, 3, "instance-b");
+            identities.Set("session-1", new RuntimeIdentity("instance-b", 53));
             await service.StartSessionAsync("session-1", paths, CancellationToken.None);
             await service.SeedSessionAsync(
                 "session-1",
@@ -410,8 +403,8 @@ public partial class ArtifactUploadServiceTests
                 CancellationToken.None);
 
             Assert.That(await service.TryEnsureArtifactAvailableAsync(Path.Combine(outputDirectory, filename), highPriority: false, CancellationToken.None), Is.True);
-            Assert.That(artifactClient.LastReadArtifactRequest!.Requester.RuntimeEpoch, Is.EqualTo(3), "reads name the runtime that now runs");
-            Assert.That(artifactClient.LastReadArtifactRequest.Requester.RuntimeInstanceId, Is.EqualTo("instance-b"));
+            Assert.That(artifactClient.LastReadArtifactRequest!.Requester.Runtime,
+                Is.EqualTo(new RuntimeRef { RuntimeId = "instance-b", RuntimeOrder = 53 }), "reads name the runtime that now runs");
         }
         finally
         {

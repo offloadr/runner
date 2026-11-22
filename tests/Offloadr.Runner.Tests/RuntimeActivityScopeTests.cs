@@ -6,19 +6,19 @@ namespace Offloadr.Runner.Tests;
 public class RuntimeActivityScopeTests
 {
     private static RuntimeActivityObservation Observation()
-        => RuntimeActivityObservation.Capture("session-1", new(2, 3, "33333333-3333-4333-8333-333333333333"),
+        => RuntimeActivityObservation.Capture("session-1", new("33333333-3333-4333-8333-333333333333", 23),
             new() { MemoryWorkspace = true, EncryptedUploads = true, EncryptedReadsRequired = true });
 
     [Test]
     public void CaptureRetainsOnlyOriginalIdentityAndFlags()
     {
         var profile = new SessionSealingStatus { MemoryWorkspace = true, EncryptedUploads = true, EncryptedReadsRequired = true };
-        var runtime = new RuntimeIdentity(2, 3, "33333333-3333-4333-8333-333333333333");
+        var runtime = new RuntimeIdentity("33333333-3333-4333-8333-333333333333", 23);
         var captured = RuntimeActivityObservation.Capture("session-1", runtime, profile);
         profile.MemoryWorkspace = false;
         profile.EncryptedUploads = false;
         profile.EncryptedReadsRequired = false;
-        runtime = new(9, 10, Guid.NewGuid().ToString("n"));
+        runtime = new(Guid.NewGuid().ToString("n"), 910);
         Assert.That(captured, Is.EqualTo(Observation()));
         Assert.That(runtime, Is.Not.EqualTo(captured.Runtime));
     }

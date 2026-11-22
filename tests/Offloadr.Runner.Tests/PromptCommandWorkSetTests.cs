@@ -65,9 +65,7 @@ public sealed partial class PromptCommandWorkSetTests
                 {
                     HandoffId = "handoff-" + epoch,
                     SessionId = "session",
-                    LifecycleGeneration = 1,
-                    RuntimeEpoch = epoch,
-                    RuntimeInstanceId = instance,
+                    Runtime = new RuntimeRef { RuntimeId = instance, RuntimeOrder = epoch },
                 };
                 Assert.That(work.Start(command, false, (captured, _, demand) =>
                 {
@@ -75,11 +73,11 @@ public sealed partial class PromptCommandWorkSetTests
                     work.HoldDemand(captured.HandoffId, Task.Delay(Timeout.Infinite, demand).ContinueWith(_ => { }));
                     return Task.CompletedTask;
                 }), Is.True);
-                command.RuntimeEpoch = 99;
+                command.Runtime.RuntimeOrder = 99;
             }
 
             await work.CancelAndWaitAsync(identity => identity.SessionId == "session"
-                && identity.Runtime.RuntimeEpoch == 1).WaitAsync(TimeSpan.FromSeconds(2));
+                && identity.Runtime.RuntimeOrder == 1).WaitAsync(TimeSpan.FromSeconds(2));
             Assert.That(tokens[1].IsCancellationRequested, Is.True);
             Assert.That(tokens[2].IsCancellationRequested, Is.False);
             work.WithdrawDemand(identity => identity.HandoffId == "handoff-2");

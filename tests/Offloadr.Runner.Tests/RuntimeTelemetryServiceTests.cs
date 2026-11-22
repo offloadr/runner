@@ -263,8 +263,8 @@ public class RuntimeTelemetryServiceTests
     [Test]
     public async Task ActiveSessionRuntimeTelemetryReporter_DropsASampleTakenAcrossARuntimeReplacement()
     {
-        var original = new RuntimeIdentity(7, 3, "original");
-        var replacement = new RuntimeIdentity(7, 4, "replacement");
+        var original = new RuntimeIdentity("original", 73);
+        var replacement = new RuntimeIdentity("replacement", 74);
         var current = original;
         var samples = 0;
         var enqueued = new List<RuntimeIdentity?>();

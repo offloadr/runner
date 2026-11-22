@@ -41,8 +41,7 @@ public sealed partial class ComfyPromptBridgeTests
         }));
         var finished = System.Threading.Channels.Channel.CreateUnbounded<ComfySessionEventRelay.PromptTerminalEvent>();
         relay.PromptFinished += prompt => finished.Writer.TryWrite(prompt);
-        await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", command.LifecycleGeneration,
-            command.RuntimeEpoch, command.RuntimeInstanceId, [], CancellationToken.None);
+        await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", RuntimeIdentity.From(command.Runtime), [], CancellationToken.None);
         var context = await listener.GetContextAsync().WaitAsync(TimeSpan.FromSeconds(3));
         using var socket = (await context.AcceptWebSocketAsync(null)).WebSocket;
         // The platform sends no native id; the bridge learns it from ComfyUI's response.
@@ -60,8 +59,7 @@ public sealed partial class ComfyPromptBridgeTests
             Assert.That(ended.PromptId, Is.EqualTo(promptId));
             Assert.That(ended.HandoffId, Is.EqualTo(command.HandoffId));
             Assert.That(ended.SessionId, Is.EqualTo(command.SessionId));
-            Assert.That(ended.Runtime, Is.EqualTo(new Offloadr.Runner.Core.RuntimeIdentity(
-                command.LifecycleGeneration, command.RuntimeEpoch, command.RuntimeInstanceId)));
+            Assert.That(ended.Runtime, Is.EqualTo(RuntimeIdentity.From(command.Runtime)));
             Assert.That(refreshCaptureAttempts, Is.EqualTo(eventType == "execution_success" ? 1 : 0));
         });
 
@@ -108,8 +106,7 @@ public sealed partial class ComfyPromptBridgeTests
                 delivered.Enqueue(frame.Clone());
             return Task.CompletedTask;
         }));
-        await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", command.LifecycleGeneration,
-            command.RuntimeEpoch, command.RuntimeInstanceId, [], CancellationToken.None);
+        await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", RuntimeIdentity.From(command.Runtime), [], CancellationToken.None);
         var context = await listener.GetContextAsync().WaitAsync(TimeSpan.FromSeconds(3));
         using var socket = (await context.AcceptWebSocketAsync(null)).WebSocket;
 
@@ -147,13 +144,11 @@ public sealed partial class ComfyPromptBridgeTests
 
         var sink = new BridgeSink();
         relay.AttachSink(sink);
-        await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", command.LifecycleGeneration,
-            command.RuntimeEpoch, command.RuntimeInstanceId, [], CancellationToken.None);
+        await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", RuntimeIdentity.From(command.Runtime), [], CancellationToken.None);
         var first = await listener.GetContextAsync().WaitAsync(TimeSpan.FromSeconds(3));
         var firstSocket = (await first.AcceptWebSocketAsync(null)).WebSocket;
         var accepted = await sink.NextBridgeStateAsync();
-        await relay.SendClientMessageAsync(command.SessionId, command.EditorSid, "client", command.LifecycleGeneration,
-            command.RuntimeEpoch, command.RuntimeInstanceId, "{\"action\":\"once\"}"u8.ToArray(), CancellationToken.None);
+        await relay.SendClientMessageAsync(command.SessionId, command.EditorSid, "client", RuntimeIdentity.From(command.Runtime), "{\"action\":\"once\"}"u8.ToArray(), CancellationToken.None);
         var buffer = new byte[1024];
         var received = await firstSocket.ReceiveAsync(buffer, CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(3));
         Assert.That(System.Text.Encoding.UTF8.GetString(buffer, 0, received.Count), Is.EqualTo("{\"action\":\"once\"}"));
@@ -177,8 +172,7 @@ public sealed partial class ComfyPromptBridgeTests
     {
         var command = Command();
         await using var relay = new ComfySessionEventRelay(static (_, _) => { }, RunnerId, "127.0.0.1", 1, _ => new SessionSealingStatus(), isTrackedRuntime: (_, _) => true);
-        await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", command.LifecycleGeneration,
-            command.RuntimeEpoch, command.RuntimeInstanceId, [], CancellationToken.None);
+        await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", RuntimeIdentity.From(command.Runtime), [], CancellationToken.None);
         var promptIds = new List<string>();
         for (var index = 0; index < ComfySessionEventRelay.MaxRetainedPromptIdentities * 2; index++)
         {
@@ -202,11 +196,10 @@ public sealed partial class ComfyPromptBridgeTests
     public async Task ExistingBridgeCannotBeReboundToAnotherRuntime()
     {
         var command = Command();
-        await using var relay = new ComfySessionEventRelay(static (_, _) => { }, RunnerId, "127.0.0.1", 1, _ => new SessionSealingStatus(), isTrackedRuntime: (_, runtime) => runtime.SameRuntime(new(command.LifecycleGeneration, command.RuntimeEpoch, command.RuntimeInstanceId)));
-        await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", command.LifecycleGeneration,
-            command.RuntimeEpoch, command.RuntimeInstanceId, [], CancellationToken.None);
+        await using var relay = new ComfySessionEventRelay(static (_, _) => { }, RunnerId, "127.0.0.1", 1, _ => new SessionSealingStatus(), isTrackedRuntime: (_, runtime) => runtime.SameRuntime(RuntimeIdentity.From(command.Runtime)));
+        await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", RuntimeIdentity.From(command.Runtime), [], CancellationToken.None);
         Assert.ThrowsAsync<InvalidOperationException>(() => relay.EnsureBridgeAsync(command.SessionId, command.EditorSid,
-            "client", command.LifecycleGeneration, command.RuntimeEpoch + 1, Guid.NewGuid().ToString("n"), [], CancellationToken.None));
+            "client", new RuntimeIdentity(Guid.NewGuid().ToString("n"), command.Runtime.RuntimeOrder + 1), [], CancellationToken.None));
     }
 
     [Test]
@@ -222,11 +215,11 @@ public sealed partial class ComfyPromptBridgeTests
             });
 
         Assert.ThrowsAsync<InvalidOperationException>(() => relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client",
-            command.LifecycleGeneration, command.RuntimeEpoch, Guid.Parse(command.RuntimeInstanceId).ToString("D"), [], CancellationToken.None));
+            new RuntimeIdentity(Guid.Parse(command.Runtime.RuntimeId).ToString("D"), command.Runtime.RuntimeOrder), [], CancellationToken.None));
         Assert.That(BridgeCount(relay), Is.Zero);
         Assert.That(checkedRuntimes, Is.EqualTo(new[]
         {
-            (command.SessionId, new RuntimeIdentity(command.LifecycleGeneration, command.RuntimeEpoch, command.RuntimeInstanceId)),
+            (command.SessionId, RuntimeIdentity.From(command.Runtime)),
         }));
     }
 
@@ -235,11 +228,10 @@ public sealed partial class ComfyPromptBridgeTests
     {
         var command = Command();
         await using var relay = new ComfySessionEventRelay(static (_, _) => { }, RunnerId, "127.0.0.1", 1, _ => new SessionSealingStatus(), isTrackedRuntime: (_, _) => true);
-        await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", command.LifecycleGeneration,
-            command.RuntimeEpoch, command.RuntimeInstanceId, [], CancellationToken.None);
+        await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", RuntimeIdentity.From(command.Runtime), [], CancellationToken.None);
 
         var other = command.Clone();
-        other.RuntimeEpoch++;
+        other.Runtime = new RuntimeRef { RuntimeId = Guid.NewGuid().ToString("n"), RuntimeOrder = other.Runtime.RuntimeOrder + 1 };
         relay.MapPrompt(command.SessionId, "client", other, NativePromptId(other));
         Assert.That(MappedPromptCount(relay), Is.Zero);
 
@@ -256,18 +248,15 @@ public sealed partial class ComfyPromptBridgeTests
     public async Task TrackedReplacementRuntimeRetiresThePreviousRuntimesBridge()
     {
         var command = Command();
-        var tracked = new RuntimeIdentity(command.LifecycleGeneration, command.RuntimeEpoch, command.RuntimeInstanceId);
+        var tracked = RuntimeIdentity.From(command.Runtime);
         await using var relay = new ComfySessionEventRelay(static (_, _) => { }, RunnerId, "127.0.0.1", 1, _ => new SessionSealingStatus(),
             isTrackedRuntime: (_, runtime) => runtime.SameRuntime(tracked));
-        await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", command.LifecycleGeneration,
-            command.RuntimeEpoch, command.RuntimeInstanceId, [], CancellationToken.None);
+        await relay.EnsureBridgeAsync(command.SessionId, command.EditorSid, "client", RuntimeIdentity.From(command.Runtime), [], CancellationToken.None);
 
         var replacement = command.Clone();
-        replacement.RuntimeEpoch++;
-        replacement.RuntimeInstanceId = Guid.NewGuid().ToString("n");
-        tracked = new RuntimeIdentity(replacement.LifecycleGeneration, replacement.RuntimeEpoch, replacement.RuntimeInstanceId);
-        await relay.EnsureBridgeAsync(replacement.SessionId, replacement.EditorSid, "client", replacement.LifecycleGeneration,
-            replacement.RuntimeEpoch, replacement.RuntimeInstanceId, [], CancellationToken.None);
+        replacement.Runtime = new RuntimeRef { RuntimeId = Guid.NewGuid().ToString("n"), RuntimeOrder = replacement.Runtime.RuntimeOrder + 1 };
+        tracked = RuntimeIdentity.From(replacement.Runtime);
+        await relay.EnsureBridgeAsync(replacement.SessionId, replacement.EditorSid, "client", RuntimeIdentity.From(replacement.Runtime), [], CancellationToken.None);
 
         Assert.That(BridgeCount(relay), Is.EqualTo(1));
         relay.MapPrompt(command.SessionId, "client", command, NativePromptId(command));
@@ -304,7 +293,7 @@ public sealed partial class ComfyPromptBridgeTests
 
         public Task<RegisterRunnerResponse> RegisterRunnerAsync(RegisterRunnerRequest request, CancellationToken token) => throw new NotSupportedException();
         public Task<SyncLocalModelsResponse> SyncLocalModelsAsync(SyncLocalModelsRequest request, CancellationToken token) => throw new NotSupportedException();
-        public Task AckStartSessionAsync(AcknowledgeSessionStartRequest request, CancellationToken token) => throw new NotSupportedException();
+        public Task AckRuntimeStartAsync(AcknowledgeRuntimeStartRequest request, CancellationToken token) => throw new NotSupportedException();
         public Task AckStopSessionAsync(AcknowledgeSessionStopRequest request, CancellationToken token) => throw new NotSupportedException();
         public Task<GrantGpuPowerExecutionResponse> GrantGpuPowerExecutionAsync(GrantGpuPowerExecutionRequest request, CancellationToken cancellationToken)
             => throw new NotSupportedException("Power execution is not part of this fixture");
@@ -327,9 +316,7 @@ public sealed partial class ComfyPromptBridgeTests
         EditorSid = "editor",
         Owner = "alice",
         EditorRuntimeKind = "comfyui",
-        LifecycleGeneration = 7,
-        RuntimeEpoch = 11,
-        RuntimeInstanceId = Guid.NewGuid().ToString("n"),
+        Runtime = new RuntimeRef { RuntimeId = Guid.NewGuid().ToString("n"), RuntimeOrder = 81 },
         ClientId = "client",
     };
 
@@ -345,9 +332,7 @@ public sealed partial class ComfyPromptBridgeTests
         RunnerId = RunnerId,
         SessionId = command.SessionId,
         EditorSid = command.EditorSid,
-        LifecycleGeneration = command.LifecycleGeneration,
-        RuntimeEpoch = command.RuntimeEpoch,
-        RuntimeInstanceId = command.RuntimeInstanceId,
+        Runtime = command.Runtime.Clone(),
         FrameType = SessionStreamFrameType.Text,
         EventType = "execution_success",
         Payload = ByteString.CopyFromUtf8("{\"type\":\"execution_success\",\"data\":{\"prompt_id\":\"" + promptId + "\"}}"),

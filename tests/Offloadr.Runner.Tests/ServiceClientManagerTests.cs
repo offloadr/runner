@@ -13,9 +13,7 @@ public partial class ServiceClientManagerTests
 
     private static SubmitPromptCommand WithPromptIdentity(SubmitPromptCommand prompt)
     {
-        prompt.LifecycleGeneration = 1;
-        prompt.RuntimeEpoch = 1;
-        prompt.RuntimeInstanceId = "77777777777747778777777777777777";
+        prompt.Runtime = new RuntimeRef { RuntimeId = "77777777777747778777777777777777", RuntimeOrder = 1 };
         return prompt;
     }
 
@@ -52,7 +50,7 @@ public partial class ServiceClientManagerTests
     public async Task AcknowledgeRuntimeCommandWithRetryAsync_RetriesUnavailableRpc()
     {
         var attempts = 0;
-        var response = new AcknowledgeEditorRuntimeQuiesceRequest { CommandId = "command-1" };
+        var response = new AcknowledgeRuntimeStartRequest { SessionId = "session-1" };
 
         var acknowledged = await ServiceClientManager.AcknowledgeRuntimeCommandWithRetryAsync(
             (_, _) =>
@@ -63,7 +61,7 @@ public partial class ServiceClientManagerTests
                     : Task.CompletedTask;
             },
             response,
-            response.CommandId,
+            response.SessionId,
             CancellationToken.None,
             TimeSpan.FromMilliseconds(1),
             TimeSpan.FromMilliseconds(1));
@@ -93,36 +91,6 @@ public partial class ServiceClientManagerTests
         {
             Assert.That(acknowledged, Is.False);
             Assert.That(attempts, Is.EqualTo(1));
-        });
-    }
-
-    [Test]
-    public void RuntimeCommandDeduplicationCache_RejectsDuplicateCommand()
-    {
-        var cache = new ServiceClientManager.RuntimeCommandDeduplicationCache();
-
-        Assert.Multiple(() =>
-        {
-            Assert.That(cache.TryAdd("command-1"), Is.True);
-            Assert.That(cache.TryAdd("command-1"), Is.False);
-            Assert.That(cache.Count, Is.EqualTo(1));
-        });
-    }
-
-    [Test]
-    public void RuntimeCommandDeduplicationCache_EvictsOldestCommandAtEntryLimit()
-    {
-        var cache = new ServiceClientManager.RuntimeCommandDeduplicationCache(maxEntries: 2);
-
-        Assert.That(cache.TryAdd("command-1"), Is.True);
-        Assert.That(cache.TryAdd("command-2"), Is.True);
-        Assert.That(cache.TryAdd("command-3"), Is.True);
-
-        Assert.Multiple(() =>
-        {
-            Assert.That(cache.TryAdd("command-1"), Is.True);
-            Assert.That(cache.TryAdd("command-3"), Is.False);
-            Assert.That(cache.Count, Is.EqualTo(2));
         });
     }
 
@@ -920,7 +888,7 @@ public partial class ServiceClientManagerTests
     {
         var logicalSession = new ServiceClientManager.LogicalSessionState("session-1");
         var runtimeIdentities = new RuntimeIdentityRegistry();
-        runtimeIdentities.Set("session-1", 7, 3, "runtime-1");
+        runtimeIdentities.Set("session-1", new RuntimeIdentity("runtime-1", 3));
 
         ServiceClientManager.ClearRuntimeSessionState(logicalSession, runtimeIdentities, "session-1");
 
@@ -936,7 +904,7 @@ public partial class ServiceClientManagerTests
     {
         var logicalSession = new ServiceClientManager.LogicalSessionState("session-2");
         var runtimeIdentities = new RuntimeIdentityRegistry();
-        runtimeIdentities.Set("session-1", 7, 3, "runtime-1");
+        runtimeIdentities.Set("session-1", new RuntimeIdentity("runtime-1", 3));
 
         ServiceClientManager.ClearRuntimeSessionState(logicalSession, runtimeIdentities, "session-1");
 
@@ -951,17 +919,15 @@ public partial class ServiceClientManagerTests
     public void ClearRuntimeSessionStateIfIdentityMatches_ClearsFailedLaunchIdentity()
     {
         var logicalSession = new ServiceClientManager.LogicalSessionState(string.Empty);
-        logicalSession.SetActiveRuntime("session-1", 7, 3, "runtime-1");
+        Adopt(logicalSession, "session-1", new RuntimeIdentity("runtime-1", 3));
         var runtimeIdentities = new RuntimeIdentityRegistry();
-        runtimeIdentities.Set("session-1", 7, 3, "runtime-1");
+        runtimeIdentities.Set("session-1", new RuntimeIdentity("runtime-1", 3));
 
         ServiceClientManager.ClearRuntimeSessionStateIfIdentityMatches(
             logicalSession,
             runtimeIdentities,
             "session-1",
-            7,
-            3,
-            "runtime-1");
+            new RuntimeIdentity("runtime-1", 3));
 
         Assert.Multiple(() =>
         {
@@ -971,82 +937,113 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
-    public void TryAdoptRuntime_RefusesAReplacedSessionAtTheGenerationItRanAt()
+    public void AdmitStart_OrdersStartsOfEverySessionByTheirRuntimeOrder()
     {
         var state = new ServiceClientManager.LogicalSessionState(string.Empty);
 
         Assert.Multiple(() =>
         {
-            Assert.That(state.TryAdoptRuntime("session-a", new RuntimeIdentity(1, 1, "a-1"), 0, replaceOtherSession: true), Is.True);
-            Assert.That(state.TryAdoptRuntime("session-b", new RuntimeIdentity(1, 1, "b-1"), 0, replaceOtherSession: true), Is.True);
-            Assert.That(state.TryAdoptRuntime("session-a", new RuntimeIdentity(1, 2, "a-2"), 0, replaceOtherSession: true), Is.False);
+            Assert.That(state.AdmitStart("session-a", new RuntimeIdentity("a-1", 5)), Is.EqualTo(ServiceClientManager.StartAdmission.Newer));
+            Assert.That(state.AdmitStart("session-b", new RuntimeIdentity("b-1", 7)), Is.EqualTo(ServiceClientManager.StartAdmission.Newer));
+            // Session c never ran here, but its start was minted before b's.
+            Assert.That(state.AdmitStart("session-c", new RuntimeIdentity("c-1", 6)), Is.EqualTo(ServiceClientManager.StartAdmission.Stale));
+            // A's own runtime is older than b's now, too.
+            Assert.That(state.AdmitStart("session-a", new RuntimeIdentity("a-1", 5)), Is.EqualTo(ServiceClientManager.StartAdmission.Stale));
+            // The newest start again, however its id is spelled, is the same work.
+            Assert.That(state.AdmitStart("session-b", new RuntimeIdentity(" b-1 ", 7)), Is.EqualTo(ServiceClientManager.StartAdmission.Same));
+            // Another runtime at the same order, or the same id for another session or order, is not.
+            Assert.That(state.AdmitStart("session-b", new RuntimeIdentity("b-2", 7)), Is.EqualTo(ServiceClientManager.StartAdmission.Stale));
+            Assert.That(state.AdmitStart("session-c", new RuntimeIdentity("b-1", 7)), Is.EqualTo(ServiceClientManager.StartAdmission.Stale));
+            Assert.That(state.AdmitStart("session-b", new RuntimeIdentity("b-1", 8)), Is.EqualTo(ServiceClientManager.StartAdmission.Stale));
+            Assert.That(state.AdmitStart("session-b", new RuntimeIdentity("b-2", 8)), Is.EqualTo(ServiceClientManager.StartAdmission.Newer));
+            Assert.That(state.AdmitStart("session-b", new RuntimeIdentity(string.Empty, 9)), Is.EqualTo(ServiceClientManager.StartAdmission.Stale));
+            Assert.That(state.AdmitStart("session-b", new RuntimeIdentity("b-3", 0)), Is.EqualTo(ServiceClientManager.StartAdmission.Stale));
+        });
+    }
+
+    [Test]
+    public void TryAdoptRuntime_RefusesAStartReplacedOrFencedSinceItsAdmission()
+    {
+        var state = new ServiceClientManager.LogicalSessionState(string.Empty);
+        state.AdmitStart("session-a", new RuntimeIdentity("a-1", 1));
+        state.AdmitStart("session-a", new RuntimeIdentity("a-2", 2));
+        state.AdmitStart("session-b", new RuntimeIdentity("b-1", 3));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(state.TryAdoptRuntime("session-a", new RuntimeIdentity("a-2", 2)), Is.False);
+            Assert.That(state.TryAdoptRuntime("session-b", new RuntimeIdentity("b-1", 3)), Is.True);
             Assert.That(state.GetActiveSessionId(), Is.EqualTo("session-b"));
-            Assert.That(state.TryAdoptRuntime("session-a", new RuntimeIdentity(2, 1, "a-3"), 0, replaceOtherSession: true), Is.True);
+        });
+
+        state.RecordStopCutoff("session-b", 3);
+        Assert.Multiple(() =>
+        {
+            Assert.That(state.TryAdoptRuntime("session-b", new RuntimeIdentity("b-1", 3)), Is.False);
+            Assert.That(state.AdmitStart("session-b", new RuntimeIdentity("b-1", 3)), Is.EqualTo(ServiceClientManager.StartAdmission.Stale));
         });
     }
 
     [Test]
-    public void TryAdoptRuntime_RefusesAStartOlderThanTheNewestAssignment()
+    public void RecordStopCutoff_RefusesALateStartAtOrBelowItEvenBeforeTheStartArrived()
     {
         var state = new ServiceClientManager.LogicalSessionState(string.Empty);
 
+        state.RecordStopCutoff("session-a", 5);
+
         Assert.Multiple(() =>
         {
-            Assert.That(state.TryAdoptRuntime("session-a", new RuntimeIdentity(1, 1, "a-1"), 0, replaceOtherSession: true, assignmentSequence: 5), Is.True);
-            Assert.That(state.TryAdoptRuntime("session-b", new RuntimeIdentity(1, 1, "b-1"), 0, replaceOtherSession: true, assignmentSequence: 7), Is.True);
-            // Session c never ran here, but its assignment predates b's.
-            Assert.That(state.TryAdoptRuntime("session-c", new RuntimeIdentity(1, 1, "c-1"), 0, replaceOtherSession: true, assignmentSequence: 6), Is.False);
-            Assert.That(state.GetActiveSessionId(), Is.EqualTo("session-b"));
-            // A redelivered start of the current assignment is still the same runtime.
-            Assert.That(state.TryAdoptRuntime("session-b", new RuntimeIdentity(1, 1, "b-1"), 0, replaceOtherSession: true, assignmentSequence: 7), Is.True);
-            Assert.That(state.TryAdoptRuntime("session-d", new RuntimeIdentity(1, 1, "d-1"), 0, replaceOtherSession: true, assignmentSequence: 8), Is.True);
-            // Without a sequence (an older control plane) starts are not ordered across sessions.
-            Assert.That(state.TryAdoptRuntime("session-e", new RuntimeIdentity(1, 1, "e-1"), 0, replaceOtherSession: true), Is.True);
+            Assert.That(state.AdmitStart("session-a", new RuntimeIdentity("a-1", 4)), Is.EqualTo(ServiceClientManager.StartAdmission.Stale));
+            Assert.That(state.AdmitStart("session-a", new RuntimeIdentity("a-2", 5)), Is.EqualTo(ServiceClientManager.StartAdmission.Stale));
+            // Another session's start is not fenced by this session's Stop.
+            Assert.That(state.AdmitStart("session-b", new RuntimeIdentity("b-1", 4)), Is.EqualTo(ServiceClientManager.StartAdmission.Newer));
+            Assert.That(state.AdmitStart("session-a", new RuntimeIdentity("a-3", 6)), Is.EqualTo(ServiceClientManager.StartAdmission.Newer));
         });
     }
 
     [Test]
-    public void ClearAndRetire_RefusesALateStartForTheStoppedGeneration()
+    public void RecordStopCutoff_EvictedCutoffStillRefusesTheSessionsOldStart()
     {
-        var state = new ServiceClientManager.LogicalSessionState(string.Empty);
-        state.TryAdoptRuntime("session-a", new RuntimeIdentity(3, 1, "a-1"), 0, replaceOtherSession: true);
-
-        state.ClearAndRetire("session-a");
+        var state = new ServiceClientManager.LogicalSessionState(string.Empty, maxStopCutoffs: 2);
+        state.RecordStopCutoff("session-a", 10);
+        state.RecordStopCutoff("session-b", 3);
+        // A third session's Stop evicts session a's cutoff.
+        state.RecordStopCutoff("session-c", 4);
 
         Assert.Multiple(() =>
         {
-            Assert.That(state.GetActiveSessionId(), Is.Empty);
-            Assert.That(state.TryAdoptRuntime("session-a", new RuntimeIdentity(3, 2, "a-2"), 0, replaceOtherSession: true), Is.False);
-            Assert.That(state.TryAdoptRuntime("session-a", new RuntimeIdentity(4, 1, "a-3"), 0, replaceOtherSession: true), Is.True);
+            Assert.That(state.AdmitStart("session-a", new RuntimeIdentity("a-1", 9)), Is.EqualTo(ServiceClientManager.StartAdmission.Stale),
+                "The floor rose to the evicted cutoff.");
+            Assert.That(state.AdmitStart("session-d", new RuntimeIdentity("d-1", 10)), Is.EqualTo(ServiceClientManager.StartAdmission.Stale));
+            Assert.That(state.AdmitStart("session-a", new RuntimeIdentity("a-2", 11)), Is.EqualTo(ServiceClientManager.StartAdmission.Newer));
         });
     }
 
     [Test]
-    public void ClearAndRetire_UsesTheStopGenerationWhenTheStartWasNotAdoptedYet()
+    public void ClearAfterStop_KeepsARuntimeNewerThanTheStop()
     {
         var state = new ServiceClientManager.LogicalSessionState(string.Empty);
+        Adopt(state, "session-a", new RuntimeIdentity("a-2", 8));
 
-        state.ClearAndRetire("session-a", stoppedGeneration: 5);
+        state.ClearAfterStop("session-a", 7);
+        Assert.That(state.GetActiveSessionId(), Is.EqualTo("session-a"));
 
-        Assert.Multiple(() =>
-        {
-            Assert.That(state.TryAdoptRuntime("session-a", new RuntimeIdentity(5, 1, "a-1"), 0, replaceOtherSession: true), Is.False);
-            Assert.That(state.TryAdoptRuntime("session-a", new RuntimeIdentity(6, 1, "a-2"), 0, replaceOtherSession: true), Is.True);
-        });
+        state.ClearAfterStop("session-a", 8);
+        Assert.That(state.GetActiveSessionId(), Is.Empty);
     }
 
     [Test]
     public async Task HandleUnexpectedRuntimeExitAsync_ClearsStateAndSidecarsOfTheExitedRuntime()
     {
         var logicalSession = new ServiceClientManager.LogicalSessionState(string.Empty);
-        logicalSession.SetActiveRuntime("session-1", 7, 3, "runtime-1");
+        Adopt(logicalSession, "session-1", new RuntimeIdentity("runtime-1", 3));
         var runtimeIdentities = new RuntimeIdentityRegistry();
-        runtimeIdentities.Set("session-1", 7, 3, "runtime-1");
+        runtimeIdentities.Set("session-1", new RuntimeIdentity("runtime-1", 3));
         var cleaned = new List<string>();
 
         await ServiceClientManager.HandleUnexpectedRuntimeExitAsync(
             "session-1",
-            new RuntimeIdentity(7, 3, "runtime-1"),
+            new RuntimeIdentity("runtime-1", 3),
             logicalSession,
             runtimeIdentities,
             (sessionId, _) =>
@@ -1065,19 +1062,19 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
-    public async Task HandleUnexpectedRuntimeExitAsync_ClearsAStartThatUsedAHyphenatedInstanceId()
+    public async Task HandleUnexpectedRuntimeExitAsync_ClearsAStartThatUsedAHyphenatedRuntimeId()
     {
-        var instance = Guid.NewGuid();
+        var runtimeId = Guid.NewGuid();
         var logicalSession = new ServiceClientManager.LogicalSessionState(string.Empty);
         // The start command carries the hyphenated spelling; the process manager keeps "n".
-        logicalSession.SetActiveRuntime("session-1", 7, 3, instance.ToString("D").ToUpperInvariant());
+        Adopt(logicalSession, "session-1", new RuntimeIdentity(runtimeId.ToString("D").ToUpperInvariant(), 3));
         var runtimeIdentities = new RuntimeIdentityRegistry();
-        runtimeIdentities.Set("session-1", 7, 3, instance.ToString("D"));
+        runtimeIdentities.Set("session-1", new RuntimeIdentity(runtimeId.ToString("D"), 3));
         var cleaned = new List<string>();
 
         await ServiceClientManager.HandleUnexpectedRuntimeExitAsync(
             "session-1",
-            new RuntimeIdentity(7, 3, instance.ToString("n")),
+            new RuntimeIdentity(runtimeId.ToString("n"), 3),
             logicalSession,
             runtimeIdentities,
             (sessionId, _) =>
@@ -1099,14 +1096,14 @@ public partial class ServiceClientManagerTests
     public async Task HandleUnexpectedRuntimeExitAsync_LeavesAReplacementRuntimeAndItsSidecars()
     {
         var logicalSession = new ServiceClientManager.LogicalSessionState(string.Empty);
-        logicalSession.SetActiveRuntime("session-1", 7, 4, "runtime-2");
+        Adopt(logicalSession, "session-1", new RuntimeIdentity("runtime-2", 4));
         var runtimeIdentities = new RuntimeIdentityRegistry();
-        runtimeIdentities.Set("session-1", 7, 4, "runtime-2");
+        runtimeIdentities.Set("session-1", new RuntimeIdentity("runtime-2", 4));
         var cleaned = new List<string>();
 
         await ServiceClientManager.HandleUnexpectedRuntimeExitAsync(
             "session-1",
-            new RuntimeIdentity(7, 3, "runtime-1"),
+            new RuntimeIdentity("runtime-1", 3),
             logicalSession,
             runtimeIdentities,
             (sessionId, _) =>
@@ -1120,7 +1117,7 @@ public partial class ServiceClientManagerTests
         {
             Assert.That(logicalSession.GetActiveSessionId(), Is.EqualTo("session-1"));
             Assert.That(runtimeIdentities.TryGet("session-1", out var identity), Is.True);
-            Assert.That(identity, Is.EqualTo(new RuntimeIdentity(7, 4, "runtime-2")));
+            Assert.That(identity, Is.EqualTo(new RuntimeIdentity("runtime-2", 4)));
             Assert.That(cleaned, Is.Empty);
         });
     }
@@ -1129,14 +1126,14 @@ public partial class ServiceClientManagerTests
     public async Task HandleUnexpectedRuntimeExitAsync_LeavesAReplacementKnownOnlyToTheRegistry()
     {
         var logicalSession = new ServiceClientManager.LogicalSessionState(string.Empty);
-        logicalSession.SetActiveRuntime("session-1", 7, 3, "runtime-1");
+        Adopt(logicalSession, "session-1", new RuntimeIdentity("runtime-1", 3));
         var runtimeIdentities = new RuntimeIdentityRegistry();
-        runtimeIdentities.Set("session-1", 8, 1, "runtime-2");
+        runtimeIdentities.Set("session-1", new RuntimeIdentity("runtime-2", 9));
         var cleaned = new List<string>();
 
         await ServiceClientManager.HandleUnexpectedRuntimeExitAsync(
             "session-1",
-            new RuntimeIdentity(7, 3, "runtime-1"),
+            new RuntimeIdentity("runtime-1", 3),
             logicalSession,
             runtimeIdentities,
             (sessionId, _) =>
@@ -1149,7 +1146,7 @@ public partial class ServiceClientManagerTests
         Assert.Multiple(() =>
         {
             Assert.That(runtimeIdentities.TryGet("session-1", out var identity), Is.True);
-            Assert.That(identity, Is.EqualTo(new RuntimeIdentity(8, 1, "runtime-2")));
+            Assert.That(identity, Is.EqualTo(new RuntimeIdentity("runtime-2", 9)));
             Assert.That(cleaned, Is.Empty);
         });
     }
@@ -1184,24 +1181,52 @@ public partial class ServiceClientManagerTests
     public void ClearRuntimeSessionStateIfIdentityMatches_PreservesReplacementLaunchForSameSession()
     {
         var logicalSession = new ServiceClientManager.LogicalSessionState(string.Empty);
-        logicalSession.SetActiveRuntime("session-1", 7, 4, "runtime-2");
+        Adopt(logicalSession, "session-1", new RuntimeIdentity("runtime-2", 4));
         var runtimeIdentities = new RuntimeIdentityRegistry();
-        runtimeIdentities.Set("session-1", 7, 4, "runtime-2");
+        runtimeIdentities.Set("session-1", new RuntimeIdentity("runtime-2", 4));
 
         ServiceClientManager.ClearRuntimeSessionStateIfIdentityMatches(
             logicalSession,
             runtimeIdentities,
             "session-1",
-            7,
-            3,
-            "runtime-1");
+            new RuntimeIdentity("runtime-1", 3));
 
         Assert.Multiple(() =>
         {
             Assert.That(logicalSession.GetActiveSessionId(), Is.EqualTo("session-1"));
             Assert.That(runtimeIdentities.TryGet("session-1", out var identity), Is.True);
-            Assert.That(identity, Is.EqualTo(new RuntimeIdentity(7, 4, "runtime-2")));
+            Assert.That(identity, Is.EqualTo(new RuntimeIdentity("runtime-2", 4)));
         });
+    }
+
+    [Test]
+    public void RuntimeIdentity_IsTheSameRuntimeByIdAndCarriesItsOrder()
+    {
+        var runtimeId = Guid.NewGuid();
+        var compact = new RuntimeIdentity(runtimeId.ToString("n"), 4);
+        var hyphenated = new RuntimeIdentity(runtimeId.ToString("D").ToUpperInvariant(), 4);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(hyphenated, Is.EqualTo(compact));
+            Assert.That(hyphenated.GetHashCode(), Is.EqualTo(compact.GetHashCode()));
+            Assert.That(new RuntimeIdentity(Guid.NewGuid().ToString("n"), 4), Is.Not.EqualTo(compact));
+            Assert.That(RuntimeIdentity.From(compact.ToRef()), Is.EqualTo(compact));
+            Assert.That(RuntimeIdentity.From(null).IsValid, Is.False);
+            Assert.That(new RuntimeIdentity("runtime", (ulong)long.MaxValue + 1).IsValid, Is.False);
+        });
+    }
+
+    [Test]
+    public void RuntimeIdentityRegistry_KeepsTheStartsLifecycleGenerationForPowerCommands()
+    {
+        var registry = new RuntimeIdentityRegistry();
+        registry.Set("session-1", new RuntimeIdentity("runtime-1", 3), lifecycleGeneration: 7);
+
+        Assert.That(registry.LifecycleGeneration("session-1"), Is.EqualTo(7));
+        Assert.That(registry.LifecycleGeneration("session-2"), Is.Zero);
+        registry.RemoveIfMatches("session-1", new RuntimeIdentity("runtime-1", 3));
+        Assert.That(registry.LifecycleGeneration("session-1"), Is.Zero);
     }
 
     private static Task HandlePromptWithDemandAsync(
@@ -1548,9 +1573,7 @@ public partial class ServiceClientManagerTests
             Kind = Offloadr.EditorRuntime.V1.EditorRuntimeRequestKind.Control,
             Path = path,
             Body = ByteString.CopyFromUtf8(body),
-            LifecycleGeneration = 1,
-            RuntimeEpoch = 1,
-            RuntimeInstanceId = "77777777777747778777777777777777",
+            Runtime = new RuntimeRef { RuntimeId = "77777777777747778777777777777777", RuntimeOrder = 1 },
         };
 
     [TestCase("api/interrupt", "{\"prompt_id\":\"running\"}", 200, true)]
@@ -1588,7 +1611,7 @@ public partial class ServiceClientManagerTests
         Assert.That(interruptedSession, Is.EqualTo(interrupted ? PromptSessionId : null));
         if (interrupted)
         {
-            Assert.That(queried, Is.EqualTo(new Offloadr.Runner.Core.RuntimeIdentity(1, 1, request.RuntimeInstanceId)));
+            Assert.That(queried, Is.EqualTo(new Offloadr.Runner.Core.RuntimeIdentity(request.Runtime.RuntimeId, 1)));
         }
     }
 
@@ -1631,8 +1654,7 @@ public partial class ServiceClientManagerTests
             HandoffId = PromptHandoffId,
             EditorSid = "editor-1",
         });
-        var runtime = new Offloadr.Runner.Core.RuntimeIdentity(
-            prompt.LifecycleGeneration, prompt.RuntimeEpoch, prompt.RuntimeInstanceId);
+        var runtime = Offloadr.Runner.Core.RuntimeIdentity.From(prompt.Runtime);
         var nativePromptId = Guid.NewGuid().ToString("D");
         ComfySessionEventRelay.PromptTerminalEvent Finished(
             string? handoffId, Offloadr.Runner.Core.RuntimeIdentity? on = null)
@@ -1646,7 +1668,7 @@ public partial class ServiceClientManagerTests
             Assert.That(ServiceClientManager.IsFinishedPrompt(PromptWorkIdentity.Capture(prompt, false), Finished(Guid.NewGuid().ToString("n"))), Is.False);
             Assert.That(ServiceClientManager.IsFinishedPrompt(
                 PromptWorkIdentity.Capture(prompt, false),
-                Finished(PromptHandoffId, on: runtime with { RuntimeEpoch = runtime.RuntimeEpoch + 1 })), Is.False);
+                Finished(PromptHandoffId, on: new Offloadr.Runner.Core.RuntimeIdentity(Guid.NewGuid().ToString("n"), runtime.RuntimeOrder + 1))), Is.False);
         });
     }
 
@@ -2128,9 +2150,7 @@ public partial class ServiceClientManagerTests
         Assert.That(streamEvent.EditorSid, Is.EqualTo("editor-1"));
         Assert.That(streamEvent.ClientId, Is.EqualTo($"http-relay:{PromptHandoffId}"));
         Assert.That(streamEvent.HandoffId, Is.EqualTo(PromptHandoffId));
-        Assert.That(streamEvent.LifecycleGeneration, Is.EqualTo(prompt.LifecycleGeneration));
-        Assert.That(streamEvent.RuntimeEpoch, Is.EqualTo(prompt.RuntimeEpoch));
-        Assert.That(streamEvent.RuntimeInstanceId, Is.EqualTo(prompt.RuntimeInstanceId));
+        Assert.That(streamEvent.Runtime, Is.EqualTo(prompt.Runtime));
         Assert.That(streamEvent.EventType, Is.EqualTo("http.response.chunk"));
         Assert.That(streamEvent.FrameType, Is.EqualTo(Offloadr.Runner.V1.SessionStreamFrameType.Binary));
         Assert.That(streamEvent.Payload.ToStringUtf8(), Is.EqualTo("data: ping\n\n"));

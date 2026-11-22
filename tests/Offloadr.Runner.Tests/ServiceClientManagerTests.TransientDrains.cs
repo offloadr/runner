@@ -9,8 +9,8 @@ public partial class ServiceClientManagerTests
         var registry = new ServiceClientManager.TransientCancellationRegistry(CancellationToken.None);
         try
         {
-            await using var failed = registry.Acquire(CommandSessionId, 7, 3, InstanceA);
-            await using var peer = registry.Acquire(CommandSessionId, 7, sameRuntime ? 3UL : 4UL, sameRuntime ? InstanceA : InstanceB);
+            await using var failed = registry.Acquire(CommandSessionId, Rt(InstanceA, 73));
+            await using var peer = registry.Acquire(CommandSessionId, sameRuntime ? Rt(InstanceA, 73) : Rt(InstanceB, 74));
             var peerCancelled = TransientLifetimeGate();
             using var failedRegistration = failed.Token.Register(() => throw new InvalidOperationException("synthetic callback failure"));
             using var peerRegistration = peer.Token.Register(() => peerCancelled.TrySetResult());
@@ -34,7 +34,7 @@ public partial class ServiceClientManagerTests
     public async Task TransientLifetime_ShutdownJoinsRetiredCallbacksAndCoalesces()
     {
         var registry = new ServiceClientManager.TransientCancellationRegistry(CancellationToken.None);
-        var retired = registry.Acquire(CommandSessionId, 7, 3, InstanceA);
+        var retired = registry.Acquire(CommandSessionId, Rt(InstanceA, 73));
         var entered = TransientLifetimeGate();
         var release = TransientLifetimeGate();
         Task? completion = null;
@@ -70,10 +70,10 @@ public partial class ServiceClientManagerTests
 
     [TestCase(false)]
     [TestCase(true)]
-    public async Task TransientLifetime_StopAndQuiesceFenceRequestsThroughPhysicalCleanup(bool quiesce)
+    public async Task TransientLifetime_StopAndRelaunchFenceRequestsThroughPhysicalCleanup(bool relaunch)
     {
-        var harness = RunningHarness(7, 3, InstanceA);
-        var request = harness.TransientCancellation.Acquire(CommandSessionId, 7, 3, InstanceA);
+        var harness = RunningHarness(InstanceA, 73);
+        var request = harness.TransientCancellation.Acquire(CommandSessionId, Rt(InstanceA, 73));
         var cancelled = TransientLifetimeGate();
         var cleanupEntered = TransientLifetimeGate();
         var releaseCleanup = TransientLifetimeGate();
@@ -86,24 +86,24 @@ public partial class ServiceClientManagerTests
         Task? command = null;
         try
         {
-            command = quiesce
-                ? ServiceClientManager.HandleQuiesceRuntimeCommandAsync(Quiesce(7, 3, InstanceA, revision: 1), harness.Deps)
-                : ServiceClientManager.HandleStopSessionCommandAsync(Stop(7, 3, InstanceA), harness.Deps);
+            command = relaunch
+                ? ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceB, 74), harness.Deps)
+                : ServiceClientManager.HandleStopSessionCommandAsync(Stop(73), harness.Deps);
             await cancelled.Task.WaitAsync(TimeSpan.FromSeconds(5));
             Assert.Multiple(() =>
             {
                 Assert.That(command.IsCompleted, Is.False);
                 Assert.That(cleanupEntered.Task.IsCompleted, Is.False, "Physical cleanup waits for the original request.");
             });
-            Assert.Throws<OperationCanceledException>(() => harness.TransientCancellation.Acquire(CommandSessionId, 7, 3, InstanceA));
-            await using var unrelated = harness.TransientCancellation.Acquire("unrelated-session", 7, 3, InstanceA);
+            Assert.Throws<OperationCanceledException>(() => harness.TransientCancellation.Acquire(CommandSessionId, Rt(InstanceA, 73)));
+            await using var unrelated = harness.TransientCancellation.Acquire("unrelated-session", Rt(InstanceA, 73));
             Assert.That(unrelated.Token.IsCancellationRequested, Is.False);
             await request.DisposeAsync();
             await cleanupEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
-            Assert.Throws<OperationCanceledException>(() => harness.TransientCancellation.Acquire(CommandSessionId, 7, 3, InstanceA));
+            Assert.Throws<OperationCanceledException>(() => harness.TransientCancellation.Acquire(CommandSessionId, Rt(InstanceA, 73)));
             releaseCleanup.SetResult();
             await command.WaitAsync(TimeSpan.FromSeconds(5));
-            Assert.That(quiesce ? harness.Sink.QuiesceAcks.Count : harness.Sink.StopAcks.Count, Is.EqualTo(1));
+            Assert.That(relaunch ? harness.Sink.StartAcks.Count : harness.Sink.StopAcks.Count, Is.EqualTo(1));
         }
         finally
         {
@@ -122,7 +122,7 @@ public partial class ServiceClientManagerTests
         await using var registry = new ServiceClientManager.TransientCancellationRegistry(shutdown.Token);
         if (hostShutdown) await shutdown.CancelAsync();
         else await registry.DisposeAsync();
-        Assert.Throws<OperationCanceledException>(() => registry.Acquire(CommandSessionId, 7, 3, InstanceA));
+        Assert.Throws<OperationCanceledException>(() => registry.Acquire(CommandSessionId, Rt(InstanceA, 73)));
     }
 
     private static TaskCompletionSource TransientLifetimeGate() => new(TaskCreationOptions.RunContinuationsAsynchronously);

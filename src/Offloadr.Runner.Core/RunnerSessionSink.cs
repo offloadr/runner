@@ -7,17 +7,13 @@ internal interface IRunnerSessionSink : IAsyncDisposable
 {
     Task<RegisterRunnerResponse> RegisterRunnerAsync(RegisterRunnerRequest request, CancellationToken cancellationToken);
     Task<SyncLocalModelsResponse> SyncLocalModelsAsync(SyncLocalModelsRequest request, CancellationToken cancellationToken);
-    Task AckStartSessionAsync(AcknowledgeSessionStartRequest request, CancellationToken cancellationToken);
+    Task AckRuntimeStartAsync(AcknowledgeRuntimeStartRequest request, CancellationToken cancellationToken);
     Task AckStopSessionAsync(AcknowledgeSessionStopRequest request, CancellationToken cancellationToken);
     Task<GrantGpuPowerExecutionResponse> GrantGpuPowerExecutionAsync(GrantGpuPowerExecutionRequest request, CancellationToken cancellationToken);
     Task AckGpuPowerLimitAsync(AcknowledgeGpuPowerLimitRequest request, CancellationToken cancellationToken);
     Task<GrantPromptExecutionResponse> GrantPromptExecutionAsync(GrantPromptExecutionRequest request, CancellationToken cancellationToken);
     Task AckSubmitEditorActionAsync(AcknowledgePromptResultRequest request, CancellationToken cancellationToken);
     Task AckEditorRuntimeRequestAsync(AcknowledgeEditorRuntimeRequestRequest request, CancellationToken cancellationToken)
-        => Task.CompletedTask;
-    Task AckEditorRuntimeQuiesceAsync(AcknowledgeEditorRuntimeQuiesceRequest request, CancellationToken cancellationToken)
-        => Task.CompletedTask;
-    Task AckEditorRuntimeLaunchAsync(AcknowledgeEditorRuntimeLaunchRequest request, CancellationToken cancellationToken)
         => Task.CompletedTask;
     Task ReportModelDownloadAsync(ReportModelDownloadRequest request, CancellationToken cancellationToken);
     Task ReportSessionEventsAsync(ReportSessionEventsRequest request, CancellationToken cancellationToken);
@@ -56,8 +52,8 @@ internal sealed class GrpcRunnerControlSink : IRunnerSessionSink
         => await _opsClient.SyncLocalModelsAsync(request, deadline: GetDeadline(), cancellationToken: cancellationToken)
             .ResponseAsync.ConfigureAwait(false);
 
-    public async Task AckStartSessionAsync(AcknowledgeSessionStartRequest request, CancellationToken cancellationToken)
-        => await _commandClient.AcknowledgeSessionStartAsync(request, deadline: GetDeadline(), cancellationToken: cancellationToken)
+    public async Task AckRuntimeStartAsync(AcknowledgeRuntimeStartRequest request, CancellationToken cancellationToken)
+        => await _commandClient.AcknowledgeRuntimeStartAsync(request, deadline: GetDeadline(), cancellationToken: cancellationToken)
             .ResponseAsync.ConfigureAwait(false);
 
     public async Task AckStopSessionAsync(AcknowledgeSessionStopRequest request, CancellationToken cancellationToken)
@@ -82,14 +78,6 @@ internal sealed class GrpcRunnerControlSink : IRunnerSessionSink
 
     public async Task AckEditorRuntimeRequestAsync(AcknowledgeEditorRuntimeRequestRequest request, CancellationToken cancellationToken)
         => await _commandClient.AcknowledgeEditorRuntimeRequestAsync(request, deadline: GetDeadline(), cancellationToken: cancellationToken)
-            .ResponseAsync.ConfigureAwait(false);
-
-    public async Task AckEditorRuntimeQuiesceAsync(AcknowledgeEditorRuntimeQuiesceRequest request, CancellationToken cancellationToken)
-        => await _commandClient.AcknowledgeEditorRuntimeQuiesceAsync(request, deadline: GetDeadline(), cancellationToken: cancellationToken)
-            .ResponseAsync.ConfigureAwait(false);
-
-    public async Task AckEditorRuntimeLaunchAsync(AcknowledgeEditorRuntimeLaunchRequest request, CancellationToken cancellationToken)
-        => await _commandClient.AcknowledgeEditorRuntimeLaunchAsync(request, deadline: GetDeadline(), cancellationToken: cancellationToken)
             .ResponseAsync.ConfigureAwait(false);
 
     public async Task ReportModelDownloadAsync(ReportModelDownloadRequest request, CancellationToken cancellationToken)

@@ -20,8 +20,7 @@ public partial class SessionProcessManagerOwnershipTests
         try
         {
             await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
-            fixture.Start.RuntimeEpoch++;
-            fixture.Start.RuntimeInstanceId = Guid.NewGuid().ToString("n");
+            fixture.Start.Runtime = new RuntimeRef { RuntimeId = Guid.NewGuid().ToString("n"), RuntimeOrder = fixture.Start.Runtime.RuntimeOrder + 1 };
             Assert.ThrowsAsync<InvalidOperationException>(() => fixture.Manager.StartSessionAsync(fixture.Start, CancellationToken.None));
         }
         finally { release.TrySetResult(); await stopping; }
@@ -65,7 +64,7 @@ public partial class SessionProcessManagerOwnershipTests
     {
         await using var fixture = await PromptRuntimeFixture.CreateAsync();
         var start = fixture.Start;
-        var tracked = new RuntimeIdentity(start.LifecycleGeneration, start.RuntimeEpoch, start.RuntimeInstanceId);
+        var tracked = RuntimeIdentity.From(start.Runtime);
         var cleanupCalls = 0;
         Task CountCleanup(string _, CancellationToken __)
         {
@@ -74,14 +73,14 @@ public partial class SessionProcessManagerOwnershipTests
         }
 
         var stale = await fixture.Manager.StopSessionIfRuntimeMatchesAsync(
-            start.SessionId, tracked with { RuntimeEpoch = start.RuntimeEpoch - 1 }, CountCleanup, CancellationToken.None);
+            start.SessionId, new RuntimeIdentity(Guid.NewGuid().ToString("n"), start.Runtime.RuntimeOrder - 1), CountCleanup, CancellationToken.None);
         Assert.That(stale, Is.False);
         Assert.That(cleanupCalls, Is.Zero);
         Assert.That(fixture.Manager.TryGetRuntimeIdentity(start.SessionId, out var current), Is.True);
         Assert.That(current.SameRuntime(tracked), Is.True);
 
         // The same runtime spelled with dashes still matches.
-        var exact = tracked with { RuntimeInstanceId = Guid.Parse(start.RuntimeInstanceId).ToString("D") };
+        var exact = tracked with { RuntimeId = Guid.Parse(start.Runtime.RuntimeId).ToString("D") };
         Assert.That(await fixture.Manager.StopSessionIfRuntimeMatchesAsync(start.SessionId, exact, CountCleanup, CancellationToken.None), Is.True);
         Assert.That(cleanupCalls, Is.EqualTo(1));
         Assert.That(fixture.Manager.TryGetRuntimeIdentity(start.SessionId, out _), Is.False);
@@ -92,12 +91,12 @@ public partial class SessionProcessManagerOwnershipTests
     {
         await using var fixture = await PromptRuntimeFixture.CreateAsync();
         var start = fixture.Start;
-        var tracked = new RuntimeIdentity(start.LifecycleGeneration, start.RuntimeEpoch, Guid.Parse(start.RuntimeInstanceId).ToString("D"));
+        var tracked = new RuntimeIdentity(Guid.Parse(start.Runtime.RuntimeId).ToString("D"), start.Runtime.RuntimeOrder);
 
         Assert.Multiple(() =>
         {
             Assert.That(fixture.Manager.IsTrackedRuntime(start.SessionId, tracked), Is.True);
-            Assert.That(fixture.Manager.IsTrackedRuntime(start.SessionId, tracked with { RuntimeEpoch = start.RuntimeEpoch + 1 }), Is.False);
+            Assert.That(fixture.Manager.IsTrackedRuntime(start.SessionId, new RuntimeIdentity(Guid.NewGuid().ToString("n"), start.Runtime.RuntimeOrder + 1)), Is.False);
             Assert.That(fixture.Manager.IsTrackedRuntime(Guid.NewGuid().ToString("n"), tracked), Is.False);
         });
 
@@ -105,17 +104,18 @@ public partial class SessionProcessManagerOwnershipTests
         Assert.That(fixture.Manager.IsTrackedRuntime(start.SessionId, tracked), Is.False);
     }
 
-    [TestCase("generation")]
-    [TestCase("epoch")]
-    [TestCase("instance")]
+    [TestCase("newer")]
+    [TestCase("same order")]
     public async Task NativeInvocationRejectsDifferentChildIdentityBeforeHttp(string mismatch)
     {
         await using var fixture = await PromptRuntimeFixture.CreateAsync();
         var command = fixture.Command();
         Assert.That(fixture.Manager.IsPromptRuntimeCurrent(command), Is.True);
-        if (mismatch == "generation") command.LifecycleGeneration++;
-        else if (mismatch == "epoch") command.RuntimeEpoch++;
-        else command.RuntimeInstanceId = Guid.NewGuid().ToString("n");
+        command.Runtime = new RuntimeRef
+        {
+            RuntimeId = Guid.NewGuid().ToString("n"),
+            RuntimeOrder = mismatch == "newer" ? command.Runtime.RuntimeOrder + 1 : command.Runtime.RuntimeOrder,
+        };
         Assert.That(fixture.Manager.IsPromptRuntimeCurrent(command), Is.False, "The pre-grant fence refuses it.");
         Assert.ThrowsAsync<InvalidOperationException>(() => fixture.Manager.SubmitEditorActionAsync(command, CancellationToken.None));
         Assert.That(fixture.Http.Requests, Is.Empty);
@@ -124,15 +124,15 @@ public partial class SessionProcessManagerOwnershipTests
     [TestCase("handoff")]
     [TestCase("instance")]
     [TestCase("session")]
-    [TestCase("generation")]
+    [TestCase("order")]
     public async Task MalformedIdentityIsRejectedAsValidationFailureBeforeHttp(string malformed)
     {
         await using var fixture = await PromptRuntimeFixture.CreateAsync();
         var command = fixture.Command();
         if (malformed == "handoff") command.HandoffId = "not-a-uuid";
-        else if (malformed == "instance") command.RuntimeInstanceId = "not-a-uuid";
+        else if (malformed == "instance") command.Runtime.RuntimeId = "not-a-uuid";
         else if (malformed == "session") command.SessionId = "not-a-uuid";
-        else command.LifecycleGeneration = 0;
+        else command.Runtime.RuntimeOrder = 0;
 
         var failure = Assert.CatchAsync(() => fixture.Manager.SubmitEditorActionAsync(command, CancellationToken.None));
 
@@ -222,8 +222,7 @@ public partial class SessionProcessManagerOwnershipTests
         await fixture.Manager.StopSessionAsync(fixture.Start.SessionId, CancellationToken.None);
         Assert.ThrowsAsync<TaskCanceledException>(async () => await pending);
 
-        fixture.Start.RuntimeEpoch++;
-        fixture.Start.RuntimeInstanceId = Guid.NewGuid().ToString("n");
+        fixture.Start.Runtime = new RuntimeRef { RuntimeId = Guid.NewGuid().ToString("n"), RuntimeOrder = fixture.Start.Runtime.RuntimeOrder + 1 };
         await fixture.Manager.StartSessionAsync(fixture.Start, CancellationToken.None);
         fixture.Http.Respond = (_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent([0xff, 0x01]) });
         Assert.That(fixture.Manager.IsPromptRuntimeCurrent(original), Is.False);
@@ -241,9 +240,7 @@ public partial class SessionProcessManagerOwnershipTests
         var command = new RelayEditorRuntimeRequestCommand
         {
             SessionId = fixture.Start.SessionId,
-            LifecycleGeneration = fixture.Start.LifecycleGeneration,
-            RuntimeEpoch = fixture.Start.RuntimeEpoch + 1,
-            RuntimeInstanceId = fixture.Start.RuntimeInstanceId,
+            Runtime = new RuntimeRef { RuntimeId = Guid.NewGuid().ToString("n"), RuntimeOrder = fixture.Start.Runtime.RuntimeOrder + 1 },
             Kind = EditorRuntimeRequestKind.Control,
             Method = "POST",
             Path = "api/interrupt",
@@ -288,8 +285,7 @@ public partial class SessionProcessManagerOwnershipTests
 
         // The old runtime's exit cleanup is still running when the replacement arrives.
         var replacement = fixture.Start.Clone();
-        replacement.RuntimeEpoch++;
-        replacement.RuntimeInstanceId = Guid.NewGuid().ToString("n");
+        replacement.Runtime = new RuntimeRef { RuntimeId = Guid.NewGuid().ToString("n"), RuntimeOrder = replacement.Runtime.RuntimeOrder + 1 };
         var start = fixture.Manager.StartSessionAsync(replacement, CancellationToken.None);
         await Task.Delay(TimeSpan.FromMilliseconds(200));
         Assert.That(start.IsCompleted, Is.False, "The replacement waits for the exited runtime's cleanup.");
@@ -298,7 +294,7 @@ public partial class SessionProcessManagerOwnershipTests
         await start.WaitAsync(TimeSpan.FromSeconds(10));
 
         Assert.That(fixture.Manager.TryGetRuntimeIdentity(replacement.SessionId, out var tracked), Is.True);
-        Assert.That(tracked, Is.EqualTo(new RuntimeIdentity(replacement.LifecycleGeneration, replacement.RuntimeEpoch, replacement.RuntimeInstanceId)));
+        Assert.That(tracked, Is.EqualTo(RuntimeIdentity.From(replacement.Runtime)));
     }
 
     [Test]
@@ -366,8 +362,7 @@ public partial class SessionProcessManagerOwnershipTests
         var start = fixture.Start.Clone();
         if (!sameRuntime)
         {
-            start.RuntimeEpoch++;
-            start.RuntimeInstanceId = Guid.NewGuid().ToString("n");
+            start.Runtime = new RuntimeRef { RuntimeId = Guid.NewGuid().ToString("n"), RuntimeOrder = start.Runtime.RuntimeOrder + 1 };
         }
 
         try
@@ -389,8 +384,7 @@ public partial class SessionProcessManagerOwnershipTests
         await using var fixture = await PromptRuntimeFixture.CreateAsync();
         await fixture.Manager.StartSessionAsync(fixture.Start, CancellationToken.None);
         var replacement = fixture.Start.Clone();
-        replacement.RuntimeEpoch++;
-        replacement.RuntimeInstanceId = Guid.NewGuid().ToString("n");
+        replacement.Runtime = new RuntimeRef { RuntimeId = Guid.NewGuid().ToString("n"), RuntimeOrder = replacement.Runtime.RuntimeOrder + 1 };
         Assert.ThrowsAsync<InvalidOperationException>(() => fixture.Manager.StartSessionAsync(replacement, CancellationToken.None));
         var result = await fixture.Manager.SubmitEditorActionAsync(fixture.Command(), CancellationToken.None);
         Assert.That(result.StatusCode, Is.EqualTo(200));
@@ -421,11 +415,11 @@ public partial class SessionProcessManagerOwnershipTests
         Assert.That(fixture.Http.Requests.Select(request => request.Path), Is.EqualTo(new[] { "/queue/data" }));
     }
 
-    private sealed class PromptRuntimeFixture(string root, SessionProcessManager manager, PromptHttpHandler http, StartSessionCommand start) : IAsyncDisposable
+    private sealed class PromptRuntimeFixture(string root, SessionProcessManager manager, PromptHttpHandler http, StartRuntimeCommand start) : IAsyncDisposable
     {
         public SessionProcessManager Manager { get; } = manager;
         public PromptHttpHandler Http { get; } = http;
-        public StartSessionCommand Start { get; } = start;
+        public StartRuntimeCommand Start { get; } = start;
 
         public SubmitPromptCommand Command() => new()
         {
@@ -434,9 +428,7 @@ public partial class SessionProcessManagerOwnershipTests
             EditorSid = "editor",
             Owner = "alice",
             EditorRuntimeKind = Start.EditorRuntimeKind,
-            LifecycleGeneration = Start.LifecycleGeneration,
-            RuntimeEpoch = Start.RuntimeEpoch,
-            RuntimeInstanceId = Start.RuntimeInstanceId,
+            Runtime = Start.Runtime.Clone(),
             Request = new() { Method = "POST", Path = "api/prompt", Body = "{}", ContentType = "application/json" },
         };
 
@@ -463,14 +455,12 @@ public partial class SessionProcessManagerOwnershipTests
                 ShutdownGracePeriod = TimeSpan.FromSeconds(2),
                 ReadyTimeout = TimeSpan.FromSeconds(5),
             };
-            var start = new StartSessionCommand
+            var start = new StartRuntimeCommand
             {
                 SessionId = Guid.NewGuid().ToString("n"),
                 User = "alice",
                 EditorRuntimeKind = kind,
-                LifecycleGeneration = 7,
-                RuntimeEpoch = 11,
-                RuntimeInstanceId = Guid.NewGuid().ToString("n")
+                Runtime = new RuntimeRef { RuntimeId = Guid.NewGuid().ToString("n"), RuntimeOrder = 81 }
             };
             var http = new PromptHttpHandler();
             // This fixture tests process/HTTP fencing, not OS user isolation.

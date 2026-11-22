@@ -33,10 +33,10 @@ public class SessionProcessLogRelayTests
     {
         var identities = new RuntimeIdentityRegistry();
         // The registry already names the replacement while the old process still drains output.
-        identities.Set("session-1", 7, 4, "replacement");
+        identities.Set("session-1", new RuntimeIdentity("replacement", 74));
         await using var relay = new SessionProcessLogRelay("runner-1", identities);
 
-        relay.Enqueue("session-1", SessionProcessLogStream.Stdout, "old-runtime-line", new RuntimeIdentity(7, 3, "original"));
+        relay.Enqueue("session-1", SessionProcessLogStream.Stdout, "old-runtime-line", new RuntimeIdentity("original", 73));
         var client = new RecordingSink();
         relay.AttachSink(client);
 
@@ -44,8 +44,7 @@ public class SessionProcessLogRelayTests
         var entry = request.Entries.Single();
         Assert.Multiple(() =>
         {
-            Assert.That(entry.RuntimeEpoch, Is.EqualTo(3));
-            Assert.That(entry.RuntimeInstanceId, Is.EqualTo("original"));
+            Assert.That(entry.Runtime, Is.EqualTo(new RuntimeRef { RuntimeId = "original", RuntimeOrder = 73 }));
         });
     }
 
@@ -260,7 +259,7 @@ public class SessionProcessLogRelayTests
             => Task.FromResult(new RegisterRunnerResponse { Accepted = true });
         public Task<SyncLocalModelsResponse> SyncLocalModelsAsync(SyncLocalModelsRequest request, CancellationToken cancellationToken)
             => Task.FromResult(new SyncLocalModelsResponse());
-        public Task AckStartSessionAsync(AcknowledgeSessionStartRequest request, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task AckRuntimeStartAsync(AcknowledgeRuntimeStartRequest request, CancellationToken cancellationToken) => Task.CompletedTask;
         public Task AckStopSessionAsync(AcknowledgeSessionStopRequest request, CancellationToken cancellationToken) => Task.CompletedTask;
         public Task<GrantGpuPowerExecutionResponse> GrantGpuPowerExecutionAsync(GrantGpuPowerExecutionRequest request, CancellationToken cancellationToken)
             => throw new NotSupportedException("Power execution is not part of this fixture");
@@ -312,7 +311,7 @@ public class SessionProcessLogRelayTests
             => Task.FromResult(new RegisterRunnerResponse { Accepted = true });
         public Task<SyncLocalModelsResponse> SyncLocalModelsAsync(SyncLocalModelsRequest request, CancellationToken cancellationToken)
             => Task.FromResult(new SyncLocalModelsResponse());
-        public Task AckStartSessionAsync(AcknowledgeSessionStartRequest request, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task AckRuntimeStartAsync(AcknowledgeRuntimeStartRequest request, CancellationToken cancellationToken) => Task.CompletedTask;
         public Task AckStopSessionAsync(AcknowledgeSessionStopRequest request, CancellationToken cancellationToken) => Task.CompletedTask;
         public Task<GrantGpuPowerExecutionResponse> GrantGpuPowerExecutionAsync(GrantGpuPowerExecutionRequest request, CancellationToken cancellationToken)
             => throw new NotSupportedException("Power execution is not part of this fixture");
@@ -364,7 +363,7 @@ public class SessionProcessLogRelayTests
             => Task.FromResult(new RegisterRunnerResponse { Accepted = true });
         public Task<SyncLocalModelsResponse> SyncLocalModelsAsync(SyncLocalModelsRequest request, CancellationToken cancellationToken)
             => Task.FromResult(new SyncLocalModelsResponse());
-        public Task AckStartSessionAsync(AcknowledgeSessionStartRequest request, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task AckRuntimeStartAsync(AcknowledgeRuntimeStartRequest request, CancellationToken cancellationToken) => Task.CompletedTask;
         public Task AckStopSessionAsync(AcknowledgeSessionStopRequest request, CancellationToken cancellationToken) => Task.CompletedTask;
         public Task<GrantGpuPowerExecutionResponse> GrantGpuPowerExecutionAsync(GrantGpuPowerExecutionRequest request, CancellationToken cancellationToken)
             => throw new NotSupportedException("Power execution is not part of this fixture");
@@ -408,7 +407,7 @@ public class SessionProcessLogRelayTests
             => Task.FromResult(new RegisterRunnerResponse { Accepted = true });
         public Task<SyncLocalModelsResponse> SyncLocalModelsAsync(SyncLocalModelsRequest request, CancellationToken cancellationToken)
             => Task.FromResult(new SyncLocalModelsResponse());
-        public Task AckStartSessionAsync(AcknowledgeSessionStartRequest request, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task AckRuntimeStartAsync(AcknowledgeRuntimeStartRequest request, CancellationToken cancellationToken) => Task.CompletedTask;
         public Task AckStopSessionAsync(AcknowledgeSessionStopRequest request, CancellationToken cancellationToken) => Task.CompletedTask;
         public Task<GrantGpuPowerExecutionResponse> GrantGpuPowerExecutionAsync(GrantGpuPowerExecutionRequest request, CancellationToken cancellationToken)
             => throw new NotSupportedException("Power execution is not part of this fixture");

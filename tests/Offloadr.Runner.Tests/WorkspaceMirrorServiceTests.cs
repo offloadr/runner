@@ -490,7 +490,7 @@ public class WorkspaceMirrorServiceTests
                 }
             };
             var identities = new RuntimeIdentityRegistry();
-            identities.Set(sessionId, 7, 3, "instance-a");
+            identities.Set(sessionId, new RuntimeIdentity("instance-a", 73));
             await using var service = new WorkspaceMirrorService(
                 workspaceClient,
                 "runner-secret-value",
@@ -501,7 +501,7 @@ public class WorkspaceMirrorServiceTests
 
             await service.PrepareSessionAsync(sessionId, paths, "editor-1", "comfyui", [], CancellationToken.None);
             // A newer start for the session is admitted while this runtime still reads.
-            identities.Set(sessionId, 8, 1, "instance-b");
+            identities.Set(sessionId, new RuntimeIdentity("instance-b", 81));
             Assert.That(
                 await service.TryEnsureWorkspaceFileAvailableAsync(Path.Combine(paths.InputDirectory, "late", "audio.wav"), highPriority: false, CancellationToken.None),
                 Is.True);
@@ -511,9 +511,7 @@ public class WorkspaceMirrorServiceTests
                 RunnerId = "runner-1",
                 InstanceId = "process-1",
                 SessionId = sessionId,
-                LifecycleGeneration = 7,
-                RuntimeEpoch = 3,
-                RuntimeInstanceId = "instance-a",
+                Runtime = new RuntimeRef { RuntimeId = "instance-a", RuntimeOrder = 73 },
             };
             Assert.That(workspaceClient.SeedArchiveRequestMessages, Is.Not.Empty);
             Assert.That(workspaceClient.SeedArchiveRequestMessages.Select(static request => request.Requester), Has.All.EqualTo(expected));

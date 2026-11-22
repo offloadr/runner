@@ -16,7 +16,7 @@ internal sealed partial class SessionProcessManager
     private Task? _disposal;
 
     public Task StartSessionAsync(
-        StartSessionCommand command,
+        StartRuntimeCommand command,
         Func<SessionPaths, CancellationToken, Task>? initializer,
         Func<SessionPaths, CancellationToken, Task>? afterWorkspaceRootsPrepared,
         CancellationToken cancellationToken)
@@ -24,7 +24,7 @@ internal sealed partial class SessionProcessManager
         ArgumentNullException.ThrowIfNull(command);
         var captured = command.Clone();
         var sessionId = captured.SessionId.Trim();
-        var runtime = new RuntimeIdentity(captured.LifecycleGeneration, captured.RuntimeEpoch, captured.RuntimeInstanceId).Normalized();
+        var runtime = RuntimeIdentity.From(captured.Runtime).Normalized();
         lock (_lifetimeGate)
         {
             ObjectDisposedException.ThrowIf(_closing, this);
@@ -38,7 +38,7 @@ internal sealed partial class SessionProcessManager
         }
     }
 
-    private async Task RunOwnedStartAsync(OwnedStart start, StartSessionCommand command,
+    private async Task RunOwnedStartAsync(OwnedStart start, StartRuntimeCommand command,
         Func<SessionPaths, CancellationToken, Task>? initializer,
         Func<SessionPaths, CancellationToken, Task>? afterWorkspaceRootsPrepared)
     {

@@ -10,8 +10,8 @@ namespace Offloadr.Runner.Tests;
 public sealed class RunnerCommandStreamLifetimeTests
 {
     [Test]
-    public async Task Shutdown_JoinsOriginalLaunchAcknowledgementAfterCommandStreamEnds()
-        => await RunHeldCommandAsync("launch");
+    public async Task Shutdown_JoinsOriginalStartAcknowledgementAfterCommandStreamEnds()
+        => await RunHeldCommandAsync("start");
 
     [Test]
     public async Task Shutdown_JoinsOriginalStopAcknowledgementAfterCommandStreamEnds()
@@ -32,14 +32,11 @@ public sealed class RunnerCommandStreamLifetimeTests
         var streamDisposed = Gate();
         var command = new CommandStreamResponse
         {
-            LaunchEditorRuntime = new LaunchEditorRuntimeCommand
+            // A start without a valid order is refused at once, so only its acknowledgement is held.
+            StartRuntime = new StartRuntimeCommand
             {
-                RunnerId = "other-runner",
                 SessionId = "synthetic-session",
-                CommandId = "synthetic-launch",
-                LifecycleGeneration = 1,
-                RuntimeEpoch = 1,
-                RuntimeInstanceId = "33333333333343338333333333333333"
+                Runtime = new RuntimeRef { RuntimeId = "33333333333343338333333333333333", RuntimeOrder = 0 }
             }
         };
         if (kind == "stop") command = new()
@@ -74,10 +71,10 @@ public sealed class RunnerCommandStreamLifetimeTests
             .Returns(new AsyncServerStreamingCall<CommandStreamResponse>(stream, Task.FromResult(new Metadata()),
                 () => Status.DefaultSuccess, () => new Metadata(), () => streamDisposed.TrySetResult()));
         invoker.Setup(peer => peer.AsyncUnaryCall(
-                It.IsAny<Method<AcknowledgeEditorRuntimeLaunchRequest, AcknowledgeEditorRuntimeLaunchResponse>>(),
-                It.IsAny<string?>(), It.IsAny<CallOptions>(), It.IsAny<AcknowledgeEditorRuntimeLaunchRequest>()))
-            .Returns((Method<AcknowledgeEditorRuntimeLaunchRequest, AcknowledgeEditorRuntimeLaunchResponse> _, string? _,
-                CallOptions options, AcknowledgeEditorRuntimeLaunchRequest _) => response.Call<AcknowledgeEditorRuntimeLaunchResponse>(options));
+                It.IsAny<Method<AcknowledgeRuntimeStartRequest, AcknowledgeRuntimeStartResponse>>(),
+                It.IsAny<string?>(), It.IsAny<CallOptions>(), It.IsAny<AcknowledgeRuntimeStartRequest>()))
+            .Returns((Method<AcknowledgeRuntimeStartRequest, AcknowledgeRuntimeStartResponse> _, string? _,
+                CallOptions options, AcknowledgeRuntimeStartRequest _) => response.Call<AcknowledgeRuntimeStartResponse>(options));
         invoker.Setup(peer => peer.AsyncUnaryCall(
                 It.IsAny<Method<AcknowledgeSessionStopRequest, AcknowledgeSessionStopResponse>>(),
                 It.IsAny<string?>(), It.IsAny<CallOptions>(), It.IsAny<AcknowledgeSessionStopRequest>()))

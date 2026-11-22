@@ -26,7 +26,7 @@ public class GrpcRuntimeActivitySinkTests
         });
         var runnerId = Guid.NewGuid().ToString();
         var sink = new GrpcRuntimeActivitySink(new(invoker.Object), runnerId, "original-process");
-        var observation = RuntimeActivityObservation.Capture("session-1", new(2, 3, "33333333-3333-4333-8333-333333333333"),
+        var observation = RuntimeActivityObservation.Capture("session-1", new("33333333-3333-4333-8333-333333333333", 23),
             new() { MemoryWorkspace = true, EncryptedUploads = true, EncryptedReadsRequired = true });
         using var stop = new CancellationTokenSource();
         var started = DateTime.UtcNow;
@@ -41,9 +41,7 @@ public class GrpcRuntimeActivitySinkTests
             Assert.That(requests[1].SessionId, Is.EqualTo(observation.SessionId));
             Assert.That(requests[1].RunnerId, Is.EqualTo(Guid.Parse(runnerId).ToString("n")));
             Assert.That(requests[1].InstanceId, Is.EqualTo("original-process"));
-            Assert.That(requests[1].LifecycleGeneration, Is.EqualTo(2));
-            Assert.That(requests[1].RuntimeEpoch, Is.EqualTo(3));
-            Assert.That(requests[1].RuntimeInstanceId, Is.EqualTo(observation.Runtime.RuntimeInstanceId));
+            Assert.That(requests[1].Runtime, Is.EqualTo(new RuntimeRef { RuntimeId = "33333333333343338333333333333333", RuntimeOrder = 23 }));
             Assert.That(requests[1].Sealing.MemoryWorkspace, Is.True);
             Assert.That(requests[1].Sealing.EncryptedUploads, Is.True);
             Assert.That(requests[1].Sealing.EncryptedReadsRequired, Is.True);
@@ -61,7 +59,7 @@ public class GrpcRuntimeActivitySinkTests
         var invoker = Invoker((_, _) => Reply(new() { Outcome = outcome }));
         var sink = new GrpcRuntimeActivitySink(new(invoker.Object), Guid.NewGuid().ToString(), "process");
         Assert.ThrowsAsync<InvalidDataException>(() => sink.ReportAsync(
-            new("session-1", new(1, 1, Guid.NewGuid().ToString("n")), false, false, false), default));
+            new("session-1", new(Guid.NewGuid().ToString("n"), 1), false, false, false), default));
     }
 
     [Test]

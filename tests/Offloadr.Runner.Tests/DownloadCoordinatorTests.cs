@@ -7,7 +7,7 @@ public class DownloadCoordinatorTests
     [Test]
     public async Task Progress_CarriesTheRuntimeTheDownloadWasRegisteredFor()
     {
-        var registered = new RuntimeIdentity(7, 3, "original");
+        var registered = new RuntimeIdentity("original", 73);
         var current = registered;
         var sut = new DownloadCoordinator(new FakeAria2Client(), new FakeFileSystem(exists: ["/tmp/model.safetensors"]))
         {
@@ -29,7 +29,7 @@ public class DownloadCoordinatorTests
             SourceUrl = "https://example.com/a"
         }]);
         // The session is replaced before the download reports progress.
-        current = new RuntimeIdentity(7, 4, "replacement");
+        current = new RuntimeIdentity("replacement", 74);
 
         await sut.EnsureDownloadedAsync("/tmp/model.safetensors", CancellationToken.None, highPriority: false);
 

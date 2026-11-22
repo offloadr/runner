@@ -8,8 +8,12 @@ internal static partial class ServiceClientManager
     /// <summary>Longest failure message a heartbeat carries, in UTF-8 bytes.</summary>
     internal const int MaxRuntimeStatusMessageBytes = 512;
 
-    /// <summary>How the last startup this runner owned ended, for the runtime it started.</summary>
-    internal sealed record RecordedStartupOutcome(string SessionId, RuntimeIdentity Runtime, StartupOutcome Outcome, Guid? Process);
+    /// <summary>
+    /// How the last startup this runner owned ended, for the runtime it started, and the sealing
+    /// its start asked for: a repeated start is answered with this outcome only when it asks the same.
+    /// </summary>
+    internal sealed record RecordedStartupOutcome(string SessionId, RuntimeIdentity Runtime, StartupOutcome Outcome, Guid? Process,
+        SessionSealing? Requested = null);
 
     /// <summary>
     /// What the heartbeat reports about the runner's one logical session: the session, the
@@ -47,7 +51,7 @@ internal static partial class ServiceClientManager
         var status = new RuntimeStatus { SessionId = sessionId, Phase = RuntimePhase.None };
         if (sessionId.Length == 0) return status;
 
-        var hasRuntime = logicalSessionState.TryGetRuntime(sessionId, out var runtime, out _);
+        var hasRuntime = logicalSessionState.TryGetRuntime(sessionId, out var runtime);
         if (isStopping(sessionId))
         {
             status.Phase = RuntimePhase.Stopping;
@@ -89,12 +93,7 @@ internal static partial class ServiceClientManager
     }
 
     private static void SetRuntime(RuntimeStatus status, RuntimeIdentity runtime)
-    {
-        var normalized = runtime.Normalized();
-        status.LifecycleGeneration = normalized.LifecycleGeneration;
-        status.RuntimeEpoch = normalized.RuntimeEpoch;
-        status.RuntimeInstanceId = normalized.RuntimeInstanceId;
-    }
+        => status.Runtime = runtime.Normalized().ToRef();
 
     internal static string Truncate(string? message, int maxBytes)
     {

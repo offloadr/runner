@@ -30,7 +30,7 @@ The Offloadr runner: the agent that executes GPU work for the Offloadr control p
 ## Protocol compatibility policy
 
 - One current protocol (`RunnerProtocol.RUNNER_PROTOCOL_CURRENT`). Coordinated protocol changes raise it and update both sides directly; an outdated runner is refused and told to update. Do not add backward-compatibility shims or preserve superseded wire layouts. See `docs/contracts-sync.md`.
-- The current Stop acknowledgement uses `command_id = 3`, string `instance_id = 4`, and lifecycle generation, runtime epoch and runtime instance in fields 5–7. The previous layout is intentionally unsupported.
+- A runtime is named by `RuntimeRef` (`runtime_id`, `runtime_order`). The Stop acknowledgement uses `command_id = 3`, string `instance_id = 4` and the echoed `up_to_runtime_order = 11`. Earlier layouts are intentionally unsupported.
 - Keep all five shared definitions identical with the control plane and regenerate affected consumers as described in `docs/contracts-sync.md`.
 
 ## Agent boundary
@@ -41,12 +41,14 @@ The Offloadr runner: the agent that executes GPU work for the Offloadr control p
 
 ## Command and session rules
 
-- Validate and retain exact runner, session, lifecycle generation, epoch, revision, attempt, command and runtime-instance identity through execution and acknowledgement.
-- Make exact command retries idempotent. Never apply an older command to a newer runtime or logical session.
+- Validate and retain exact runner, session, command and runtime (`RuntimeRef`) identity through execution and acknowledgement. Two runtimes are the same when their `runtime_id` is; the higher `runtime_order` is newer, across sessions. `lifecycle_generation` only matches GPU power commands.
+- A start is refused when its order is at or below its session's Stop cutoff or the eviction floor, below the newest start adopted, or equal to it with another id. A repeated start of the adopted runtime joins its startup or replays its recorded acknowledgement; it never launches twice. A newer start replaces: it cancels the startup in flight, stops the session's older child (or pre-empts another session), then launches.
+- A Stop compares once: a runtime, child or startup of its session above its cutoff makes it superseded, and it does nothing. Otherwise it records the cutoff before cleanup.
+- Never apply an older command to a newer runtime or logical session.
 - Retry acknowledgements with the same result and identity without re-executing a completed action.
 - Distinguish host shutdown cancellation, workflow cancellation, Stop and command failure. Host shutdown is never a successful acknowledgement.
-- Preserve the logical runner session through an intentional child-runtime restart.
-- Clear matching logical session and runtime identity state after failed start/launch cleanup or unexpected child exit, so heartbeats do not protect a dead process.
+- Preserve the logical runner session through an intentional child-runtime restart. A relaunch keeps the session's sealing and may not weaken it.
+- Clear matching logical session and runtime identity state after failed start cleanup or unexpected child exit, so heartbeats do not protect a dead process.
 - Cleanup tolerates partially started sidecars, already-stopped processes and repeated calls.
 - Gate runtime-specific probes and behavior explicitly by runtime kind (ComfyUI, Forge Neo, future runtimes).
 - Preserve Linux-only assumptions in Offloadr.Runner.Linux unless adding explicit multi-platform support.
@@ -54,7 +56,8 @@ The Offloadr runner: the agent that executes GPU work for the Offloadr control p
 ## Testing rules
 
 - Cover duplicate and stale commands, acknowledgement replay, reconnect ordering, cancellation classes, and Stop during startup or restart.
-- Verify failed start/launch and unexpected-exit cleanup clears only the matching logical session and runtime identity.
+- Cover the start and Stop orderings: a Stop before an older delayed start, an older Stop after a newer start, a repeated start while launching and after it finished, a newer start for the same session, an evicted Stop cutoff, and a start for an older assignment.
+- Verify failed start and unexpected-exit cleanup clears only the matching logical session and runtime identity.
 - Test runtime-kind gating, native connection bridge state and reconnects, the heartbeat's runtime status, and idempotent process/download/workspace/artifact cleanup.
 - Linux-native tests call `LinuxTestPrerequisites` and are ignored elsewhere; `RUNNER_NATIVE_TESTS_REQUIRED=1` turns a missing prerequisite into a failure (CI sets it).
 

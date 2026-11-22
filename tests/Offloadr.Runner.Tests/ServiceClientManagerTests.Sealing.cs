@@ -15,103 +15,107 @@ public partial class ServiceClientManagerTests
             SealingStatus = new SessionSealingStatus { MemoryWorkspace = true, EncryptedUploads = true, EncryptedReadsRequired = true },
         };
 
-        await ServiceClientManager.HandleStartSessionCommand(SealedStart(7, 3, InstanceA), harness.Deps);
+        await ServiceClientManager.HandleStartRuntimeCommand(SealedStart(InstanceA, 3), harness.Deps);
 
         var ack = await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
         Assert.That(ack.Ready, Is.True);
         Assert.That(ack.Sealing, Is.EqualTo(harness.SealingStatus));
         Assert.That(ack.InstanceId, Is.EqualTo(harness.InstanceId.Trim()), "the process that ran it");
+        Assert.That(harness.Starts.Single().Sealing, Is.EqualTo(SealedStart(InstanceA, 3).Sealing));
     }
 
     [Test]
-    public async Task LaunchSeenWithoutItsStart_KeepsItsSealingForTheNextLaunch()
+    public async Task Relaunch_WithoutSealingKeepsTheSealingTheSessionStartedWith()
     {
         var harness = new RuntimeCommandHarness();
-        // This runner never saw the lifecycle's Start (a restart of the agent, say).
-        var first = Launch(7, 4, InstanceA, revision: 1);
-        first.Sealing = SealedStart(7, 4, InstanceA).Sealing;
-        await ServiceClientManager.HandleLaunchRuntimeCommand(first, harness.Deps);
-        await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 1);
+        var start = SealedStart(InstanceA, 3);
+        await ServiceClientManager.HandleStartRuntimeCommand(start, harness.Deps);
+        await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
 
-        await ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 5, InstanceB, revision: 2), harness.Deps);
-        await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 2);
+        await ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceB, 4), harness.Deps);
+        var ack = await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 2);
 
-        Assert.That(harness.Starts.Last().Sealing, Is.EqualTo(first.Sealing), "the child's restart stays sealed");
+        var relaunch = harness.Starts.Last();
+        Assert.Multiple(() =>
+        {
+            Assert.That(ack.Ready, Is.True);
+            Assert.That(relaunch.Runtime.RuntimeOrder, Is.EqualTo(4));
+            Assert.That(relaunch.Sealing, Is.EqualTo(start.Sealing), "the child's restart stays sealed");
+        });
     }
 
     [Test]
-    public async Task LaunchThatStrengthensTheStartsSealing_KeepsItForTheNextLaunch()
+    public async Task RelaunchThatStrengthensTheStartsSealing_KeepsItForTheNextRelaunch()
     {
         var harness = new RuntimeCommandHarness();
-        // Started with a weaker, unsealed profile; a launch then runs it sealed.
-        var start = SealedStart(7, 3, InstanceA);
+        // Started with a weaker, unsealed profile; a relaunch then runs it sealed.
+        var start = SealedStart(InstanceA, 3);
         start.Sealing = new SessionSealing { Required = false };
-        await ServiceClientManager.HandleStartSessionCommand(start, harness.Deps);
+        await ServiceClientManager.HandleStartRuntimeCommand(start, harness.Deps);
         await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
-        await ServiceClientManager.HandleQuiesceRuntimeCommandAsync(Quiesce(7, 3, InstanceA, revision: 1), harness.Deps);
-        var sealedLaunch = Launch(7, 4, InstanceB, revision: 2);
-        sealedLaunch.Sealing = SealedStart(7, 4, InstanceB).Sealing;
-        await ServiceClientManager.HandleLaunchRuntimeCommand(sealedLaunch, harness.Deps);
-        await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 1);
+        var sealedRelaunch = SealedStart(InstanceB, 4);
+        await ServiceClientManager.HandleStartRuntimeCommand(sealedRelaunch, harness.Deps);
+        await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 2);
 
-        // The next restart's launch omits sealing.
-        await ServiceClientManager.HandleQuiesceRuntimeCommandAsync(Quiesce(7, 4, InstanceB, revision: 3), harness.Deps);
-        await ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 5, InstanceA, revision: 4), harness.Deps);
-        await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 2);
+        // The next relaunch omits sealing.
+        await ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceC, 5), harness.Deps);
+        await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 3);
 
-        Assert.That(harness.Sink.LaunchAcks.Select(static ack => ack.Ready), Is.All.True);
-        Assert.That(harness.Starts.Last().Sealing, Is.EqualTo(sealedLaunch.Sealing), "it stays as sealed as it last ran");
+        Assert.That(harness.Sink.StartAcks.Select(static ack => ack.Ready), Is.All.True);
+        Assert.That(harness.Starts.Last().Sealing, Is.EqualTo(sealedRelaunch.Sealing), "it stays as sealed as it last ran");
     }
 
     [Test]
-    public async Task RefusedLaunch_KeepsTheSealingForTheNextLaunch()
+    public async Task RefusedRelaunch_KeepsTheSealingForTheNextRelaunch()
     {
         var harness = new RuntimeCommandHarness();
-        var start = SealedStart(7, 3, InstanceA);
-        await ServiceClientManager.HandleStartSessionCommand(start, harness.Deps);
+        var start = SealedStart(InstanceA, 3);
+        await ServiceClientManager.HandleStartRuntimeCommand(start, harness.Deps);
         await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
 
-        // Refused as weakening, then a launch that carries no sealing of its own.
-        var weakening = Launch(7, 4, InstanceB, revision: 1);
+        // Refused as weakening, then a relaunch that carries no sealing of its own.
+        var weakening = Start(InstanceB, 4);
         weakening.Sealing = new SessionSealing { Required = false };
-        await ServiceClientManager.HandleLaunchRuntimeCommand(weakening, harness.Deps);
-        await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 1);
-        await ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 5, InstanceA, revision: 2), harness.Deps);
-        await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 2);
+        await ServiceClientManager.HandleStartRuntimeCommand(weakening, harness.Deps);
+        Assert.That((await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 2)).Ready, Is.False);
+        await ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceC, 5), harness.Deps);
+        Assert.That((await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 3)).Ready, Is.True);
 
         Assert.That(harness.Starts.Last().Sealing, Is.EqualTo(start.Sealing), "still sealed as it started");
     }
 
     [Test]
-    public async Task LaunchOfANewerLifecycle_DoesNotInheritAnOlderLifecyclesSealing()
+    public async Task StartOfANewerLifecycle_DoesNotInheritAnOlderLifecyclesSealing()
     {
         var harness = new RuntimeCommandHarness();
-        await ServiceClientManager.HandleStartSessionCommand(SealedStart(7, 3, InstanceA), harness.Deps);
+        await ServiceClientManager.HandleStartRuntimeCommand(SealedStart(InstanceA, 3), harness.Deps);
         await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
 
         // Generation 8 began without this runner seeing generation 7 stop.
-        await ServiceClientManager.HandleLaunchRuntimeCommand(Launch(8, 1, InstanceB, revision: 1), harness.Deps);
-        await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 1);
+        var newer = Start(InstanceB, 4);
+        newer.LifecycleGeneration = 8;
+        await ServiceClientManager.HandleStartRuntimeCommand(newer, harness.Deps);
+        Assert.That((await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 2)).Ready, Is.True);
 
         Assert.That(harness.Starts.Last().Sealing, Is.Null);
     }
 
     [Test]
-    public async Task FailedStart_DoesNotLeaveItsSealingForALaterLaunch()
+    public async Task FailedStart_DoesNotLeaveItsSealingForALaterStart()
     {
         var harness = new RuntimeCommandHarness
         {
-            BeforeStart = (start, _) => start.RuntimeEpoch == 3
+            BeforeStart = (start, _) => start.Runtime.RuntimeOrder == 3
                 ? throw new InvalidOperationException("Sealed storage is unavailable: low.")
                 : Task.CompletedTask,
         };
-        await ServiceClientManager.HandleStartSessionCommand(SealedStart(7, 3, InstanceA), harness.Deps);
+        await ServiceClientManager.HandleStartRuntimeCommand(SealedStart(InstanceA, 3), harness.Deps);
         var ack = await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
         Assert.That(ack.Ready, Is.False);
 
-        // A launch whose Start this runner did not see, without sealing of its own.
-        await ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 4, InstanceB, revision: 1), harness.Deps);
-        await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 1);
+        // A later start without sealing of its own.
+        await ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceB, 4), harness.Deps);
+        await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 2);
 
         Assert.That(harness.Starts.Last().Sealing, Is.Null, "the failed start's recipient is not inherited");
     }
@@ -125,7 +129,7 @@ public partial class ServiceClientManagerTests
             BeforeStart = (_, _) => throw new InvalidOperationException("Sealed storage is unavailable: low."),
         };
 
-        await ServiceClientManager.HandleStartSessionCommand(SealedStart(7, 3, InstanceA), harness.Deps);
+        await ServiceClientManager.HandleStartRuntimeCommand(SealedStart(InstanceA, 3), harness.Deps);
 
         var ack = await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
         Assert.That(ack.Ready, Is.False);
@@ -148,9 +152,9 @@ public partial class ServiceClientManagerTests
                 BeforeStart = (_, _) => throw new InvalidOperationException("Workspace seed entry 'my-secret-portrait.png' is invalid."),
                 SealsStart = _ => sealedByRunner,
             };
-            var start = sealingRequested ? SealedStart(7, 3, InstanceA) : Start(7, 3, InstanceA);
+            var start = sealingRequested ? SealedStart(InstanceA, 3) : Start(InstanceA, 3);
 
-            await ServiceClientManager.HandleStartSessionCommand(start, harness.Deps);
+            await ServiceClientManager.HandleStartRuntimeCommand(start, harness.Deps);
 
             var ack = await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
             Assert.That(ack.Message, Does.Contain("my-secret-portrait.png"), "the control plane still learns why");
@@ -177,22 +181,6 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
-    public async Task LaunchRuntime_KeepsTheSealingTheSessionStartedWith()
-    {
-        var harness = new RuntimeCommandHarness();
-        var start = SealedStart(7, 3, InstanceA);
-        await ServiceClientManager.HandleStartSessionCommand(start, harness.Deps);
-        await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
-
-        await ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 4, InstanceB, revision: 1), harness.Deps);
-        await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 1);
-
-        var relaunch = harness.Starts.Last();
-        Assert.That(relaunch.RuntimeEpoch, Is.EqualTo(4));
-        Assert.That(relaunch.Sealing, Is.EqualTo(start.Sealing));
-    }
-
-    [Test]
     public async Task StartAskingForOtherSealing_DoesNotJoinTheStartupInProgress()
     {
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -207,9 +195,9 @@ public partial class ServiceClientManagerTests
         };
 
         // An unsealed start of the runtime is under way when a sealed one for it arrives.
-        var unsealed = ServiceClientManager.HandleStartSessionCommand(Start(7, 3, InstanceA), harness.Deps);
+        var unsealed = ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceA, 3), harness.Deps);
         await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
-        await ServiceClientManager.HandleStartSessionCommand(SealedStart(7, 3, InstanceA), harness.Deps);
+        await ServiceClientManager.HandleStartRuntimeCommand(SealedStart(InstanceA, 3), harness.Deps);
         var refused = await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
         release.TrySetResult();
         await unsealed.WaitAsync(TimeSpan.FromSeconds(5));
@@ -225,98 +213,106 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
-    public async Task DuplicateStartOfARunningRuntime_KeepsTheAdmittedSealing()
+    public async Task RepeatedStartOfAFinishedRuntimeWithOtherSealing_IsRefusedAndKeepsTheAdmittedSealing()
     {
         var harness = new RuntimeCommandHarness();
-        var start = SealedStart(7, 3, InstanceA);
-        await ServiceClientManager.HandleStartSessionCommand(start, harness.Deps);
+        var start = SealedStart(InstanceA, 3);
+        await ServiceClientManager.HandleStartRuntimeCommand(start, harness.Deps);
         await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
-        harness.Track(start.SessionId, new RuntimeIdentity(7, 3, InstanceA));
 
-        // The same runtime's Start, delivered again without sealing.
-        var duplicate = Start(7, 3, InstanceA);
-        await ServiceClientManager.HandleStartSessionCommand(duplicate, harness.Deps);
-        await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 2);
-        await ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 4, InstanceB, revision: 1), harness.Deps);
-        await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 1);
+        // The same runtime's start, delivered again without sealing.
+        await ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceA, 3), harness.Deps);
+        var refused = await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 2);
+        await ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceB, 4), harness.Deps);
+        await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 3);
 
-        Assert.That(harness.Starts.Last().Sealing, Is.EqualTo(start.Sealing));
+        Assert.Multiple(() =>
+        {
+            Assert.That(refused.Ready, Is.False);
+            Assert.That(refused.Message, Is.EqualTo(ServiceClientManager.OtherSealingMessage));
+            Assert.That(harness.Starts, Has.Count.EqualTo(2), "the refused repeat launched nothing");
+            Assert.That(harness.Starts.Last().Sealing, Is.EqualTo(start.Sealing));
+        });
     }
 
     [Test]
-    public async Task LaunchRuntime_ThatWouldSwapTheOutputRecipientIsRefused()
+    public async Task Relaunch_ThatWouldSwapTheOutputRecipientIsRefused()
     {
         var harness = new RuntimeCommandHarness();
-        await ServiceClientManager.HandleStartSessionCommand(SealedStart(7, 3, InstanceA), harness.Deps);
+        await ServiceClientManager.HandleStartRuntimeCommand(SealedStart(InstanceA, 3), harness.Deps);
         await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
         var startsBefore = harness.Starts.Count;
 
-        var launch = Launch(7, 4, InstanceB, revision: 1);
-        launch.Sealing = SealedStart(7, 4, InstanceB).Sealing;
-        launch.Sealing.OutputRecipient.KeyId = "output-2";
-        await ServiceClientManager.HandleLaunchRuntimeCommand(launch, harness.Deps);
+        var relaunch = SealedStart(InstanceB, 4);
+        relaunch.Sealing.OutputRecipient.KeyId = "output-2";
+        await ServiceClientManager.HandleStartRuntimeCommand(relaunch, harness.Deps);
 
-        var ack = await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 1);
+        var ack = await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 2);
         Assert.That(ack.Ready, Is.False);
         Assert.That(harness.Starts, Has.Count.EqualTo(startsBefore));
     }
 
     [Test]
-    public async Task LaunchRuntime_ThatWouldDropTheOutputRecipientIsRefused()
+    public async Task Relaunch_ThatWouldDropTheOutputRecipientIsRefused()
     {
         var harness = new RuntimeCommandHarness();
         // Encrypted uploads without the full sealed profile.
-        var start = SealedStart(7, 3, InstanceA);
+        var start = SealedStart(InstanceA, 3);
         start.Sealing.Required = false;
-        await ServiceClientManager.HandleStartSessionCommand(start, harness.Deps);
+        await ServiceClientManager.HandleStartRuntimeCommand(start, harness.Deps);
         await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
         var startsBefore = harness.Starts.Count;
 
-        var launch = Launch(7, 4, InstanceB, revision: 1);
-        launch.Sealing = new SessionSealing();
-        await ServiceClientManager.HandleLaunchRuntimeCommand(launch, harness.Deps);
+        var relaunch = Start(InstanceB, 4);
+        relaunch.Sealing = new SessionSealing();
+        await ServiceClientManager.HandleStartRuntimeCommand(relaunch, harness.Deps);
 
-        var ack = await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 1);
+        var ack = await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 2);
         Assert.That(ack.Ready, Is.False);
         Assert.That(harness.Starts, Has.Count.EqualTo(startsBefore));
     }
 
     [Test]
-    public async Task LaunchRuntime_ThatWouldWeakenTheSessionsSealingIsRefused()
+    public async Task Relaunch_ThatWouldWeakenTheSessionsSealingIsRefused()
     {
         var harness = new RuntimeCommandHarness();
-        await ServiceClientManager.HandleStartSessionCommand(SealedStart(7, 3, InstanceA), harness.Deps);
+        await ServiceClientManager.HandleStartRuntimeCommand(SealedStart(InstanceA, 3), harness.Deps);
         await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
         var startsBefore = harness.Starts.Count;
 
-        var launch = Launch(7, 4, InstanceB, revision: 1);
-        launch.Sealing = new SessionSealing { Required = false };
-        await ServiceClientManager.HandleLaunchRuntimeCommand(launch, harness.Deps);
+        var relaunch = Start(InstanceB, 4);
+        relaunch.Sealing = new SessionSealing { Required = false };
+        await ServiceClientManager.HandleStartRuntimeCommand(relaunch, harness.Deps);
 
-        var ack = await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 1);
-        Assert.That(ack.Ready, Is.False);
-        Assert.That(ack.Message, Does.Contain("cannot run it with less sealing"));
-        Assert.That(harness.Starts, Has.Count.EqualTo(startsBefore), "no runtime was started");
+        var ack = await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 2);
+        Assert.Multiple(() =>
+        {
+            Assert.That(ack.Ready, Is.False);
+            Assert.That(ack.Message, Does.Contain("cannot run it with less sealing"));
+            Assert.That(harness.Starts, Has.Count.EqualTo(startsBefore), "no runtime was started");
+            Assert.That(harness.Tracked(CommandSessionId), Is.Null, "the older child was stopped first, as for any newer start");
+        });
     }
 
     [Test]
-    public async Task DuplicateStartDelivery_DoesNotReplaceTheAdmittedStartsSealing()
+    public async Task RepeatedStartDelivery_DoesNotReplaceTheAdmittedStartsSealing()
     {
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var harness = new RuntimeCommandHarness { BeforeStart = (_, token) => release.Task.WaitAsync(token) };
-        var start = SealedStart(7, 3, InstanceA);
+        var start = SealedStart(InstanceA, 3);
         var duplicate = start.Clone();
         duplicate.Sealing = null;
 
-        var admitted = ServiceClientManager.HandleStartSessionCommand(start, harness.Deps);
+        var admitted = ServiceClientManager.HandleStartRuntimeCommand(start, harness.Deps);
         await WaitUntilStartedAsync(harness);
-        var joined = ServiceClientManager.HandleStartSessionCommand(duplicate, harness.Deps);
+        var joined = ServiceClientManager.HandleStartRuntimeCommand(duplicate, harness.Deps);
         release.SetResult();
         await Task.WhenAll(admitted, joined);
-        await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1);
+        await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 2);
 
-        await ServiceClientManager.HandleLaunchRuntimeCommand(Launch(7, 4, InstanceB, revision: 1), harness.Deps);
-        await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 1);
+        harness.BeforeStart = (_, _) => Task.CompletedTask;
+        await ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceB, 4), harness.Deps);
+        await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 3);
 
         Assert.That(harness.Starts.Last().Sealing, Is.EqualTo(start.Sealing));
     }
@@ -333,10 +329,10 @@ public partial class ServiceClientManagerTests
     [Test]
     public async Task Stop_WithAnUnknownCountReplaysTheSameAcknowledgement()
     {
-        var harness = RunningHarness(7, 3, InstanceA);
+        var harness = RunningHarness(InstanceA, 3);
         harness.UnsavedArtifacts = 1;
         harness.UnsavedArtifactsIncomplete = true;
-        var stop = Stop(7, 3, InstanceA);
+        var stop = Stop(3);
 
         await ServiceClientManager.HandleStopSessionCommandAsync(stop, harness.Deps);
         var first = await harness.Sink.WaitForAsync(harness.Sink.StopAcks, 1);
@@ -352,10 +348,10 @@ public partial class ServiceClientManagerTests
     [Test]
     public async Task Stop_DropsTheLifecycleNoteOnlyAfterItsAcknowledgementGoesThrough()
     {
-        var harness = RunningHarness(7, 3, InstanceA);
+        var harness = RunningHarness(InstanceA, 3);
         harness.Sink.FailNextAcknowledgements(2);
 
-        await ServiceClientManager.HandleStopSessionCommandAsync(Stop(7, 3, InstanceA), harness.Deps);
+        await ServiceClientManager.HandleStopSessionCommandAsync(Stop(3), harness.Deps);
         Assert.That(harness.ForgottenLifecycles, Is.Empty, "not before the control plane has the count");
 
         await harness.Sink.WaitForAsync(harness.Sink.StopAcks, 1);
@@ -371,11 +367,11 @@ public partial class ServiceClientManagerTests
     [Test]
     public async Task Stop_ReportsAnIncompleteCountAsUnknown()
     {
-        var harness = RunningHarness(7, 3, InstanceA);
+        var harness = RunningHarness(InstanceA, 3);
         harness.UnsavedArtifacts = 1;
         harness.UnsavedArtifactsIncomplete = true;
 
-        await ServiceClientManager.HandleStopSessionCommandAsync(Stop(7, 3, InstanceA), harness.Deps);
+        await ServiceClientManager.HandleStopSessionCommandAsync(Stop(3), harness.Deps);
         var ack = await harness.Sink.WaitForAsync(harness.Sink.StopAcks, 1);
 
         Assert.That(ack.UnsavedArtifactsUnknown, Is.True);
@@ -385,9 +381,9 @@ public partial class ServiceClientManagerTests
     [Test]
     public async Task Stop_ReportsUnsavedArtifactsAndReplaysTheSameAcknowledgement()
     {
-        var harness = RunningHarness(7, 3, InstanceA);
+        var harness = RunningHarness(InstanceA, 3);
         harness.UnsavedArtifacts = 2;
-        var stop = Stop(7, 3, InstanceA);
+        var stop = Stop(3);
 
         await ServiceClientManager.HandleStopSessionCommandAsync(stop, harness.Deps);
         var first = await harness.Sink.WaitForAsync(harness.Sink.StopAcks, 1);
@@ -398,19 +394,27 @@ public partial class ServiceClientManagerTests
         {
             Assert.That(first.UnsavedArtifactCount, Is.EqualTo(2));
             Assert.That(replayed.UnsavedArtifactCount, Is.EqualTo(2), "a redelivery replays the completed stop's result");
+            Assert.That(harness.UnsavedTakenFor, Is.EqualTo(new[] { CommandSessionId }));
             Assert.That(harness.Calls.Count(call => call.StartsWith("stop:", StringComparison.Ordinal)), Is.EqualTo(1));
         });
     }
 
     [Test]
-    public async Task SupersededStop_LeavesTheLostArtifactsForTheCurrentRuntimesStop()
+    public async Task SupersededStop_LeavesTheLostArtifactsAndTheNoteForTheCurrentRuntimesStop()
     {
-        var harness = RunningHarness(7, 4, InstanceB);
+        var harness = RunningHarness(InstanceB, 4);
         harness.UnsavedArtifacts = 2;
 
-        await ServiceClientManager.HandleStopSessionCommandAsync(Stop(7, 3, InstanceA), harness.Deps);
+        await ServiceClientManager.HandleStopSessionCommandAsync(Stop(3), harness.Deps);
         var stale = await harness.Sink.WaitForAsync(harness.Sink.StopAcks, 1);
-        await ServiceClientManager.HandleStopSessionCommandAsync(Stop(7, 4, InstanceB), harness.Deps);
+        await Task.Delay(100);
+        Assert.Multiple(() =>
+        {
+            Assert.That(harness.UnsavedTakenFor, Is.Empty);
+            Assert.That(harness.ForgottenLifecycles, Is.Empty);
+        });
+
+        await ServiceClientManager.HandleStopSessionCommandAsync(Stop(4), harness.Deps);
         var current = await harness.Sink.WaitForAsync(harness.Sink.StopAcks, 2);
 
         Assert.Multiple(() =>
@@ -421,46 +425,6 @@ public partial class ServiceClientManagerTests
             Assert.That(current.CleanupDisposition, Is.EqualTo(RunnerCleanupDisposition.Performed));
             Assert.That(current.UnsavedArtifactCount, Is.EqualTo(2));
         });
-    }
-
-    [Test]
-    public async Task OlderLifecyclesStop_ReportsThatLifecyclesLossWithoutStoppingTheNewerOne()
-    {
-        var harness = RunningHarness(8, 1, InstanceB);
-        harness.UnsavedArtifacts = 2;
-
-        await ServiceClientManager.HandleStopSessionCommandAsync(Stop(7, 3, InstanceA), harness.Deps);
-        var older = await harness.Sink.WaitForAsync(harness.Sink.StopAcks, 1);
-
-        Assert.Multiple(() =>
-        {
-            Assert.That(older.UnsavedArtifactCount, Is.EqualTo(2), "lifecycle 7's own loss");
-            Assert.That(older.CleanupDisposition, Is.EqualTo(RunnerCleanupDisposition.Superseded), "it tore nothing down");
-            Assert.That(older.UnsavedArtifactsUnknown, Is.True, "a superseded Stop's evidence stays unknown");
-            Assert.That(harness.UnsavedTakenFor, Is.EqualTo(new[] { 7UL }), "none of lifecycle 8's");
-            Assert.That(harness.ForgottenLifecycles, Has.Count.EqualTo(1), "its note goes once acknowledged");
-            Assert.That(harness.Calls.Any(call => call.StartsWith("stop:", StringComparison.Ordinal)), Is.False, "the newer runtime keeps running");
-            Assert.That(harness.Tracked(CommandSessionId), Is.EqualTo(new RuntimeIdentity(8, 1, InstanceB)));
-        });
-    }
-
-    [Test]
-    public async Task LaunchRuntime_UsesItsOwnSealingAndAcknowledgesWhatItGot()
-    {
-        var harness = new RuntimeCommandHarness
-        {
-            SealingStatus = new SessionSealingStatus { MemoryWorkspace = true, EncryptedUploads = true, EncryptedReadsRequired = true },
-        };
-        var launch = Launch(7, 3, InstanceA, revision: 1);
-        launch.Sealing = SealedStart(7, 3, InstanceA).Sealing;
-
-        // A runner that never saw the start, as after an agent restart.
-        await ServiceClientManager.HandleLaunchRuntimeCommand(launch, harness.Deps);
-        var ack = await harness.Sink.WaitForAsync(harness.Sink.LaunchAcks, 1);
-
-        Assert.That(harness.Starts.Single().Sealing, Is.EqualTo(launch.Sealing));
-        Assert.That(ack.Sealing, Is.EqualTo(harness.SealingStatus));
-        Assert.That(ack.InstanceId, Is.EqualTo(harness.InstanceId.Trim()), "the process that ran it");
     }
 
     [Test]
@@ -530,9 +494,9 @@ public partial class ServiceClientManagerTests
         }
     }
 
-    private static StartSessionCommand SealedStart(ulong generation, ulong epoch, string instance)
+    private static StartRuntimeCommand SealedStart(string runtimeId, ulong runtimeOrder)
     {
-        var start = Start(generation, epoch, instance);
+        var start = Start(runtimeId, runtimeOrder);
         start.Sealing = new SessionSealing
         {
             Required = true,
