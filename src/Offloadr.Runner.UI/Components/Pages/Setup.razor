@@ -8,7 +8,7 @@
 
 <PageTitle>Set up - Offloadr Runner</PageTitle>
 
-<MudStack Spacing="4">
+<MudStack Spacing="3">
     <MudStack Row="true" AlignItems="AlignItems.Start" Justify="Justify.SpaceBetween" Wrap="Wrap.Wrap" Spacing="2">
         <div>
             <MudText Typo="Typo.h5" HtmlTag="h1">Set up your GPU for Offloadr</MudText>
@@ -22,9 +22,9 @@
         }
     </MudStack>
 
-    <MudGrid Spacing="4">
+    <MudGrid Spacing="3">
         <MudItem xs="12" md="6">
-            <MudPaper Outlined="true" Class="pa-5" Style="height: 100%">
+            <MudPaper Outlined="true" Class="pa-4" Style="height: 100%">
                 <SetupStepHeading Number="1" Title="Check this computer" Done="ComputerReady" />
                 <MudStack Spacing="3" Class="mt-3">
                     <CheckRow Check="EnvironmentChecks.Docker(View)" />
@@ -38,7 +38,7 @@
         </MudItem>
 
         <MudItem xs="12" md="6">
-            <MudPaper Outlined="true" Class="pa-5" Style="height: 100%">
+            <MudPaper Outlined="true" Class="pa-4" Style="height: 100%">
                 <SetupStepHeading Number="2" Title="Add your runner key" Done="KeyEntered" />
                 <MudText Typo="Typo.body2" Class="mud-text-secondary mt-2">
                     In the Offloadr web app, open Settings and create a personal runner key, then paste it here. It is stored encrypted on this computer.
@@ -57,7 +57,7 @@
         </MudItem>
 
         <MudItem xs="12" md="6">
-            <MudPaper Outlined="true" Class="pa-5" Style="height: 100%">
+            <MudPaper Outlined="true" Class="pa-4" Style="height: 100%">
                 <SetupStepHeading Number="3" Title="Choose your models" Done="@null" />
                 <MudText Typo="Typo.body2" Class="mud-text-secondary mt-2">
                     Point the runner at the folder with your model files, and it uses the ones that match what a workflow needs. You can skip this and add a folder later in Settings.
@@ -94,13 +94,16 @@
         </MudItem>
 
         <MudItem xs="12" md="6">
-            <MudPaper Outlined="true" Class="pa-5" Style="height: 100%">
+            <MudPaper Outlined="true" Class="pa-4" Style="height: 100%">
                 <SetupStepHeading Number="4" Title="Start the runner" Done="RunnerReady" />
                 <MudText Typo="Typo.body2" Class="mud-text-secondary mt-2">
                     The first start downloads the runner image for your editor, which is several gigabytes and can take a while.
                 </MudText>
                 <MudStack Spacing="3" Class="mt-3">
-                    <MudSwitch T="bool" @bind-Value="_autoStart" Color="Color.Primary" Label="Start the runner whenever this app opens" />
+                    <MudStack Spacing="0">
+                        <MudSwitch T="bool" @bind-Value="_autoStart" Color="Color.Primary" Label="Make this GPU available to Offloadr whenever this app opens" />
+                        <MudText Typo="Typo.caption" Class="mud-text-secondary ml-14">@SettingsPage.AutoStartHelp</MudText>
+                    </MudStack>
                     @if (_problems.Count > 0)
                     {
                         <MudAlert Severity="Severity.Warning" Dense="true">

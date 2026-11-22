@@ -32,7 +32,7 @@ public sealed record RunnerSettings
     /// <summary>Editor template to run when the control plane does not say which one is selected.</summary>
     public string? SelectedEditorTemplate { get; init; }
 
-    /// <summary>Start the runner when the app opens.</summary>
+    /// <summary>Start the runner when the app opens, idle until a session starts its editor.</summary>
     public bool AutoStart { get; init; }
 
     /// <summary>

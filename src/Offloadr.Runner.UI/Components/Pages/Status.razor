@@ -6,12 +6,12 @@
 
 <PageTitle>Offloadr Runner</PageTitle>
 
-<MudStack Spacing="4">
-    <MudPaper Outlined="true" Class="pa-5">
+<MudStack Spacing="3" Class="runner-fill">
+    <MudPaper Outlined="true" Class="pa-4">
         <StatusHero />
         @if (EnvironmentChecks.NeedsSetup(SettingsStore.Current) && View.Fault is null)
         {
-            <MudAlert Severity="Severity.Info" Class="mt-4">
+            <MudAlert Severity="Severity.Info" Class="mt-3">
                 <MudStack Row="true" AlignItems="AlignItems.Center" Justify="Justify.SpaceBetween" Wrap="Wrap.Wrap" Spacing="3">
                     <span>Finish setting up: the runner needs your runner key from Offloadr.</span>
                     <MudButton Size="Size.Small" Variant="Variant.Filled" Color="Color.Primary" OnClick="@(() => Navigation.NavigateTo("setup"))">Set up</MudButton>
@@ -20,15 +20,15 @@
         }
     </MudPaper>
 
-    <MudGrid Spacing="4">
+    <MudGrid Spacing="3">
         <MudItem xs="12" md="6">
-            <MudPaper Outlined="true" Class="pa-5" Style="height: 100%">
+            <MudPaper Outlined="true" Class="pa-4" Style="height: 100%">
                 <MudStack Row="true" AlignItems="AlignItems.Center" Justify="Justify.SpaceBetween">
                     <MudText Typo="Typo.h6" HtmlTag="h2">This computer</MudText>
                     <MudButton Size="Size.Small" Variant="Variant.Text" StartIcon="@Icons.Material.Filled.Refresh"
                                Disabled="@View.IsActive" OnClick="Supervisor.RequestRefresh">Check again</MudButton>
                 </MudStack>
-                <MudStack Spacing="3" Class="mt-3">
+                <MudStack Spacing="2" Class="mt-2">
                     <CheckRow Check="EnvironmentChecks.Docker(View)" />
                     <CheckRow Check="EnvironmentChecks.HostGpu(View, SettingsStore.Current.SelectedGpuUuid)" />
                     <CheckRow Check="EnvironmentChecks.GpuInContainers(View)">
@@ -40,14 +40,14 @@
             </MudPaper>
         </MudItem>
         <MudItem xs="12" md="6">
-            <MudPaper Outlined="true" Class="pa-5" Style="height: 100%">
+            <MudPaper Outlined="true" Class="pa-4" Style="height: 100%">
                 <MudText Typo="Typo.h6" HtmlTag="h2">Runner</MudText>
                 <MudSimpleTable Dense="true" Elevation="0" Class="mt-2 runner-facts">
                     <tbody>
                         <tr><th scope="row">Editor</th><td>@(Template?.Label ?? "Not chosen yet")</td></tr>
                         <tr><th scope="row">Chosen by</th><td>@PlanSource</td></tr>
                         <tr><th scope="row">Session</th><td>@(View.RunnerStatus is null ? "–" : View.HasActiveSession ? "In use" : "Idle")</td></tr>
-                        <tr><th scope="row">Agent version</th><td>@(View.RunnerStatus?.Version ?? "–")</td></tr>
+                        <tr><th scope="row">Agent version</th><td title="@View.RunnerStatus?.Version">@(SupervisorView.ShortVersion(View.RunnerStatus?.Version) ?? "–")</td></tr>
                         <tr><th scope="row">Restarts</th><td>@View.Restarts</td></tr>
                     </tbody>
                 </MudSimpleTable>
@@ -68,24 +68,30 @@
         </MudItem>
     </MudGrid>
 
-    <MudPaper Outlined="true" Class="pa-5">
+    @* Takes the height the window has left: a taller window shows more of the log, not a longer page. *@
+    <MudPaper Outlined="true" Class="pa-4 runner-fill-card">
         <MudStack Row="true" AlignItems="AlignItems.Center" Justify="Justify.SpaceBetween">
             <MudText Typo="Typo.h6" HtmlTag="h2">Recent log</MudText>
             <MudLink Href="logs">All logs</MudLink>
         </MudStack>
         @if (Supervisor.LogLines.Count == 0)
         {
-            <MudText Typo="Typo.body2" Class="mud-text-secondary mt-3">Image downloads and runner output appear here once the runner starts.</MudText>
+            <MudText Typo="Typo.body2" Class="mud-text-secondary mt-2">Image downloads and runner output appear here once the runner starts.</MudText>
         }
         else
         {
-            <pre class="runner-log runner-log-tail mt-3">@string.Join('\n', Supervisor.LogLines.TakeLast(14))</pre>
+            <div class="runner-log-fill runner-log-tail mt-2">
+                <pre class="runner-log">@string.Join('\n', Supervisor.LogLines.TakeLast(TailLines))</pre>
+            </div>
         }
     </MudPaper>
 </MudStack>
 
 @code {
     private bool _checkingGpu;
+
+    // Enough to fill a tall window; Logs has the rest.
+    private const int TailLines = 60;
 
     private LaunchTemplate? Template => View.ActiveTemplate ?? (View.Plan ?? BuiltInLaunchPlanCatalog.Plan()).Choose(SettingsStore.Current);
 

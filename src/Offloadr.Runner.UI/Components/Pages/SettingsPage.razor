@@ -9,72 +9,86 @@
 
 <NavigationLock OnBeforeInternalNavigation="ConfirmLeavingAsync" />
 
-<MudText Typo="Typo.h5" HtmlTag="h1" Class="mb-4">Settings</MudText>
+<MudText Typo="Typo.h5" HtmlTag="h1" Class="mb-3">Settings</MudText>
 
-<MudPaper Outlined="true" Class="pa-5">
-    <MudStack Spacing="4">
-        <MudStack Spacing="1">
-            <MudTextField T="string" @bind-Value="_runnerKey" Immediate="true" Label="Runner key" Variant="Variant.Outlined"
-                          InputType="@(_showKey ? InputType.Text : InputType.Password)"
-                          Adornment="Adornment.End" AdornmentIcon="@(_showKey ? Icons.Material.Filled.VisibilityOff : Icons.Material.Filled.Visibility)"
-                          AdornmentAriaLabel="Show or hide the key" OnAdornmentClick="@(() => _showKey = !_showKey)"
-                          HelperText="Create a personal runner key under Settings in the Offloadr web app. It is stored encrypted on this computer." />
-            <div>
-                <MudButton Size="Size.Small" Variant="Variant.Text" EndIcon="@Icons.Material.Filled.OpenInNew"
-                           OnClick="OpenOffloadrAsync">Open Offloadr</MudButton>
-            </div>
-        </MudStack>
+<MudPaper Outlined="true" Class="pa-4">
+    <MudStack Spacing="3">
+        @* Side by side in a wide window, so the page fits it without scrolling. *@
+        <MudGrid Spacing="3">
+            <MudItem xs="12" md="6">
+                <MudStack Spacing="3">
+                    <MudStack Spacing="1">
+                        <MudTextField T="string" @bind-Value="_runnerKey" Immediate="true" Label="Runner key" Variant="Variant.Outlined"
+                                      InputType="@(_showKey ? InputType.Text : InputType.Password)"
+                                      Adornment="Adornment.End" AdornmentIcon="@(_showKey ? Icons.Material.Filled.VisibilityOff : Icons.Material.Filled.Visibility)"
+                                      AdornmentAriaLabel="Show or hide the key" OnAdornmentClick="@(() => _showKey = !_showKey)"
+                                      HelperText="Create a personal runner key under Settings in the Offloadr web app. It is stored encrypted on this computer." />
+                        <div>
+                            <MudButton Size="Size.Small" Variant="Variant.Text" EndIcon="@Icons.Material.Filled.OpenInNew"
+                                       OnClick="OpenOffloadrAsync">Open Offloadr</MudButton>
+                        </div>
+                    </MudStack>
 
-        <MudSelect T="string" @bind-Value="_editorTemplate" Label="Editor" Variant="Variant.Outlined"
-                   HelperText="@EditorHelp">
-            @foreach (var template in Templates)
-            {
-                <MudSelectItem Value="@template.EditorTemplate">@template.Label</MudSelectItem>
-            }
-        </MudSelect>
+                    <MudSelect T="string" @bind-Value="_editorTemplate" Label="Editor" Variant="Variant.Outlined"
+                               HelperText="@EditorHelp">
+                        @foreach (var template in Templates)
+                        {
+                            <MudSelectItem Value="@template.EditorTemplate">@template.Label</MudSelectItem>
+                        }
+                    </MudSelect>
 
-        <MudStack Row="true" AlignItems="AlignItems.Start" Spacing="2">
-            <MudTextField T="string" @bind-Value="_modelsDirectory" Immediate="true" Label="Models folder (optional)" Variant="Variant.Outlined" Clearable="true"
-                          HelperText="Your model files. Offloadr uses the ones that match what a workflow needs, and saves the models it downloads here." />
-            @if (Host.CanPickFolder)
-            {
-                <MudButton Variant="Variant.Outlined" Class="mt-2" OnClick="PickModelsFolderAsync">Browse</MudButton>
-            }
-        </MudStack>
+                    <MudStack Row="true" AlignItems="AlignItems.Start" Spacing="2">
+                        <MudTextField T="string" @bind-Value="_modelsDirectory" Immediate="true" Label="Models folder (optional)" Variant="Variant.Outlined" Clearable="true"
+                                      HelperText="Your model files. Offloadr uses the ones that match what a workflow needs, and saves the models it downloads here." />
+                        @if (Host.CanPickFolder)
+                        {
+                            <MudButton Variant="Variant.Outlined" Class="mt-2" OnClick="PickModelsFolderAsync">Browse</MudButton>
+                        }
+                    </MudStack>
 
-        <MudStack Spacing="0">
-            <MudSwitch T="bool" @bind-Value="_downloadModels" Color="Color.Primary" Label="Download models this computer does not have"
-                       Disabled="@(string.IsNullOrWhiteSpace(_modelsDirectory) && !_downloadModels)" />
-            <MudText Typo="Typo.caption" Class="mud-text-secondary ml-14">
-                @if (string.IsNullOrWhiteSpace(_modelsDirectory))
-                {
-                    <text>Choose a models folder first: downloaded models are saved there, where you can see them, delete them and use them in other apps.</text>
-                }
-                else
-                {
-                    <text>Downloaded models are saved in your models folder. They are often several gigabytes each. When this is off, workflows can use only the models already there.</text>
-                }
-            </MudText>
-        </MudStack>
+                    <MudStack Spacing="0">
+                        <MudSwitch T="bool" @bind-Value="_downloadModels" Color="Color.Primary" Label="Download models this computer does not have"
+                                   Disabled="@(string.IsNullOrWhiteSpace(_modelsDirectory) && !_downloadModels)" />
+                        <MudText Typo="Typo.caption" Class="mud-text-secondary ml-14">
+                            @if (string.IsNullOrWhiteSpace(_modelsDirectory))
+                            {
+                                <text>Choose a models folder first: downloaded models are saved there, where you can see them, delete them and use them in other apps.</text>
+                            }
+                            else
+                            {
+                                <text>Downloaded models are saved in your models folder. They are often several gigabytes each. When this is off, workflows can use only the models already there.</text>
+                            }
+                        </MudText>
+                    </MudStack>
+                </MudStack>
+            </MudItem>
 
-        <MudSwitch T="bool" @bind-Value="_autoStart" Color="Color.Primary" Label="Start the runner when this app opens" />
+            <MudItem xs="12" md="6">
+                <MudStack Spacing="3">
+                    <MudStack Spacing="0">
+                        <MudSwitch T="bool" @bind-Value="_autoStart" Color="Color.Primary" Label="Make this GPU available to Offloadr when this app opens" />
+                        <MudText Typo="Typo.caption" Class="mud-text-secondary ml-14">@AutoStartHelp</MudText>
+                    </MudStack>
 
-        @if (Host.CanStartAtSignIn)
-        {
-            <MudStack Spacing="0">
-                <MudSwitch T="bool" @bind-Value="_startAtSignIn" Color="Color.Primary" Label="Open this app in the notification area when I sign in to Windows" />
-                <MudText Typo="Typo.caption" Class="mud-text-secondary ml-14">Together with the switch above, your GPU is available to Offloadr after every sign-in.</MudText>
-            </MudStack>
-        }
+                    @if (Host.CanStartAtSignIn)
+                    {
+                        <MudStack Spacing="0">
+                            <MudSwitch T="bool" @bind-Value="_startAtSignIn" Color="Color.Primary" Label="Open this app in the notification area when I sign in to Windows" />
+                            <MudText Typo="Typo.caption" Class="mud-text-secondary ml-14">Together with the switch above, your GPU is available to Offloadr after every sign-in.</MudText>
+                        </MudStack>
+                    }
 
-        <MudStack Spacing="0">
-            <MudSwitch T="bool" @bind-Value="_keepAwake" Color="Color.Primary" Label="Keep this computer awake while a session runs on it" />
-            <MudText Typo="Typo.caption" Class="mud-text-secondary ml-14">Sleep would cut the session off. The display can still turn off, and the computer sleeps again once the session ends.</MudText>
-        </MudStack>
+                    <MudStack Spacing="0">
+                        <MudSwitch T="bool" @bind-Value="_keepAwake" Color="Color.Primary" Label="Keep this computer awake while a session runs on it" />
+                        <MudText Typo="Typo.caption" Class="mud-text-secondary ml-14">Sleep would cut the session off. The display can still turn off, and the computer sleeps again once the session ends.</MudText>
+                    </MudStack>
+                </MudStack>
+            </MudItem>
+        </MudGrid>
 
         <MudExpansionPanels Outlined="true" Elevation="0">
             <MudExpansionPanel Text="Advanced">
-                <MudStack Spacing="4">
+                <MudStack Spacing="3">
                     <MudTextField T="string" @bind-Value="_origin" Immediate="true" Label="Offloadr address" Variant="Variant.Outlined"
                                   HelperText="Change this only to use another Offloadr environment." />
                     <MudTextField T="string" @bind-Value="_engineExecutable" Immediate="true" Label="Docker or podman executable" Variant="Variant.Outlined" Clearable="true"
@@ -189,8 +203,12 @@
         => View.Plan?.Source == LaunchPlanSource.ControlPlane ? View.Plan.Templates : BuiltInLaunchPlanCatalog.Templates;
 
     private string EditorHelp => View.Plan?.Source == LaunchPlanSource.ControlPlane
-        ? "Offloadr picks the editor you have selected there; this choice is only a fallback."
-        : "The runner image to run. Match the editor you use in Offloadr.";
+        ? "Offloadr chooses the editor you select there. This one is used only when Offloadr has not chosen one."
+        : "Used only when Offloadr does not choose the editor itself, as now. Match the editor you use in Offloadr.";
+
+    /// <summary>Said once for Settings and Setup: people read "runner" as an editor, and expect it to start.</summary>
+    internal const string AutoStartHelp
+        = "Starts the runner in the background, where it waits for Offloadr. An editor such as ComfyUI starts only when you open a session: the one you select in Offloadr, or else the Editor in Settings.";
 
     protected override void OnInitialized()
     {

@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using Windows.Storage;
 using Windows.Storage.Pickers;
 
@@ -22,6 +23,7 @@ internal static class PlatformWindow
 
         _attached = true;
         var handle = WinRT.Interop.WindowNative.GetWindowHandle(native);
+        PlaceOnWorkArea(window, native, handle, App.PreferredWidth, App.PreferredHeight);
         var balloonShown = false;
         var activated = false;
         TrayIcon? tray = null;
@@ -200,6 +202,64 @@ internal static class PlatformWindow
     }
 
     private static string Tooltip(SupervisorView view) => $"Offloadr Runner: {view.StateTitle}";
+
+    /// <summary>
+    /// Sizes the window as asked, in device-independent pixels, but never larger than the work area of
+    /// the screen it opens on (a 1080p screen at 150 % has about 1280 × 690 beside the taskbar), and
+    /// centres it there. A screen lower than the window's minimum height lowers that minimum to fit; the
+    /// minimum width stays, since the menu needs it and no screen in use is narrower.
+    /// </summary>
+    private static void PlaceOnWorkArea(Window window, Microsoft.UI.Xaml.Window native, nint handle, double width, double height)
+    {
+        // In screen coordinates, the ones MoveAndResize takes, whichever screen the window is on.
+        var info = new MonitorInfo { Size = Marshal.SizeOf<MonitorInfo>() };
+        if (MonitorFromWindow(handle, MonitorDefaultToNearest) is var monitor && (monitor == 0 || !GetMonitorInfo(monitor, ref info)))
+        {
+            return;
+        }
+
+        var area = info.Work;
+        var (areaWidth, areaHeight) = (area.Right - area.Left, area.Bottom - area.Top);
+        var scale = GetDpiForWindow(handle) is var dpi and > 0 ? dpi / 96.0 : 1.0;
+        window.MinimumHeight = Math.Min(window.MinimumHeight, Math.Floor(areaHeight / scale));
+        var pixelWidth = Math.Min((int)Math.Round(width * scale), areaWidth);
+        var pixelHeight = Math.Min((int)Math.Round(height * scale), areaHeight);
+        native.AppWindow.MoveAndResize(new Windows.Graphics.RectInt32(
+            area.Left + ((areaWidth - pixelWidth) / 2),
+            area.Top + ((areaHeight - pixelHeight) / 2),
+            pixelWidth,
+            pixelHeight));
+    }
+
+    private const uint MonitorDefaultToNearest = 2;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ScreenRect
+    {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MonitorInfo
+    {
+        public int Size;
+        public ScreenRect Monitor;
+        public ScreenRect Work;
+        public uint Flags;
+    }
+
+    [DllImport("user32.dll")]
+    private static extern uint GetDpiForWindow(nint hwnd);
+
+    [DllImport("user32.dll")]
+    private static extern nint MonitorFromWindow(nint hwnd, uint flags);
+
+    [DllImport("user32.dll", EntryPoint = "GetMonitorInfoW")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetMonitorInfo(nint monitor, ref MonitorInfo info);
 
     /// <summary>The title bar in the page's colors, so the window reads as one surface.</summary>
     private static void PaintTitleBar(Microsoft.UI.Xaml.Window native, AppTheme? theme)

@@ -6,7 +6,7 @@
 @* Shown while a newer release downloads and once it is ready to install. *@
 @if (_updates?.Status is { State: AppUpdateState.Downloading or AppUpdateState.Ready, Available: { } version } status && version != _dismissed)
 {
-    <MudAlert Severity="Severity.Info" Variant="Variant.Outlined" Class="mb-4" ShowCloseIcon="@(status.State == AppUpdateState.Ready)"
+    <MudAlert Severity="Severity.Info" Variant="Variant.Outlined" Class="mb-3" ShowCloseIcon="@(status.State == AppUpdateState.Ready)"
               CloseIconClicked="@(() => _dismissed = version)">
         @if (status.State == AppUpdateState.Downloading)
         {

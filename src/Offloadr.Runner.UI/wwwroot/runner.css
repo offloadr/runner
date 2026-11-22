@@ -22,12 +22,50 @@
     overflow-y: auto;
 }
 
-.runner-log-tail {
-    max-height: 16rem;
+/* Pages whose last card takes the height the window has left (a log, say) rather than making the
+   page longer. Every box from the main content down is a column that fills the window; the card keeps
+   a usable minimum, below which the page scrolls after all. */
+.runner-shell .mud-main-content {
+    min-height: 100vh;
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: column;
 }
 
-.runner-log-full {
-    height: calc(100vh - 13rem);
+.runner-main {
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+}
+
+.runner-fill {
+    flex: 1 1 auto;
+}
+
+.runner-fill-card {
+    flex: 1 1 0;
+    min-height: 10rem;
+    display: flex;
+    flex-direction: column;
+}
+
+.runner-log-fill {
+    flex: 1 1 0;
+    min-height: 0;
+    overflow-y: auto;
+}
+
+/* Starts at the newest line, and stays there as lines arrive while the reader is at the bottom. */
+.runner-log-tail {
+    display: flex;
+    flex-direction: column-reverse;
+}
+
+/* The box scrolls, not the log in it; a log shorter than its card starts at the top, not the bottom. */
+.runner-log-tail > * {
+    flex: none;
+    overflow: visible;
+    margin-bottom: auto;
 }
 
 .runner-fault-detail {
@@ -65,6 +103,16 @@
     font-weight: 500;
     color: var(--color-text-muted);
     white-space: nowrap;
+}
+
+.runner-shell .runner-facts.mud-simple-table table * tr > td,
+.runner-shell .runner-facts.mud-simple-table table * tr > th {
+    padding: 5px 12px;
+}
+
+/* Long values (paths, digests) wrap rather than giving the card a horizontal scrollbar. */
+.runner-facts td {
+    overflow-wrap: anywhere;
 }
 
 .runner-facts td.runner-check-detail {
