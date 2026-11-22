@@ -1,7 +1,9 @@
 namespace Offloadr.Runner.Tests;
 
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Offloadr.Runner.V1;
+using RunnerRegistrationLoop = Offloadr.Runner.Core.RunnerRegistrationLoop;
 
 public partial class ServiceClientManagerTests
 {
@@ -472,21 +474,23 @@ public partial class ServiceClientManagerTests
             Algorithms = { Offloadr.Runner.Core.Sealing.SealedEnvelopeFormat.AlgorithmId },
         };
 
-        var request = ServiceClientManager.BuildStatusUpdateRequest(
+        var request = RunnerRegistrationLoop.BuildRequest(
             CommandRunnerId,
             "process-1",
             "1.0.0",
             new RunnerResources(),
             () => new RuntimeStatus(),
             ["comfyui-latest"],
+            NullLogger.Instance,
             () => sealedStorage);
-        var failing = ServiceClientManager.BuildStatusUpdateRequest(
+        var failing = RunnerRegistrationLoop.BuildRequest(
             CommandRunnerId,
             "process-1",
             "1.0.0",
             new RunnerResources(),
             () => new RuntimeStatus(),
             ["comfyui-latest"],
+            NullLogger.Instance,
             () => throw new IOException("statfs failed"));
 
         Assert.That(request.SealedStorage, Is.EqualTo(sealedStorage));

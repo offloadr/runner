@@ -265,7 +265,11 @@ public sealed class RunnerAgentOptions
         return defaultValue;
     }
 
-    private static string ResolveRunnerId(string runnerSecret, string? configuredRunnerId)
+    /// <summary>
+    /// The runner id: <paramref name="configuredRunnerId"/> when set, otherwise derived from the key, so
+    /// everything holding the same key registers as the same runner.
+    /// </summary>
+    internal static string ResolveRunnerId(string runnerSecret, string? configuredRunnerId)
     {
         if (!string.IsNullOrWhiteSpace(configuredRunnerId))
         {
