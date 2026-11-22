@@ -67,7 +67,7 @@ public class GrpcRuntimeActivitySinkTests
     {
         Assert.That(ReportRuntimeActivityRequest.Descriptor.Fields.InDeclarationOrder().Select(field => field.Name), Is.EqualTo(new[]
         {
-            "runner_id", "session_id", "instance_id", "lifecycle_generation", "runtime_epoch", "runtime_instance_id", "sealing"
+            "runner_id", "session_id", "instance_id", "sealing", "runtime"
         }));
     }
 

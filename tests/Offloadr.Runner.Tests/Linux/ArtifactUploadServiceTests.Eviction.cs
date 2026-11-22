@@ -362,7 +362,7 @@ public partial class ArtifactUploadServiceTests
         try
         {
             var identities = new RuntimeIdentityRegistry();
-            identities.Set("session-1", new RuntimeIdentity("instance-1", 11));
+            identities.Set("session-1", new RuntimeIdentity("instance-1", 11), lifecycleGeneration: 1);
             var paths = CreateEvictionPaths(root, sealedSession: true);
             var artifactClient = new FakeRunnerArtifactClient(new RunnerArtifactServiceListArtifactsResponse())
             {
@@ -377,7 +377,7 @@ public partial class ArtifactUploadServiceTests
             Assert.That(await service.StopSessionAsync("session-1"), Is.EqualTo(1));
 
             // A newer lifecycle of the same session id loses nothing.
-            identities.Set("session-1", new RuntimeIdentity("instance-2", 21));
+            identities.Set("session-1", new RuntimeIdentity("instance-2", 21), lifecycleGeneration: 2);
             var relaunched = CreateEvictionPaths(Path.Combine(root, "next"), sealedSession: true);
             await service.StartSessionAsync("session-1", relaunched, CancellationToken.None);
             Assert.That(await service.StopSessionAsync("session-1"), Is.Zero);
@@ -386,7 +386,7 @@ public partial class ArtifactUploadServiceTests
             Assert.That(service.TakeUnsavedUploadCount("session-1", 1), Is.EqualTo(1), "its own Stop still reports it after the newer one's");
 
             // An unfenced Stop (no generation) takes whatever the session lost, in any lifecycle.
-            identities.Set("session-1", new RuntimeIdentity("instance-3", 31));
+            identities.Set("session-1", new RuntimeIdentity("instance-3", 31), lifecycleGeneration: 3);
             var third = CreateEvictionPaths(Path.Combine(root, "third"), sealedSession: true);
             await service.StartSessionAsync("session-1", third, CancellationToken.None);
             await service.ActivateSessionAsync("session-1", "editor-1", "owner-1", CancellationToken.None);
