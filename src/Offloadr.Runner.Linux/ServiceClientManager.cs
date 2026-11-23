@@ -568,6 +568,20 @@ internal static partial class ServiceClientManager
 
         public string GetActiveSessionId() => Volatile.Read(ref _state).SessionId;
 
+        /// <summary>
+        /// The session, its runtime and the newest runtime order this process adopted, read together.
+        /// An adoption writes the session state and the order under one lock, so a status built from
+        /// this never pairs one runtime's session with another's order.
+        /// </summary>
+        public (string SessionId, RuntimeIdentity? Runtime, ulong AdoptedRuntimeOrder) Snapshot()
+        {
+            lock (_fenceGate)
+            {
+                var current = Volatile.Read(ref _state);
+                return (current.SessionId, current.RuntimeIdentity, _adoptedRuntimeOrder);
+            }
+        }
+
         public bool TryGetRuntime(string? sessionId, out RuntimeIdentity runtimeIdentity)
         {
             var current = Volatile.Read(ref _state);
@@ -807,9 +821,28 @@ internal static partial class ServiceClientManager
             }
         }
 
-        // Caller holds _fenceGate.
+        /// <summary>
+        /// The highest runtime order this process adopted as a session's runtime, of any session; 0
+        /// before any. Never decreases. Raised together with the session state that names that
+        /// runtime (see <see cref="Snapshot"/>).
+        /// </summary>
+        public ulong AdoptedRuntimeOrder
+        {
+            get
+            {
+                lock (_fenceGate)
+                {
+                    return _adoptedRuntimeOrder;
+                }
+            }
+        }
+
+        private ulong _adoptedRuntimeOrder;
+
+        // Caller holds _fenceGate, and has written the session state naming this runtime.
         private void RecordAdopted(string sessionId, ulong runtimeOrder)
         {
+            _adoptedRuntimeOrder = Math.Max(_adoptedRuntimeOrder, runtimeOrder);
             if (_highestAdopted.TryGetValue(sessionId, out var known))
             {
                 _highestAdopted[sessionId] = Math.Max(known, runtimeOrder);

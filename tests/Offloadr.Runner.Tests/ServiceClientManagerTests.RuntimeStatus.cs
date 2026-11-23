@@ -26,7 +26,47 @@ public partial class ServiceClientManagerTests
             Assert.That(status.SessionId, Is.Empty);
             Assert.That(status.Phase, Is.EqualTo(RuntimePhase.None));
             Assert.That(status.Runtime, Is.Null);
+            Assert.That(status.AdoptedRuntimeOrder, Is.Zero, "A new process has adopted nothing.");
         });
+    }
+
+    [Test]
+    public async Task RuntimeStatus_ReportsTheNewestAdoptedOrder_AlsoOnceTheSessionIsGone()
+    {
+        var harness = new RuntimeCommandHarness();
+        await ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceA, 3), harness.Deps).WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.That((await harness.Sink.WaitForAsync(harness.Sink.StartAcks, 1)).Ready, Is.True);
+        var ready = Status(harness);
+
+        // An older Start is refused as older work, and does not count.
+        await ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceB, 2), harness.Deps).WaitAsync(TimeSpan.FromSeconds(5));
+        var afterRefused = Status(harness);
+        harness.Logical.ClearIfMatches(CommandSessionId);
+        var gone = Status(harness);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(ready.AdoptedRuntimeOrder, Is.EqualTo(3));
+            Assert.That(afterRefused.AdoptedRuntimeOrder, Is.EqualTo(3), "A refused Start does not raise it.");
+            Assert.That(gone.SessionId, Is.Empty);
+            Assert.That(gone.AdoptedRuntimeOrder, Is.EqualTo(3), "Sampled after the Start: the control plane may act on this report.");
+        });
+    }
+
+    [Test]
+    public void AdoptedRuntimeOrder_IsRaisedOnlyOnceTheSessionNamesTheRuntime_AndNeverDecreases()
+    {
+        var state = new ServiceClientManager.LogicalSessionState(string.Empty);
+        var first = Rt(InstanceA, 5);
+        Assert.That(state.AdmitStart("session-a", first), Is.EqualTo(ServiceClientManager.StartAdmission.Newer));
+        Assert.That(state.AdoptedRuntimeOrder, Is.Zero, "Admitted, not adopted: the session does not name it yet.");
+
+        Assert.That(state.TryAdoptRuntime("session-a", first), Is.True);
+        Assert.That(state.AdoptedRuntimeOrder, Is.EqualTo(5));
+
+        Assert.That(state.AdmitStart("session-b", Rt(InstanceB, 4)), Is.EqualTo(ServiceClientManager.StartAdmission.Stale));
+        state.ClearIfMatches("session-a");
+        Assert.That(state.AdoptedRuntimeOrder, Is.EqualTo(5));
     }
 
     [Test]

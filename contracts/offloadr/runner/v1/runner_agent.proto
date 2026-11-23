@@ -319,6 +319,10 @@ message RuntimeStatus {
     RuntimePhase phase = 5;
     SessionSealingStatus sealing = 6; // What the runtime got; set only when READY.
     string message = 7;               // Why it failed; set only when FAILED, at most 512 bytes.
+    // The highest runtime_order this process had adopted when it sampled this status, also when
+    // session_id is empty; 0 when it has adopted none. The control plane ignores a report from an
+    // executor whose acknowledged first Start is newer, because the report was sampled before it.
+    uint64 adopted_runtime_order = 9;
 }
 
 // What a registration speaks for. One runner (one key, one runner_id) can have an executor and a
@@ -348,13 +352,19 @@ message RegisterRunnerRequest {
     RunnerRole role = 11;
     // Executor only: the LaunchRunnerCommand.launch_id this container was started for; empty when
     // it was started otherwise (by hand, or by hosting). The only way a launch finds its executor.
-    // A registration carrying a retired or released launch_id, or a released instance_id, is refused
-    // (EXECUTOR_FENCED) before anything else is touched: it never replaces the current executor
+    // A registration carrying a retired, released or unknown launch_id, or a released instance_id, is
+    // refused (EXECUTOR_FENCED) before anything else is touched: it never replaces the current executor
     // instance, refreshes liveness or ends a session. Only a launch no executor has matched can be
     // retired: the first accepted registration echoing it that is eligible for its allocation (for one,
     // it supports the launch's editor_template) matches it; a refused or ineligible one matches
-    // nothing. A matched launch is never retired afterwards.
+    // nothing. A matched launch is never retired afterwards. An executor echoing the launch_id of the
+    // registered one is that container's agent restarted: it replaces it even while busy, and the
+    // instance it replaces is fenced in the same transaction.
     string launch_id = 12;
+    // Launcher only: increases whenever what it offers changes (the GPU or the container engine it
+    // launches on), within one launcher instance. A launch carries the offer_revision of the heartbeat
+    // it was allocated against (LaunchRunnerCommand.offer_revision).
+    uint64 offer_revision = 13;
 }
 
 // Why registration was refused. Anything other than these four is retried.
@@ -866,6 +876,10 @@ message LaunchRunnerCommand {
     uint64 launch_sequence = 2;  // Increases per runner; a launch replaces only one with a lower sequence.
     string editor_template = 3;  // As RunnerLaunchTemplate.editor_template.
     string runner_image = 4;     // As RunnerLaunchTemplate.runner_image.
+    // The launcher's RegisterRunnerRequest.offer_revision that the allocation was checked against, read
+    // together with the resources it checked. The launcher fails a launch whose revision is not its
+    // current one: it was chosen for hardware this computer no longer offers.
+    uint64 offer_revision = 5;
 }
 
 enum RunnerLaunchPhase {
@@ -910,11 +924,21 @@ message ReportRunnerLaunchResponse {}
 // - A granted release fences every identity it names, launch_id and executor_instance_id, for good:
 //   a registration carrying a fenced one is refused, whenever it arrives. A replacement
 //   container always has new identities, so it is unaffected. Repeating a granted release is granted again.
+// - With container_exited, the executor is not checked for being idle: the session it held is ended,
+//   its pending Stop completed and its pending Start cancelled, it is unregistered and both identities
+//   are fenced. A launch it names that no executor has matched is retired in the same transaction. The rules above on a missing launch_id, an instance registered under another
+//   launch_id and repeats apply unchanged.
 message ReleaseRunnerRequest {
     string runner_id = 1;
-    string instance_id = 2;           // The launcher's registered instance.
+    // The launcher instance asking. Recorded; a release is decided on the executor's state, not on
+    // whether this launcher is still current.
+    string instance_id = 2;
     string executor_instance_id = 3;  // The executor's registered instance, from its status file; empty if it never wrote one.
     string launch_id = 4;             // The launch the container was started for. Required: a release without one is refused.
+    // The container this release names is not running and will not be started again: it exited,
+    // was killed, or the launcher stopped it without a granted release. The control plane then ends
+    // the session that executor held and fences it, instead of checking that it is idle.
+    bool container_exited = 5;
 }
 
 message ReleaseRunnerResponse {
