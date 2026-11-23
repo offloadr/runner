@@ -877,8 +877,9 @@ message LaunchRunnerCommand {
     string editor_template = 3;  // As RunnerLaunchTemplate.editor_template.
     string runner_image = 4;     // As RunnerLaunchTemplate.runner_image.
     // The launcher's RegisterRunnerRequest.offer_revision that the allocation was checked against, read
-    // together with the resources it checked. The launcher fails a launch whose revision is not its
-    // current one: it was chosen for hardware this computer no longer offers.
+    // together with the resources it checked. A launch whose revision is not the launcher's current one
+    // was chosen for hardware this computer no longer offers: the launcher's registration with the new
+    // revision retires it, and the launcher reports FAILED for it only after that registration was accepted.
     uint64 offer_revision = 5;
 }
 
