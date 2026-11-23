@@ -17,7 +17,7 @@ internal static partial class ServiceClientManager
 
     /// <summary>
     /// What the heartbeat reports about the runner's one logical session: the session, the
-    /// runtime it runs and that runtime's phase. It reads the state the command handlers
+    /// runtime it runs, that runtime's phase and the newest runtime this process adopted. It reads the state the command handlers
     /// already own, so the report never runs ahead of them. READY needs a recorded ready
     /// outcome of the process now running, recorded by the startup that owns it before it
     /// releases its slot.
@@ -36,7 +36,10 @@ internal static partial class ServiceClientManager
             var status = DescribeRuntimeStatusOnce(logicalSessionState, workState, isStopping, trackedProcess, out var version);
             if (version == workState.StartupVersion) return status;
         }
-        return new RuntimeStatus { SessionId = logicalSessionState.GetActiveSessionId(), Phase = RuntimePhase.None };
+
+        // The session and the adopted order of one snapshot.
+        var (session, _, adopted) = logicalSessionState.Snapshot();
+        return new RuntimeStatus { SessionId = session, Phase = RuntimePhase.None, AdoptedRuntimeOrder = adopted };
     }
 
     private static RuntimeStatus DescribeRuntimeStatusOnce(
@@ -47,11 +50,16 @@ internal static partial class ServiceClientManager
         out long version)
     {
         version = workState.StartupVersion;
-        var sessionId = logicalSessionState.GetActiveSessionId();
-        var status = new RuntimeStatus { SessionId = sessionId, Phase = RuntimePhase.None };
+
+        // The session, its runtime and the adopted order read together: the control plane takes a
+        // report whose order is below an acknowledged first Start as sampled before it, so the order
+        // must be the one of the session reported, neither older nor newer.
+        var (sessionId, snapshotRuntime, adopted) = logicalSessionState.Snapshot();
+        var status = new RuntimeStatus { SessionId = sessionId, Phase = RuntimePhase.None, AdoptedRuntimeOrder = adopted };
         if (sessionId.Length == 0) return status;
 
-        var hasRuntime = logicalSessionState.TryGetRuntime(sessionId, out var runtime);
+        var hasRuntime = snapshotRuntime is not null;
+        var runtime = snapshotRuntime.GetValueOrDefault();
         if (isStopping(sessionId))
         {
             status.Phase = RuntimePhase.Stopping;
@@ -59,8 +67,9 @@ internal static partial class ServiceClientManager
             return status;
         }
 
-        var (startup, recorded, read) = workState.ReadStartupState(sessionId, hasRuntime ? runtime : null);
-        version = read;
+        // The version stays the one read before the snapshot: a startup that changed anything since, up to
+        // this read, makes the caller read again, so the phase and the adopted order are of one moment.
+        var (startup, recorded, _) = workState.ReadStartupState(sessionId, hasRuntime ? runtime : null);
         if (startup is not null && string.Equals(startup.SessionId, sessionId, StringComparison.Ordinal) &&
             startup.RuntimeIdentity.IsValid)
         {

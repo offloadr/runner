@@ -37,6 +37,7 @@ The Offloadr runner: the agent that executes GPU work for the Offloadr control p
 
 - The agent is an authenticated external executor of exact control-plane commands. It does not own durable allocation, lifecycle, restart, Stop, prompt or metering decisions.
 - Heartbeat registration (`RegisterRunner`) is the authoritative liveness lane; other traffic does not silently refresh liveness.
+- The agent registers as `RUNNER_ROLE_EXECUTOR`. The desktop app may register the same runner as `RUNNER_ROLE_LAUNCHER`: that heartbeat means only "can start these editors". It never stands in for executor liveness or protects a session, and the launcher starts a container only for the launch the latest `LauncherState` on a connected stream names (`docs/contracts-sync.md`, Launchers). Shared registration code lives in Core (`RunnerRegistrationLoop`).
 - Keep long-running status, command, event, artifact/workspace and operational lanes independently cancellable and reconnectable.
 
 ## Command and session rules

@@ -11,12 +11,29 @@ public class RunnerProtocolHandshakeTests
     [Test]
     public void StatusAndCommandRequestsCarryThisBuildsProtocol()
     {
-        var request = RunnerRegistrationLoop.BuildRequest(
+        var request = RunnerRegistrationLoop.BuildExecutorRequest(
             Guid.NewGuid().ToString("n"), "process-1", "1.0.0", new RunnerResources(), () => new RuntimeStatus(), ["comfyui-latest"],
             NullLogger.Instance);
 
         Assert.That(request.ProtocolVersion, Is.EqualTo((uint)RunnerProtocol.Current));
         Assert.That(RunnerProtocolVersion.Current, Is.GreaterThan(0u));
+    }
+
+    [Test]
+    public void TheAgentRegistersAsAnExecutor_EchoingTheLaunchItWasStartedFor()
+    {
+        var launchId = Guid.NewGuid().ToString();
+        var launched = RunnerRegistrationLoop.BuildExecutorRequest(
+            Guid.NewGuid().ToString("n"), "process-1", "1.0.0", new RunnerResources(), () => new RuntimeStatus(), ["comfyui-latest"],
+            NullLogger.Instance, launchId: launchId);
+        var byHand = RunnerRegistrationLoop.BuildExecutorRequest(
+            Guid.NewGuid().ToString("n"), "process-1", "1.0.0", new RunnerResources(), () => new RuntimeStatus(), ["comfyui-latest"],
+            NullLogger.Instance);
+
+        Assert.That(launched.Role, Is.EqualTo(RunnerRole.Executor));
+        Assert.That(launched.LaunchId, Is.EqualTo(launchId), "echoed exactly as the launcher passed it");
+        Assert.That(byHand.Role, Is.EqualTo(RunnerRole.Executor));
+        Assert.That(byHand.LaunchId, Is.Empty);
     }
 
     [Test]
@@ -102,7 +119,9 @@ public class RunnerProtocolHandshakeTests
 
     [TestCase(RegistrationRejection.RunnerOutdated)]
     [TestCase(RegistrationRejection.ServerOutdated)]
-    public async Task AProtocolRejectionStopsTheStatusLoopInsteadOfRetrying(RegistrationRejection rejection)
+    [TestCase(RegistrationRejection.LauncherSuperseded)]
+    [TestCase(RegistrationRejection.ExecutorFenced)]
+    public async Task AFinalRejectionStopsTheStatusLoopInsteadOfRetrying(RegistrationRejection rejection)
     {
         var calls = 0;
         RegisterRunnerResponse? reported = null;
@@ -123,6 +142,8 @@ public class RunnerProtocolHandshakeTests
         Assert.That(timeout.IsCancellationRequested, Is.False, "the loop returns by itself");
         Assert.That(reported?.Rejection, Is.EqualTo(rejection));
         Assert.That(calls, Is.EqualTo(1));
+        Assert.That(RunnerProtocolVersion.IsProtocolRejection(reported!), Is.EqualTo(rejection is RegistrationRejection.RunnerOutdated or RegistrationRejection.ServerOutdated),
+            "only an outdated protocol means 'update'; the agent exits with a different code otherwise");
     }
 
     [Test]
@@ -201,7 +222,7 @@ public class RunnerProtocolHandshakeTests
     }
 
     private static RegisterRunnerRequest NewRequest()
-        => RunnerRegistrationLoop.BuildRequest(
+        => RunnerRegistrationLoop.BuildExecutorRequest(
             Guid.NewGuid().ToString("n"), "process-1", "1.0.0", new RunnerResources(), () => new RuntimeStatus(), ["comfyui-latest"],
             NullLogger.Instance);
 

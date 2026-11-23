@@ -173,6 +173,30 @@ public class RunnerAgentOptionsTests
     }
 
     [Test]
+    public void FromEnvironment_ReadsTheLaunchId_KeepsABlankOne_AndLeavesItUnsetWhenUnset()
+    {
+        var launchId = Guid.NewGuid().ToString();
+        var launched = RunnerAgentOptions.FromEnvironment(GetEnv(new Dictionary<string, string?>
+        {
+            ["RUNNER_SECRET"] = "stable-secret",
+            ["RUNNER_LAUNCH_ID"] = $"  {launchId} ",
+        }));
+        var blank = RunnerAgentOptions.FromEnvironment(GetEnv(new Dictionary<string, string?>
+        {
+            ["RUNNER_SECRET"] = "stable-secret",
+            ["RUNNER_LAUNCH_ID"] = "  ",
+        }));
+        var byHand = RunnerAgentOptions.FromEnvironment(GetEnv(new Dictionary<string, string?>
+        {
+            ["RUNNER_SECRET"] = "stable-secret",
+        }));
+
+        Assert.That(launched.LaunchId, Is.EqualTo(launchId));
+        Assert.That(blank.LaunchId, Is.Empty, "set but blank, so startup validation refuses it");
+        Assert.That(byHand.LaunchId, Is.Null);
+    }
+
+    [Test]
     public void FromEnvironment_ParsesLocalModelSettings()
     {
         var env = new Dictionary<string, string?>

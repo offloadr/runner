@@ -124,6 +124,14 @@ public sealed class RunnerAgentOptions
     public required string OffloadrApiUrl { get; init; }
     public required bool TraceGrpcHttp { get; init; }
     public required string RunnerId { get; init; }
+
+    /// <summary>
+    /// The launch this container was started for (<c>RUNNER_LAUNCH_ID</c>, set by the desktop app from
+    /// <c>LaunchRunnerCommand.launch_id</c>), echoed in every registration so the launch finds this runner.
+    /// Null when the container was started any other way. Set but blank is kept as empty, so startup
+    /// validation refuses it instead of treating the container as started by hand.
+    /// </summary>
+    public string? LaunchId { get; init; }
     public required TimeSpan RegistrationMinBackoff { get; init; }
     public required TimeSpan RegistrationMaxBackoff { get; init; }
     public required TimeSpan RegistrationRpcTimeout { get; init; }
@@ -181,6 +189,7 @@ public sealed class RunnerAgentOptions
             OffloadrApiUrl = offloadrApiUrl,
             TraceGrpcHttp = ParseBool(env("RUNNER_GRPC_TRACE_HTTP"), defaultValue: false),
             RunnerId = runnerId,
+            LaunchId = env("RUNNER_LAUNCH_ID")?.Trim(),
             RegistrationMinBackoff = minBackoff,
             RegistrationMaxBackoff = maxBackoff,
             RegistrationRpcTimeout = rpcTimeout,

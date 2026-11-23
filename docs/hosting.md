@@ -160,6 +160,7 @@ abbreviations. The startup log lists the extra flags without their values.
   - `RUNNER_EDITOR_ARGS_COMFYUI`, `RUNNER_EDITOR_ARGS_FORGE_NEO` (extra arguments for that editor family, split like a shell line; a refused flag fails startup)
 - Optional identity/retry tuning
   - `RUNNER_ID` (optional UUID override; primarily for Offloadr-managed hosted runners)
+  - `RUNNER_LAUNCH_ID` (set by the desktop app: the UUID of the launch it started this container for, echoed at registration; leave it unset otherwise)
   - `REG_MIN_BACKOFF_SEC`
   - `REG_MAX_BACKOFF_SEC`
   - `REG_RPC_TIMEOUT_SEC`

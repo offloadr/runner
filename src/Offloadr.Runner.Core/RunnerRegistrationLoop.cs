@@ -14,10 +14,12 @@ internal static class RunnerRegistrationLoop
     internal static readonly TimeSpan DefaultRefresh = TimeSpan.FromMinutes(1);
 
     /// <summary>
-    /// One heartbeat. A failed sealed-storage probe leaves <c>sealed_storage</c> unset instead of
-    /// failing the heartbeat: the runner then offers no sealed sessions, but stays registered.
+    /// One executor heartbeat: the agent that runs sessions. A failed sealed-storage probe leaves
+    /// <c>sealed_storage</c> unset instead of failing the heartbeat: the runner then offers no sealed
+    /// sessions, but stays registered. <paramref name="launchId"/> is the launch the container was
+    /// started for, empty when it was started any other way.
     /// </summary>
-    internal static RegisterRunnerRequest BuildRequest(
+    internal static RegisterRunnerRequest BuildExecutorRequest(
         string runnerId,
         string instanceId,
         string version,
@@ -25,7 +27,8 @@ internal static class RunnerRegistrationLoop
         Func<RuntimeStatus> describeRuntime,
         IReadOnlyList<string> supportedEditorTemplates,
         ILogger logger,
-        Func<RunnerSealedStorage>? describeSealedStorage = null)
+        Func<RunnerSealedStorage>? describeSealedStorage = null,
+        string launchId = "")
     {
         ArgumentNullException.ThrowIfNull(describeRuntime);
         ArgumentNullException.ThrowIfNull(supportedEditorTemplates);
@@ -39,6 +42,8 @@ internal static class RunnerRegistrationLoop
             Version = version,
             Resources = resources,
             ProtocolVersion = RunnerProtocolVersion.Current,
+            Role = RunnerRole.Executor,
+            LaunchId = launchId ?? string.Empty,
         };
         request.SupportedEditorTemplates.AddRange(supportedEditorTemplates);
         try
@@ -57,8 +62,9 @@ internal static class RunnerRegistrationLoop
     /// <summary>
     /// Registers until <paramref name="shutdown"/>, at the interval Offloadr names, retrying failures
     /// and refusals with jittered backoff. <paramref name="initialStatusApplied"/> completes with the
-    /// first accepted registration. A protocol refusal ends the loop instead: retrying cannot help
-    /// until this build is updated, so <paramref name="onProtocolRejected"/> hears about it once.
+    /// first accepted registration. A final refusal (<see cref="RunnerProtocolVersion.IsFinalRejection"/>)
+    /// ends the loop instead: retrying with this build and identity cannot help, so
+    /// <paramref name="onFinalRejection"/> hears about it once.
     /// </summary>
     internal static async Task RunAsync(
         Func<RegisterRunnerRequest, CancellationToken, Task<RegisterRunnerResponse>> register,
@@ -68,7 +74,7 @@ internal static class RunnerRegistrationLoop
         TaskCompletionSource initialStatusApplied,
         ILogger logger,
         CancellationToken shutdown,
-        Action<RegisterRunnerResponse>? onProtocolRejected = null)
+        Action<RegisterRunnerResponse>? onFinalRejection = null)
     {
         ArgumentNullException.ThrowIfNull(register);
         ArgumentNullException.ThrowIfNull(buildRequest);
@@ -91,12 +97,14 @@ internal static class RunnerRegistrationLoop
                 var response = await register(buildRequest(), shutdown).ConfigureAwait(false);
 
                 logger.LogInformation("{Message}", $"Status update accepted={response.Accepted} message='{response.Message}' next={response.RefreshSeconds}s");
-                if (RunnerProtocolVersion.IsProtocolRejection(response))
+                if (RunnerProtocolVersion.IsFinalRejection(response))
                 {
-                    // Retrying cannot help: this build and Offloadr no longer share a protocol.
-                    logger.LogError("{Message}",
-                        $"Offloadr refused this runner's protocol {RunnerProtocolVersion.Current} (Offloadr speaks {response.ServerProtocolVersion}): {response.Message}");
-                    onProtocolRejected?.Invoke(response);
+                    // Retrying cannot help: this build and Offloadr no longer share a protocol, or
+                    // this registrant's identity can never be accepted again.
+                    logger.LogError("{Message}", RunnerProtocolVersion.IsProtocolRejection(response)
+                        ? $"Offloadr refused this runner's protocol {RunnerProtocolVersion.Current} (Offloadr speaks {response.ServerProtocolVersion}): {response.Message}"
+                        : $"Offloadr will not accept this registration again ({response.Rejection}): {response.Message}");
+                    onFinalRejection?.Invoke(response);
                     return;
                 }
 

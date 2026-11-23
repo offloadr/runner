@@ -64,6 +64,11 @@ public sealed class RunnerStartupValidator
             errors.Add("RUNNER_ID must be a UUID when provided.");
         }
 
+        if (options.LaunchId is not null && !Guid.TryParse(options.LaunchId, out _))
+        {
+            errors.Add("RUNNER_LAUNCH_ID must be a UUID when provided.");
+        }
+
         ValidateHttpsUrl(options.OffloadrApiUrl, "offloadr-api", errors);
 
         ValidateDirectoryWritable(options.Session.SessionRoot, "SESSION_ROOT", errors);
