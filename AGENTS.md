@@ -43,8 +43,9 @@ The Offloadr runner: the agent that executes GPU work for the Offloadr control p
 ## Command and session rules
 
 - Validate and retain exact runner, session, command and runtime (`RuntimeRef`) identity through execution and acknowledgement. Two runtimes are the same when their `runtime_id` is; the higher `runtime_order` is newer, across sessions. `lifecycle_generation` only matches GPU power commands.
-- A start is refused when its order is at or below its session's Stop cutoff or the eviction floor, below the newest start adopted, or equal to it with another id. A repeated start of the adopted runtime joins its startup or replays its recorded acknowledgement; it never launches twice. A newer start replaces: it cancels the startup in flight, stops the session's older child (or pre-empts another session), then launches.
+- A start is refused when its order is at or below its session's Stop cutoff or the eviction floor, below the newest start adopted, or equal to it with another id; any start but a repeat of the adopted runtime is also refused at or below the settled order. A repeated start of the adopted runtime joins its startup or replays its recorded acknowledgement; it never launches twice. A newer start replaces: it cancels the startup in flight, stops the session's older child (or pre-empts another session), then launches.
 - A Stop compares once: a runtime, child or startup of its session above its cutoff makes it superseded, and it does nothing. Otherwise it records the cutoff before cleanup.
+- The settled order (`RuntimeStatus.settled_runtime_order`) rises when a start is adopted, when a start ends not ready (before its acknowledgement is sent) and when a Stop records its cutoff. It never reaches a start that is admitted and not yet adopted, and it is read in one snapshot with the session. Nothing starts at or below a value a status carried.
 - Never apply an older command to a newer runtime or logical session.
 - Retry acknowledgements with the same result and identity without re-executing a completed action.
 - Distinguish host shutdown cancellation, workflow cancellation, Stop and command failure. Host shutdown is never a successful acknowledgement.
@@ -57,7 +58,7 @@ The Offloadr runner: the agent that executes GPU work for the Offloadr control p
 ## Testing rules
 
 - Cover duplicate and stale commands, acknowledgement replay, reconnect ordering, cancellation classes, and Stop during startup or restart.
-- Cover the start and Stop orderings: a Stop before an older delayed start, an older Stop after a newer start, a repeated start while launching and after it finished, a newer start for the same session, an evicted Stop cutoff, and a start for an older assignment.
+- Cover the start and Stop orderings: a Stop before an older delayed start, an older Stop after a newer start, a repeated start while launching and after it finished, a newer start for the same session, an evicted Stop cutoff, and a start for an older assignment. Cover the settled order for each: refused, failed before adoption, admitted and not yet adopted, a cutoff with no session held, and a superseded Stop.
 - Verify failed start and unexpected-exit cleanup clears only the matching logical session and runtime identity.
 - Test runtime-kind gating, native connection bridge state and reconnects, the heartbeat's runtime status, and idempotent process/download/workspace/artifact cleanup.
 - Linux-native tests call `LinuxTestPrerequisites` and are ignored elsewhere; `RUNNER_NATIVE_TESTS_REQUIRED=1` turns a missing prerequisite into a failure (CI sets it).

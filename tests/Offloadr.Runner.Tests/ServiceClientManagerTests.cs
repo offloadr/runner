@@ -995,8 +995,9 @@ public partial class ServiceClientManagerTests
         {
             Assert.That(state.AdmitStart("session-a", new RuntimeIdentity("a-1", 4)), Is.EqualTo(ServiceClientManager.StartAdmission.Stale));
             Assert.That(state.AdmitStart("session-a", new RuntimeIdentity("a-2", 5)), Is.EqualTo(ServiceClientManager.StartAdmission.Stale));
-            // Another session's start is not fenced by this session's Stop.
-            Assert.That(state.AdmitStart("session-b", new RuntimeIdentity("b-1", 4)), Is.EqualTo(ServiceClientManager.StartAdmission.Newer));
+            // Another session's start at or below it is older work as well: the cutoff is settled, and a
+            // status may have said so.
+            Assert.That(state.AdmitStart("session-b", new RuntimeIdentity("b-1", 4)), Is.EqualTo(ServiceClientManager.StartAdmission.Stale));
             Assert.That(state.AdmitStart("session-a", new RuntimeIdentity("a-3", 6)), Is.EqualTo(ServiceClientManager.StartAdmission.Newer));
         });
     }

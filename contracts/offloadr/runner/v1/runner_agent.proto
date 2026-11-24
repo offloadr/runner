@@ -319,10 +319,13 @@ message RuntimeStatus {
     RuntimePhase phase = 5;
     SessionSealingStatus sealing = 6; // What the runtime got; set only when READY.
     string message = 7;               // Why it failed; set only when FAILED, at most 512 bytes.
-    // The highest runtime_order this process had adopted when it sampled this status, also when
-    // session_id is empty; 0 when it has adopted none. The control plane ignores a report from an
-    // executor whose acknowledged first Start is newer, because the report was sampled before it.
-    uint64 adopted_runtime_order = 9;
+    // The highest runtime_order this process had settled when it sampled this status, also when
+    // session_id is empty; 0 when it has settled none. A Start is settled once the session names
+    // its runtime (it was adopted) or its outcome is "not ready" (it was refused, or failed before
+    // it was adopted). A Stop settles its cutoff when the cutoff is recorded. The control plane
+    // does not act on a report from an executor it has sent a newer Start: that report was
+    // sampled before the Start was settled.
+    uint64 settled_runtime_order = 9;
 }
 
 // What a registration speaks for. One runner (one key, one runner_id) can have an executor and a

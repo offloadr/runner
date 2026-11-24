@@ -569,16 +569,16 @@ internal static partial class ServiceClientManager
         public string GetActiveSessionId() => Volatile.Read(ref _state).SessionId;
 
         /// <summary>
-        /// The session, its runtime and the newest runtime order this process adopted, read together.
+        /// The session, its runtime and the highest runtime order this process settled, read together.
         /// An adoption writes the session state and the order under one lock, so a status built from
         /// this never pairs one runtime's session with another's order.
         /// </summary>
-        public (string SessionId, RuntimeIdentity? Runtime, ulong AdoptedRuntimeOrder) Snapshot()
+        public (string SessionId, RuntimeIdentity? Runtime, ulong SettledRuntimeOrder) Snapshot()
         {
             lock (_fenceGate)
             {
                 var current = Volatile.Read(ref _state);
-                return (current.SessionId, current.RuntimeIdentity, _adoptedRuntimeOrder);
+                return (current.SessionId, current.RuntimeIdentity, _settledRuntimeOrder);
             }
         }
 
@@ -659,7 +659,26 @@ internal static partial class ServiceClientManager
                     }
                 }
 
+                if (candidate.RuntimeOrder <= _settledRuntimeOrder)
+                {
+                    // Settled already (a Stop of another session recorded a cutoff at or above it): a
+                    // status may have told the control plane that nothing at or below it starts here.
+                    return StartAdmission.Stale;
+                }
+
                 _newestStart = (normalizedSessionId, candidate);
+
+                // Not settled until the session names its runtime, or its startup ends not ready. The
+                // start it replaces can no longer be adopted, so what waited behind that one counts
+                // now, up to this start.
+                var behind = _settledBehindStart;
+                _unsettledStart = candidate;
+                _settledBehindStart = 0;
+                if (behind > 0)
+                {
+                    RaiseSettled(behind);
+                }
+
                 return StartAdmission.Newer;
             }
         }
@@ -687,6 +706,7 @@ internal static partial class ServiceClientManager
 
                 Volatile.Write(ref _state, new State(normalizedSessionId, candidate));
                 RecordAdopted(normalizedSessionId, candidate.RuntimeOrder);
+                Settle(candidate);
                 return true;
             }
         }
@@ -746,6 +766,14 @@ internal static partial class ServiceClientManager
 
             lock (_fenceGate)
             {
+                // The cutoff is settled from now on: no start at or below it runs for this session.
+                // One past every valid order still fences the session, but it is no runtime order,
+                // and settling it would refuse every other session's start.
+                if (upToRuntimeOrder <= long.MaxValue)
+                {
+                    RaiseSettled(upToRuntimeOrder);
+                }
+
                 if (_stopCutoffs.TryGetValue(normalizedSessionId, out var known))
                 {
                     _stopCutoffs[normalizedSessionId] = Math.Max(known, upToRuntimeOrder);
@@ -822,27 +850,108 @@ internal static partial class ServiceClientManager
         }
 
         /// <summary>
-        /// The highest runtime order this process adopted as a session's runtime, of any session; 0
-        /// before any. Never decreases. Raised together with the session state that names that
-        /// runtime (see <see cref="Snapshot"/>).
+        /// The highest runtime order this process has settled, of any session; 0 before any. Never
+        /// decreases. A Start is settled once the session names its runtime (it was adopted) or its
+        /// outcome is "not ready" (it was refused, or failed before it was adopted); a Stop settles
+        /// its cutoff when the cutoff is recorded. After a status carried a value, no runtime is
+        /// started here for a Start at or below it, unless that status's session already named it:
+        /// the control plane takes a report from an executor it has sent a newer Start as sampled
+        /// before that Start was settled. Read with the session state (see <see cref="Snapshot"/>).
         /// </summary>
-        public ulong AdoptedRuntimeOrder
+        public ulong SettledRuntimeOrder
         {
             get
             {
                 lock (_fenceGate)
                 {
-                    return _adoptedRuntimeOrder;
+                    return _settledRuntimeOrder;
                 }
             }
         }
 
-        private ulong _adoptedRuntimeOrder;
+        private ulong _settledRuntimeOrder;
+
+        // The newest start admitted whose outcome is not known yet: it may still be adopted, so the
+        // settled order stays below its order, whatever else is settled meanwhile.
+        private RuntimeIdentity? _unsettledStart;
+
+        // What was settled at or above the unsettled start's order meanwhile (a Stop's cutoff for
+        // another session, say); it counts once that start is settled.
+        private ulong _settledBehindStart;
+
+        /// <summary>
+        /// Settles a Start whose startup ended "not ready": it failed or was cancelled, before the
+        /// session named its runtime or after. Called by that startup alone, before its
+        /// acknowledgement is sent.
+        /// </summary>
+        public void SettleStart(RuntimeIdentity runtime)
+        {
+            if (!runtime.IsValid)
+            {
+                return;
+            }
+
+            lock (_fenceGate)
+            {
+                Settle(runtime);
+            }
+        }
+
+        /// <summary>
+        /// Settles a Start that was refused as older work, before its acknowledgement is sent. It
+        /// never ends the wait for a startup in flight, whatever identity the refused command names.
+        /// A Start without a session or a valid runtime settles nothing: it names no work. Nor does one
+        /// that reuses the newest start's runtime id at another order or for another session: that
+        /// order belongs to no Start, and settling it would refuse valid work below it.
+        /// </summary>
+        public void SettleRefusedStart(string? sessionId, RuntimeIdentity runtime)
+        {
+            if (string.IsNullOrWhiteSpace(sessionId) || !runtime.IsValid)
+            {
+                return;
+            }
+
+            lock (_fenceGate)
+            {
+                if (_newestStart is { } newest && newest.Runtime.SameRuntime(runtime))
+                {
+                    return;
+                }
+
+                RaiseSettled(runtime.RuntimeOrder);
+            }
+        }
+
+        // Caller holds _fenceGate.
+        private void Settle(RuntimeIdentity runtime)
+        {
+            if (_unsettledStart is { } unsettled && unsettled.SameRuntime(runtime) && unsettled.RuntimeOrder == runtime.RuntimeOrder)
+            {
+                // Its outcome is known: it, and whatever waited behind it, is settled.
+                _unsettledStart = null;
+                _settledRuntimeOrder = Math.Max(_settledRuntimeOrder, Math.Max(runtime.RuntimeOrder, _settledBehindStart));
+                _settledBehindStart = 0;
+                return;
+            }
+
+            RaiseSettled(runtime.RuntimeOrder);
+        }
+
+        // Caller holds _fenceGate. Never to or past a start that may still be adopted.
+        private void RaiseSettled(ulong runtimeOrder)
+        {
+            if (_unsettledStart is { } unsettled && runtimeOrder >= unsettled.RuntimeOrder)
+            {
+                _settledBehindStart = Math.Max(_settledBehindStart, runtimeOrder);
+                runtimeOrder = unsettled.RuntimeOrder - 1;
+            }
+
+            _settledRuntimeOrder = Math.Max(_settledRuntimeOrder, runtimeOrder);
+        }
 
         // Caller holds _fenceGate, and has written the session state naming this runtime.
         private void RecordAdopted(string sessionId, ulong runtimeOrder)
         {
-            _adoptedRuntimeOrder = Math.Max(_adoptedRuntimeOrder, runtimeOrder);
             if (_highestAdopted.TryGetValue(sessionId, out var known))
             {
                 _highestAdopted[sessionId] = Math.Max(known, runtimeOrder);
@@ -2212,6 +2321,10 @@ internal static partial class ServiceClientManager
         if (outcome is null)
         {
             RunnerLog.Warning(nameof(ServiceClientManager), $"Rejecting stale start for session {command.SessionId}.");
+
+            // Refused: settled before its acknowledgement is sent, so the control plane can tell a
+            // status sampled after this from one sampled before the start arrived.
+            deps.LogicalSessionState.SettleRefusedStart(command.SessionId, runtime);
             outcome = Task.FromResult(new StartupOutcome(false, StaleRuntimeCommandMessage));
         }
 
@@ -2314,6 +2427,7 @@ internal static partial class ServiceClientManager
 
         async Task<StartupOutcome> RunPhysicalAsync()
         {
+            var settled = false;
             try
             {
                 await CancelTrackedWorkAsync(previous).ConfigureAwait(false);
@@ -2330,6 +2444,15 @@ internal static partial class ServiceClientManager
                     ClearSupersededSession(command.SessionId, deps);
                 }
 
+                if (!result.Ready)
+                {
+                    // Failed or cancelled, before the session named its runtime or after: settled
+                    // before the acknowledgement is sent. (A ready one was settled when adopted.)
+                    deps.LogicalSessionState.SettleStart(runtime);
+                }
+
+                settled = true;
+
                 // Recorded while this startup still holds the slot, so a repeated start sees
                 // either this startup in progress or its outcome.
                 deps.WorkState.RecordStartupOutcome(command.SessionId, runtime, result, deps.GetTrackedProcess, command.Sealing);
@@ -2337,6 +2460,13 @@ internal static partial class ServiceClientManager
             }
             finally
             {
+                if (!settled)
+                {
+                    // It ended without an outcome (the host is shutting down, say): it starts
+                    // nothing more, and the settled order must not wait for it for ever.
+                    deps.LogicalSessionState.SettleStart(runtime);
+                }
+
                 try { await tracked.CompleteAsync().ConfigureAwait(false); }
                 finally { deps.WorkState.ClearActiveStartup(tracked); }
             }
