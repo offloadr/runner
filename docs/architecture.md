@@ -279,6 +279,9 @@ reconnect:
 
 - the session it holds, that session's runtime and the runtime's phase;
 - the newest start it adopted, of any session;
+- the highest order it has settled: a start adopted or ended not ready, or a Stop's
+  cutoff recorded. Every status carries it (`settled_runtime_order`), and it stays
+  below a start that is admitted and not yet adopted;
 - a Stop cutoff per session, in a bounded map (16,384 sessions). Evicting one
   raises a runner-wide floor to its cutoff, so the evicted session's old start is
   still refused;
@@ -289,7 +292,9 @@ command is read:
 
 1. **Older work is refused.** A start at or below its session's Stop cutoff or the
    floor, below the newest start adopted, or at that start's order with another
-   id, is acknowledged `ready = false`. It touches nothing.
+   id, is acknowledged `ready = false`. So is any other start at or below the
+   settled order: a status may have told the control plane that nothing at or
+   below it starts here. It touches nothing.
 2. **The same runtime replays.** A repeated start of the runtime adopted joins its
    startup in flight, or is answered with its recorded acknowledgement. Nothing is
    launched again. One asking for other sealing is refused.
