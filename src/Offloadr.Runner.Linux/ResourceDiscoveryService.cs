@@ -1,4 +1,5 @@
 using Offloadr.Common.V1;
+using Offloadr.Runner.Core;
 using Offloadr.Runner.V1;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
@@ -83,7 +84,7 @@ public sealed class ResourceDiscoveryService
             if (gpuCount == 0)
             {
                 detectedName = parts[0];
-                detectedType = MapGpuNameToType(parts[0], TryNormalizeDetectedGpuVramGb(parts[1]));
+                detectedType = RunnerGpuClassification.Classify(parts[0], memMiB);
             }
 
             checked
@@ -97,28 +98,7 @@ public sealed class ResourceDiscoveryService
     }
 
     public static GpuType MapGpuNameToType(string nameRaw, int? detectedVramGb = null)
-    {
-        if (ProviderGpuNormalization.TryNormalizeGpuName(nameRaw, detectedVramGb, out var gpuType, ProviderGpuNormalizationSource.Runner))
-        {
-            return gpuType;
-        }
-
-        var name = (nameRaw ?? string.Empty).ToLowerInvariant();
-        if (name.Contains("nvidia", StringComparison.Ordinal)) return GpuType.NvidiaOther;
-        if (name.Contains("amd", StringComparison.Ordinal) || name.Contains("radeon", StringComparison.Ordinal)) return GpuType.AmdOther;
-
-        return GpuType.Unknown;
-    }
-
-    private static int? TryNormalizeDetectedGpuVramGb(string? memoryTotalMiBRaw)
-    {
-        if (!ulong.TryParse(memoryTotalMiBRaw, out var memoryTotalMiB) || memoryTotalMiB == 0)
-        {
-            return null;
-        }
-
-        return (int)Math.Round(memoryTotalMiB / 1024d, MidpointRounding.AwayFromZero);
-    }
+        => RunnerGpuClassification.Classify(nameRaw, detectedVramGb is > 0 ? (ulong)detectedVramGb.Value * 1024UL : 0);
 }
 
 public sealed class LinuxResourceProbe : IResourceProbe

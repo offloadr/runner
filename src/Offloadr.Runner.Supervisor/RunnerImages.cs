@@ -198,7 +198,7 @@ public sealed class RunnerImages
     }
 
     private static bool Busy(SupervisorView view)
-        => view.State is SupervisorState.Checking or SupervisorState.ResolvingPlan or SupervisorState.Pulling
+        => view.State is SupervisorState.Checking or SupervisorState.Pulling
             or SupervisorState.Starting or SupervisorState.Stopping;
 
     /// <summary>The runner images among <paramref name="images"/>: what each is for, the running and chosen ones first.</summary>

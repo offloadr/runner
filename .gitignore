@@ -13,3 +13,6 @@ TestResults/
 .vscode/
 .idea/
 .claude/settings.local.json
+
+# The .NET SDK's per-user cache, when DOTNET_CLI_HOME points into the checkout (machine ids, telemetry).
+.dotnet/

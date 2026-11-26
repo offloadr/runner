@@ -69,7 +69,7 @@ public static partial class DiagnosticsReport
         Section(text, "Runner");
         Line(text, "State", $"{view.StateTitle} ({view.State})");
         Line(text, "Message", view.Message);
-        Line(text, "Restarts", view.Restarts.ToString(CultureInfo.InvariantCulture));
+        Line(text, "Unexpected exits", view.UnexpectedExits.ToString(CultureInfo.InvariantCulture));
         Line(text, "Updated", Time(view.UpdatedUtc));
         if (view.Fault is { } fault)
         {

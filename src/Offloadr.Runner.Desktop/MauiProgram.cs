@@ -24,6 +24,16 @@ public static class MauiProgram
         return string.IsNullOrWhiteSpace(data) ? SupervisorPaths.UserDefault() : new SupervisorPaths(data);
     }
 
+    /// <summary>How the runner key in the settings file is kept: also read by the uninstall hook, with no app running.</summary>
+    internal static void AddRunnerKeyProtection(IServiceCollection services, SupervisorPaths paths)
+    {
+        services.AddDataProtection()
+            .SetApplicationName("OffloadrRunner")
+            .PersistKeysToFileSystem(new DirectoryInfo(paths.Keys))
+            .ProtectKeysWithDpapi();
+        services.AddSingleton<ISecretProtector, DesktopSecretProtector>();
+    }
+
     public static MauiApp CreateMauiApp()
     {
         var paths = Paths();
@@ -35,11 +45,7 @@ public static class MauiProgram
         builder.Services.AddMauiBlazorWebView();
         builder.Services.Replace(ServiceDescriptor.Singleton<IHostEnvironment>(new DesktopHostEnvironment()));
 
-        builder.Services.AddDataProtection()
-            .SetApplicationName("OffloadrRunner")
-            .PersistKeysToFileSystem(new DirectoryInfo(paths.Keys))
-            .ProtectKeysWithDpapi();
-        builder.Services.AddSingleton<ISecretProtector, DesktopSecretProtector>();
+        AddRunnerKeyProtection(builder.Services, paths);
         builder.Services.AddScoped<IHostActions, DesktopHostActions>();
 
         // Hosted services start in registration order: take the single-instance lock before the supervisor runs.

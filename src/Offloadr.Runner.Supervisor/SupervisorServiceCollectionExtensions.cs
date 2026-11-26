@@ -4,6 +4,7 @@ using Microsoft.Extensions.Logging;
 using Offloadr.Runner.Supervisor.Hosting;
 using Offloadr.Runner.Supervisor.Containers;
 using Offloadr.Runner.Supervisor.Hardware;
+using Offloadr.Runner.Supervisor.Launcher;
 using Offloadr.Runner.Supervisor.LaunchPlans;
 using Offloadr.Runner.Supervisor.Processes;
 using Offloadr.Runner.Supervisor.Settings;
@@ -33,6 +34,7 @@ public static class SupervisorServiceCollectionExtensions
             () => provider.GetRequiredService<ContainerEngineSelection>().Pin));
         services.AddSingleton<IHostGpuProbe, NvidiaSmiHostGpuProbe>();
         services.TryAddSingleton<ILaunchPlanProvider, ControlPlaneLaunchPlanProvider>();
+        services.TryAddSingleton<ILauncherLink, ControlPlaneLauncherLink>();
         services.AddSingleton<RunnerSupervisor>();
         services.AddHostedService(provider => provider.GetRequiredService<RunnerSupervisor>());
         services.AddSingleton<DiagnosticsExport>();

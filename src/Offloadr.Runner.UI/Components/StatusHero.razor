@@ -11,8 +11,16 @@
     </MudStack>
     @if (View.IsActive || View.State == SupervisorState.Stopping)
     {
-        <MudButton Variant="Variant.Outlined" Color="Color.Error" StartIcon="@Icons.Material.Filled.Stop"
-                   Disabled="@(View.State == SupervisorState.Stopping)" OnClick="Supervisor.RequestStop">Stop runner</MudButton>
+        <MudStack Row="true" Spacing="2">
+            @if (View.State == SupervisorState.Running && !Supervisor.RunnerWanted)
+            {
+                @* A container still serves, but the computer is no longer offered (another app took over, say). *@
+                <MudButton Variant="Variant.Filled" Color="Color.Primary" StartIcon="@Icons.Material.Filled.PlayArrow"
+                           Disabled="Starting" OnClick="StartAsync">Offer this GPU again</MudButton>
+            }
+            <MudButton Variant="Variant.Outlined" Color="Color.Error" StartIcon="@Icons.Material.Filled.Stop"
+                       Disabled="@(View.State == SupervisorState.Stopping)" OnClick="Supervisor.RequestStop">Stop runner</MudButton>
+        </MudStack>
     }
     else
     {
@@ -30,13 +38,21 @@
     <MudProgressLinear Value="@(fraction * 100)" Color="Color.Primary" Class="mt-3" aria-label="Image download" />
     <MudText Typo="Typo.caption" Class="mud-text-secondary">@pull.Summary</MudText>
 }
-else if (View.State is SupervisorState.Pulling or SupervisorState.Checking or SupervisorState.ResolvingPlan or SupervisorState.Starting or SupervisorState.Stopping)
+else if (View.State is SupervisorState.Pulling or SupervisorState.Checking or SupervisorState.Starting or SupervisorState.Stopping)
 {
     <MudProgressLinear Indeterminate="true" Color="Color.Primary" Class="mt-3" aria-label="@View.StateTitle" />
     @if (View.PullProgress is { } measuring)
     {
         <MudText Typo="Typo.caption" Class="mud-text-secondary">@measuring.Summary</MudText>
     }
+}
+@if (View.Interruption is { } interruption)
+{
+    <MudAlert Severity="Severity.Warning" Dense="true" Class="mt-3" ShowCloseIcon="true" CloseIconClicked="@(_ => Supervisor.DismissInterruption())">@interruption</MudAlert>
+}
+@if (View.LaunchFailure is { } launchFailure)
+{
+    <MudAlert Severity="Severity.Warning" Dense="true" Class="mt-3">@launchFailure.Title: @launchFailure.Message</MudAlert>
 }
 @if (View.HasActiveSession)
 {
@@ -92,9 +108,10 @@ else if (View.State is SupervisorState.Pulling or SupervisorState.Checking or Su
         }
     }
 
+    // Success only once Offloadr can use the computer: a launcher still connecting, or refused, is not.
     private string StateIcon => View.State switch
     {
-        SupervisorState.Running or SupervisorState.RestartPending => Icons.Material.Filled.CheckCircle,
+        _ when View.IsReady => Icons.Material.Filled.CheckCircle,
         SupervisorState.Faulted => Icons.Material.Filled.Error,
         SupervisorState.Stopped => Icons.Material.Filled.PauseCircle,
         _ => Icons.Material.Filled.Autorenew,
@@ -102,9 +119,10 @@ else if (View.State is SupervisorState.Pulling or SupervisorState.Checking or Su
 
     private Color StateColor => View.State switch
     {
-        SupervisorState.Running or SupervisorState.RestartPending => Color.Success,
+        _ when View.IsReady => Color.Success,
+        SupervisorState.Available => Color.Warning,
         SupervisorState.Faulted => Color.Error,
-        SupervisorState.WaitingToRestart => Color.Warning,
+        SupervisorState.WaitingToRetry => Color.Warning,
         SupervisorState.Stopped => Color.Default,
         _ => Color.Primary,
     };

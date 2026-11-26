@@ -55,6 +55,18 @@ The Offloadr runner: the agent that executes GPU work for the Offloadr control p
 - Gate runtime-specific probes and behavior explicitly by runtime kind (ComfyUI, Forge Neo, future runtimes).
 - Preserve Linux-only assumptions in Offloadr.Runner.Linux unless adding explicit multi-platform support.
 
+## Supervisor loop
+
+- `RunnerSupervisor` state is read and written on its loop alone, with no lock. Other threads hand it immutable values (`Intent`, the settings, the link's state) and wake it; they read back only what it published (`View`, the offer).
+- The loop never waits for Docker or Offloadr. Those calls live in `SupervisorEffects`, which holds no supervisor state, and run as jobs in a slot; a result comes back as a message and is recorded as a fact. Do not add an `await` to the loop, or state to `SupervisorEffects`.
+- A procedure that takes several jobs (going online, a launch, a Stop, an idle release) is run again from its top on every tick. Keep nothing across a job in a local: what a later tick needs is a named field of the procedure, and every check is made against the tick's inputs.
+- What is owed (a launch outcome, a container gone, a stopped container an engine kept, a container of unknown fate) is data, worked off on every tick in every state. Do not tie it to the procedure that incurred it.
+- A signal that must reach a job at once from another thread (a Stop, Settings naming another key) cancels a token from the fence. Never share mutable state for it.
+- A container is created (`CreateAsync`), then started by its ID (`StartAsync`); never the two in one engine call. A created container runs nothing, so nothing this app did not start runs unseen, and a start that fails is always a start of a container that can be asked about.
+- The last check that a launch may start is made right before the engine's process is created (`ProcessSpec.StillWanted`), off the loop and outside the link's lock: creating a process can stall, and neither the loop nor the link may wait for it. The same for a release that makes room: checked right before the call, which is made outside the lock. A state that arrives in the instant after that check is answered as one that arrives after the start (the withdrawal is reported, and the container released before it is stopped).
+- A container that started and exited is reported with `container_exited`, never `FAILED`; one that never started gets `FAILED` alone. While the engine does not say which, neither is sent.
+- "Never started" needs proof: the engine refused the start itself (`ContainerEngineException.Refused`) and the container was then seen created. After a start whose answer was lost or given up, a container seen created may still have run, and is reported gone. The engine refusing to remove a container because it runs is proof that it started.
+
 ## Testing rules
 
 - Cover duplicate and stale commands, acknowledgement replay, reconnect ordering, cancellation classes, and Stop during startup or restart.

@@ -142,6 +142,12 @@ public sealed class MainPage : ContentPage
         _closing = true;
         try
         {
+            // Decided again by the supervisor itself, in one step with the launches it takes up.
+            if (!await _supervisor.TryHoldForUpdateAsync(_updates.CanRestartNow))
+            {
+                return;
+            }
+
             Content = new Label { Text = "Restarting to install the update…", Margin = 32 };
             _supervisor.KeepRunnerOnShutdown();
 
@@ -173,6 +179,10 @@ public sealed class MainPage : ContentPage
         finally
         {
             _closing = false;
+            if (!CanClose)
+            {
+                _supervisor.ReleaseUpdateHold();
+            }
         }
     }
 

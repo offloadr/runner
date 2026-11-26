@@ -8,8 +8,8 @@ namespace Offloadr.Runner.Supervisor.Tests;
 
 /// <summary>
 /// Drives a real Docker engine with a locally built runner image. Opt in with
-/// RUNNER_REAL_DOCKER_IMAGE=&lt;image&gt;; the runner points at an unreachable endpoint, so nothing
-/// reaches a control plane. GPU access is not required.
+/// RUNNER_REAL_DOCKER_IMAGE=&lt;image&gt;; the runner points at an unreachable endpoint and the launcher is a
+/// fake, so nothing reaches a control plane. GPU access is not required.
 /// </summary>
 [Category("RealDocker")]
 public class RealDockerTests
@@ -41,11 +41,14 @@ public class RealDockerTests
         };
         // A machine without NVIDIA container support cannot honour --gpus; this test checks supervision, not GPUs.
         var noGpuEngine = new WithoutGpus(engine);
-        using var supervisor = new RunnerSupervisor(settings, noGpuEngine, plans, new FakeHostGpuProbe(), options, TimeProvider.System, NullLogger<RunnerSupervisor>.Instance);
+        var link = new FakeLauncherLink();
+        using var supervisor = new RunnerSupervisor(settings, noGpuEngine, plans, new FakeHostGpuProbe(), link, options, TimeProvider.System, NullLogger<RunnerSupervisor>.Instance);
         await supervisor.StartAsync(CancellationToken.None);
         try
         {
             supervisor.RequestStart();
+            await WaitUntilAsync(() => supervisor.View.IsReady && link.Running, supervisor, TimeSpan.FromMinutes(3));
+            link.Name("comfyui-master", image);
             await WaitUntilAsync(() => supervisor.View.RunnerStatus is not null, supervisor, TimeSpan.FromMinutes(3));
 
             var inspect = await processes.RunAsync(
@@ -102,7 +105,9 @@ public class RealDockerTests
 
         public Task<IReadOnlyList<StoredImage>> ListImagesAsync(CancellationToken cancellationToken) => inner.ListImagesAsync(cancellationToken);
 
-        public Task<string> RunDetachedAsync(ContainerSpec spec, CancellationToken cancellationToken) => inner.RunDetachedAsync(spec with { Gpus = false }, cancellationToken);
+        public Task<string> CreateAsync(ContainerSpec spec, CancellationToken cancellationToken) => inner.CreateAsync(spec with { Gpus = false }, cancellationToken);
+
+        public Task StartAsync(string container, CancellationToken cancellationToken, Func<bool>? stillWanted = null) => inner.StartAsync(container, cancellationToken, stillWanted);
 
         public Task<ContainerInfo?> InspectContainerAsync(string name, CancellationToken cancellationToken) => inner.InspectContainerAsync(name, cancellationToken);
 
@@ -114,6 +119,12 @@ public class RealDockerTests
 
         public Task RemoveAsync(string container, CancellationToken cancellationToken) => inner.RemoveAsync(container, cancellationToken);
 
-        public Task<GpuAccessCheck> CheckGpuAccessAsync(string image, CancellationToken cancellationToken) => inner.CheckGpuAccessAsync(image, cancellationToken);
+        public Task<bool> RemoveStoppedAsync(string container, CancellationToken cancellationToken) => inner.RemoveStoppedAsync(container, cancellationToken);
+
+        public Task<ContainerInfo?> FindByLabelAsync(string label, string value, CancellationToken cancellationToken) => inner.FindByLabelAsync(label, value, cancellationToken);
+
+        public Task<IReadOnlyList<Offloadr.Runner.Supervisor.Hardware.HostGpu>> ListContainerGpusAsync(string image, CancellationToken cancellationToken) => inner.ListContainerGpusAsync(image, cancellationToken);
+
+        public Task<GpuAccessCheck> CheckGpuAccessAsync(string image, CancellationToken cancellationToken) => Task.FromResult(new GpuAccessCheck(true, "GPU 0: not checked"));
     }
 }

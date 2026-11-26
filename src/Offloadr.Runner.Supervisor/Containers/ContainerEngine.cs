@@ -87,6 +87,12 @@ public sealed record ContainerEngineInfo(
     /// <summary>Why no engine is available, when <see cref="Error"/> is set.</summary>
     public FaultKind ErrorKind { get; init; }
 
+    /// <summary>
+    /// The memory the engine's containers can use (Docker Desktop: its WSL virtual machine's), as the
+    /// engine reports it; null when it did not.
+    /// </summary>
+    public long? MemoryBytes { get; init; }
+
     public static ContainerEngineInfo Unavailable(
         string error,
         string? executable = null,
@@ -112,12 +118,35 @@ public sealed record ContainerInfo(
     bool Running,
     int? ExitCode,
     IReadOnlyDictionary<string, string> Labels,
-    string? ImageId = null);
+    string? ImageId = null)
+{
+    /// <summary>
+    /// Never started: nothing of it ever ran. Docker's and Podman's "created" state, or one the engine
+    /// is removing (or left dead as it removed it) that has no start time.
+    /// </summary>
+    public bool NeverStarted { get; init; }
+
+    /// <summary>
+    /// The engine is removing it, or left it dead as it removed it: it runs nothing, and cannot be
+    /// started any more, whatever was asked of it before.
+    /// </summary>
+    public bool BeingRemoved { get; init; }
+
+    /// <summary>
+    /// Never started, and in a state a start can still take it from: an engine that was asked to start
+    /// it, and never said it refused, may start it yet.
+    /// </summary>
+    public bool MayStartYet => NeverStarted && !Running && !BeingRemoved;
+}
 
 /// <param name="RepoTags">The names that point at the image; none once its tag moved to a newer one.</param>
 public sealed record ImageInfo(string Id, string? RepoDigest, IReadOnlyList<string>? RepoTags = null);
 
-public sealed record GpuAccessCheck(bool Succeeded, string Output);
+public sealed record GpuAccessCheck(bool Succeeded, string Output)
+{
+    /// <summary>It was not answered (it never finished, or the engine's command line did not run): it says nothing of the GPU.</summary>
+    public bool Inconclusive { get; init; }
+}
 
 /// <summary>An image the engine holds. <paramref name="Size"/> counts layers it shares with other images too.</summary>
 public sealed record StoredImage(string Id, IReadOnlyList<string> RepoTags, IReadOnlyList<string> RepoDigests, long Size, DateTimeOffset? Created = null);
@@ -134,7 +163,17 @@ public sealed class ContainerEngineException(
 {
     public string? Detail { get; } = detail;
 
+    /// <summary>What failed, in this app's words, without the engine's own output (<see cref="Detail"/>), which may hold a signed URL.</summary>
+    public string Summary { get; } = message;
+
     public FaultKind Kind { get; } = kind ?? EngineFailureClassifier.Classify(operation, detail);
+
+    /// <summary>
+    /// The engine itself answered that it did not do what was asked, so nothing of it is still under way
+    /// there. False when its answer may only be lost (the command line could not reach it, or was given
+    /// up): the engine may still do it.
+    /// </summary>
+    public bool Refused { get; } = EngineFailureClassifier.IsRefusal(detail);
 }
 
 public interface IContainerEngine
@@ -161,8 +200,19 @@ public interface IContainerEngine
     /// </summary>
     Task<bool> RemoveImageAsync(string reference, CancellationToken cancellationToken);
 
-    /// <summary>Starts the container detached and returns its id.</summary>
-    Task<string> RunDetachedAsync(ContainerSpec spec, CancellationToken cancellationToken);
+    /// <summary>
+    /// Creates the container without starting it, and returns its ID. A created container runs nothing
+    /// until <see cref="StartAsync"/>: one the engine creates after this call was cancelled or given up
+    /// is inert, and can only be found and removed.
+    /// </summary>
+    Task<string> CreateAsync(ContainerSpec spec, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Starts a created container, by its ID. When this fails or is given up, the container is still
+    /// known by that ID, and what became of it can be asked.
+    /// </summary>
+    /// <param name="stillWanted">Asked at the last moment before the engine's command is run: false, and it is not (a <c>ProcessNotSpawnedException</c>).</param>
+    Task StartAsync(string container, CancellationToken cancellationToken, Func<bool>? stillWanted = null);
 
     /// <summary>Null when no container has that name.</summary>
     Task<ContainerInfo?> InspectContainerAsync(string name, CancellationToken cancellationToken);
@@ -187,6 +237,25 @@ public interface IContainerEngine
     /// <summary>Removes the container if it exists.</summary>
     Task RemoveAsync(string container, CancellationToken cancellationToken);
 
+    /// <summary>
+    /// Removes <paramref name="container"/> only if it does not run (never by force): false when the
+    /// engine kept it because it runs. Gone already counts as removed; any other failure throws.
+    /// </summary>
+    Task<bool> RemoveStoppedAsync(string container, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// The container, running or not, whose <paramref name="label"/> is <paramref name="value"/>, whatever
+    /// it is called; null when there is none.
+    /// </summary>
+    Task<ContainerInfo?> FindByLabelAsync(string label, string value, CancellationToken cancellationToken);
+
     /// <summary>Runs <c>nvidia-smi -L</c> in a throwaway container from <paramref name="image"/> with GPU access.</summary>
     Task<GpuAccessCheck> CheckGpuAccessAsync(string image, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// The GPUs a throwaway container from <paramref name="image"/> gets, with their names and memory
+    /// (<c>nvidia-smi --query-gpu</c>): what the engine's own computer has, where this one cannot tell
+    /// (a remote engine). Empty when that cannot be read.
+    /// </summary>
+    Task<IReadOnlyList<Hardware.HostGpu>> ListContainerGpusAsync(string image, CancellationToken cancellationToken);
 }

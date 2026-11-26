@@ -36,9 +36,10 @@ internal sealed class TrayStateIcons : IDisposable
     /// <summary>The icon for a badge; zero once disposed (a state change still queued while the app quits).</summary>
     public IntPtr this[TrayBadge badge] => _icons.GetValueOrDefault(badge);
 
-    public static TrayBadge BadgeFor(SupervisorState state) => state switch
+    /// <summary>Green only while Offloadr can use the computer: a launcher still connecting, or refused, is busy.</summary>
+    public static TrayBadge BadgeFor(SupervisorView view) => view.State switch
     {
-        SupervisorState.Running or SupervisorState.RestartPending => TrayBadge.Running,
+        _ when view.IsReady => TrayBadge.Running,
         SupervisorState.Faulted => TrayBadge.Problem,
         SupervisorState.Stopped => TrayBadge.None,
         _ => TrayBadge.Busy,

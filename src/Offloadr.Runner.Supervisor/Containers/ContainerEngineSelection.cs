@@ -35,14 +35,20 @@ public sealed class ContainerEngineSelection(Func<string?, LocatedEngine?>? loca
     public void PinContext(ContainerEnginePin? pin)
     {
         var selected = Volatile.Read(ref _selected);
-        var normalized = pin switch
-        {
-            { Name: { } name } when !string.IsNullOrWhiteSpace(name) => pin with { Name = name.Trim() },
-            { Name: null, Endpoint.Count: > 0 } => pin,
-            _ => null,
-        };
-        Volatile.Write(ref _selected, selected with { Context = normalized });
+        Volatile.Write(ref _selected, WithContext(selected, pin));
     }
+
+    /// <summary><paramref name="engine"/> pinned to <paramref name="pin"/>, as <see cref="PinContext"/> pins the selected one.</summary>
+    internal static Selected WithContext(Selected engine, ContainerEnginePin? pin)
+        => engine with
+        {
+            Context = pin switch
+            {
+                { Name: { } name } when !string.IsNullOrWhiteSpace(name) => pin with { Name = name.Trim() },
+                { Name: null, Endpoint.Count: > 0 } => pin,
+                _ => null,
+            },
+        };
 
     /// <summary>
     /// Selects the engine Settings name (blank: discover one) and resolves it now, so later commands
@@ -50,9 +56,12 @@ public sealed class ContainerEngineSelection(Func<string?, LocatedEngine?>? loca
     /// </summary>
     public void Select(string? configured) => Volatile.Write(ref _selected, Resolve(configured));
 
-    /// <summary>True when <paramref name="configured"/> is the Settings value the engine was selected from.</summary>
+    /// <summary>
+    /// True when <paramref name="configured"/> is the Settings value the engine was selected from: the
+    /// one a scope uses, inside it, as for <see cref="Executable"/>.
+    /// </summary>
     public bool Matches(string? configured)
-        => string.Equals(Volatile.Read(ref _selected).Configured, Normalize(configured), StringComparison.Ordinal);
+        => string.Equals((_scoped.Value ?? Volatile.Read(ref _selected)).Configured, Normalize(configured), StringComparison.Ordinal);
 
     /// <summary>
     /// The ID of the runner container on the remembered engine, saved with the hint once known, so
@@ -178,7 +187,30 @@ public sealed class ContainerEngineSelection(Func<string?, LocatedEngine?>? loca
         }
     }
 
-    private static string? Normalize(string? configured) => string.IsNullOrWhiteSpace(configured) ? null : configured.Trim();
+    /// <summary>
+    /// An engine as saved in the data folder (a password in its address left out, as for the hint),
+    /// to find a container on it again after a restart.
+    /// </summary>
+    internal static string Describe(Selected engine)
+        => Convert.ToBase64String(JsonSerializer.SerializeToUtf8Bytes(engine with { Context = engine.Context?.WithoutPasswords() }));
+
+    /// <summary>The engine <see cref="Describe"/> saved; null when it cannot be read.</summary>
+    internal static Selected? Read(string described)
+    {
+        try
+        {
+            return JsonSerializer.Deserialize<Selected>(Convert.FromBase64String(described)) is { } engine
+                ? engine with { Configured = Normalize(engine.Configured) }
+                : null;
+        }
+        catch (Exception ex) when (ex is FormatException or JsonException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>The Settings value as <see cref="Selected.Configured"/> holds it. Reads nothing from disk, unlike <see cref="Resolve"/>.</summary>
+    internal static string? Normalize(string? configured) => string.IsNullOrWhiteSpace(configured) ? null : configured.Trim();
 
     /// <summary>The selected engine (not one a scope uses).</summary>
     internal Selected Current => Volatile.Read(ref _selected);

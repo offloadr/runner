@@ -1,24 +1,33 @@
 using Offloadr.Runner.Core;
 using Offloadr.Runner.Supervisor.Containers;
 using Offloadr.Runner.Supervisor.Hardware;
+using Offloadr.Runner.Supervisor.Launcher;
 using Offloadr.Runner.Supervisor.LaunchPlans;
 
 namespace Offloadr.Runner.Supervisor;
 
 public enum SupervisorState
 {
+    /// <summary>Not available: the person stopped it, or never started it.</summary>
     Stopped,
+
+    /// <summary>Checking the settings, Docker and the GPU before offering this computer.</summary>
     Checking,
-    ResolvingPlan,
+
+    /// <summary>Offered to Offloadr as a launcher, with no runner container running.</summary>
+    Available,
+
+    /// <summary>Downloading a runner image, for a session or for the first GPU check.</summary>
     Pulling,
+
+    /// <summary>Starting the runner container a session needs.</summary>
     Starting,
+
+    /// <summary>A runner container runs: serving a session, or kept warm for the next one.</summary>
     Running,
 
-    /// <summary>Running, but a different image or setting is waiting for the current session to end.</summary>
-    RestartPending,
-
-    /// <summary>The runner exited unexpectedly and will be started again after a backoff.</summary>
-    WaitingToRestart,
+    /// <summary>Making the computer available failed for now (Docker still starting, say) and is tried again after a backoff.</summary>
+    WaitingToRetry,
     Stopping,
     Faulted,
 }
@@ -34,7 +43,7 @@ public sealed record SupervisorView(
     LaunchTemplate? ActiveTemplate,
     ImageInfo? Image,
     RunnerStatusSnapshot? RunnerStatus,
-    int Restarts,
+    int UnexpectedExits,
     DateTimeOffset UpdatedUtc)
 {
     /// <summary>
@@ -46,24 +55,59 @@ public sealed record SupervisorView(
     /// <summary>How far the image download is while <see cref="SupervisorState.Pulling"/>; null otherwise.</summary>
     public PullProgress? PullProgress { get; init; }
 
+    /// <summary>How the app's registration as the runner's launcher stands; null before it first ran.</summary>
+    public LauncherLinkState? Launcher { get; init; }
+
+    /// <summary>Why the last session on this computer was cut off, until the next launch or until dismissed.</summary>
+    public string? Interruption { get; init; }
+
+    /// <summary>Why the last launch Offloadr asked for could not start, until the next one.</summary>
+    public SupervisorFault? LaunchFailure { get; init; }
+
     public static SupervisorView Initial(DateTimeOffset now)
         => new(SupervisorState.Stopped, "The runner is stopped.", null, null, null, null, null, null, null, 0, now);
 
-    /// <summary>True while a runner container is wanted: starting, running or about to restart.</summary>
-    public bool IsActive => State is SupervisorState.Checking or SupervisorState.ResolvingPlan or SupervisorState.Pulling
-        or SupervisorState.Starting or SupervisorState.Running or SupervisorState.RestartPending or SupervisorState.WaitingToRestart;
+    /// <summary>True while this computer is wanted available: being checked, offered, launching or running a container, or about to retry.</summary>
+    public bool IsActive => State is SupervisorState.Checking or SupervisorState.Available or SupervisorState.Pulling
+        or SupervisorState.Starting or SupervisorState.Running or SupervisorState.WaitingToRetry;
+
+    /// <summary>
+    /// The launcher runs but offers no editor and no GPU: what this computer offers failed its checks
+    /// (or is being checked), while a runner container still runs or after it has gone.
+    /// </summary>
+    public bool OfferPaused { get; init; }
+
+    /// <summary>
+    /// The runner container that runs was started for a launch Offloadr still names, as far as is known: no
+    /// executor has matched it yet. A launcher that starts anew meanwhile has that launch retired.
+    /// </summary>
+    public bool LaunchUnmatched { get; init; }
+
+    /// <summary>
+    /// True when Offloadr can start sessions here now: its launcher is accepted with a live stream and
+    /// offers this computer. A container that keeps running for an earlier runner, or with no launcher,
+    /// does not make it ready.
+    /// </summary>
+    public bool IsReady => State is SupervisorState.Running or SupervisorState.Available &&
+                           !OfferPaused &&
+                           Launcher is { Connection: LauncherConnection.Online, StreamLive: true };
 
     /// <summary>Short name of the state for headings, tooltips and menus.</summary>
     public string StateTitle => State switch
     {
         SupervisorState.Stopped => "Stopped",
         SupervisorState.Checking => "Checking…",
-        SupervisorState.ResolvingPlan => "Finding the image…",
+        SupervisorState.Available => Launcher?.Connection switch
+        {
+            LauncherConnection.Online when OfferPaused => "Checking…",
+            LauncherConnection.Online when Launcher.StreamLive => "Ready for sessions",
+            LauncherConnection.Refused or LauncherConnection.Unreachable => "Not connected to Offloadr",
+            _ => "Connecting…",
+        },
         SupervisorState.Pulling => "Downloading the image…",
         SupervisorState.Starting => "Starting…",
-        SupervisorState.Running => "Running",
-        SupervisorState.RestartPending => "Running, restart pending",
-        SupervisorState.WaitingToRestart => "Restarting soon",
+        SupervisorState.Running => HasActiveSession ? "Session running" : "Running",
+        SupervisorState.WaitingToRetry => "Trying again soon",
         SupervisorState.Stopping => "Stopping…",
         SupervisorState.Faulted => "Needs attention",
         _ => State.ToString(),
