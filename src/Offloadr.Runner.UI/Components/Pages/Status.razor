@@ -48,7 +48,7 @@
                         <tr><th scope="row">Chosen by</th><td>@PlanSource</td></tr>
                         <tr><th scope="row">Session</th><td>@(View.RunnerStatus is null ? "–" : View.HasActiveSession ? "In use" : "Idle")</td></tr>
                         <tr><th scope="row">Agent version</th><td title="@View.RunnerStatus?.Version">@(SupervisorView.ShortVersion(View.RunnerStatus?.Version) ?? "–")</td></tr>
-                        <tr><th scope="row">Restarts</th><td>@View.Restarts</td></tr>
+                        <tr><th scope="row">Unexpected exits</th><td>@View.UnexpectedExits</td></tr>
                     </tbody>
                 </MudSimpleTable>
                 @if (Template is not null)

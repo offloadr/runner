@@ -14,13 +14,13 @@ public class DockerCliArgumentsTests
         Gpus: true);
 
     [Test]
-    public void Run_NamesEnvironmentVariablesWithoutTheirValues()
+    public void Create_NamesEnvironmentVariablesWithoutTheirValues()
     {
-        var arguments = DockerCliArguments.Run(Spec, ContainerEngineKind.Docker);
+        var arguments = DockerCliArguments.Create(Spec, ContainerEngineKind.Docker);
 
         Assert.That(arguments, Is.EqualTo(new[]
         {
-            "run", "--detach", "--name", "offloadr-runner", "--pull", "never", "--restart", "no",
+            "create", "--name", "offloadr-runner", "--pull", "never", "--restart", "no",
             "--gpus", "all",
             "--label", "app.offloadr.runner.managed=true",
             "--env", "OFFLOADR_API_GRPC",
@@ -45,15 +45,15 @@ public class DockerCliArgumentsTests
 
         Assert.Multiple(() =>
         {
-            Assert.That(string.Join(" ", DockerCliArguments.Run(withModels, ContainerEngineKind.Docker)), Does.Contain("--security-opt label=disable"));
-            Assert.That(string.Join(" ", DockerCliArguments.Run(withoutModels, ContainerEngineKind.Docker)), Does.Not.Contain("label=disable"));
+            Assert.That(string.Join(" ", DockerCliArguments.Create(withModels, ContainerEngineKind.Docker)), Does.Contain("--security-opt label=disable"));
+            Assert.That(string.Join(" ", DockerCliArguments.Create(withoutModels, ContainerEngineKind.Docker)), Does.Not.Contain("label=disable"));
         });
     }
 
     [Test]
     public void Run_UsesTheCdiDeviceForPodman()
     {
-        var arguments = DockerCliArguments.Run(Spec, ContainerEngineKind.Podman);
+        var arguments = DockerCliArguments.Create(Spec, ContainerEngineKind.Podman);
 
         Assert.Multiple(() =>
         {
@@ -345,6 +345,128 @@ public class DockerCliContainerEngineTests
             Throws.InstanceOf<ContainerEngineException>());
     }
 
+    [TestCase(true)]
+    [TestCase(false)]
+    public async Task RemoveStopped_KeepsARunningContainer_AndReportsAnyOtherFailure(bool running)
+    {
+        var processes = new FakeProcessRunner()
+            .On("rm", 1, stderr: running ? "Error response from daemon: cannot remove container: container is running" : "permission denied")
+            .On("container inspect", 0, stdout: """[{"Id":"abc","State":{"Running":RUNNING,"ExitCode":0},"Config":{"Image":"x","Labels":{}}}]""".Replace("RUNNING", running ? "true" : "false", StringComparison.Ordinal));
+        var engine = new DockerCliContainerEngine(processes, () => Docker);
+
+        if (running)
+        {
+            Assert.That(await engine.RemoveStoppedAsync("offloadr-runner", CancellationToken.None), Is.False);
+        }
+        else
+        {
+            Assert.That(
+                async () => await engine.RemoveStoppedAsync("offloadr-runner", CancellationToken.None),
+                Throws.InstanceOf<ContainerEngineException>(),
+                "A stopped container the engine would not remove is no restart.");
+        }
+
+        Assert.That(processes.Calls[0].Arguments, Is.EqualTo(new[] { "rm", "offloadr-runner" }), "Never by force.");
+    }
+
+    [TestCase("Error response from daemon: cannot remove container \"/offloadr-runner\": container is running: stop the container before removing or force remove")]
+    [TestCase("Error response from daemon: You cannot remove a running container abc. Stop the container before attempting removal or force remove")]
+    [TestCase("Error: cannot remove container abc as it is running - running or paused containers cannot be removed without force: container state improper")]
+    public async Task RemoveStopped_TakesTheEnginesRefusalAsProofItRan_WhateverItIsByTheTimeItIsLookedAt(string refusal)
+    {
+        // It started, which is why the engine kept it, and has exited again by the time it is inspected.
+        var processes = new FakeProcessRunner()
+            .On("rm", 1, stderr: refusal)
+            .On("container inspect", 0, stdout: """[{"Id":"abc","State":{"Running":false,"ExitCode":1},"Config":{"Image":"x","Labels":{}}}]""");
+        var engine = new DockerCliContainerEngine(processes, () => Docker);
+
+        Assert.That(await engine.RemoveStoppedAsync("offloadr-runner", CancellationToken.None), Is.False);
+    }
+
+    [Test]
+    public async Task ListContainerGpus_AsksAThrowawayContainer_ForEachGpusNameAndMemory()
+    {
+        var processes = new FakeProcessRunner().On("run --rm", 0, stdout: "GPU-0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0, NVIDIA RTX A6000, 49140\n");
+        var engine = new DockerCliContainerEngine(processes, () => Docker);
+
+        var gpus = await engine.ListContainerGpusAsync("runner:latest", CancellationToken.None);
+
+        var arguments = processes.Calls.Single().Arguments;
+        Assert.Multiple(() =>
+        {
+            Assert.That(gpus.Single(), Is.EqualTo(new Offloadr.Runner.Supervisor.Hardware.HostGpu("NVIDIA RTX A6000", 49140, "GPU-0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0")));
+            Assert.That(arguments, Does.Contain("--gpus").And.Contain("--rm").And.Contain("never"));
+            Assert.That(arguments.TakeLast(3), Is.EqualTo(new[] { "runner:latest", "--query-gpu=uuid,name,memory.total", "--format=csv,noheader,nounits" }));
+        });
+    }
+
+    [Test]
+    public void ContainerInfo_CountsAPausedContainerAsRunning()
+    {
+        // Podman: paused is reported as not running.
+        const string json = """[{"Id":"abc","State":{"Status":"paused","Running":false,"Paused":true,"ExitCode":0},"Config":{"Image":"x","Labels":{}}}]""";
+
+        Assert.That(DockerCliJson.Container(json)!.Running, Is.True, "It can be resumed, with its session: it did not exit.");
+    }
+
+    [Test]
+    public void ContainerInfo_CountsAContainerThatIsStillStoppingAsRunning()
+    {
+        // Podman, during a graceful stop: not running, and its agent is alive.
+        const string json = """[{"Id":"abc","State":{"Status":"stopping","Running":false,"ExitCode":0,"StartedAt":"2026-11-25T10:00:00Z"},"Config":{"Image":"x","Labels":{}}}]""";
+
+        Assert.That(DockerCliJson.Container(json)!.Running, Is.True, "Told as gone, Offloadr would end a session that is still being shut down.");
+    }
+
+    [TestCase("created", false, true)]
+    [TestCase("configured", false, true)]
+    [TestCase("initialized", false, true)]
+    [TestCase("exited", false, false)]
+    [TestCase("running", true, false)]
+    public void ContainerInfo_TellsAContainerThatNeverStarted(string status, bool running, bool neverStarted)
+    {
+        var json = """[{"Id":"abc","State":{"Status":"STATUS","Running":RUNNING,"ExitCode":0},"Config":{"Image":"x","Labels":{}}}]"""
+            .Replace("STATUS", status, StringComparison.Ordinal).Replace("RUNNING", running ? "true" : "false", StringComparison.Ordinal);
+
+        Assert.That(DockerCliJson.Container(json)!.NeverStarted, Is.EqualTo(neverStarted), "created: nothing of it ever ran, so no exit is reported");
+    }
+
+    [TestCase("removing", "0001-01-01T00:00:00Z", true)]
+    [TestCase("dead", "0001-01-01T00:00:00Z", true)]
+    [TestCase("removing", "2026-11-25T10:00:00.123456789Z", false)]
+    [TestCase("dead", "2026-11-25T10:00:00.123456789Z", false)]
+    [TestCase("exited", "0001-01-01T00:00:00Z", false)]
+    public void ContainerInfo_TellsByItsStartTime_WhetherAContainerBeingRemovedEverStarted(string status, string startedAt, bool neverStarted)
+    {
+        // Docker shows "removing" (or "dead", after a removal that failed half-way) whatever it was before.
+        var json = """[{"Id":"abc","State":{"Status":"STATUS","Running":false,"ExitCode":0,"StartedAt":"STARTED"},"Config":{"Image":"x","Labels":{}}}]"""
+            .Replace("STATUS", status, StringComparison.Ordinal).Replace("STARTED", startedAt, StringComparison.Ordinal);
+
+        var container = DockerCliJson.Container(json)!;
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(container.NeverStarted, Is.EqualTo(neverStarted), "No start time: nothing of it ever ran, so no exit is reported.");
+            Assert.That(container.MayStartYet, Is.False, "One being removed, or one that exited, cannot be started any more.");
+        });
+    }
+
+    [Test]
+    public void ContainerInfo_WithoutAStartTime_IsNotTakenForOneThatNeverStarted_WhileItIsBeingRemoved()
+    {
+        const string json = """[{"Id":"abc","State":{"Status":"removing","Running":false,"ExitCode":0},"Config":{"Image":"x","Labels":{}}}]""";
+
+        Assert.That(DockerCliJson.Container(json)!.NeverStarted, Is.False, "Nothing says it never ran.");
+    }
+
+    [Test]
+    public void ContainerInfo_SaysACreatedContainerMayStartYet()
+    {
+        const string json = """[{"Id":"abc","State":{"Status":"created","Running":false,"ExitCode":0,"StartedAt":"0001-01-01T00:00:00Z"},"Config":{"Image":"x","Labels":{}}}]""";
+
+        Assert.That(DockerCliJson.Container(json)!.MayStartYet, Is.True);
+    }
+
     [Test]
     public void FollowLogs_ReportsAStreamThatFails()
     {
@@ -422,11 +544,11 @@ public class DockerCliContainerEngineTests
         var processes = new FakeProcessRunner()
             .On("version", 0, """{"Client":{"APIVersion":"4.9.3","Version":"4.9.3","OsArch":"linux/amd64","Os":"linux"}}""")
             .On("info", 0, """{"host":{"os":"linux","distribution":{"distribution":"fedora"}}}""")
-            .On("run", 0, "container-id\n");
+            .On("create", 0, "container-id\n");
         var engine = new DockerCliContainerEngine(processes, () => Docker);
 
         var info = await engine.ProbeAsync(CancellationToken.None);
-        await engine.RunDetachedAsync(
+        await engine.CreateAsync(
             new ContainerSpec("offloadr-runner", "image", new Dictionary<string, string>(), [], new Dictionary<string, string>(), Gpus: true),
             CancellationToken.None);
 
@@ -987,9 +1109,9 @@ public class DockerCliContainerEngineTests
     }
 
     [Test]
-    public async Task RunDetached_PassesTheSecretThroughTheProcessEnvironment()
+    public async Task Create_PassesTheSecretThroughTheProcessEnvironment()
     {
-        var processes = new FakeProcessRunner().On("run", 0, "container-id\n");
+        var processes = new FakeProcessRunner().On("create", 0, "container-id\n");
         var engine = new DockerCliContainerEngine(processes, () => Docker);
         var spec = new ContainerSpec(
             "offloadr-runner",
@@ -999,15 +1121,38 @@ public class DockerCliContainerEngineTests
             new Dictionary<string, string>(),
             Gpus: true);
 
-        var id = await engine.RunDetachedAsync(spec, CancellationToken.None);
+        var id = await engine.CreateAsync(spec, CancellationToken.None);
 
         var call = processes.Calls.Single();
         Assert.Multiple(() =>
         {
             Assert.That(id, Is.EqualTo("container-id"));
+            Assert.That(call.Arguments[0], Is.EqualTo("create"), "Created, not started: a container the engine makes after a cancelled call runs nothing.");
             Assert.That(call.Arguments, Has.None.Contains("secret-value"));
             Assert.That(call.Environment!["RUNNER_SECRET"], Is.EqualTo("secret-value"));
         });
+    }
+
+    [Test]
+    public async Task Start_StartsTheCreatedContainerByItsId()
+    {
+        var processes = new FakeProcessRunner();
+        var engine = new DockerCliContainerEngine(processes, () => Docker);
+
+        await engine.StartAsync("container-id", CancellationToken.None);
+
+        Assert.That(processes.Calls.Single().Arguments, Is.EqualTo(new[] { "start", "container-id" }));
+    }
+
+    [Test]
+    public void Start_ThatFails_IsClassifiedAsAFailedRun()
+    {
+        var processes = new FakeProcessRunner().On("start", 1, stderr: "could not select device driver \"nvidia\" with capabilities: [[gpu]]");
+        var engine = new DockerCliContainerEngine(processes, () => Docker);
+
+        var failure = Assert.ThrowsAsync<ContainerEngineException>(() => engine.StartAsync("container-id", CancellationToken.None));
+
+        Assert.That(failure!.Kind, Is.EqualTo(FaultKind.GpuUnavailable));
     }
 
     [Test]
@@ -1058,6 +1203,86 @@ public class SystemProcessRunnerTests
             Assert.That(result.ExitCode, Is.Zero);
             Assert.That(result.StandardOutput.Trim(), Is.EqualTo("hello"));
         });
+    }
+
+    [Test]
+    public void Run_CancelledWhileTheProcessIsPrepared_StartsNone_AndSaysSo()
+    {
+        var marker = Path.Combine(Path.GetTempPath(), "offloadr-not-spawned-" + Guid.NewGuid().ToString("n"));
+        using var cancellation = new CancellationTokenSource();
+        var runner = new SystemProcessRunner();
+
+        // Cancelled after the first look at the token, as its environment is read for the process.
+        var environment = new CancellingEnvironment(cancellation);
+        var spec = OperatingSystem.IsWindows()
+            ? new ProcessSpec("cmd.exe", ["/c", $"echo started> \"{marker}\""], environment)
+            : new ProcessSpec("/bin/sh", ["-c", $"echo started > '{marker}'"], environment);
+
+        try
+        {
+            Assert.That(
+                async () => await runner.RunAsync(spec, cancellation.Token),
+                Throws.TypeOf<ProcessNotSpawnedException>(),
+                "Held back before it existed: not a command that was cut short and may have been heard.");
+            Assert.That(File.Exists(marker), Is.False, "Nothing of the command ran.");
+        }
+        finally
+        {
+            File.Delete(marker);
+        }
+    }
+
+    [Test]
+    public void Run_NotWantedAnyMoreAsTheProcessIsToBeStarted_StartsNone_AndSaysSo()
+    {
+        var spec = OperatingSystem.IsWindows() ? new ProcessSpec("cmd.exe", ["/c", "exit 0"]) : new ProcessSpec("/bin/sh", ["-c", "exit 0"]);
+
+        Assert.That(
+            async () => await new SystemProcessRunner().RunAsync(spec with { StillWanted = () => false }, CancellationToken.None),
+            Throws.TypeOf<ProcessNotSpawnedException>());
+    }
+
+    [Test]
+    public void Run_CancelledWhileItIsAskedWhetherItIsStillWanted_StartsNone()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var spec = OperatingSystem.IsWindows() ? new ProcessSpec("cmd.exe", ["/c", "exit 0"]) : new ProcessSpec("/bin/sh", ["-c", "exit 0"]);
+        bool Asked()
+        {
+            cancellation.Cancel();
+            return true;
+        }
+
+        Assert.That(
+            async () => await new SystemProcessRunner().RunAsync(spec with { StillWanted = Asked }, cancellation.Token),
+            Throws.TypeOf<ProcessNotSpawnedException>(),
+            "A Stop that arrives during the last check prevents the start.");
+    }
+
+    /// <summary>An environment whose reading cancels: what a Stop pressed while the process is prepared looks like.</summary>
+    private sealed class CancellingEnvironment(CancellationTokenSource cancellation) : IReadOnlyDictionary<string, string>
+    {
+        private readonly Dictionary<string, string> _values = new() { ["RUNNER_TEST_VALUE"] = "hello" };
+
+        public string this[string key] => _values[key];
+
+        public IEnumerable<string> Keys => _values.Keys;
+
+        public IEnumerable<string> Values => _values.Values;
+
+        public int Count => _values.Count;
+
+        public bool ContainsKey(string key) => _values.ContainsKey(key);
+
+        public bool TryGetValue(string key, [System.Diagnostics.CodeAnalysis.MaybeNullWhen(false)] out string value) => _values.TryGetValue(key, out value);
+
+        public IEnumerator<KeyValuePair<string, string>> GetEnumerator()
+        {
+            cancellation.Cancel();
+            return _values.GetEnumerator();
+        }
+
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
     }
 
     [Test]

@@ -31,14 +31,15 @@ public enum LauncherConnection
 /// <summary>
 /// A launch Offloadr named (<c>LaunchRunnerCommand</c>), as an immutable value. It belongs to the run
 /// of the link whose stream named it: report on it with the value <see cref="LauncherLinkState.Launch"/> gave.
+/// <see cref="OfferRevision"/> is the <see cref="LauncherProfile.OfferRevision"/> Offloadr checked it against.
 /// </summary>
-public sealed record LaunchRequest(string LaunchId, ulong Sequence, string EditorTemplate, string RunnerImage)
+public sealed record LaunchRequest(string LaunchId, ulong Sequence, string EditorTemplate, string RunnerImage, ulong OfferRevision = 0)
 {
     /// <summary>The run of the link that received it; 0 for one made by hand, which no run accepts.</summary>
     internal long Run { get; init; }
 
     internal static LaunchRequest From(LaunchRunnerCommand command, long run)
-        => new(command.LaunchId.Trim(), command.LaunchSequence, command.EditorTemplate.Trim(), command.RunnerImage.Trim()) { Run = run };
+        => new(command.LaunchId.Trim(), command.LaunchSequence, command.EditorTemplate.Trim(), command.RunnerImage.Trim(), command.OfferRevision) { Run = run };
 }
 
 /// <summary>
@@ -58,8 +59,11 @@ public sealed record LauncherLinkState(
     public bool IsFinal => Connection is LauncherConnection.Outdated or LauncherConnection.Superseded;
 }
 
-/// <summary>What a launcher heartbeat says about this computer: its GPU and the editors it can start.</summary>
-public sealed record LauncherProfile(RunnerResources Resources, IReadOnlyList<string> EditorTemplates);
+/// <summary>
+/// What a launcher heartbeat says about this computer: its GPU and the editors it can start, and the
+/// revision of that offer, which rises whenever the GPU or container engine it launches on changes.
+/// </summary>
+public sealed record LauncherProfile(RunnerResources Resources, IReadOnlyList<string> EditorTemplates, ulong OfferRevision = 0);
 
 /// <summary>One progress or outcome report for a launch.</summary>
 public sealed record LaunchReport(
@@ -77,7 +81,18 @@ public sealed record LaunchReport(
 
 /// <param name="Released">Offloadr granted the release: the container may be stopped.</param>
 /// <param name="Reached">False when Offloadr could not be asked; keep the container and ask again.</param>
-public sealed record ReleaseResult(bool Released, bool Reached, string Message);
+/// <param name="Sent">
+/// False when the request was not sent at all (the launch it was for was no longer named, or no launcher
+/// runs to send it): nothing can have been granted.
+/// </param>
+public sealed record ReleaseResult(bool Released, bool Reached, string Message, bool Sent = true)
+{
+    /// <summary>
+    /// False when Offloadr refused the call itself (a gRPC error) rather than its release handler
+    /// answering: not granted, but nothing was decided about the container either.
+    /// </summary>
+    public bool Answered { get; init; } = true;
+}
 
 /// <summary>
 /// The desktop app's registration as a launcher (see "Launchers" in <c>docs/contracts-sync.md</c>):
@@ -109,7 +124,40 @@ public interface ILauncherLink
     /// the state it sent last names exactly <paramref name="launch"/> (as this run received it) and no
     /// outcome was reported for it yet. Ask right before starting the container.
     /// </summary>
-    bool MayStart(LaunchRequest launch);
+    /// <param name="streamDrops">
+    /// The <see cref="StreamDrops"/> at which the caller's checks began: false once the stream dropped since,
+    /// asked in one step with the rest (it may have come back, with the same launch named).
+    /// </param>
+    bool MayStart(LaunchRequest launch, long? streamDrops = null);
+
+    /// <summary>
+    /// How often the stream went from live to not live, in any run. What was checked at one count (the
+    /// GPUs a container gets, say) was checked with the stream live throughout only while the count is
+    /// still the same: a drop and a reconnect in between, which <see cref="MayStart"/> alone does not
+    /// show afterwards, raise it.
+    /// </summary>
+    long StreamDrops { get; }
+
+    /// <summary>
+    /// The highest <see cref="LauncherProfile.OfferRevision"/> of a heartbeat Offloadr accepted in this run;
+    /// 0 before any. Offloadr retires launches stamped lower once it accepts one: a launch chosen for an
+    /// older offer is reported FAILED only after that, as a FAILED sent first would fail its allocation.
+    /// </summary>
+    ulong AcceptedOfferRevision { get; }
+
+    /// <summary>
+    /// Runs <paramref name="dispatch"/> only if <see cref="MayStart"/> holds, and with nothing able to
+    /// change the link's state until it returns: the check and the start are one step. Keep
+    /// <paramref name="dispatch"/> short and synchronous (spawning `docker run`, not waiting for it), and
+    /// never call back into the link from it. False when the launch may not start now.
+    /// </summary>
+    /// <param name="streamDrops">
+    /// The <see cref="StreamDrops"/> the caller's checks were made at: with another count by now (the
+    /// stream dropped and came back, with the same launch named), nothing is started, and false returned.
+    /// </param>
+    bool TryStart(LaunchRequest launch, Action dispatch, long? streamDrops = null);
+
+
 
     /// <summary>
     /// Reports a launch's progress, for a launch this run's stream named (a report on a launch an
@@ -137,7 +185,24 @@ public interface ILauncherLink
     /// <summary>
     /// Asks once whether the container started for <paramref name="launchId"/> may be stopped. Only
     /// the Offloadr that asked for it can say: a <paramref name="launchTarget"/> other than the
-    /// current <see cref="LaunchTarget"/> is not asked, and comes back not reached.
+    /// current <see cref="LaunchTarget"/> is not asked, and comes back not reached. With
+    /// <paramref name="onlyFor"/>, a release that makes room for that launch, it is sent only if
+    /// <see cref="MayStart"/> holds for it, checked as one step with the sending (as for
+    /// <see cref="TryStart"/>); otherwise it comes back not sent. Nor is it sent once
+    /// <paramref name="sendUnless"/> is cancelled (the caller no longer needs the room), checked in the
+    /// same step; a request already sent is still answered. With <paramref name="containerExited"/>
+    /// it reports a container that is gone (it exited, or was stopped without a granted release):
+    /// Offloadr then ends its executor's session instead of checking that it is idle. Such a report needs
+    /// no registered launcher: it goes as the launcher instance that last ran for that target, or, with
+    /// <paramref name="reportAs"/> naming that target, as this link's instance for it. With
+    /// <paramref name="reportAs"/>, a release that makes room for no launch (the person stops a container
+    /// while the launcher does not run) is asked the same way, registering nothing.
     /// </summary>
-    Task<ReleaseResult> ReleaseAsync(string launchId, string? executorInstanceId, string launchTarget, CancellationToken cancellationToken);
+    /// <param name="streamDrops">
+    /// With <paramref name="onlyFor"/>: the <see cref="StreamDrops"/> the caller's checks were made at.
+    /// With another count by now, the release is not sent.
+    /// </param>
+    Task<ReleaseResult> ReleaseAsync(string launchId, string? executorInstanceId, string launchTarget, CancellationToken cancellationToken,
+        LaunchRequest? onlyFor = null, CancellationToken sendUnless = default, bool containerExited = false, RunnerSettings? reportAs = null,
+        long? streamDrops = null);
 }

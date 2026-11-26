@@ -16,7 +16,7 @@
                 The runner lets the Offloadr editor in your browser use the NVIDIA GPU in this computer. It only makes outbound connections.
             </MudText>
         </div>
-        @if (!(View.State is SupervisorState.Running or SupervisorState.RestartPending))
+        @if (!View.IsReady)
         {
             <MudButton Variant="Variant.Text" OnClick="@(() => Navigation.NavigateTo(""))">Skip for now</MudButton>
         }
@@ -114,7 +114,7 @@
                         </MudAlert>
                     }
                     <StatusHero OnStart="SaveAndStartAsync" StartLabel="Save and start" IsPageHeading="false" OnOpenSettings="FocusKeyAsync" />
-                    @if (View.State is SupervisorState.Running or SupervisorState.RestartPending)
+                    @if (View.IsReady)
                     {
                         <CheckRow Check="EnvironmentChecks.GpuInContainers(View)" />
                         <MudAlert Severity="Severity.Success">
@@ -146,12 +146,9 @@
         ? false
         : string.IsNullOrWhiteSpace(_runnerKey) ? null : true;
 
-    private bool? RunnerReady => View.State switch
-    {
-        SupervisorState.Running or SupervisorState.RestartPending => true,
-        SupervisorState.Faulted => false,
-        _ => _problems.Count > 0 ? false : null,
-    };
+    private bool? RunnerReady => View.IsReady
+        ? true
+        : View.State == SupervisorState.Faulted || _problems.Count > 0 ? false : null;
 
     protected override void OnInitialized()
     {

@@ -12,7 +12,15 @@ public sealed record ProcessSpec(
     string FileName,
     IReadOnlyList<string> Arguments,
     IReadOnlyDictionary<string, string>? Environment = null,
-    IReadOnlyList<string>? RemovedEnvironment = null);
+    IReadOnlyList<string>? RemovedEnvironment = null)
+{
+    /// <summary>
+    /// Asked at the last moment before the process is started: false, and it is not (a
+    /// <see cref="ProcessNotSpawnedException"/>). For what can change without a token being cancelled,
+    /// a permission that runs out with time, say.
+    /// </summary>
+    public Func<bool>? StillWanted { get; init; }
+}
 
 public sealed record ProcessResult(int ExitCode, string StandardOutput, string StandardError)
 {
@@ -22,6 +30,13 @@ public sealed record ProcessResult(int ExitCode, string StandardOutput, string S
 /// <summary>Thrown when the executable cannot be started at all.</summary>
 public sealed class ProcessStartException(string fileName, Exception inner)
     : Exception($"Could not start '{fileName}': {inner.Message}", inner);
+
+/// <summary>
+/// The command was cancelled before its process was started: nothing of it reached what it was to be
+/// asked of. Unlike a command cancelled while it ran, which may have been heard.
+/// </summary>
+public sealed class ProcessNotSpawnedException(CancellationToken cancellationToken)
+    : OperationCanceledException("The command was cancelled before its process was started.", cancellationToken);
 
 public interface IProcessRunner
 {
@@ -58,7 +73,11 @@ public sealed class SystemProcessRunner : IProcessRunner
         Action<string> onStderr,
         CancellationToken cancellationToken)
     {
-        cancellationToken.ThrowIfCancellationRequested();
+        if (cancellationToken.IsCancellationRequested)
+        {
+            throw new ProcessNotSpawnedException(cancellationToken);
+        }
+
         var startInfo = new ProcessStartInfo(spec.FileName)
         {
             UseShellExecute = false,
@@ -92,6 +111,15 @@ public sealed class SystemProcessRunner : IProcessRunner
         var stderrDone = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         process.OutputDataReceived += (_, e) => { if (e.Data is null) { stdoutDone.TrySetResult(); } else { onStdout(e.Data); } };
         process.ErrorDataReceived += (_, e) => { if (e.Data is null) { stderrDone.TrySetResult(); } else { onStderr(e.Data); } };
+
+        // Looked at once more, at the last moment before the process exists: cancelled while it was being
+        // prepared, nothing of the command is started, and the caller is told so (a start of a container
+        // that was held back is not one whose answer was lost).
+        // (The token last: it may be cancelled while the other is asked.)
+        if (spec.StillWanted?.Invoke() == false || cancellationToken.IsCancellationRequested)
+        {
+            throw new ProcessNotSpawnedException(cancellationToken);
+        }
 
         try
         {

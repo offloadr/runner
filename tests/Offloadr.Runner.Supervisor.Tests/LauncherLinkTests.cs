@@ -78,6 +78,8 @@ public class LauncherLinkTests
             Assert.That(registration.Runtime, Is.Null);
             Assert.That(registration.SealedStorage, Is.Null);
             Assert.That(registration.LaunchId, Is.Empty);
+            Assert.That(registration.OfferRevision, Is.EqualTo(7UL), "each launch is checked against the offer it names");
+            Assert.That(link.AcceptedOfferRevision, Is.EqualTo(7UL), "Offloadr accepted that offer");
             Assert.That(stream.RunnerId, Is.EqualTo(registration.RunnerId));
             Assert.That(stream.InstanceId, Is.EqualTo(link.InstanceId));
             Assert.That(stream.ProtocolVersion, Is.EqualTo(RunnerProtocolVersion.Current));
@@ -120,6 +122,45 @@ public class LauncherLinkTests
         {
             Assert.That(link.State.Launch, Is.Null, "withdrawn while the stream was down");
             Assert.That(MayStart(link, launch.LaunchId), Is.False);
+        });
+
+        _stop.Cancel();
+        await run;
+    }
+
+    [Test]
+    public async Task TryStart_DispatchesOnlyWhatMayStart_AndNoStateLandsMeanwhile()
+    {
+        var link = NewLink();
+        var run = RunAsync(link);
+        var stream = await _server.NextStreamAsync();
+        var launch = NewLaunch(1);
+        await stream.WriteAsync(State(launch));
+        await WaitUntilAsync(() => MayStart(link, launch.LaunchId));
+        var named = link.State.Launch!;
+        var dispatched = 0;
+
+        Assert.That(link.TryStart(named with { LaunchId = Guid.NewGuid().ToString() }, () => dispatched++), Is.False, "not the launch named");
+
+        LauncherLinkState? seenDuring = null;
+        var withdrawal = Task.CompletedTask;
+        var started = link.TryStart(named, () =>
+        {
+            dispatched++;
+            // A withdrawal arriving now waits until the start is handed over.
+            withdrawal = Task.Run(async () => await stream.WriteAsync(State(null)));
+            Thread.Sleep(200);
+            seenDuring = link.State;
+        });
+        await withdrawal;
+        await WaitUntilAsync(() => link.State.Launch is null);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(started, Is.True);
+            Assert.That(dispatched, Is.EqualTo(1));
+            Assert.That(seenDuring?.Launch, Is.EqualTo(named), "the state stays as checked while the start is handed over");
+            Assert.That(link.TryStart(named, () => dispatched++), Is.False, "withdrawn afterwards");
         });
 
         _stop.Cancel();
@@ -640,6 +681,8 @@ public class LauncherLinkTests
         _server.Release = _ => throw new RpcException(new Status(StatusCode.Unimplemented, "404 from a proxy"));
         var noRoute = await link.ReleaseAsync(launchId, null, target, _stop.Token);
         Assert.That(noRoute.Reached, Is.False, "a missing route did not ask Offloadr");
+        _server.Release = _ => new ReleaseRunnerResponse { Released = true };
+        var exited = await link.ReleaseAsync(launchId, null, target, _stop.Token, containerExited: true);
 
         var request = _server.Releases[0];
         Assert.Multiple(() =>
@@ -649,6 +692,9 @@ public class LauncherLinkTests
             Assert.That(unreachable.Reached, Is.False);
             Assert.That(rejected is { Reached: true, Released: false }, Is.True);
             Assert.That(request.LaunchId, Is.EqualTo(launchId));
+            Assert.That(request.ContainerExited, Is.False);
+            Assert.That(exited.Released, Is.True);
+            Assert.That(_server.Releases.Last().ContainerExited, Is.True, "a container that is gone is reported as such");
             Assert.That(request.ExecutorInstanceId, Is.EqualTo("executor-1"));
             Assert.That(request.InstanceId, Is.EqualTo(link.InstanceId));
             Assert.That(request.RunnerId, Is.EqualTo(RunnerAgentOptions.ResolveRunnerId(Key, null)));
@@ -657,6 +703,208 @@ public class LauncherLinkTests
 
         _stop.Cancel();
         await run;
+    }
+
+    [Test]
+    public async Task AStreamThatDroppedAndCameBack_StartsNothingThatWasCheckedBefore()
+    {
+        var link = NewLink();
+        var run = RunAsync(link);
+        var first = await _server.NextStreamAsync();
+        var launch = NewLaunch(1);
+        await first.WriteAsync(State(launch));
+        await WaitUntilAsync(() => MayStart(link, launch.LaunchId));
+        var drops = link.StreamDrops;
+        Assert.That(link.MayStart(link.State.Launch!, drops), Is.True);
+
+        first.Complete();
+        await WaitUntilAsync(() => !link.State.StreamLive);
+        var second = await _server.NextStreamAsync();
+        await second.WriteAsync(State(launch));
+        await WaitUntilAsync(() => MayStart(link, launch.LaunchId));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(link.MayStart(link.State.Launch!, drops), Is.False, "The same launch, named on another stream than the checks were made on.");
+            Assert.That(link.MayStart(link.State.Launch!, link.StreamDrops), Is.True);
+        });
+
+        _stop.Cancel();
+        await run;
+    }
+
+    [Test]
+    public async Task AReleaseWhoseCallIsSlowToBeSetUp_HoldsUpNothingElseOfTheLink()
+    {
+        var link = NewLink();
+        var run = RunAsync(link);
+        var stream = await _server.NextStreamAsync();
+        await stream.WriteAsync(State(null));
+        await WaitUntilAsync(() => link.State.StreamLive);
+        using var setUp = new ManualResetEventSlim();
+        using var proceed = new ManualResetEventSlim();
+        _server.Release = _ =>
+        {
+            setUp.Set();
+            proceed.Wait(TimeSpan.FromSeconds(8));
+            return new ReleaseRunnerResponse { Released = true };
+        };
+        var target = link.LaunchTarget!;
+        var release = Task.Run(() => link.ReleaseAsync(Guid.NewGuid().ToString(), null, target, _stop.Token));
+        Assert.That(setUp.Wait(TimeSpan.FromSeconds(8)), Is.True);
+        try
+        {
+            // Meanwhile the stream names a launch, and the link records it.
+            var launch = NewLaunch(1);
+            await stream.WriteAsync(State(launch));
+            var recorded = Task.Run(() => WaitUntilAsync(() => MayStart(link, launch.LaunchId)));
+            await recorded.WaitAsync(TimeSpan.FromSeconds(4));
+        }
+        finally
+        {
+            proceed.Set();
+        }
+
+        Assert.That((await release).Released, Is.True);
+        _stop.Cancel();
+        await run;
+    }
+
+    [Test]
+    public async Task AReleaseThatMakesRoomForALaunch_IsSentOnlyWhileThatLaunchIsNamed()
+    {
+        var link = NewLink();
+        var run = RunAsync(link);
+        var stream = await _server.NextStreamAsync();
+        var launch = await NameAsync(link, stream);
+        var target = link.LaunchTarget!;
+        _server.Release = _ => new ReleaseRunnerResponse { Released = true };
+
+        var whileNamed = await link.ReleaseAsync(Guid.NewGuid().ToString(), null, target, _stop.Token, onlyFor: launch);
+        await stream.WriteAsync(State(null));
+        await WaitUntilAsync(() => link.State.Launch is null);
+        var afterWithdrawal = await link.ReleaseAsync(Guid.NewGuid().ToString(), null, target, _stop.Token, onlyFor: launch);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(launch.OfferRevision, Is.EqualTo(7UL), "the offer Offloadr checked it against");
+            Assert.That(whileNamed is { Released: true, Sent: true }, Is.True);
+            Assert.That(afterWithdrawal is { Released: false, Reached: false, Sent: false }, Is.True);
+            Assert.That(_server.Releases, Has.Count.EqualTo(1), "Nothing is sent once the launch is withdrawn.");
+        });
+        _stop.Cancel();
+        await run;
+    }
+
+    [Test]
+    public async Task AReleaseWithNoLauncherToSendIt_IsToldAsNotSent()
+    {
+        var link = NewLink();
+        var run = RunAsync(link);
+        await _server.NextStreamAsync();
+        var target = link.LaunchTarget!;
+        _server.Release = _ => new ReleaseRunnerResponse { Released = true };
+        var another = await link.ReleaseAsync(Guid.NewGuid().ToString(), null, "https://another.example#runner", _stop.Token);
+        _stop.Cancel();
+        await run;
+
+        var ended = await link.ReleaseAsync(Guid.NewGuid().ToString(), null, target, CancellationToken.None);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(another is { Released: false, Reached: false, Sent: false }, Is.True, "Only the Offloadr that launched it can say.");
+            Assert.That(ended is { Released: false, Reached: false, Sent: false }, Is.True, "Nothing can have been granted.");
+            Assert.That(_server.Releases, Is.Empty);
+        });
+    }
+
+    [Test]
+    public async Task AContainerGone_IsStillReported_AfterTheRunEnded_AsTheInstanceThatRan()
+    {
+        var link = NewLink();
+        var run = RunAsync(link);
+        await _server.NextStreamAsync();
+        var target = link.LaunchTarget!;
+        var instance = link.InstanceId;
+        _stop.Cancel();
+        await run;
+        _server.Release = _ => new ReleaseRunnerResponse { Released = true };
+
+        // Taken over, say: no run now. A gone container is reported all the same; a normal release is not.
+        var exited = await link.ReleaseAsync(Guid.NewGuid().ToString(), null, target, CancellationToken.None, containerExited: true);
+        var normal = await link.ReleaseAsync(Guid.NewGuid().ToString(), null, target, CancellationToken.None);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(exited.Released, Is.True);
+            Assert.That(_server.Releases.Single().InstanceId, Is.EqualTo(instance), "as the launcher instance that ran");
+            Assert.That(_server.Releases.Single().ContainerExited, Is.True);
+            Assert.That(normal.Reached, Is.False, "a normal release needs a registered launcher");
+        });
+    }
+
+    [Test]
+    public async Task AContainerGone_IsReported_WithNoRunAtAll_AsTheSettingsThatNameItsTarget()
+    {
+        var link = NewLink();
+        var target = RunnerSupervisor.LaunchTargetFor(Settings);
+        _server.Release = _ => new ReleaseRunnerResponse { Released = true };
+
+        // A new process, say: nothing ran here. Reported all the same, without registering.
+        var exited = await link.ReleaseAsync(Guid.NewGuid().ToString(), null, target, CancellationToken.None, containerExited: true, reportAs: Settings);
+        var elsewhere = await link.ReleaseAsync(Guid.NewGuid().ToString(), null, "https://other.example#runner", CancellationToken.None, containerExited: true, reportAs: Settings);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(exited.Released, Is.True);
+            Assert.That(_server.Registrations, Is.Empty, "not registered just to report");
+            Assert.That(_server.Releases.Single().InstanceId, Is.EqualTo(link.InstanceId));
+            Assert.That(_server.Releases.Single().RunnerId, Is.EqualTo(RunnerAgentOptions.ResolveRunnerId(Key, null)));
+            Assert.That(elsewhere.Reached, Is.False, "settings for another target do not speak for it");
+        });
+    }
+
+    [Test]
+    public async Task AReleaseBeforeAStop_IsAsked_WithNoRunAtAll_AsTheSettingsThatNameItsTarget()
+    {
+        var link = NewLink();
+        var target = RunnerSupervisor.LaunchTargetFor(Settings);
+        _server.Release = _ => new ReleaseRunnerResponse { Released = true };
+
+        // The person stops an adopted container while this computer is not offered: asked without registering.
+        var asked = await link.ReleaseAsync(Guid.NewGuid().ToString(), null, target, CancellationToken.None, reportAs: Settings);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(asked.Released, Is.True);
+            Assert.That(_server.Registrations, Is.Empty, "not registered just to ask");
+            Assert.That(_server.Releases.Single().ContainerExited, Is.False);
+        });
+    }
+
+    [Test]
+    public async Task AReleaseBeforeAStop_ForARunnerSettingsNoLongerName_IsAskedAsTheLauncherThatRanForIt()
+    {
+        var link = NewLink();
+        var run = RunAsync(link);
+        await _server.NextStreamAsync();
+        var target = link.LaunchTarget!;
+        var instance = link.InstanceId;
+        await _stop.CancelAsync();
+        await run;
+        _server.Release = _ => new ReleaseRunnerResponse { Released = true };
+
+        // The person changed the key and stops the container the old one launched: only the Offloadr
+        // that launched it can say, and it is asked as the launcher that ran for it.
+        var other = Settings with { RunnerKey = "another-runner-key-0123456789abcdefghijklmnop" };
+        var asked = await link.ReleaseAsync(Guid.NewGuid().ToString(), null, target, CancellationToken.None, reportAs: other);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(asked.Released, Is.True);
+            Assert.That(_server.Releases.Single().InstanceId, Is.EqualTo(instance));
+            Assert.That(_server.Releases.Single().ContainerExited, Is.False);
+        });
     }
 
     [Test]
@@ -925,7 +1173,7 @@ public class LauncherLinkTests
 
     private static LauncherProfile Profile()
         => new(LauncherResources.From(new HostGpuReport([new HostGpu("NVIDIA GeForce RTX 4090", 24564)], null), null, null),
-            ["comfyui-latest", "forge-neo"]);
+            ["comfyui-latest", "forge-neo"], OfferRevision: 7);
 
     private static LaunchRunnerCommand NewLaunch(ulong sequence) => new()
     {
@@ -933,6 +1181,7 @@ public class LauncherLinkTests
         LaunchSequence = sequence,
         EditorTemplate = "comfyui-latest",
         RunnerImage = "ghcr.io/offloadr/runner:comfyui-latest-p6",
+        OfferRevision = 7,
     };
 
     /// <summary>Whether the launch with <paramref name="launchId"/> may start, asked as a caller would: with the request the state holds.</summary>

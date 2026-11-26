@@ -62,14 +62,16 @@ internal static class RunnerRegistrationLoop
     /// <summary>
     /// One launcher heartbeat: the desktop app that starts runner containers on request. It names the
     /// host GPU it launches on and the editors it can start; it reports no runtime, sealed storage or
-    /// launch, and protects no session.
+    /// launch, and protects no session. <paramref name="offerRevision"/> rises whenever what it offers
+    /// changes; each launch carries the one it was allocated against.
     /// </summary>
     internal static RegisterRunnerRequest BuildLauncherRequest(
         string runnerId,
         string instanceId,
         string version,
         RunnerResources resources,
-        IReadOnlyList<string> launchableEditorTemplates)
+        IReadOnlyList<string> launchableEditorTemplates,
+        ulong offerRevision = 0)
     {
         ArgumentNullException.ThrowIfNull(resources);
         ArgumentNullException.ThrowIfNull(launchableEditorTemplates);
@@ -82,6 +84,7 @@ internal static class RunnerRegistrationLoop
             Resources = resources,
             ProtocolVersion = RunnerProtocolVersion.Current,
             Role = RunnerRole.Launcher,
+            OfferRevision = offerRevision,
         };
         request.SupportedEditorTemplates.AddRange(launchableEditorTemplates);
         return request;

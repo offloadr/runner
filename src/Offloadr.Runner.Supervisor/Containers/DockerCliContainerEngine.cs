@@ -207,11 +207,11 @@ public sealed class DockerCliContainerEngine(IProcessRunner processes, Func<stri
            result.StandardError.Contains("in use", StringComparison.OrdinalIgnoreCase) ||
            result.StandardError.Contains("referenced in multiple", StringComparison.OrdinalIgnoreCase);
 
-    public async Task<string> RunDetachedAsync(ContainerSpec spec, CancellationToken cancellationToken)
+    public async Task<string> CreateAsync(ContainerSpec spec, CancellationToken cancellationToken)
     {
         var engine = Require();
         var result = await processes.RunAsync(
-            Spec(engine, DockerCliArguments.Run(spec, engine.Kind), spec.Environment),
+            Spec(engine, DockerCliArguments.Create(spec, engine.Kind), spec.Environment),
             cancellationToken).ConfigureAwait(false);
         if (!result.Succeeded)
         {
@@ -219,6 +219,16 @@ public sealed class DockerCliContainerEngine(IProcessRunner processes, Func<stri
         }
 
         return result.StandardOutput.Trim();
+    }
+
+    public async Task StartAsync(string container, CancellationToken cancellationToken, Func<bool>? stillWanted = null)
+    {
+        var result = await processes.RunAsync(Spec(Require(), ["start", container]) with { StillWanted = stillWanted }, cancellationToken).ConfigureAwait(false);
+        if (!result.Succeeded)
+        {
+            // Where a GPU that cannot be attached shows: classified as a failed run.
+            throw new ContainerEngineException("Could not start the runner container.", result.StandardError, EngineOperation.Run);
+        }
     }
 
     public async Task<ContainerInfo?> InspectContainerAsync(string name, CancellationToken cancellationToken)
@@ -319,6 +329,26 @@ public sealed class DockerCliContainerEngine(IProcessRunner processes, Func<stri
         }
     }
 
+    public async Task<bool> RemoveStoppedAsync(string container, CancellationToken cancellationToken)
+    {
+        // Without --force the engine refuses a container that runs, so one that started meanwhile stays.
+        var result = await RunQuickAsync(Require(), ["rm", container], cancellationToken).ConfigureAwait(false);
+        if (result.Succeeded || IsNotFound(result))
+        {
+            return true;
+        }
+
+        // Kept because it runs, or for another reason (a daemon or permission error), which is reported.
+        // The refusal itself says it runs: it may have exited, or be gone, by the time it is looked at.
+        if (IsRunningRefusal(result) ||
+            await InspectContainerAsync(container, cancellationToken).ConfigureAwait(false) is { Running: true })
+        {
+            return false;
+        }
+
+        throw new ContainerEngineException($"Could not remove container {container}.", result.StandardError);
+    }
+
     public async Task<GpuAccessCheck> CheckGpuAccessAsync(string image, CancellationToken cancellationToken)
     {
         var engine = Require();
@@ -344,15 +374,55 @@ public sealed class DockerCliContainerEngine(IProcessRunner processes, Func<stri
             }
 
             // A broken driver or toolkit can leave nvidia-smi hanging: that is the answer to show.
-            return new GpuAccessCheck(false, $"The GPU check did not finish within {limit.TotalSeconds:0} seconds. Check the NVIDIA driver and container toolkit.");
+            return new GpuAccessCheck(false, $"The GPU check did not finish within {limit.TotalSeconds:0} seconds. Check the NVIDIA driver and container toolkit.") { Inconclusive = true };
         }
         catch (ProcessStartException ex)
         {
-            return new GpuAccessCheck(false, ex.Message);
+            return new GpuAccessCheck(false, ex.Message) { Inconclusive = true };
         }
 
         var output = (result.Succeeded ? result.StandardOutput : result.StandardError + result.StandardOutput).Trim();
         return new GpuAccessCheck(result.Succeeded && output.Contains("GPU", StringComparison.Ordinal), output);
+    }
+
+    public async Task<ContainerInfo?> FindByLabelAsync(string label, string value, CancellationToken cancellationToken)
+    {
+        var result = await RunQuickAsync(Require(), ["ps", "--all", "--filter", $"label={label}={value}", "--format", "{{.ID}}"], cancellationToken).ConfigureAwait(false);
+        if (!result.Succeeded)
+        {
+            throw new ContainerEngineException("Could not list the runner containers.", result.StandardError);
+        }
+
+        var id = result.StandardOutput.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).FirstOrDefault();
+        return id is null ? null : await InspectContainerAsync(id, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<IReadOnlyList<Hardware.HostGpu>> ListContainerGpusAsync(string image, CancellationToken cancellationToken)
+    {
+        var engine = Require();
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(_gpuCheckTimeout);
+        var name = $"offloadr-gpu-list-{Guid.NewGuid():N}";
+        try
+        {
+            var result = await processes.RunAsync(Spec(engine, DockerCliArguments.GpuInventory(image, engine.Kind, name)), timeout.Token).ConfigureAwait(false);
+            return result.Succeeded ? Hardware.NvidiaSmiHostGpuProbe.Parse(result.StandardOutput) : [];
+        }
+        catch (OperationCanceledException)
+        {
+            // As for the GPU check: a hanging nvidia-smi would keep its container, holding the GPU.
+            await RemoveGpuCheckAsync(engine, name).ConfigureAwait(false);
+            if (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+
+            return [];
+        }
+        catch (ProcessStartException)
+        {
+            return [];
+        }
     }
 
     /// <summary>Removes a GPU check that did not finish, best effort, with its own time limit.</summary>
@@ -663,6 +733,14 @@ public sealed class DockerCliContainerEngine(IProcessRunner processes, Func<stri
     /// a connection error such as "dial tcp: lookup …: no such host" means the engine did not answer,
     /// and must never pass for a container that is gone.
     /// </summary>
+    /// <summary>The engine would not remove the container because it runs (or is paused), in Docker's or Podman's words.</summary>
+    private static bool IsRunningRefusal(ProcessResult result)
+        => result.StandardError.Contains("container is running", StringComparison.OrdinalIgnoreCase) ||
+           result.StandardError.Contains("a running container", StringComparison.OrdinalIgnoreCase) ||
+           result.StandardError.Contains("as it is running", StringComparison.OrdinalIgnoreCase) ||
+           result.StandardError.Contains("container is paused", StringComparison.OrdinalIgnoreCase) ||
+           result.StandardError.Contains("a paused container", StringComparison.OrdinalIgnoreCase);
+
     private static bool IsNotFound(ProcessResult result)
         => result.StandardError.Contains("No such container", StringComparison.OrdinalIgnoreCase) ||
            result.StandardError.Contains("No such object", StringComparison.OrdinalIgnoreCase) ||

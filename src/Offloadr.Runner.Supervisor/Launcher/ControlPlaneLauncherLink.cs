@@ -54,7 +54,12 @@ public sealed class ControlPlaneLauncherLink : ILauncherLink, IDisposable
     private string _instanceId = Guid.NewGuid().ToString();
     private CancellationTokenSource? _run;
     private bool _disposed;
+
     private Session? _session;
+
+    // The settings and launcher identity each target last ran with: a container it started that is gone is
+    // still reported (container_exited) after its run ended, by a takeover say, without registering again.
+    private readonly Dictionary<string, (RunnerSettings Settings, string RunnerId, string InstanceId)> _lastRuns = new(StringComparer.Ordinal);
 
     // One book per target, each with its own instance, so switching the address or key away and
     // back forgets nothing, and a takeover on one target changes nothing on another.
@@ -154,6 +159,7 @@ public sealed class ControlPlaneLauncherLink : ILauncherLink, IDisposable
                 session = new Session(settings with { RunnerKey = key }, runnerId, book.InstanceId, run.Token, book, Interlocked.Increment(ref s_runCount));
                 _session = session;
                 _run = run;
+                _lastRuns[target] = (session.Settings, runnerId, book.InstanceId);
             }
 
             Update(_ => new LauncherLinkState(LauncherConnection.Connecting, null, false, null));
@@ -184,11 +190,27 @@ public sealed class ControlPlaneLauncherLink : ILauncherLink, IDisposable
         }
     }
 
-    public bool MayStart(LaunchRequest launch)
+    public ulong AcceptedOfferRevision
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _session?.AcceptedOfferRevision ?? 0;
+            }
+        }
+    }
+
+    public bool MayStart(LaunchRequest launch, long? streamDrops = null)
     {
         ArgumentNullException.ThrowIfNull(launch);
         lock (_gate)
         {
+            if (streamDrops is { } checkedAt && checkedAt != Interlocked.Read(ref _streamDrops))
+            {
+                return false;
+            }
+
             // The very request this run's latest state named: one an earlier run received is not it.
             // A refused heartbeat withdraws permission until one is accepted again (a heartbeat that
             // only failed to get through does not).
@@ -199,6 +221,23 @@ public sealed class ControlPlaneLauncherLink : ILauncherLink, IDisposable
                    _state.StreamLive &&
                    _state.Launch == launch &&
                    _time.GetElapsedTime(_lastStreamMessage) < _options.KeepAliveTimeout;
+        }
+    }
+
+    public bool TryStart(LaunchRequest launch, Action dispatch, long? streamDrops = null)
+    {
+        ArgumentNullException.ThrowIfNull(dispatch);
+        lock (_gate)
+        {
+            // Every state change goes through this lock: none lands between the check and the start.
+            // (Nor on another stream than the one the caller's checks were made on.)
+            if (!MayStart(launch, streamDrops))
+            {
+                return false;
+            }
+
+            dispatch();
+            return true;
         }
     }
 
@@ -232,6 +271,13 @@ public sealed class ControlPlaneLauncherLink : ILauncherLink, IDisposable
             {
                 // Shutting down: no outcome is recorded, so none is replayed as if it had been reported.
                 dropped = "the launcher is stopping";
+            }
+            else if (cancellationToken.IsCancellationRequested)
+            {
+                // Cancelled while this waited for the lock: recorded only if submitted before that, so a
+                // Stop or shutdown meanwhile is never acknowledged as the launch's outcome. One recorded
+                // earlier is still delivered by its own delivery.
+                return;
             }
             else if (!report.IsTerminal &&
                      (session.Book.Finished.ContainsKey(launchId) || !string.Equals(_state.Launch?.LaunchId, launchId, StringComparison.OrdinalIgnoreCase)))
@@ -427,7 +473,9 @@ public sealed class ControlPlaneLauncherLink : ILauncherLink, IDisposable
         await Task.WhenAll(deliveries).ConfigureAwait(false);
     }
 
-    public async Task<ReleaseResult> ReleaseAsync(string launchId, string? executorInstanceId, string launchTarget, CancellationToken cancellationToken)
+    public async Task<ReleaseResult> ReleaseAsync(string launchId, string? executorInstanceId, string launchTarget, CancellationToken cancellationToken,
+        LaunchRequest? onlyFor = null, CancellationToken sendUnless = default, bool containerExited = false, RunnerSettings? reportAs = null,
+        long? streamDrops = null)
     {
         if (!Guid.TryParse(launchId, out _))
         {
@@ -435,38 +483,77 @@ public sealed class ControlPlaneLauncherLink : ILauncherLink, IDisposable
         }
 
         Session? session;
+        (RunnerSettings Settings, string RunnerId, string InstanceId)? lastRun = null;
         lock (_gate)
         {
             // Not once the run is stopping: whatever would stop the container is being cancelled too.
             session = _session is { Registered: true, Lifetime.IsCancellationRequested: false } registered ? registered : null;
+            if ((containerExited || reportAs is not null) && onlyFor is null &&
+                (session is null || !string.Equals(session.Target, launchTarget, StringComparison.Ordinal)))
+            {
+                // A container that is gone, or one the person stops (a release that makes room for nothing),
+                // for a target not running now (taken over, the app restarted, or not offered): sent with the
+                // identity it last ran as, or this link's for that target. Offloadr records the launcher
+                // instance, it does not check it; nothing is registered for it.
+                if (_lastRuns.TryGetValue(launchTarget, out var known))
+                {
+                    lastRun = known;
+                    session = null;
+                }
+                else if (reportAs is { RunnerKey: { Length: > 0 } key } &&
+                         LaunchTargetOf(reportAs.OffloadrApiOrigin, RunnerAgentOptions.ResolveRunnerId(key.Trim(), configuredRunnerId: null)) == launchTarget)
+                {
+                    var runnerId = RunnerAgentOptions.ResolveRunnerId(key.Trim(), configuredRunnerId: null);
+                    lastRun = (reportAs with { RunnerKey = key.Trim() }, runnerId, _books.TryGetValue(launchTarget, out var book) ? book.InstanceId : _instanceId);
+                    session = null;
+                }
+            }
         }
 
-        if (session is null)
+        if (session is null && lastRun is null)
         {
             // Asked again once registered: Offloadr checks a release against a registered launcher.
-            return new ReleaseResult(false, false, "The launcher is not connected to Offloadr.");
+            return new ReleaseResult(false, false, "The launcher is not connected to Offloadr.", Sent: false);
         }
 
-        if (!string.Equals(session.Target, launchTarget, StringComparison.Ordinal))
+        if (session is not null && !string.Equals(session.Target, launchTarget, StringComparison.Ordinal))
         {
             // Only the Offloadr that asked for the container knows whether something is assigned to it.
             return new ReleaseResult(false, false,
-                "This container was started for another Offloadr address or runner key. Connect with those settings to release it, or stop it yourself.");
+                "This container was started for another Offloadr address or runner key. Connect with those settings to release it, or stop it yourself.",
+                Sent: false);
         }
 
+        var sender = session is not null ? (session.Settings, session.RunnerId, session.InstanceId) : lastRun!.Value;
         var request = new ReleaseRunnerRequest
         {
-            RunnerId = session.RunnerId,
-            InstanceId = session.InstanceId,
+            RunnerId = sender.RunnerId,
+            InstanceId = sender.InstanceId,
             LaunchId = launchId.Trim(),
             ExecutorInstanceId = executorInstanceId?.Trim() ?? string.Empty,
+            ContainerExited = containerExited,
         };
         // Ended with the run as well: a release asked while availability is switched off is not sent.
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, session.Lifetime);
+        using var linked = session is not null
+            ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, session.Lifetime)
+            : CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         try
         {
-            var response = await _controlPlane.ReleaseAsync(session.Settings, request, linked.Token).ConfigureAwait(false);
-            _logger.LogInformation("Release of launch {LaunchId}: released={Released}", request.LaunchId, response.Released);
+            // Asked right before it is sent, and not under the lock: setting the call up can stall (a proxy
+            // looked up, a connection opened), and the stream's state must be recorded meanwhile. A withdrawal
+            // of the launch it makes room for that lands in the instant between is one that lands as it is sent.
+            if ((onlyFor is not null && !MayStart(onlyFor, streamDrops)) || sendUnless.IsCancellationRequested)
+            {
+                return new ReleaseResult(false, false, "The launch it would make room for is no longer named.", Sent: false);
+            }
+
+            if (linked.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+            {
+                return new ReleaseResult(false, false, "The launcher is not connected to Offloadr.", Sent: false);
+            }
+
+            var response = await _controlPlane.ReleaseAsync(sender.Settings, request, linked.Token).ConfigureAwait(false);
+            _logger.LogInformation("Release of launch {LaunchId}: released={Released}, exited={Exited}", request.LaunchId, response.Released, containerExited);
             return new ReleaseResult(response.Released, true, response.Message);
         }
         catch (RpcException ex) when (ex.StatusCode == StatusCode.Cancelled && cancellationToken.IsCancellationRequested)
@@ -480,7 +567,7 @@ public sealed class ControlPlaneLauncherLink : ILauncherLink, IDisposable
         }
         catch (RpcException ex)
         {
-            return new ReleaseResult(false, true, $"Offloadr refused the release ({ex.StatusCode}).");
+            return new ReleaseResult(false, true, $"Offloadr refused the release ({ex.StatusCode}).") { Answered = false };
         }
         catch (HttpRequestException ex)
         {
@@ -540,7 +627,7 @@ public sealed class ControlPlaneLauncherLink : ILauncherLink, IDisposable
                 () =>
                 {
                     var current = profile();
-                    return RunnerRegistrationLoop.BuildLauncherRequest(session.RunnerId, session.InstanceId, AppVersion, current.Resources, current.EditorTemplates);
+                    return RunnerRegistrationLoop.BuildLauncherRequest(session.RunnerId, session.InstanceId, AppVersion, current.Resources, current.EditorTemplates, current.OfferRevision);
                 },
                 _options.RegistrationMinBackoff,
                 _options.RegistrationMaxBackoff,
@@ -602,6 +689,7 @@ public sealed class ControlPlaneLauncherLink : ILauncherLink, IDisposable
                 {
                     session.Registered = true;
                     session.RefusedSinceAccepted = false;
+                    session.AcceptedOfferRevision = Math.Max(session.AcceptedOfferRevision, request.OfferRevision);
                     return state with { Connection = LauncherConnection.Online, Message = null };
                 });
             }
@@ -1102,6 +1190,10 @@ public sealed class ControlPlaneLauncherLink : ILauncherLink, IDisposable
         }
     }
 
+    private long _streamDrops;
+
+    public long StreamDrops => Interlocked.Read(ref _streamDrops);
+
     private void Update(Func<LauncherLinkState, LauncherLinkState> change) => Mutate(change);
 
     /// <summary>Changes the state under the lock (null: no change), then tells listeners outside it.</summary>
@@ -1114,6 +1206,11 @@ public sealed class ControlPlaneLauncherLink : ILauncherLink, IDisposable
             if (next is null || next == _state)
             {
                 return;
+            }
+
+            if (_state.StreamLive && !next.StreamLive)
+            {
+                Interlocked.Increment(ref _streamDrops);
             }
 
             _state = next;
@@ -1217,6 +1314,9 @@ public sealed class ControlPlaneLauncherLink : ILauncherLink, IDisposable
 
         /// <summary>Offloadr refused a heartbeat after the last one it accepted.</summary>
         public bool RefusedSinceAccepted { get; set; }
+
+        /// <summary>The highest offer_revision of a heartbeat Offloadr accepted in this run.</summary>
+        public ulong AcceptedOfferRevision { get; set; }
     }
 
     /// <summary>
@@ -1252,7 +1352,8 @@ public sealed class ControlPlaneLauncherLink : ILauncherLink, IDisposable
     }
 
     /// <summary>The canonical origin (no default port, lower case) and the runner id.</summary>
-    private static string LaunchTargetOf(string origin, string runnerId)
+    /// <summary>The canonical Offloadr address and runner a launch is for: what <see cref="LaunchTarget"/> names.</summary>
+    internal static string LaunchTargetOf(string origin, string runnerId)
     {
         // Scheme, host and port only, never user information a URL might carry. An IPv6 host keeps
         // its brackets and its scope id (fe80::1%3 and fe80::1%7 can be different servers).

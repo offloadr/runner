@@ -78,4 +78,49 @@ public class EngineFailureClassifierTests
             Assert.That(SupervisorFault.For(kind, "x").Title, Is.Not.Empty, kind.ToString());
         }
     }
+
+    [TestCase("Error response from daemon: could not select device driver \"nvidia\" with capabilities: [[gpu]]", true)]
+    [TestCase("docker: Error response from daemon: failed to create task for container: OCI runtime create failed", true)]
+    [TestCase("Error: unable to start container abc: crun: executable file not found in $PATH: No such file or directory: OCI runtime attempted to invoke a command that was not found", true)]
+    [TestCase("Error: unable to start container \"abc\": setting up CDI devices: unresolvable CDI devices nvidia.com/gpu=all", true)]
+    [TestCase("Error: unable to start container \"abc\": EOF", false)]
+    [TestCase("error during connect: read tcp 10.0.0.2:2375: connection reset by peer", false)]
+    [TestCase("Cannot connect to the Docker daemon at npipe:////./pipe/docker_engine. Is the docker daemon running?", false)]
+    [TestCase("Error response from daemon: unexpected EOF", false)]
+    [TestCase("context deadline exceeded", false)]
+    [TestCase("Error response from daemon: 504 Gateway Timeout", false)]
+    [TestCase("Error response from daemon: Internal Server Error", false)]
+    [TestCase("Error response from daemon: driver failed programming external connectivity on endpoint offloadr-runner: Bind for 0.0.0.0:8188 failed: port is already allocated", true)]
+    [TestCase("Error response from daemon: failed to create task for container: context deadline exceeded", false)]
+    [TestCase("Error response from daemon: Conflict. The container name \"/offloadr-runner\" is already in use by container \"abc\".", true)]
+    // What the engine quotes (paths, image names, addresses) is no word of its own.
+    [TestCase("Error response from daemon: error while creating mount source path '/host_mnt/c/gateway/models': mkdir /host_mnt/c/gateway: file exists", true)]
+    [TestCase("Error response from daemon: invalid mount config for type \"bind\": bind source path does not exist: C:\\My Proxy\\models", true)]
+    [TestCase("Error response from daemon: Mounts denied: \nThe path /srv/timeout models is not shared from the host and is not known to Docker.", true)]
+    [TestCase("Error response from daemon: No such image: ghcr.io/example/proxy:latest", true)]
+    [TestCase("Error response from daemon: failed to create task for container: Post \"http://%2Frun%2Fshim/start\": context deadline exceeded", false)]
+    [TestCase("Error: unable to start container \"abc\": crun: Post http://d/v4.0.0/libpod/containers/abc/start: net/http: request canceled", false)]
+    [TestCase("Error response from daemon: failed to create task for container: rpc error: desc = \"transport: timeout\"", false)]
+    [TestCase("Error response from daemon: OCI runtime create failed: dial unix /run/containerd/containerd.sock: i/o timeout", false)]
+    [TestCase("Error response from daemon: lost the answer for '/srv/runc: logs'", false)]
+    [TestCase("Error response from daemon: mkdir /var/lib/docker/overlay2/abc/merged: no space left on device", true)]
+    [TestCase("Error: unable to start container \"abc\": write /run/containers/x: disk quota exceeded", true)]
+    [TestCase("error during connect: write tcp: no space left on device", false)]
+    [TestCase("", false)]
+    [TestCase(null, false)]
+    public void OnlyTheEnginesOwnAnswer_IsARefusal(string? output, bool refusal)
+        => Assert.That(EngineFailureClassifier.IsRefusal(output), Is.EqualTo(refusal));
+
+    [TestCase("docker: Error response from daemon: could not select device driver \"\" with capabilities: [[gpu]].", true)]
+    [TestCase("docker: Error response from daemon: failed to create task for container: exec: \"nvidia-smi\": executable file not found in $PATH", true)]
+    [TestCase("NVIDIA-SMI has failed because it could not communicate with the NVIDIA driver.", true)]
+    [TestCase("No devices were found", true)]
+    [TestCase("error during connect: read tcp 10.0.0.2:2375: connection reset by peer", false)]
+    [TestCase("Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?", false)]
+    [TestCase("docker: Error response from daemon: No such image: ghcr.io/example/runner:latest", false)]
+    [TestCase("docker: Error response from daemon: nvidia-container-cli: context deadline exceeded", false)]
+    [TestCase("", false)]
+    [TestCase(null, false)]
+    public void OnlyAnAnswerAboutTheGpu_SaysItIsLost(string? output, bool lost)
+        => Assert.That(EngineFailureClassifier.SaysNoGpu(output), Is.EqualTo(lost));
 }

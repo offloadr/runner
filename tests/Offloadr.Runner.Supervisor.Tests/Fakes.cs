@@ -1,9 +1,11 @@
 using System.Collections.Concurrent;
 using Offloadr.Runner.Supervisor.Containers;
 using Offloadr.Runner.Supervisor.Hardware;
+using Offloadr.Runner.Supervisor.Launcher;
 using Offloadr.Runner.Supervisor.LaunchPlans;
 using Offloadr.Runner.Supervisor.Processes;
 using Offloadr.Runner.Supervisor.Settings;
+using Offloadr.Runner.V1;
 
 namespace Offloadr.Runner.Supervisor.Tests;
 
@@ -44,7 +46,7 @@ internal sealed class FakeContainerEngine : IContainerEngine
     /// <summary>Thrown by InspectContainerAsync.</summary>
     public Exception? InspectFailure { get; set; }
 
-    /// <summary>Awaited inside RunDetachedAsync after the container exists, for example to hold the CLI until it is cancelled.</summary>
+    /// <summary>Awaited inside the start once the container runs, for example to hold the CLI until it is cancelled.</summary>
     public Func<CancellationToken, Task>? OnRun { get; set; }
 
     /// <summary>Awaited inside ProbeAsync, for example to hold a slow check.</summary>
@@ -125,9 +127,24 @@ internal sealed class FakeContainerEngine : IContainerEngine
 
         lock (_gate)
         {
-            _images.Add(image);
+            if (!PullLeavesNoImage)
+            {
+                _images.Add(image);
+            }
         }
     }
+
+    /// <summary>Removes an image by name, as a cleanup outside the app would.</summary>
+    public void RemoveImageNamed(string image)
+    {
+        lock (_gate)
+        {
+            _images.Remove(image);
+        }
+    }
+
+    /// <summary>A pull succeeds, but the image is gone right after (removed by a cleanup outside the app, say).</summary>
+    public bool PullLeavesNoImage { get; set; }
 
     /// <summary>What a pull prints before OnPull runs.</summary>
     public IReadOnlyList<string> PullLines { get; set; } = [];
@@ -242,47 +259,65 @@ internal sealed class FakeContainerEngine : IContainerEngine
         }
     }
 
-    /// <summary>The next RunDetachedAsync finds the name taken by a container this app did not create.</summary>
+    /// <summary>The next creation finds the name taken by a container this app did not create.</summary>
     public bool NextRunConflict { get; set; }
 
     /// <summary>The labels of the container that wins the name in a run conflict (none: someone else's).</summary>
     public IReadOnlyDictionary<string, string> ConflictLabels { get; set; } = new Dictionary<string, string>();
 
-    /// <summary>Thrown by the next RunDetachedAsync only, before anything is created (the executable did not start).</summary>
+    /// <summary>Thrown by the next creation only, before anything is created (the executable did not start).</summary>
     public Exception? NextRunStartFailure { get; set; }
 
-    /// <summary>Thrown by the next RunDetachedAsync only, after it created the container.</summary>
+    /// <summary>Thrown by the next start only: the container stays created, and never started.</summary>
     public Exception? NextRunFailure { get; set; }
 
-    /// <summary>Runs once at the start of the next RunDetachedAsync, for example to move a tag.</summary>
+    /// <summary>Runs once as the next start is spawned, before its process would start (a Stop pressed then, a tag moved).</summary>
     public Action? BeforeRun { get; set; }
 
-    /// <summary>Replaces the whole of RunDetachedAsync, for example to create the container only later.</summary>
+    /// <summary>Awaited inside the next creation, before anything is created, for example to hold it or have it given up.</summary>
+    public Func<ContainerSpec, CancellationToken, Task>? OnCreate { get; set; }
+
+    /// <summary>
+    /// Replaces the whole of the next start, for example to fail it while the container runs, or has
+    /// exited. With it set, the creation makes nothing itself: the override decides what exists, and
+    /// what it puts under the runner's name is the container that creation returned.
+    /// </summary>
     public Func<ContainerSpec, CancellationToken, Task<string>>? RunOverride { get; set; }
 
-    public async Task<string> RunDetachedAsync(ContainerSpec spec, CancellationToken cancellationToken)
+    private readonly Dictionary<string, (ContainerSpec Spec, Func<ContainerSpec, CancellationToken, Task<string>>? Override)> _created = new(StringComparer.Ordinal);
+    private int _creations;
+
+    /// <summary>How many containers were created (started or not).</summary>
+    public int Creations => Volatile.Read(ref _creations);
+
+    public async Task<string> CreateAsync(ContainerSpec spec, CancellationToken cancellationToken)
     {
-        if (RunOverride is { } runOverride)
+        if (OnCreate is { } onCreate)
         {
-            return await runOverride(spec, cancellationToken);
+            OnCreate = null;
+            await onCreate(spec, cancellationToken);
         }
 
-        var beforeRun = BeforeRun;
-        BeforeRun = null;
-        beforeRun?.Invoke();
-        string id;
+        // As the real engine: a call cancelled before its process starts starts none.
+        cancellationToken.ThrowIfCancellationRequested();
         lock (_gate)
         {
+            var id = $"runner-container-{Interlocked.Increment(ref _creations):D4}";
+            if (RunOverride is { } runOverride)
+            {
+                RunOverride = null;
+                _created[id] = (spec, runOverride);
+                return id;
+            }
+
             if (_containers.ContainsKey(Key(spec.Name)))
             {
                 throw new ContainerEngineException("The container name is already in use.");
             }
 
-            Runs.Add(spec);
-            RunExecutables.Add(Executable());
             if (NextRunConflict)
             {
-                // Someone else created a container of that name just before; the run fails on the name.
+                // Someone else created a container of that name just before; the creation fails on the name.
                 NextRunConflict = false;
                 _containers[Key(spec.Name)] = new FakeContainer("someone-elses-image", true, null, ConflictLabels, "sha256:other", Id: "someone-elses-container");
                 throw new ContainerEngineException("Could not start the runner container.", "The container name is already in use.");
@@ -295,33 +330,90 @@ internal sealed class FakeContainerEngine : IContainerEngine
                 throw notStarted;
             }
 
+            _containers[Key(spec.Name)] = new FakeContainer(spec.Image, false, null, new Dictionary<string, string>(spec.Labels), ImageId(spec.Image), new Dictionary<string, string>(spec.Environment), id) { NeverStarted = true };
+            _created[id] = (spec, null);
+            return id;
+        }
+    }
+
+    public async Task StartAsync(string container, CancellationToken cancellationToken, Func<bool>? stillWanted = null)
+    {
+        (ContainerSpec Spec, Func<ContainerSpec, CancellationToken, Task<string>>? Override) created;
+        lock (_gate)
+        {
+            if (!_created.TryGetValue(container, out created))
+            {
+                throw new ContainerEngineException("No such container.");
+            }
+        }
+
+        if (created.Override is { } runOverride)
+        {
+            await runOverride(created.Spec, cancellationToken);
+            return;
+        }
+
+        var beforeRun = BeforeRun;
+        BeforeRun = null;
+        beforeRun?.Invoke();
+
+        // As the real engine: a call cancelled, or not wanted any more, before its process starts starts none, and says so.
+        if (cancellationToken.IsCancellationRequested || stillWanted?.Invoke() == false)
+        {
+            throw new Offloadr.Runner.Supervisor.Processes.ProcessNotSpawnedException(cancellationToken);
+        }
+
+        lock (_gate)
+        {
+            Runs.Add(created.Spec);
+            RunExecutables.Add(Executable());
             if (NextRunFailure is { } failure)
             {
-                // Created but never started, as when the GPU cannot be attached.
+                // Stays created and never started, as when the GPU cannot be attached.
                 NextRunFailure = null;
-                _containers[Key(spec.Name)] = new FakeContainer(spec.Image, false, null, new Dictionary<string, string>(spec.Labels), ImageId(spec.Image), Id: $"runner-container-{Runs.Count:D4}");
                 throw failure;
             }
 
-            id = $"runner-container-{Runs.Count:D4}";
-            _containers[Key(spec.Name)] = new FakeContainer(spec.Image, true, null, new Dictionary<string, string>(spec.Labels), ImageId(spec.Image), new Dictionary<string, string>(spec.Environment), id);
-            _seenImageIds.Add(ImageId(spec.Image));
+            if (Find(container) is { } key)
+            {
+                _containers[key] = _containers[key] with { Running = true, ExitCode = null, NeverStarted = false };
+            }
+
+            _seenImageIds.Add(ImageId(created.Spec.Image));
         }
 
         if (OnRun is not null)
         {
             await OnRun(cancellationToken);
         }
-
-        return id;
     }
 
-    public void AddContainer(string name, string image, bool running, IReadOnlyDictionary<string, string> labels, IReadOnlyDictionary<string, string>? environment = null)
+    /// <param name="neverStarted">Created and never started, from the moment it exists (no look sees it as one that exited).</param>
+    public void AddContainer(string name, string image, bool running, IReadOnlyDictionary<string, string> labels, IReadOnlyDictionary<string, string>? environment = null, bool neverStarted = false)
     {
         lock (_gate)
         {
-            _containers[Key(name)] = new FakeContainer(image, running, running ? null : 0, labels, ImageId(image), environment, $"added-container-{Guid.NewGuid():N}");
+            // What a start override places for a creation is the container that creation returned.
+            var created = labels.TryGetValue(RunnerSupervisor.LaunchLabel, out var attempt)
+                ? _created.Where(entry => entry.Value.Override is not null &&
+                                          entry.Value.Spec.Labels.TryGetValue(RunnerSupervisor.LaunchLabel, out var wanted) && wanted == attempt)
+                    .Select(entry => entry.Key)
+                    .FirstOrDefault()
+                : null;
+            _containers[Key(name)] = new FakeContainer(image, running, running ? null : 0, labels, ImageId(image), environment, created ?? $"added-container-{Guid.NewGuid():N}")
+            {
+                NeverStarted = neverStarted && !running,
+            };
             _seenImageIds.Add(ImageId(image));
+        }
+    }
+
+    /// <summary>Starts a stopped container again, as `docker start` or a restart policy does.</summary>
+    public void Restart(string name)
+    {
+        lock (_gate)
+        {
+            _containers[Key(name)] = _containers[Key(name)] with { Running = true, ExitCode = null, NeverStarted = false };
         }
     }
 
@@ -363,10 +455,46 @@ internal sealed class FakeContainerEngine : IContainerEngine
             return Task.FromException<ContainerInfo?>(failure);
         }
 
+        Interlocked.Exchange(ref _onNextInspect, null)?.Invoke();
+        OnInspect?.Invoke(name);
         lock (_gate)
         {
             return Task.FromResult(Find(name) is { } key && _containers.TryGetValue(key, out var container)
-                ? new ContainerInfo(container.Id ?? "id-" + name, container.Image, container.Running, container.ExitCode, container.Labels, container.ImageId)
+                ? new ContainerInfo(container.Id ?? "id-" + name, container.Image, container.Running, container.ExitCode, container.Labels, container.ImageId) { NeverStarted = container.NeverStarted }
+                : null);
+        }
+    }
+
+    /// <summary>How many label lookups still fail, as when Docker hiccups.</summary>
+    public int FindByLabelFailures { get; set; }
+
+    /// <summary>Runs once, at the next FindByLabelAsync, before it looks (a Stop pressed during the look, say).</summary>
+    public Action? BeforeNextFindByLabel { get; set; }
+
+    public Task<ContainerInfo?> FindByLabelAsync(string label, string value, CancellationToken cancellationToken)
+    {
+        if (NotAnswering() is { } down)
+        {
+            return Task.FromException<ContainerInfo?>(down);
+        }
+
+        var before = BeforeNextFindByLabel;
+        BeforeNextFindByLabel = null;
+        before?.Invoke();
+
+        if (FindByLabelFailures > 0)
+        {
+            FindByLabelFailures--;
+            return Task.FromException<ContainerInfo?>(new ContainerEngineException("docker ps timed out."));
+        }
+
+        lock (_gate)
+        {
+            var prefix = Key(string.Empty);
+            var found = _containers.FirstOrDefault(entry => entry.Key.StartsWith(prefix, StringComparison.Ordinal) &&
+                                                            entry.Value.Labels.TryGetValue(label, out var labelled) && labelled == value);
+            return Task.FromResult(found.Value is { } container
+                ? new ContainerInfo(container.Id ?? "id-" + found.Key[prefix.Length..], container.Image, container.Running, container.ExitCode, container.Labels, container.ImageId) { NeverStarted = container.NeverStarted }
                 : null);
         }
     }
@@ -510,11 +638,35 @@ internal sealed class FakeContainerEngine : IContainerEngine
     /// <summary>How long a stop takes.</summary>
     public TimeSpan StopDuration { get; set; }
 
+    /// <summary>Thrown once, by the next forced removal.</summary>
+    public ContainerEngineException? NextRemoveFailure { get; set; }
+
+    /// <summary>Runs once, at the next forced removal, before it does anything (a container started at that moment, say).</summary>
+    public Action? BeforeNextRemove { get; set; }
+
+    /// <summary>Forced removals never return (until they are cancelled), and remove nothing.</summary>
+    public bool RemovalHangs { get; set; }
+
     public Task RemoveAsync(string container, CancellationToken cancellationToken)
     {
+        if (RemovalHangs)
+        {
+            return Task.Delay(Timeout.Infinite, cancellationToken);
+        }
+
         if (NotAnswering() is { } down)
         {
             return Task.FromException(down);
+        }
+
+        var before = BeforeNextRemove;
+        BeforeNextRemove = null;
+        before?.Invoke();
+
+        if (NextRemoveFailure is { } failure)
+        {
+            NextRemoveFailure = null;
+            return Task.FromException(failure);
         }
 
         lock (_gate)
@@ -528,15 +680,152 @@ internal sealed class FakeContainerEngine : IContainerEngine
         return Task.CompletedTask;
     }
 
+    /// <summary>Runs at every InspectContainerAsync, before it looks, with the name or ID asked for.</summary>
+    public Action<string>? OnInspect { get; set; }
+
+    /// <summary>Runs once, at the next InspectContainerAsync, before it looks (a container that exits at that moment, say).</summary>
+    public Action? OnNextInspect
+    {
+        get => Volatile.Read(ref _onNextInspect);
+        set => Volatile.Write(ref _onNextInspect, value);
+    }
+
+    private Action? _onNextInspect;
+
+    /// <summary>What RemoveStoppedAsync fails with, as when the engine will not let go of a stopped container.</summary>
+    public ContainerEngineException? RemoveStoppedFailure { get; set; }
+
+    /// <summary>Leaves the container created and never started, as a crash between Docker creating and starting it does.</summary>
+    public void MarkNeverStarted(string name)
+    {
+        lock (_gate)
+        {
+            _containers[Key(name)] = _containers[Key(name)] with { Running = false, ExitCode = null, NeverStarted = true };
+        }
+    }
+
+    /// <summary>Runs once, at the next RemoveStoppedAsync, before it looks (a container started again meanwhile, say).</summary>
+    public Action? BeforeNextRemoveStopped
+    {
+        get => Volatile.Read(ref _beforeNextRemoveStopped);
+        set => Volatile.Write(ref _beforeNextRemoveStopped, value);
+    }
+
+    private Action? _beforeNextRemoveStopped;
+
+    /// <summary>Awaited once, after the next RemoveStoppedAsync removed the container and before it says so.</summary>
+    public Func<Task>? OnNextRemovedStopped
+    {
+        get => Volatile.Read(ref _onNextRemovedStopped);
+        set => Volatile.Write(ref _onNextRemovedStopped, value);
+    }
+
+    private Func<Task>? _onNextRemovedStopped;
+
+    public Task<bool> RemoveStoppedAsync(string container, CancellationToken cancellationToken)
+    {
+        var removal = RemoveStoppedCoreAsync(container);
+        return removal.IsCompletedSuccessfully && removal.Result && Interlocked.Exchange(ref _onNextRemovedStopped, null) is { } hold
+            ? HoldAsync(hold)
+            : removal;
+
+        static async Task<bool> HoldAsync(Func<Task> hold)
+        {
+            await hold();
+            return true;
+        }
+    }
+
+    private Task<bool> RemoveStoppedCoreAsync(string container)
+    {
+        if (NotAnswering() is { } down)
+        {
+            return Task.FromException<bool>(down);
+        }
+
+        Interlocked.Exchange(ref _beforeNextRemoveStopped, null)?.Invoke();
+        if (RemoveStoppedFailure is { } kept)
+        {
+            return Task.FromException<bool>(kept);
+        }
+
+        lock (_gate)
+        {
+            if (Find(container) is { } key && _containers.TryGetValue(key, out var found))
+            {
+                if (found.Running)
+                {
+                    return Task.FromResult(false);
+                }
+
+                _containers.Remove(key);
+            }
+        }
+
+        return Task.FromResult(true);
+    }
+
     private int _gpuChecks;
 
     /// <summary>How often the GPU check ran.</summary>
     public int GpuChecks => Volatile.Read(ref _gpuChecks);
 
-    public Task<GpuAccessCheck> CheckGpuAccessAsync(string image, CancellationToken cancellationToken)
+    /// <summary>What the GPU check answers.</summary>
+    public GpuAccessCheck GpuCheck { get; set; } = new(true, $"GPU 0: NVIDIA GeForce RTX 4090 (UUID: {GpuUuid})");
+
+    /// <summary>What the GPU check answers for containers of one image, when it is not <see cref="GpuCheck"/>.</summary>
+    public Func<string, GpuAccessCheck?>? GpuCheckOf { get; set; }
+
+    /// <summary>The UUID the GPU check lists, as `nvidia-smi -L` prints it.</summary>
+    public const string GpuUuid = "GPU-aaaaaaaa-1111-2222-3333-444444444444";
+
+    /// <summary>The images the GPU check ran in, in order.</summary>
+    public ConcurrentQueue<string> GpuCheckImages { get; } = new();
+
+    /// <summary>What ListContainerGpusAsync reports: the GPUs a container on this engine gets.</summary>
+    public IReadOnlyList<HostGpu> ContainerGpus { get; set; } = [new HostGpu("NVIDIA GeForce RTX 4090", 24564, GpuUuid)];
+
+    /// <summary>How often the containers were asked for their GPUs.</summary>
+    public int ContainerGpuLists => Volatile.Read(ref _containerGpuLists);
+
+    private int _containerGpuLists;
+
+    /// <summary>The images ListContainerGpusAsync was asked with, in order.</summary>
+    public ConcurrentQueue<string> ContainerGpuImages { get; } = new();
+
+    /// <summary>Awaited inside every listing of the containers' GPUs, with how many there have been (to hold one, say).</summary>
+    public Func<int, Task>? OnContainerGpuList { get; set; }
+
+    public async Task<IReadOnlyList<HostGpu>> ListContainerGpusAsync(string image, CancellationToken cancellationToken)
+    {
+        var count = Interlocked.Increment(ref _containerGpuLists);
+        ContainerGpuImages.Enqueue(image);
+
+        // (What it lists is what was there when it was asked: a change made by the hook comes after.)
+        var listed = ContainerGpus;
+        if (OnContainerGpuList is { } onList)
+        {
+            await onList(count);
+        }
+
+        return listed;
+    }
+
+    /// <summary>Awaited once, inside the next GPU check (to hold it while Settings change, say).</summary>
+    public Func<Task>? OnNextGpuCheck { get; set; }
+
+    public async Task<GpuAccessCheck> CheckGpuAccessAsync(string image, CancellationToken cancellationToken)
     {
         Interlocked.Increment(ref _gpuChecks);
-        return Task.FromResult(new GpuAccessCheck(true, "GPU 0: NVIDIA GeForce RTX 4090"));
+        GpuCheckImages.Enqueue(image);
+        var hold = OnNextGpuCheck;
+        OnNextGpuCheck = null;
+        if (hold is not null)
+        {
+            await hold();
+        }
+
+        return GpuCheckOf?.Invoke(image) ?? GpuCheck;
     }
 
     /// <summary>The engine executable in use; each engine sees only the containers it created.</summary>
@@ -551,6 +840,15 @@ internal sealed class FakeContainerEngine : IContainerEngine
         lock (_gate)
         {
             return _containers.ContainsKey((executable ?? string.Empty) + "|" + name);
+        }
+    }
+
+    /// <summary>Removes a container on <paramref name="executable"/>'s engine, as someone at that engine does (whether or not it answers this app).</summary>
+    public void RemoveOn(string? executable, string name)
+    {
+        lock (_gate)
+        {
+            _containers.Remove((executable ?? string.Empty) + "|" + name);
         }
     }
 
@@ -571,20 +869,417 @@ internal sealed class FakeContainerEngine : IContainerEngine
         }
 
         var prefix = Key(string.Empty);
-        return _containers
+        var byId = _containers
             .Where(entry => entry.Key.StartsWith(prefix, StringComparison.Ordinal) &&
                             entry.Value.Id is { } id &&
                             id.StartsWith(nameOrId, StringComparison.OrdinalIgnoreCase))
             .Select(entry => entry.Key)
             .FirstOrDefault();
+        return byId;
     }
 
     /// <summary>The image ID a reference names locally; set one to simulate a tag that moved.</summary>
     public ConcurrentDictionary<string, string> ImageIds { get; } = new(StringComparer.Ordinal);
 
-    private string ImageId(string image) => ImageIds.TryGetValue(image, out var id) ? id : "sha256:local";
+    private string ImageId(string image)
+        => ImageIds.TryGetValue(image, out var id) ? id : image.StartsWith("sha256:", StringComparison.Ordinal) ? image : "sha256:local";
 
-    private sealed record FakeContainer(string Image, bool Running, int? ExitCode, IReadOnlyDictionary<string, string> Labels, string ImageId, IReadOnlyDictionary<string, string>? Environment = null, string? Id = null);
+    private sealed record FakeContainer(string Image, bool Running, int? ExitCode, IReadOnlyDictionary<string, string> Labels, string ImageId, IReadOnlyDictionary<string, string>? Environment = null, string? Id = null)
+    {
+        /// <summary>Created and never started, as Docker leaves a container whose GPU it could not attach.</summary>
+        public bool NeverStarted { get; init; }
+    }
+}
+
+/// <summary>
+/// A launcher link the test drives: a run goes online at once and lasts until cancelled or
+/// <see cref="End"/>; <see cref="Name"/> names a launch on a live stream.
+/// </summary>
+internal sealed class FakeLauncherLink : ILauncherLink
+{
+    private readonly object _gate = new();
+    private readonly ConcurrentDictionary<string, LaunchReport> _outcomes = new(StringComparer.OrdinalIgnoreCase);
+    private LauncherLinkState _state = LauncherLinkState.Offline;
+    private TaskCompletionSource<LauncherLinkState>? _end;
+    private long _run;
+    private long _runCount;
+    private ulong _sequence;
+    private string? _target;
+
+    public LauncherLinkState State
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _state;
+            }
+        }
+    }
+
+    public event EventHandler? StateChanged;
+
+    /// <summary>The settings each run was started with, in order.</summary>
+    public ConcurrentQueue<RunnerSettings> Runs { get; } = new();
+
+    /// <summary>Final states the next runs end with at their first heartbeat, in order (a takeover found then, say).</summary>
+    public ConcurrentQueue<LauncherLinkState> FirstHeartbeats { get; } = new();
+
+    /// <summary>Runs once, as the next run registers, before Offloadr accepts it (a Stop pressed then, say).</summary>
+    public Action? BeforeNextOnline { get; set; }
+
+    /// <summary>How many runs Offloadr accepted.</summary>
+    public int Onlines => Volatile.Read(ref _onlines);
+
+    private int _onlines;
+
+    /// <summary>Runs once, as the next run is cancelled (a Stop pressed at that moment, say).</summary>
+    public Action? OnNextCancel { get; set; }
+
+    /// <summary>Final states the next cancelled runs end with, in order (a heartbeat refused as the run stops, say).</summary>
+    public ConcurrentQueue<LauncherLinkState> CancelEndsWith { get; } = new();
+
+    public ConcurrentQueue<LaunchReport> Reports { get; } = new();
+
+    public ConcurrentQueue<(string LaunchId, string? ExecutorInstanceId, string Target)> Releases { get; } = new();
+
+    /// <summary>How Offloadr answers a release.</summary>
+    public Func<string, ReleaseResult> ReleaseAnswer { get; set; } = _ => new ReleaseResult(true, true, string.Empty);
+
+    /// <summary>Awaited inside ReleaseAsync, for example to hold a release while something else happens.</summary>
+    public Func<CancellationToken, Task>? OnRelease { get; set; }
+
+    /// <summary>False holds every start, as while the stream is down.</summary>
+    public bool StartsAllowed { get; set; } = true;
+
+    /// <summary>Has whoever listens look at the link again, as any change of its state does.</summary>
+    public void Touch() => StateChanged?.Invoke(this, EventArgs.Empty);
+
+    /// <summary>The profile the running run reads for its heartbeats.</summary>
+    public Func<LauncherProfile>? Profile { get; private set; }
+
+    /// <summary>A run is online: its stream may name launches.</summary>
+    public bool Running
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _run != 0 && _state.Connection == LauncherConnection.Online;
+            }
+        }
+    }
+
+    public string? LaunchTarget
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _run == 0 ? null : _target;
+            }
+        }
+    }
+
+    /// <summary>The launch target a run with <paramref name="settings"/> has: never the key itself.</summary>
+    public static string TargetOf(RunnerSettings settings) => RunnerSupervisor.LaunchTargetFor(settings);
+
+    public async Task RunAsync(RunnerSettings settings, Func<LauncherProfile> profile, CancellationToken cancellationToken)
+    {
+        TaskCompletionSource<LauncherLinkState> end;
+        lock (_gate)
+        {
+            if (_run != 0)
+            {
+                throw new InvalidOperationException("The launcher link is already running.");
+            }
+
+            _run = Interlocked.Increment(ref _runCount);
+            _target = TargetOf(settings);
+            end = _end = new TaskCompletionSource<LauncherLinkState>(TaskCreationOptions.RunContinuationsAsynchronously);
+            Profile = profile;
+        }
+
+        Runs.Enqueue(settings);
+        try
+        {
+            Set(_ => new LauncherLinkState(LauncherConnection.Connecting, null, false, null));
+            profile();
+            if (FirstHeartbeats.TryDequeue(out var final))
+            {
+                Set(_ => final);
+                return;
+            }
+
+            var beforeOnline = BeforeNextOnline;
+            BeforeNextOnline = null;
+            beforeOnline?.Invoke();
+            if (cancellationToken.IsCancellationRequested)
+            {
+                // Ended before Offloadr accepted it.
+                Set(_ => LauncherLinkState.Offline);
+                return;
+            }
+
+            // A launch named meanwhile stays named.
+            Interlocked.Increment(ref _onlines);
+            Set(state => state with { Connection = LauncherConnection.Online, Message = null, StreamLive = true });
+            try
+            {
+                var ended = await end.Task.WaitAsync(cancellationToken);
+                Set(_ => ended);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                var onCancel = OnNextCancel;
+                OnNextCancel = null;
+                onCancel?.Invoke();
+                Set(_ => CancelEndsWith.TryDequeue(out var last) ? last : LauncherLinkState.Offline);
+            }
+        }
+        finally
+        {
+            lock (_gate)
+            {
+                _run = 0;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Names a launch on the live stream, with a higher sequence than any before, checked against the
+    /// offer the run sends now (or <paramref name="offerRevision"/>, an older one, say).
+    /// </summary>
+    public LaunchRequest Name(string editorTemplate, string runnerImage, ulong? offerRevision = null)
+    {
+        var revision = offerRevision ?? Profile?.Invoke().OfferRevision ?? 0;
+        LaunchRequest launch;
+        lock (_gate)
+        {
+            launch = new LaunchRequest(Guid.NewGuid().ToString(), ++_sequence, editorTemplate, runnerImage, revision) { Run = _run };
+        }
+
+        Set(state => state with { StreamLive = true, Launch = launch });
+        return launch;
+    }
+
+    /// <summary>Names a launch again on the live stream, as Offloadr does with one still pending for this launcher instance.</summary>
+    public LaunchRequest NameAgain(LaunchRequest launch)
+    {
+        LaunchRequest again;
+        lock (_gate)
+        {
+            again = launch with { Run = _run };
+        }
+
+        Set(state => state with { StreamLive = true, Launch = again });
+        return again;
+    }
+
+    /// <summary>The latest state names no launch.</summary>
+    public void Withdraw() => Set(state => state with { Launch = null });
+
+    /// <summary>The registration answers differently (refused, unreachable) while the run goes on.</summary>
+    public void SetConnection(LauncherConnection connection, string? message)
+        => Set(state => state with { Connection = connection, Message = message, StreamLive = connection == LauncherConnection.Online });
+
+    /// <summary>The stream breaks (or comes back): the launch stays named, and nothing may start meanwhile.</summary>
+    public void SetStreamLive(bool live) => Set(state => state with { StreamLive = live });
+
+    /// <summary>Ends the running run with a final state, as Offloadr refusing it for good does.</summary>
+    public void End(LauncherConnection connection, string message)
+    {
+        TaskCompletionSource<LauncherLinkState>? end;
+        lock (_gate)
+        {
+            end = _end;
+        }
+
+        end?.TrySetResult(new LauncherLinkState(connection, message, false, null));
+    }
+
+    /// <summary>The offer_revision a heartbeat was last accepted with: the run's profile, unless held back.</summary>
+    public ulong AcceptedOfferRevision => HoldAcceptedOfferRevision ?? (Running ? Profile?.Invoke().OfferRevision ?? 0 : 0);
+
+    /// <summary>Holds the accepted offer_revision back (a heartbeat with the new one not answered yet).</summary>
+    public ulong? HoldAcceptedOfferRevision { get; set; }
+
+    public bool MayStart(LaunchRequest launch, long? streamDrops = null)
+    {
+        lock (_gate)
+        {
+            return (streamDrops is not { } checkedAt || checkedAt == StreamDrops) && StartsAllowed && _run != 0 && launch.Run == _run && _state.StreamLive && _state.Launch == launch &&
+                   !_outcomes.ContainsKey(launch.LaunchId);
+        }
+    }
+
+    /// <summary>Sees every report as it is submitted.</summary>
+    public Action<LaunchReport>? ReportObserver { get; set; }
+
+    /// <summary>Runs once, as the next start is asked for, before it is checked (a Stop pressed at that moment, say).</summary>
+    public Action? OnNextTryStart { get; set; }
+
+    public bool TryStart(LaunchRequest launch, Action dispatch, long? streamDrops = null)
+    {
+        var before = OnNextTryStart;
+        OnNextTryStart = null;
+        before?.Invoke();
+        lock (_gate)
+        {
+            if (!MayStart(launch) || (streamDrops is { } checkedAt && checkedAt != StreamDrops))
+            {
+                return false;
+            }
+
+            dispatch();
+            return true;
+        }
+    }
+
+    /// <summary>Runs once, as the next terminal report waits to be submitted (the link is busy), before it is taken.</summary>
+    public Action? OnNextOutcomeSubmitted { get; set; }
+
+    /// <summary>Runs as progress is sent, on the thread that sends it (one that stalls, say).</summary>
+    public Action<LaunchReport>? OnProgress { get; set; }
+
+    /// <summary>While set and not completed, outcomes are submitted and not delivered yet: the link keeps sending them.</summary>
+    public Task? OutcomeGate { get; set; }
+
+    public async Task ReportAsync(LaunchReport report, CancellationToken cancellationToken)
+    {
+        if (report.IsTerminal && OnNextOutcomeSubmitted is { } waiting)
+        {
+            OnNextOutcomeSubmitted = null;
+            waiting();
+        }
+
+        if (cancellationToken.IsCancellationRequested)
+        {
+            // As the real link: a cancelled submission records nothing.
+            return;
+        }
+
+        if (!report.IsTerminal)
+        {
+            if (OnProgress is { } onProgress)
+            {
+                onProgress(report);
+            }
+
+            // As the real link: progress never follows an outcome.
+            if (_outcomes.ContainsKey(report.LaunchId))
+            {
+                return;
+            }
+        }
+
+        ReportObserver?.Invoke(report);
+        if (!report.IsTerminal)
+        {
+            Reports.Enqueue(report);
+            return;
+        }
+
+        if (_outcomes.TryAdd(report.LaunchId, report))
+        {
+            Reports.Enqueue(report);
+        }
+
+        if (OutcomeGate is { } gate)
+        {
+            // Recorded, and resent until it is delivered (or the wait for that is given up).
+            await gate.WaitAsync(cancellationToken);
+        }
+    }
+
+    public LaunchReport? OutcomeOf(string launchId) => _outcomes.TryGetValue(launchId, out var outcome) ? outcome : null;
+
+    /// <summary>The phases reported for <paramref name="launch"/>, in order.</summary>
+    public IReadOnlyList<RunnerLaunchPhase> PhasesOf(LaunchRequest launch)
+        => [.. Reports.Where(report => report.LaunchId == launch.LaunchId).Select(report => report.Phase)];
+
+    /// <summary>The releases sent with container_exited: containers reported gone.</summary>
+    public ConcurrentQueue<(string LaunchId, string? ExecutorInstanceId, string Target)> ExitReports { get; } = new();
+
+    /// <summary>Awaited as a report of a gone container is sent, before it is taken (to hold one that Offloadr does not answer, say).</summary>
+    public Func<string, CancellationToken, Task>? OnExitReport { get; set; }
+
+    /// <summary>How Offloadr answers a release that reports a container gone.</summary>
+    public Func<string, ReleaseResult> ExitReportAnswer { get; set; } = _ => new ReleaseResult(true, true, string.Empty);
+
+    /// <summary>Runs once, as the next release is about to be sent (a withdrawal at that moment, say).</summary>
+    public Action? BeforeNextRelease { get; set; }
+
+    public async Task<ReleaseResult> ReleaseAsync(string launchId, string? executorInstanceId, string launchTarget, CancellationToken cancellationToken,
+        LaunchRequest? onlyFor = null, CancellationToken sendUnless = default, bool containerExited = false, RunnerSettings? reportAs = null,
+        long? streamDrops = null)
+    {
+        if (containerExited)
+        {
+            // Reports a container that is gone: answered on its own, so release counts stay as they were.
+            // Sent by the run for that target, or as the settings that name it (no registration needed).
+            if ((launchTarget != LaunchTarget || !Running) && (reportAs is null || TargetOf(reportAs) != launchTarget))
+            {
+                return new ReleaseResult(false, false, "Not connected.");
+            }
+
+            if (OnExitReport is { } onExitReport)
+            {
+                await onExitReport(launchId, cancellationToken);
+            }
+
+            ExitReports.Enqueue((launchId, executorInstanceId, launchTarget));
+            return ExitReportAnswer(launchId);
+        }
+
+        var before = BeforeNextRelease;
+        BeforeNextRelease = null;
+        before?.Invoke();
+        lock (_gate)
+        {
+            if ((onlyFor is not null && (!MayStart(onlyFor) || (streamDrops is { } checkedAt && checkedAt != StreamDrops))) || sendUnless.IsCancellationRequested)
+            {
+                return new ReleaseResult(false, false, "No longer named.", Sent: false);
+            }
+
+            Releases.Enqueue((launchId, executorInstanceId, launchTarget));
+        }
+
+        if (OnRelease is { } onRelease)
+        {
+            await onRelease(cancellationToken);
+        }
+
+        // Asked by the run for that target, or, with no run for it, as the settings that name it.
+        return launchTarget == LaunchTarget || (reportAs is not null && onlyFor is null && TargetOf(reportAs) == launchTarget)
+            ? ReleaseAnswer(launchId)
+            : new ReleaseResult(false, false, "Another target.", Sent: false);
+    }
+
+    private void Set(Func<LauncherLinkState, LauncherLinkState?> change)
+    {
+        lock (_gate)
+        {
+            var next = change(_state);
+            if (next is null || next == _state)
+            {
+                return;
+            }
+
+            if (_state.StreamLive && !next.StreamLive)
+            {
+                Interlocked.Increment(ref _streamDrops);
+            }
+
+            _state = next;
+        }
+
+        StateChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    private long _streamDrops;
+
+    public long StreamDrops => Interlocked.Read(ref _streamDrops);
 }
 
 internal sealed class FakeLaunchPlanProvider : ILaunchPlanProvider
@@ -627,8 +1322,19 @@ internal sealed class FakeLaunchPlanProvider : ILaunchPlanProvider
 
 internal sealed class FakeHostGpuProbe : IHostGpuProbe
 {
+    /// <summary>What the probe lists.</summary>
+    public HostGpuReport Report { get; set; } = new([new HostGpu("NVIDIA GeForce RTX 4090", 24564)], null);
+
+    private int _probes;
+
+    /// <summary>How often this computer's GPUs were listed.</summary>
+    public int Probes => Volatile.Read(ref _probes);
+
     public Task<HostGpuReport> ProbeAsync(CancellationToken cancellationToken)
-        => Task.FromResult(new HostGpuReport([new HostGpu("NVIDIA GeForce RTX 4090", 24564)], null));
+    {
+        Interlocked.Increment(ref _probes);
+        return Task.FromResult(Report);
+    }
 }
 
 internal sealed class FakeSettingsStore(RunnerSettings settings) : IRunnerSettingsStore
@@ -674,12 +1380,24 @@ internal sealed class FakeProcessRunner : IProcessRunner
     /// <summary>Awaited before answering a call, for example to hang until the call is cancelled, or to throw.</summary>
     public Func<ProcessSpec, CancellationToken, Task>? OnRun { get; set; }
 
+    /// <summary>Answers a call by what it asks, before the answers set with <see cref="On"/>; null leaves it to those.</summary>
+    public Func<ProcessSpec, ProcessResult?>? Answer { get; set; }
+
     public async Task<ProcessResult> RunAsync(ProcessSpec spec, CancellationToken cancellationToken)
     {
-        Calls.Add(spec);
+        lock (Calls)
+        {
+            Calls.Add(spec);
+        }
+
         if (OnRun is { } onRun)
         {
             await onRun(spec, cancellationToken);
+        }
+
+        if (Answer?.Invoke(spec) is { } answer)
+        {
+            return answer;
         }
 
         if (spec.Arguments.Count > 1 && _results.TryGetValue(spec.Arguments[0] + " " + spec.Arguments[1], out var specific))

@@ -5,9 +5,9 @@ namespace Offloadr.Runner.Supervisor.Containers;
 /// <summary>Builds docker/podman command lines. Pure, so the exact arguments are unit-tested.</summary>
 internal static class DockerCliArguments
 {
-    public static IReadOnlyList<string> Run(ContainerSpec spec, ContainerEngineKind kind)
+    public static IReadOnlyList<string> Create(ContainerSpec spec, ContainerEngineKind kind)
     {
-        var arguments = new List<string> { "run", "--detach", "--name", spec.Name, "--pull", "never", "--restart", "no" };
+        var arguments = new List<string> { "create", "--name", spec.Name, "--pull", "never", "--restart", "no" };
         if (spec.Gpus)
         {
             arguments.AddRange(GpuArguments(kind));
@@ -50,6 +50,15 @@ internal static class DockerCliArguments
         var arguments = new List<string> { "run", "--rm", "--name", name, "--pull", "never" };
         arguments.AddRange(GpuArguments(kind));
         arguments.AddRange(["--entrypoint", "nvidia-smi", image, "-L"]);
+        return arguments;
+    }
+
+    /// <summary>As <see cref="GpuCheck"/>, listing each GPU's UUID, name and memory, as the host probe does.</summary>
+    public static IReadOnlyList<string> GpuInventory(string image, ContainerEngineKind kind, string name)
+    {
+        var arguments = new List<string> { "run", "--rm", "--name", name, "--pull", "never" };
+        arguments.AddRange(GpuArguments(kind));
+        arguments.AddRange(["--entrypoint", "nvidia-smi", image, "--query-gpu=uuid,name,memory.total", "--format=csv,noheader,nounits"]);
         return arguments;
     }
 
@@ -273,9 +282,14 @@ internal static class DockerCliJson
             code.TryGetInt32(out var value)
                 ? value
                 : null;
+        // Podman reports a paused container as not running; it is as live as a running one (it can be
+        // resumed, and its executor's session with it), so it is never taken for one that exited.
         var running = state.ValueKind == JsonValueKind.Object &&
-            state.TryGetProperty("Running", out var runningElement) &&
-            runningElement.ValueKind == JsonValueKind.True;
+            ((state.TryGetProperty("Running", out var runningElement) && runningElement.ValueKind == JsonValueKind.True) ||
+             (state.TryGetProperty("Paused", out var pausedElement) && pausedElement.ValueKind == JsonValueKind.True) ||
+             string.Equals(String(container, "State", "Status"), "paused", StringComparison.OrdinalIgnoreCase) ||
+             // Nor does it report one that is still stopping as running: its agent is, until it exited.
+             string.Equals(String(container, "State", "Status"), "stopping", StringComparison.OrdinalIgnoreCase));
         var labels = new Dictionary<string, string>(StringComparer.Ordinal);
         if (container.TryGetProperty("Config", out var config) &&
             config.TryGetProperty("Labels", out var labelsElement) &&
@@ -287,6 +301,13 @@ internal static class DockerCliJson
             }
         }
 
+        var status = String(container, "State", "Status") ?? string.Empty;
+
+        // Docker shows a container it is removing as "removing", and one whose removal failed half-way as
+        // "dead", whatever it was before: created and never started, or exited.
+        var beingRemoved = !running &&
+                           (status.Equals("removing", StringComparison.OrdinalIgnoreCase) ||
+                            status.Equals("dead", StringComparison.OrdinalIgnoreCase));
         return new ContainerInfo(
             String(container, "Id") ?? string.Empty,
             String(container, "Config", "Image") ?? string.Empty,
@@ -294,8 +315,22 @@ internal static class DockerCliJson
             exitCode,
             labels,
             // The image ID it runs (docker and podman both put it here), which a moved tag no longer names.
-            String(container, "Image"));
+            String(container, "Image"))
+        {
+            // Docker says "created"; Podman also "configured" and, once the OCI container exists and its
+            // process has not started, "initialized". One being removed no longer says which it was: its
+            // start time does, which is the zero time for a container that never started.
+            NeverStarted = !running &&
+                           (status.Equals("created", StringComparison.OrdinalIgnoreCase) ||
+                            status.Equals("configured", StringComparison.OrdinalIgnoreCase) ||
+                            status.Equals("initialized", StringComparison.OrdinalIgnoreCase) ||
+                            (beingRemoved && IsZeroTime(String(container, "State", "StartedAt")))),
+            BeingRemoved = beingRemoved,
+        };
     }
+
+    /// <summary>The start time of a container that never started: year 1, as Docker and Podman write "no time". Absent, it proves nothing.</summary>
+    private static bool IsZeroTime(string? time) => time is not null && time.StartsWith("0001-01-01", StringComparison.Ordinal);
 
     public static ImageInfo? Image(string json)
     {

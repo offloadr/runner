@@ -42,7 +42,7 @@ public class DiagnosticsReportTests
         ActiveTemplate = new LaunchTemplate("comfyui-latest", "comfyui", "ghcr.io/offloadr/runner-comfyui:latest", "ComfyUI"),
         Image = new ImageInfo("sha256:1111", "ghcr.io/offloadr/runner-comfyui@sha256:2222"),
         RunnerStatus = new RunnerStatusSnapshot("runner-7", "instance-3", "1.4.0", ["comfyui-latest"], "session-9", Now),
-        Restarts = 2,
+        UnexpectedExits = 2,
         Fault = new SupervisorFault(FaultKind.GpuUnavailable, "The GPU is not available to Docker", "Docker could not give the runner the GPU.", "docker: Error response from daemon"),
     };
 
@@ -60,7 +60,7 @@ public class DiagnosticsReportTests
             Assert.That(report, Does.Contain("State: Needs attention (Faulted)"));
             Assert.That(report, Does.Contain("Problem: GpuUnavailable: The GPU is not available to Docker"));
             Assert.That(report, Does.Contain("    docker: Error response from daemon"));
-            Assert.That(report, Does.Contain("Restarts: 2"));
+            Assert.That(report, Does.Contain("Unexpected exits: 2"));
             Assert.That(report, Does.Contain("Image digest: ghcr.io/offloadr/runner-comfyui@sha256:2222"));
             Assert.That(report, Does.Contain("Runner ID: runner-7"));
             Assert.That(report, Does.Contain("Session running: yes"));

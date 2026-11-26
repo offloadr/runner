@@ -55,6 +55,9 @@ public enum FaultKind
 
     /// <summary>Another copy of the app manages the runner.</summary>
     AnotherCopy,
+
+    /// <summary>Offloadr and this app no longer share a protocol: the app needs an update.</summary>
+    AppOutdated,
 }
 
 /// <summary>The one thing that most likely fixes a fault, for the UI to offer as a button or link.</summary>
@@ -149,6 +152,7 @@ public sealed record SupervisorFault(FaultKind Kind, string Title, string Messag
         FaultKind.KeyRejected => ("Offloadr did not accept the runner key", null),
         FaultKind.NameTaken => ("The runner's container name is taken", null),
         FaultKind.AnotherCopy => ("Another copy of the app is open", null),
+        FaultKind.AppOutdated => ("Update the app", null),
         _ => ("The runner ran into a problem", null),
     };
 }

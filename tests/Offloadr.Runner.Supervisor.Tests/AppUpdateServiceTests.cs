@@ -97,12 +97,13 @@ public class AppUpdateServiceTests
 
     [TestCase(SupervisorState.Stopped, true)]
     [TestCase(SupervisorState.Running, true)]
-    [TestCase(SupervisorState.RestartPending, true)]
+    [TestCase(SupervisorState.Available, true)]
+    [TestCase(SupervisorState.WaitingToRetry, true)]
     [TestCase(SupervisorState.Faulted, true)]
+    [TestCase(SupervisorState.Checking, false)]
     [TestCase(SupervisorState.Pulling, false)]
     [TestCase(SupervisorState.Starting, false)]
     [TestCase(SupervisorState.Stopping, false)]
-    [TestCase(SupervisorState.WaitingToRestart, false)]
     public async Task ARestart_WaitsWhileTheRunnerIsBeingStartedOrStopped(SupervisorState state, bool allowed)
     {
         using var updates = Create(new FakeAppUpdateSource { Latest = new Version(1, 3, 0) });
@@ -111,6 +112,21 @@ public class AppUpdateServiceTests
         var view = SupervisorView.Initial(DateTimeOffset.UtcNow) with { State = state };
 
         Assert.That(updates.CanRestartNow(view), Is.EqualTo(allowed));
+    }
+
+    [Test]
+    public async Task ARestart_WaitsUntilTheExecutorOfAContainerJustStartedHasRegistered()
+    {
+        using var updates = Create(new FakeAppUpdateSource { Latest = new Version(1, 3, 0) });
+        await updates.CheckAsync(CancellationToken.None);
+
+        var view = SupervisorView.Initial(DateTimeOffset.UtcNow) with { State = SupervisorState.Running, LaunchUnmatched = true };
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(updates.CanRestartNow(view), Is.False, "The new version registers anew, which retires a launch no executor matched, and fences its container.");
+            Assert.That(updates.CanRestartNow(view with { LaunchUnmatched = false }), Is.True);
+        });
     }
 
     [Test]

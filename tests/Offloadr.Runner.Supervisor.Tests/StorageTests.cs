@@ -244,7 +244,7 @@ public class RunnerImagesTests
     {
         var view = SupervisorView.Initial(DateTimeOffset.UtcNow);
         var engine = new ImageStore(Running, Forge);
-        engine.BeforeInspect = _ => view = view with { State = SupervisorState.ResolvingPlan };
+        engine.BeforeInspect = _ => view = view with { State = SupervisorState.Checking };
         var images = new RunnerImages(() => view, engine, new FakeSettingsStore(new RunnerSettings()));
 
         await Assert.MultipleAsync(async () =>
@@ -340,7 +340,6 @@ public class RunnerImagesTests
     }
 
     [TestCase(SupervisorState.Checking)]
-    [TestCase(SupervisorState.ResolvingPlan)]
     [TestCase(SupervisorState.Pulling)]
     [TestCase(SupervisorState.Starting)]
     [TestCase(SupervisorState.Stopping)]
@@ -448,7 +447,9 @@ public class RunnerImagesTests
 
         public Task PullAsync(string image, Action<string> onProgress, CancellationToken cancellationToken) => throw new NotSupportedException();
 
-        public Task<string> RunDetachedAsync(ContainerSpec spec, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<string> CreateAsync(ContainerSpec spec, CancellationToken cancellationToken) => throw new NotSupportedException();
+
+        public Task StartAsync(string container, CancellationToken cancellationToken, Func<bool>? stillWanted = null) => throw new NotSupportedException();
 
         public Task<ContainerInfo?> InspectContainerAsync(string name, CancellationToken cancellationToken) => throw new NotSupportedException();
 
@@ -461,6 +462,12 @@ public class RunnerImagesTests
         public Task StopAsync(string container, TimeSpan timeout, CancellationToken cancellationToken) => throw new NotSupportedException();
 
         public Task RemoveAsync(string container, CancellationToken cancellationToken) => throw new NotSupportedException();
+
+        public Task<bool> RemoveStoppedAsync(string container, CancellationToken cancellationToken) => throw new NotSupportedException();
+
+        public Task<ContainerInfo?> FindByLabelAsync(string label, string value, CancellationToken cancellationToken) => throw new NotSupportedException();
+
+        public Task<IReadOnlyList<Offloadr.Runner.Supervisor.Hardware.HostGpu>> ListContainerGpusAsync(string image, CancellationToken cancellationToken) => throw new NotSupportedException();
 
         public Task<GpuAccessCheck> CheckGpuAccessAsync(string image, CancellationToken cancellationToken) => throw new NotSupportedException();
     }
