@@ -131,6 +131,54 @@ public partial class ServiceClientManagerTests
     }
 
     [Test]
+    public async Task AnAdmittedStart_CountsAsReceived_BeforeItSettles()
+    {
+        var harness = new RuntimeCommandHarness();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        harness.BeforeActivate = async token =>
+        {
+            entered.TrySetResult();
+            await release.Task.WaitAsync(token);
+        };
+
+        var start = ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceA, 3), harness.Deps);
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Multiple(() =>
+        {
+            Assert.That(harness.Received, Is.EqualTo(new[] { 3UL }), "Received as admission decides, before its startup ends.");
+            Assert.That(harness.Logical.SettledRuntimeOrder, Is.LessThan(3UL), "Not settled yet: its heartbeat does not name it.");
+        });
+
+        release.TrySetResult();
+        await start.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Test]
+    public async Task ARefusedStart_CountsAsReceived_OnlyWhenItsOrderSettles()
+    {
+        var harness = new RuntimeCommandHarness();
+        await ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceA, 5), harness.Deps);
+
+        // At or below its session's Stop cutoff: refused, and its order settles.
+        harness.Logical.RecordStopCutoff("another-session", 8);
+        await ServiceClientManager.HandleStartRuntimeCommand(new StartRuntimeCommand
+        {
+            SessionId = "another-session",
+            Runtime = new RuntimeRef { RuntimeId = InstanceB, RuntimeOrder = 7 },
+        }, harness.Deps);
+
+        // The newest Start's runtime again, at a higher order: refused, and nothing settles.
+        await ServiceClientManager.HandleStartRuntimeCommand(Start(InstanceA, 9), harness.Deps);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(harness.Received, Is.EqualTo(new[] { 5UL, 7UL }));
+            Assert.That(harness.Sink.StartAcks.Where(ack => !ack.Ready).Select(ack => ack.Runtime.RuntimeOrder), Is.EquivalentTo(new[] { 7UL, 9UL }));
+        });
+    }
+
+    [Test]
     public async Task NewerStartForTheSameSession_StopsTheOldChildThenLaunches()
     {
         var harness = RunningHarness(InstanceA, 3);
@@ -1848,8 +1896,12 @@ public partial class ServiceClientManagerTests
             return completed.Task;
         }
 
+        /// <summary>The orders admission counted as received, in order.</summary>
+        public ConcurrentQueue<ulong> Received { get; } = new();
+
         public ServiceClientManager.RuntimeCommandDependencies Deps => new()
         {
+            Received = Received.Enqueue,
             RunnerId = CommandRunnerId,
             InstanceId = InstanceId,
             Sink = Sink,

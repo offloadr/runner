@@ -328,6 +328,9 @@ internal static partial class ServiceClientManager
         public required Func<Func<Task>, Task> StartAcknowledgement { get; init; }
         public required RunnerCommandWorkState WorkState { get; init; }
         public required LogicalSessionState LogicalSessionState { get; init; }
+
+        /// <summary>Told the order of each Start admitted, or refused with its order settled, as admission decides it.</summary>
+        public Action<ulong>? Received { get; init; }
         public required RuntimeIdentityRegistry RuntimeIdentities { get; init; }
         public required TransientCancellationRegistry TransientCancellation { get; init; }
         public required Func<string> GetActiveRuntimeSessionId { get; init; }
@@ -904,21 +907,23 @@ internal static partial class ServiceClientManager
         /// that reuses the newest start's runtime id at another order or for another session: that
         /// order belongs to no Start, and settling it would refuse valid work below it.
         /// </summary>
-        public void SettleRefusedStart(string? sessionId, RuntimeIdentity runtime)
+        /// <returns>Whether its order is settled: a Start that cannot be ordered, or that reuses the newest Start's runtime, settles nothing.</returns>
+        public bool SettleRefusedStart(string? sessionId, RuntimeIdentity runtime)
         {
             if (string.IsNullOrWhiteSpace(sessionId) || !runtime.IsValid)
             {
-                return;
+                return false;
             }
 
             lock (_fenceGate)
             {
                 if (_newestStart is { } newest && newest.Runtime.SameRuntime(runtime))
                 {
-                    return;
+                    return false;
                 }
 
                 RaiseSettled(runtime.RuntimeOrder);
+                return true;
             }
         }
 
@@ -1251,8 +1256,12 @@ internal static partial class ServiceClientManager
         await using var commandTasks = new RunnerCommandLifetime(shutdown, requestParentShutdown);
         shutdown = commandTasks.Token;
         await using var transientCancellation = new TransientCancellationRegistry(shutdown);
+
+        // Each open says which it is and what this process received on the earlier ones (see CommandStreamOpens).
+        var opens = new CommandStreamOpens();
         var runtimeCommands = new RuntimeCommandDependencies
         {
+            Received = opens.Received,
             RunnerId = runnerId,
             InstanceId = instanceId,
             Sink = sessionSink,
@@ -1295,13 +1304,7 @@ internal static partial class ServiceClientManager
             try
             {
                 using var call = commandClient.CommandStream(
-                    new CommandStreamRequest
-                    {
-                        RunnerId = runnerId,
-                        Version = version,
-                        InstanceId = instanceId,
-                        ProtocolVersion = RunnerProtocolVersion.Current,
-                    },
+                    opens.Next(runnerId, version, instanceId),
                     cancellationToken: shutdown);
                 RunnerLog.Info(nameof(ServiceClientManager), "Runner commands stream (grpc) connected.");
                 attempt = 0;
@@ -2160,13 +2163,23 @@ internal static partial class ServiceClientManager
             };
         }
 
-        if (outcome is null)
+        if (outcome is not null)
+        {
+            // Admitted: it settles, adopted or not ready, before anything else counts behind it.
+            deps.Received?.Invoke(runtime.RuntimeOrder);
+        }
+        else
         {
             RunnerLog.Warning(nameof(ServiceClientManager), $"Rejecting stale start for session {command.SessionId}.");
 
             // Refused: settled before its acknowledgement is sent, so the control plane can tell a
-            // status sampled after this from one sampled before the start arrived.
-            deps.LogicalSessionState.SettleRefusedStart(command.SessionId, runtime);
+            // status sampled after this from one sampled before the start arrived. Only a settled order
+            // counts as received: the next command stream says so.
+            if (deps.LogicalSessionState.SettleRefusedStart(command.SessionId, runtime))
+            {
+                deps.Received?.Invoke(runtime.RuntimeOrder);
+            }
+
             outcome = Task.FromResult(new StartupOutcome(false, StaleRuntimeCommandMessage));
         }
 

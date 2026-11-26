@@ -14,7 +14,7 @@ import "google/protobuf/wrappers.proto";
 // so an outdated runner is told to update instead of misbehaving.
 enum RunnerProtocol {
     RUNNER_PROTOCOL_UNSPECIFIED = 0;
-    RUNNER_PROTOCOL_CURRENT = 6;
+    RUNNER_PROTOCOL_CURRENT = 7;
 }
 
 message RunnerRuntimeTelemetrySnapshot {
@@ -654,6 +654,20 @@ message CommandStreamRequest {
     string version = 2;
     string instance_id = 3;
     uint32 protocol_version = 4;
+    // The highest runtime_order of any StartRuntimeCommand this process read from an earlier
+    // command stream and admitted, or refused as older work (a refusal that counts toward
+    // RuntimeStatus.settled_runtime_order, whether or not it raises it); 0 for none. A refused
+    // Start that cannot be ordered, or that names the newest Start's runtime at another order, is
+    // not counted. Every Start read from an earlier stream was admitted or refused before this
+    // stream opened, but an admitted one may still be starting: this is no evidence that a
+    // heartbeat accounts for it, which settled_runtime_order alone says. A Start the control plane
+    // wrote to an earlier stream with a higher order never arrived, or was refused without
+    // counting: it holds no report back.
+    uint64 received_runtime_order = 5;
+    // Rises by one with each command stream this process opens, starting at 1. The control plane
+    // ignores an open whose sequence is not above the newest it has seen from this process, and
+    // ends that stream.
+    uint64 command_stream_sequence = 6;
 }
 
 message CommandStreamResponse {

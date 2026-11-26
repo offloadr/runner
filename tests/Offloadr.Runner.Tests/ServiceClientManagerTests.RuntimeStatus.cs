@@ -494,10 +494,11 @@ public partial class ServiceClientManagerTests
         Assert.That(state.TryAdoptRuntime("session-a", Rt(InstanceA, 5)), Is.True);
 
         Assert.That(state.AdmitStart("session-a", Rt(InstanceA, 9)), Is.EqualTo(ServiceClientManager.StartAdmission.Stale));
-        state.SettleRefusedStart("session-a", Rt(InstanceA, 9));
+        var settled = state.SettleRefusedStart("session-a", Rt(InstanceA, 9));
 
         Assert.Multiple(() =>
         {
+            Assert.That(settled, Is.False, "Not counted as received on the next command stream either.");
             Assert.That(state.SettledRuntimeOrder, Is.EqualTo(5));
             Assert.That(state.AdmitStart("session-b", Rt(InstanceB, 6)), Is.EqualTo(ServiceClientManager.StartAdmission.Newer));
         });
