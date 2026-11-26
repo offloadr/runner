@@ -5064,7 +5064,7 @@ public class RunnerSupervisorTests
         {
             Assert.That(_link.Releases, Is.Empty);
             Assert.That(_engine.Exists(Name), Is.True);
-            Assert.That(supervisor.View.StateTitle, Is.EqualTo("Session running"));
+            Assert.That(supervisor.View.StateTitle, Is.EqualTo("ComfyUI session running"));
         });
     }
 
@@ -10013,7 +10013,7 @@ public class RunnerSupervisorTests
             Assert.That(input.OtherRunnerKeys, Is.EqualTo(new[] { Key }));
             Assert.That(Offloadr.Runner.Supervisor.Hosting.DiagnosticsReport.Redact($"old {Key} new {newKey}", input), Is.EqualTo("old [runner key] new [runner key]"));
             Assert.That(report, Does.Not.Contain(Key).And.Not.Contain(newKey));
-            Assert.That(report, Does.Contain("State: Session running (Running)"));
+            Assert.That(report, Does.Contain("session running (Running)"));
             Assert.That(name, Does.StartWith("offloadr-runner-diagnostics-").And.EndWith(".txt"));
         });
     }

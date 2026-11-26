@@ -323,7 +323,7 @@ public class ModelLibraryTests
         // local model, through the same link.
         var destination = WriteLibraryFile("loras/style.safetensors", 4);
         var projector = new LocalModelProjector(_library, _editorModels, downloadLinks: library);
-        projector.UpdateSnapshot(new LocalModelScanner("runner-1", _library).Scan());
+        projector.UpdateSnapshot(new LocalModelScanner("runner-1", _library, ModelLibrary.IsStagingFolderName).Scan());
         projector.SetRequestedModels([LocalAt("loras/style.safetensors", 4, ModelCategory.Lora)]);
         var staging = Stage(library, destination, 8);
 
@@ -370,7 +370,7 @@ public class ModelLibraryTests
         Assert.That(library.KeepsEditorLink(style), Is.False);
         var mine = WriteLibraryFile("loras/mine/style.safetensors", 6);
         var projector = new LocalModelProjector(_library, _editorModels, downloadLinks: library);
-        projector.UpdateSnapshot(new LocalModelScanner("runner-1", _library).Scan());
+        projector.UpdateSnapshot(new LocalModelScanner("runner-1", _library, ModelLibrary.IsStagingFolderName).Scan());
         projector.SetRequestedModels([LocalAt("loras/style.safetensors", 6, ModelCategory.Lora)]);
         Assert.That(new FileInfo(style).LinkTarget, Is.EqualTo(mine));
     }
@@ -732,7 +732,7 @@ public class ModelLibraryTests
         library.ReleaseSessionsOtherThan("session-2");
         // The next session picks the saved file as a local model, through the same link.
         var projector = new LocalModelProjector(_library, _editorModels, downloadLinks: library);
-        projector.UpdateSnapshot(new LocalModelScanner("runner-1", _library).Scan());
+        projector.UpdateSnapshot(new LocalModelScanner("runner-1", _library, ModelLibrary.IsStagingFolderName).Scan());
         projector.SetRequestedModels([LocalAt("checkpoints/base.safetensors", 8, ModelCategory.Checkpoint)]);
 
         Assert.That(
@@ -790,7 +790,7 @@ public class ModelLibraryTests
         // The same session may have the owner's model linked there instead.
         var mine = WriteLibraryFile("loras/mine/style.safetensors", 6);
         var projector = new LocalModelProjector(_library, _editorModels, downloadLinks: library);
-        projector.UpdateSnapshot(new LocalModelScanner("runner-1", _library).Scan());
+        projector.UpdateSnapshot(new LocalModelScanner("runner-1", _library, ModelLibrary.IsStagingFolderName).Scan());
         projector.SetRequestedModels([LocalAt("loras/style.safetensors", 6, ModelCategory.Lora)]);
         Assert.That(new FileInfo(style).LinkTarget, Is.EqualTo(mine));
     }
@@ -838,7 +838,7 @@ public class ModelLibraryTests
         // The new session may have another local model linked there.
         var mine = WriteLibraryFile("loras/mine/style.safetensors", 6);
         var projector = new LocalModelProjector(_library, _editorModels, downloadLinks: library);
-        projector.UpdateSnapshot(new LocalModelScanner("runner-1", _library).Scan());
+        projector.UpdateSnapshot(new LocalModelScanner("runner-1", _library, ModelLibrary.IsStagingFolderName).Scan());
         projector.SetRequestedModels([LocalAt("loras/style.safetensors", 6, ModelCategory.Lora)]);
         Assert.That(new FileInfo(style).LinkTarget, Is.EqualTo(mine));
     }
@@ -1001,7 +1001,7 @@ public class ModelLibraryTests
         library.Redirect([Remote("checkpoints/base.safetensors", 8)], Session, out var refused);
         // Meanwhile the session picks the saved model as a local one, through the same link.
         var projector = new LocalModelProjector(_library, _editorModels, downloadLinks: library);
-        projector.UpdateSnapshot(new LocalModelScanner("runner-1", _library).Scan());
+        projector.UpdateSnapshot(new LocalModelScanner("runner-1", _library, ModelLibrary.IsStagingFolderName).Scan());
         projector.SetRequestedModels([LocalAt("checkpoints/base.safetensors", 8, ModelCategory.Checkpoint)]);
 
         library.Undo(refused);
@@ -1030,7 +1030,7 @@ public class ModelLibraryTests
         // Another local model can be linked there.
         var mine = WriteLibraryFile("loras/mine/style.safetensors", 6);
         var projector = new LocalModelProjector(_library, _editorModels, downloadLinks: library);
-        projector.UpdateSnapshot(new LocalModelScanner("runner-1", _library).Scan());
+        projector.UpdateSnapshot(new LocalModelScanner("runner-1", _library, ModelLibrary.IsStagingFolderName).Scan());
         projector.SetRequestedModels([LocalAt("loras/style.safetensors", 6, ModelCategory.Lora)]);
         Assert.That(new FileInfo(style).LinkTarget, Is.EqualTo(mine));
     }
@@ -1085,7 +1085,7 @@ public class ModelLibraryTests
         // The same session may have the owner's model linked there instead.
         var mine = WriteLibraryFile("loras/mine/style.safetensors", 6);
         var projector = new LocalModelProjector(_library, _editorModels, downloadLinks: library);
-        projector.UpdateSnapshot(new LocalModelScanner("runner-1", _library).Scan());
+        projector.UpdateSnapshot(new LocalModelScanner("runner-1", _library, ModelLibrary.IsStagingFolderName).Scan());
         projector.SetRequestedModels([LocalAt("loras/style.safetensors", 6, ModelCategory.Lora)]);
         Assert.That(new FileInfo(style).LinkTarget, Is.EqualTo(mine));
     }
@@ -1106,7 +1106,7 @@ public class ModelLibraryTests
         // While the model downloads, and once it is saved and found by the scan.
         projector.SetRequestedModels([]);
         WriteLibraryFile("checkpoints/base.safetensors", 8);
-        projector.UpdateSnapshot(new LocalModelScanner("runner-1", _library).Scan());
+        projector.UpdateSnapshot(new LocalModelScanner("runner-1", _library, ModelLibrary.IsStagingFolderName).Scan());
         projector.AddRequestedModels([]);
 
         Assert.Multiple(() =>
@@ -1148,7 +1148,7 @@ public class ModelLibraryTests
             LocalSelectionHash = LocalModelSelectionHash.Compute("base.safetensors", 12, ModelCategory.Checkpoint)
         };
         var projector = new LocalModelProjector(_library, _editorModels, downloadLinks: library);
-        projector.UpdateSnapshot(new LocalModelScanner("runner-1", _library).Scan());
+        projector.UpdateSnapshot(new LocalModelScanner("runner-1", _library, ModelLibrary.IsStagingFolderName).Scan());
         Assert.That(() => projector.SetRequestedModels([local]), Throws.InvalidOperationException, "While its session lasts, the download's link stays.");
 
         if (cancelled)

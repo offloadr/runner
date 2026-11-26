@@ -48,7 +48,7 @@ public class LocalModelScannerTests
             Directory.CreateDirectory(partial);
             File.WriteAllText(Path.Combine(partial, "half.safetensors"), "ha");
 
-            var snapshot = new LocalModelScanner("runner-1", root).Scan();
+            var snapshot = new LocalModelScanner("runner-1", root, ModelLibrary.IsStagingFolderName).Scan();
 
             Assert.That(snapshot.Models.Select(static model => model.Filename), Is.EqualTo(new[] { "style.safetensors" }));
         }

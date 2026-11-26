@@ -224,6 +224,7 @@ public sealed partial class RunnerSupervisor
         if (HasCurrentSession())
         {
             _idleSince = _now;
+            SetReleaseDue(false);
         }
 
         if (_now >= PlanRefreshDue())
@@ -381,6 +382,9 @@ public sealed partial class RunnerSupervisor
         /// <summary>Offloadr granted its release (now, or before a stop that failed): it is stopped, never reused.</summary>
         public bool Granted { get; set; } = granted;
 
+        /// <summary>The warm time, in minutes, in the settings that decided the release.</summary>
+        public int WarmMinutes { get; init; }
+
         public long Id { get; set; }
 
         public Fact<RunnerStatusSnapshot?> Status { get; } = new();
@@ -460,7 +464,7 @@ public sealed partial class RunnerSupervisor
             return false;
         }
 
-        _idle = new IdleRelease(outdated, granted: false) { Id = ++_ids };
+        _idle = new IdleRelease(outdated, granted: false) { Id = ++_ids, WarmMinutes = settings.WarmMinutes };
         return true;
     }
 
@@ -474,7 +478,7 @@ public sealed partial class RunnerSupervisor
                        _runningTemplate is { } template &&
                        (!string.Equals((_containerEngine ?? _engineSelection.Current).Configured, ContainerEngineSelection.Normalize(settings.ContainerEngineExecutable), StringComparison.Ordinal) ||
                         !string.Equals(Fingerprint(BuildSpec(settings, template)), _activeFingerprint, StringComparison.Ordinal));
-        return outdated ? true : _now - _idleSince >= _options.WarmTime ? false : null;
+        return outdated ? true : _releaseDue || _now - _idleSince >= WarmTimeFor(settings) ? false : null;
     }
 
     private bool StepIdleRelease(IdleRelease idle)
@@ -560,6 +564,13 @@ public sealed partial class RunnerSupervisor
             if (HasCurrentSession())
             {
                 _idleSince = _now;
+                SetReleaseDue(false);
+                return true;
+            }
+
+            if (!idle.Outdated && !_releaseDue && _options.WarmTime is null && _settings.Current.WarmMinutes != idle.WarmMinutes)
+            {
+                // Another warm time was saved since its end decided this: decided again.
                 return true;
             }
 
@@ -589,7 +600,7 @@ public sealed partial class RunnerSupervisor
 
         var executor = idle.Status.Error is null ? idle.Status.Value?.InstanceId : null;
         if (idle.UnlessSent is null && _runningTemplate is { } runs && _activeFingerprint is { } fingerprint &&
-            _now - _idleSince < _options.WarmTime)
+            !_releaseDue && _now - _idleSince < WarmTimeFor(_settings.Current))
         {
             // Only changed settings call for this release (its warm time is not over): not sent once they
             // are changed back, on the thread that saves them. A grant is for good, and would cost the
@@ -610,6 +621,12 @@ public sealed partial class RunnerSupervisor
                     return false;
                 }
             });
+        }
+        else if (idle.UnlessSent is null && !_releaseDue && _options.WarmTime is null)
+        {
+            // Its warm time is over: not sent once a warm time other than the one that decided it is saved.
+            var minutes = idle.WarmMinutes;
+            idle.ReasonWatch = _fence.Until(() => _settings.Current.WarmMinutes != minutes);
         }
 
         var unsent = (idle.UnlessSent ??= idle.ReasonWatch is { } reason
@@ -646,6 +663,7 @@ public sealed partial class RunnerSupervisor
 
                 AppendLog("supervisor: Offloadr keeps the runner container for now.");
                 _idleSince = _now;
+                SetReleaseDue(false);
             }
 
             _releaseRetryAt = _now + _options.ReleaseRetryInterval;
@@ -675,6 +693,8 @@ public sealed partial class RunnerSupervisor
     {
         if (Once(ref stopping.Begun))
         {
+            // Granted for good: not shown as kept warm, also while its stop is retried.
+            SetReleaseDue(true);
             WriteReleaseMarker(_containerLaunchId);
             stopping.MessageBefore = View.Message;
             Set(SupervisorState.Stopping, "Stopping the runner container…");

@@ -10,6 +10,42 @@ public class RunnerSettingsTests
 {
     private const string ValidKey = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG";
 
+    [TestCase(0, false)]
+    [TestCase(1, true)]
+    [TestCase(10, true)]
+    [TestCase(RunnerSettings.MaximumWarmMinutes, true)]
+    [TestCase(RunnerSettings.MaximumWarmMinutes + 1, false)]
+    public void Validate_KeepsTheWarmTimeWithinItsRange(int minutes, bool valid)
+    {
+        var settings = new RunnerSettings { RunnerKey = ValidKey, WarmMinutes = minutes };
+
+        Assert.That(settings.Validate(_ => true), valid ? Is.Empty : Has.Some.Contains("idle editor"));
+    }
+
+    [Test]
+    public void SupervisorView_NamesTheEditorItIsBusyWith()
+    {
+        var view = SupervisorView.Initial(DateTimeOffset.UnixEpoch);
+        var comfyUi = new LaunchTemplate("comfyui-latest", RunnerSettings.ComfyUiRuntimeKind, "image", "ComfyUI - current release");
+        var forge = new LaunchTemplate("forge-neo", RunnerSettings.ForgeNeoRuntimeKind, "image", "Forge Neo - current release");
+        var online = new Offloadr.Runner.Supervisor.Launcher.LauncherLinkState(Offloadr.Runner.Supervisor.Launcher.LauncherConnection.Online, null, true, null);
+        var session = new Offloadr.Runner.Core.RunnerStatusSnapshot("runner", "instance", "1.0", [], "session-1", DateTimeOffset.UnixEpoch);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That((view with { State = SupervisorState.Pulling, LaunchingEditor = "ComfyUI" }).StateTitle, Is.EqualTo("Downloading ComfyUI…"));
+            Assert.That((view with { State = SupervisorState.Pulling }).StateTitle, Is.EqualTo("Downloading the image…"), "For the GPU check.");
+            Assert.That((view with { State = SupervisorState.Starting, LaunchingEditor = "Forge Neo" }).StateTitle, Is.EqualTo("Starting Forge Neo…"));
+            Assert.That((view with { State = SupervisorState.Running, ActiveTemplate = forge, RunnerStatus = session }).StateTitle, Is.EqualTo("Forge Neo session running"));
+            Assert.That((view with { State = SupervisorState.Running, ActiveTemplate = comfyUi, Launcher = online }).StateTitle, Is.EqualTo("Ready for sessions"));
+            Assert.That((view with { State = SupervisorState.Running, ActiveTemplate = comfyUi, Launcher = online }).IsWarm, Is.True);
+            Assert.That((view with { State = SupervisorState.Running, ActiveTemplate = comfyUi, Launcher = online, ReleaseDue = true }).IsWarm, Is.False, "Released as soon as it is idle.");
+            Assert.That((view with { State = SupervisorState.Running, ActiveTemplate = comfyUi }).StateTitle, Is.EqualTo("Running"), "Offloadr cannot start sessions here now.");
+            Assert.That((view with { State = SupervisorState.Faulted, Fault = new SupervisorFault(FaultKind.AppOutdated, "Update the app", "Offloadr needs a newer app.", null) }).StateTitle, Is.EqualTo("Update needed"));
+            Assert.That(SupervisorView.EditorName(new LaunchTemplate("other", "other", "image", "Other editor - nightly")), Is.EqualTo("Other editor"));
+        });
+    }
+
     [Test]
     public void Validate_AcceptsCompleteSettings()
     {
@@ -107,6 +143,25 @@ public class FileRunnerSettingsStoreTests
             Assert.That(reloaded.SelectedEditorTemplate, Is.EqualTo("comfyui-master"));
             Assert.That(reloaded.AutoStart, Is.True);
             Assert.That(reloaded.DownloadModels, Is.True);
+        });
+    }
+
+    [Test]
+    public async Task TheWarmTime_IsTenMinutesUnlessSaved_EvenInSettingsFromBeforeTheOption()
+    {
+        var paths = new SupervisorPaths(_root);
+        Directory.CreateDirectory(_root);
+        File.WriteAllText(paths.SettingsFile, """{"OffloadrApiOrigin":"https://offloadr.studio","AutoStart":true}""");
+        var store = new FileRunnerSettingsStore(paths, new ReversingSecretProtector(), NullLogger<FileRunnerSettingsStore>.Instance);
+        var older = store.Current.WarmMinutes;
+
+        await store.SaveAsync(store.Current with { WarmMinutes = 45 });
+        var reloaded = new FileRunnerSettingsStore(paths, new ReversingSecretProtector(), NullLogger<FileRunnerSettingsStore>.Instance).Current;
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(older, Is.EqualTo(10));
+            Assert.That(reloaded.WarmMinutes, Is.EqualTo(45));
         });
     }
 

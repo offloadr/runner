@@ -244,8 +244,8 @@ public sealed class MainPage : ContentPage
             if (view.IsActive)
             {
                 var message = view.HasActiveSession
-                    ? "An editor session is using this runner. Quitting stops the runner and interrupts that session."
-                    : "Quitting stops the runner. Offloadr can no longer use this GPU until you open the app again. Close the window instead to keep it running in the notification area.";
+                    ? "An editor session is using this GPU. Quitting stops its editor and interrupts that session."
+                    : "Offloadr can no longer use this GPU until you open the app again. Close the window instead to keep it available from the notification area.";
                 if (!await DisplayAlertAsync("Quit Offloadr Runner?", message, "Quit", "Keep running"))
                 {
                     return false;

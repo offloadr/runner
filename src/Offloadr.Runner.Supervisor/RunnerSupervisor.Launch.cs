@@ -1216,6 +1216,7 @@ public sealed partial class RunnerSupervisor
                 return true;
             }
 
+            Update(view => view with { LaunchingEditor = SupervisorView.EditorName(flight.Template) });
             Set(SupervisorState.Starting, $"Preparing {flight.Label} for a session…");
             if (_checked.Engine is not null && OfferedConfigurationChanged(settings))
             {
@@ -2399,8 +2400,9 @@ public sealed partial class RunnerSupervisor
         _runningEngine = engine;
         _containerEngine = engine;
 
-        // A withdrawn launch's container counts as idle for the whole warm time already.
-        _idleSince = retired ? _now - _options.WarmTime : _now;
+        // A withdrawn launch's container is released as soon as it is idle, whatever the warm time.
+        _idleSince = _now;
+        SetReleaseDue(retired);
         _releaseRetryAt = TimeSpan.Zero;
         ResetStatusTracking();
         ContainerChanged();

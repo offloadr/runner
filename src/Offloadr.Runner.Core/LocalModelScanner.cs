@@ -4,7 +4,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 
-namespace Offloadr.Runner.Linux;
+namespace Offloadr.Runner.Core;
 
 public readonly record struct LocalModelFolderStat(string Folder, int ModelCount, long TotalBytes);
 public readonly record struct LocalModelSnapshot(
@@ -14,6 +14,14 @@ public readonly record struct LocalModelSnapshot(
     IReadOnlyList<string> SelectionHashes,
     string SelectionDigest);
 
+/// <summary>The local models folder could not be read (it is not there, or listing it failed): that is no empty folder.</summary>
+public sealed class LocalModelScanException(string message, Exception? inner = null) : Exception(message, inner);
+
+/// <summary>
+/// Reads the local models folder into the inventory Offloadr matches workflows against. The same on the
+/// desktop app's host (Windows) and in the runner container (Linux): a model is known by its name, size
+/// and category, and paths are compared with '/' separators.
+/// </summary>
 internal sealed class LocalModelScanner
 {
     private static readonly HashSet<string> AllowedExtensions = new(StringComparer.OrdinalIgnoreCase)
@@ -78,36 +86,49 @@ internal sealed class LocalModelScanner
 
     private readonly string _runnerId;
     private readonly string _rootDirectory;
+    private readonly Func<string, bool> _isStagingFolder;
 
-    public LocalModelScanner(string runnerId, string rootDirectory)
+    /// <param name="isStagingFolder">Whether a folder at the top of the root holds downloads in progress, which are skipped.</param>
+    public LocalModelScanner(string runnerId, string rootDirectory, Func<string, bool>? isStagingFolder = null)
     {
         _runnerId = runnerId ?? throw new ArgumentNullException(nameof(runnerId));
         _rootDirectory = rootDirectory ?? throw new ArgumentNullException(nameof(rootDirectory));
+        _isStagingFolder = isStagingFolder ?? (static _ => false);
     }
 
+    /// <summary>The models in the folder. Throws <see cref="LocalModelScanException"/> when the folder cannot be read.</summary>
     public LocalModelSnapshot Scan()
     {
         if (string.IsNullOrWhiteSpace(_rootDirectory) || !Directory.Exists(_rootDirectory))
         {
-            return CreateSnapshot(Array.Empty<ModelInfo>());
+            throw new LocalModelScanException($"The local models folder '{_rootDirectory}' is not there.");
         }
 
         var items = new List<ModelInfo>();
-        // Enumeration is lazy, so traversal errors surface while iterating: the whole walk
-        // is guarded, and unreadable folders are skipped rather than failing the scan.
+        // The root is listed strictly: a listing that fails there would read as an empty folder. Below it, a
+        // folder it cannot enter is skipped, not a failed scan: a models folder at the root of a drive holds
+        // folders no one may list (System Volume Information), which would otherwise keep any inventory from
+        // being read at all. Dot-files are scanned as before. Symbolic links are skipped and never followed:
+        // a link could alias a host file outside the local model root into sessions.
+        // Enumeration is lazy, so traversal errors surface while iterating: the whole walk is guarded.
         try
         {
-            var files = Directory.EnumerateFiles(
-                _rootDirectory,
-                "*",
-                new EnumerationOptions
-                {
-                    RecurseSubdirectories = true,
-                    IgnoreInaccessible = true,
-                    // Dot-files are scanned as before. Symbolic links are skipped and never followed:
-                    // a link could alias a host file outside the local model root into sessions.
-                    AttributesToSkip = FileAttributes.ReparsePoint,
-                });
+            var below = new EnumerationOptions
+            {
+                RecurseSubdirectories = true,
+                IgnoreInaccessible = true,
+                AttributesToSkip = FileAttributes.ReparsePoint,
+            };
+            var top = new EnumerationOptions
+            {
+                RecurseSubdirectories = false,
+                IgnoreInaccessible = false,
+                AttributesToSkip = FileAttributes.ReparsePoint,
+            };
+            var files = Directory.EnumerateFiles(_rootDirectory, "*", top)
+                .Concat(Directory.EnumerateDirectories(_rootDirectory, "*", top)
+                    .Where(folder => !_isStagingFolder(Path.GetFileName(folder)))
+                    .SelectMany(folder => FilesBelow(folder, below)));
             foreach (var path in files)
             {
                 if (IsInDownloadFolder(path))
@@ -134,8 +155,7 @@ internal sealed class LocalModelScanner
         }
         catch (Exception ex)
         {
-            RunnerLog.Error<LocalModelScanner>(ex, $"Failed enumerating local model directory '{_rootDirectory}': {ex.Message}");
-            return CreateSnapshot(Array.Empty<ModelInfo>());
+            throw new LocalModelScanException($"Could not list the local models folder '{_rootDirectory}': {ex.Message}", ex);
         }
 
         items.Sort(static (left, right) =>
@@ -152,11 +172,45 @@ internal sealed class LocalModelScanner
         return CreateSnapshot(items);
     }
 
+    /// <summary>The files below a folder at the top of the root; one that went away, or cannot be entered, has none.</summary>
+    private static IEnumerable<string> FilesBelow(string folder, EnumerationOptions options)
+    {
+        IEnumerator<string> files;
+        try
+        {
+            files = Directory.EnumerateFiles(folder, "*", options).GetEnumerator();
+        }
+        catch (Exception ex) when (ex is DirectoryNotFoundException or UnauthorizedAccessException)
+        {
+            yield break;
+        }
+
+        using (files)
+        {
+            while (true)
+            {
+                try
+                {
+                    if (!files.MoveNext())
+                    {
+                        yield break;
+                    }
+                }
+                catch (Exception ex) when (ex is DirectoryNotFoundException or UnauthorizedAccessException)
+                {
+                    yield break;
+                }
+
+                yield return files.Current;
+            }
+        }
+    }
+
     private bool IsInDownloadFolder(string path)
     {
         var relative = Path.GetRelativePath(_rootDirectory, path);
         var first = relative.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)[0];
-        return ModelLibrary.IsStagingFolderName(first);
+        return _isStagingFolder(first);
     }
 
     private static LocalModelSnapshot CreateSnapshot(IReadOnlyList<ModelInfo> models)

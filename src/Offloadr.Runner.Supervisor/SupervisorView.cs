@@ -64,6 +64,12 @@ public sealed record SupervisorView(
     /// <summary>Why the last launch Offloadr asked for could not start, until the next one.</summary>
     public SupervisorFault? LaunchFailure { get; init; }
 
+    /// <summary>The container is released as soon as it is idle (its launch was withdrawn, say): it is not kept warm.</summary>
+    public bool ReleaseDue { get; init; }
+
+    /// <summary>The editor a launch is preparing, downloading or starting (ComfyUI, say); null when none is.</summary>
+    public string? LaunchingEditor { get; init; }
+
     public static SupervisorView Initial(DateTimeOffset now)
         => new(SupervisorState.Stopped, "The runner is stopped.", null, null, null, null, null, null, null, 0, now);
 
@@ -104,13 +110,30 @@ public sealed record SupervisorView(
             LauncherConnection.Refused or LauncherConnection.Unreachable => "Not connected to Offloadr",
             _ => "Connecting…",
         },
-        SupervisorState.Pulling => "Downloading the image…",
-        SupervisorState.Starting => "Starting…",
-        SupervisorState.Running => HasActiveSession ? "Session running" : "Running",
+        SupervisorState.Pulling => LaunchingEditor is { } downloading ? $"Downloading {downloading}…" : "Downloading the image…",
+        SupervisorState.Starting => (LaunchingEditor ?? EditorName(ActiveTemplate)) is { } starting ? $"Starting {starting}…" : "Starting…",
+        SupervisorState.Running when HasActiveSession => EditorName(ActiveTemplate) is { } serving ? $"{serving} session running" : "Session running",
+        SupervisorState.Running => IsReady ? "Ready for sessions" : "Running",
         SupervisorState.WaitingToRetry => "Trying again soon",
         SupervisorState.Stopping => "Stopping…",
+        SupervisorState.Faulted when Fault?.Kind == FaultKind.AppOutdated => "Update needed",
         SupervisorState.Faulted => "Needs attention",
         _ => State.ToString(),
+    };
+
+    /// <summary>
+    /// A container kept warm after its session (or before its first), with Offloadr able to start sessions
+    /// here: the next session with that editor starts quicker.
+    /// </summary>
+    public bool IsWarm => State == SupervisorState.Running && IsReady && !HasActiveSession && !LaunchUnmatched && !ReleaseDue && ActiveTemplate is not null;
+
+    /// <summary>The short name of an editor (ComfyUI, Forge Neo), for titles and menus; null for none.</summary>
+    public static string? EditorName(LaunchTemplate? template) => template switch
+    {
+        null => null,
+        { RuntimeKind: Settings.RunnerSettings.ComfyUiRuntimeKind } => "ComfyUI",
+        { RuntimeKind: Settings.RunnerSettings.ForgeNeoRuntimeKind } => "Forge Neo",
+        _ => template.Label.Split(" - ", 2)[0],
     };
 
     /// <summary>True when the runner reports an editor session; stopping now would interrupt someone's work.</summary>

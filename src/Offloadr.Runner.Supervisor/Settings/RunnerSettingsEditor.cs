@@ -14,7 +14,8 @@ public sealed record SettingsForm(
     bool KeepAwakeDuringSessions = true,
     string? ComfyUiArguments = null,
     string? ForgeNeoArguments = null,
-    string? GpuUuid = null)
+    string? GpuUuid = null,
+    int WarmMinutes = RunnerSettings.DefaultWarmMinutes)
 {
     /// <summary>
     /// True when saving this form saves the same settings as <paramref name="other"/>: a field left blank
@@ -62,7 +63,8 @@ public sealed class RunnerSettingsEditor(IRunnerSettingsStore store)
             settings.KeepAwakeDuringSessions,
             settings.ComfyUiArguments,
             settings.ForgeNeoArguments,
-            settings.GpuUuid);
+            settings.GpuUuid,
+            settings.WarmMinutes);
     }
 
     /// <summary>Saves the form. Settings with problems are saved too, so nothing typed is lost; the problems are returned.</summary>
@@ -81,6 +83,7 @@ public sealed class RunnerSettingsEditor(IRunnerSettingsStore store)
             ComfyUiArguments = form.ComfyUiArguments,
             ForgeNeoArguments = form.ForgeNeoArguments,
             GpuUuid = form.GpuUuid,
+            WarmMinutes = form.WarmMinutes,
         };
 
         try

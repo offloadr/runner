@@ -47,8 +47,11 @@ public sealed class SupervisorOptions
 
     public TimeSpan RetryMaxBackoff { get; init; } = TimeSpan.FromMinutes(5);
 
-    /// <summary>How long a container stays after its last session, so the next one on the same editor starts at once.</summary>
-    public TimeSpan WarmTime { get; init; } = TimeSpan.FromMinutes(10);
+    /// <summary>
+    /// How long a container stays after its last session, so the next one on the same editor starts at once.
+    /// Null, the default: <see cref="Settings.RunnerSettings.WarmMinutes"/>.
+    /// </summary>
+    public TimeSpan? WarmTime { get; init; }
 
     /// <summary>How long creating the container, and then starting it, may each take before it is given up.</summary>
     public TimeSpan RunTimeout { get; init; } = TimeSpan.FromMinutes(2);

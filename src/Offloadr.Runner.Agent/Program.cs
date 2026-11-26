@@ -298,7 +298,7 @@ static async Task<int> RunAgentAsync(string[] commandLine)
     LocalModelProjector? projector = null;
     if (!string.IsNullOrWhiteSpace(options.LocalModelsDirectory))
     {
-        scanner = new LocalModelScanner(options.RunnerId, options.LocalModelsDirectory);
+        scanner = new LocalModelScanner(options.RunnerId, options.LocalModelsDirectory, ModelLibrary.IsStagingFolderName);
         projector = new LocalModelProjector(
             options.LocalModelsDirectory,
             modelProjectionRoot,

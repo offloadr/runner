@@ -19,7 +19,7 @@ namespace Offloadr.Runner.Supervisor;
 /// While available, the app registers as the runner's launcher (<see cref="ILauncherLink"/>). It starts
 /// a container only for the launch Offloadr names, and the agent in it registers as the executor
 /// itself. A container stays warm after its session and is stopped, once Offloadr releases it, when it
-/// has been idle for <see cref="SupervisorOptions.WarmTime"/>, when its settings changed, or when
+/// has been idle for the warm time (<see cref="Settings.RunnerSettings.WarmMinutes"/>), when its settings changed, or when
 /// another editor is needed. See "Launchers" in <c>docs/contracts-sync.md</c>.
 /// </para>
 /// <para>

@@ -978,7 +978,6 @@ internal static partial class ServiceClientManager
     }
 
     internal static TimeSpan CommandStreamKeepAliveInterval { get; set; } = TimeSpan.FromSeconds(20);
-    internal static TimeSpan LocalModelKeepAliveInterval { get; set; } = TimeSpan.FromMinutes(1);
     internal static IReadOnlyList<TimeSpan> PromptArtifactRefreshDelays { get; set; } =
     [
         TimeSpan.Zero,
@@ -1134,7 +1133,7 @@ internal static partial class ServiceClientManager
                 }),
             localModels: token => localModelSnapshotProvider is null
                 ? Task.CompletedTask
-                : RunLocalModelSyncLoopAsync(
+                : LocalModelSync.RunAsync(
                     sessionSink.SyncLocalModelsAsync,
                     token,
                     runnerId,
@@ -1144,6 +1143,7 @@ internal static partial class ServiceClientManager
                     localModelSnapshotProvider,
                     localModelSnapshotObserver,
                     initialStatusApplied.Task,
+                    RunnerLog.CreateLogger(nameof(ServiceClientManager)),
                     initialLocalModelSnapshot),
             commands: token => RunCommandStreamLoopAsync(
                 commandClient,
@@ -1182,157 +1182,6 @@ internal static partial class ServiceClientManager
             ]).ConfigureAwait(false);
     }
 
-    internal static async Task RunLocalModelSyncLoopAsync(
-        Func<SyncLocalModelsRequest, CancellationToken, Task<SyncLocalModelsResponse>> syncLocalModelsAsync,
-        CancellationToken shutdown,
-        string runnerId,
-        TimeSpan scanInterval,
-        TimeSpan minBackoff,
-        TimeSpan maxBackoff,
-        Func<LocalModelSnapshot> snapshotProvider,
-        Action<LocalModelSnapshot>? snapshotObserver,
-        Task initialStatusApplied,
-        LocalModelSnapshot? initialSnapshot = null)
-    {
-        ArgumentNullException.ThrowIfNull(syncLocalModelsAsync);
-        if (snapshotProvider == null) throw new ArgumentNullException(nameof(snapshotProvider));
-
-        try
-        {
-            await initialStatusApplied.WaitAsync(shutdown).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) when (shutdown.IsCancellationRequested)
-        {
-            return;
-        }
-
-        var attempt = 0;
-        var rng = new Random();
-        var keepAliveInterval = LocalModelKeepAliveInterval;
-        var lastSentDigest = string.Empty;
-        var lastObservedDigest = initialSnapshot?.Digest ?? string.Empty;
-        var hasSnapshot = initialSnapshot.HasValue;
-        LocalModelSnapshot cachedSnapshot = initialSnapshot.GetValueOrDefault();
-        var nextScanUtc = hasSnapshot ? DateTime.UtcNow + scanInterval : DateTime.MinValue;
-        var nextKeepAliveUtc = DateTime.MinValue;
-        var lastRequestWasFullSnapshot = false;
-
-        while (!shutdown.IsCancellationRequested)
-        {
-            try
-            {
-                var now = DateTime.UtcNow;
-                if (!hasSnapshot || now >= nextScanUtc)
-                {
-                    var scannedSnapshot = snapshotProvider();
-                    cachedSnapshot = scannedSnapshot;
-                    hasSnapshot = true;
-                    nextScanUtc = now + scanInterval;
-
-                    if (snapshotObserver is not null)
-                    {
-                        try
-                        {
-                            snapshotObserver(scannedSnapshot);
-                        }
-                        catch (Exception ex)
-                        {
-                            RunnerLog.Error(nameof(ServiceClientManager), ex, $"Failed to reconcile local models into session roots: {ex.Message}");
-                        }
-                    }
-
-                    if (!string.Equals(lastObservedDigest, scannedSnapshot.Digest, StringComparison.Ordinal))
-                    {
-                        RunnerLog.Info(nameof(ServiceClientManager), BuildLocalModelSummary(scannedSnapshot));
-                        lastObservedDigest = scannedSnapshot.Digest;
-                    }
-                }
-
-                if (!hasSnapshot)
-                {
-                    throw new InvalidOperationException("Local model snapshot cache is not initialized.");
-                }
-
-                var snapshot = cachedSnapshot;
-                var inventoryChanged = !string.Equals(lastSentDigest, snapshot.SelectionDigest, StringComparison.Ordinal);
-                var fullSnapshot = inventoryChanged;
-                var shouldSync = fullSnapshot
-                                 || now >= nextKeepAliveUtc;
-
-                if (shouldSync)
-                {
-                    lastRequestWasFullSnapshot = fullSnapshot;
-                    var response = await syncLocalModelsAsync(
-                        BuildLocalModelsRequest(runnerId, snapshot, fullSnapshot),
-                        shutdown).ConfigureAwait(false);
-                    if (inventoryChanged)
-                    {
-                        RunnerLog.Info(
-                            nameof(ServiceClientManager),
-                            $"Local model sync accepted={response.AcceptedCount} digest={snapshot.SelectionDigest[..Math.Min(12, snapshot.SelectionDigest.Length)]}");
-                    }
-
-                    lastSentDigest = snapshot.SelectionDigest;
-                    nextKeepAliveUtc = DateTime.UtcNow + keepAliveInterval;
-                }
-
-                attempt = 0;
-                var delay = ComputeLocalModelLoopDelay(DateTime.UtcNow, nextScanUtc, nextKeepAliveUtc);
-                if (delay > TimeSpan.Zero)
-                {
-                    await Task.Delay(delay, shutdown).ConfigureAwait(false);
-                }
-            }
-            catch (OperationCanceledException) when (shutdown.IsCancellationRequested)
-            {
-                break;
-            }
-            catch (RpcException ex) when (ex.StatusCode == StatusCode.Cancelled && shutdown.IsCancellationRequested)
-            {
-                break;
-            }
-            catch (RpcException ex)
-            {
-                if (ex.StatusCode == StatusCode.InvalidArgument && !lastRequestWasFullSnapshot)
-                {
-                    RunnerLog.Warning(
-                        nameof(ServiceClientManager),
-                        "Digest-only local model refresh was rejected; forcing a full local model resync.");
-                    lastSentDigest = string.Empty;
-                    nextKeepAliveUtc = DateTime.MinValue;
-                    attempt = 0;
-                    continue;
-                }
-
-                attempt++;
-                RunnerLog.Error(nameof(ServiceClientManager), ex, $"Local model sync RPC error attempt {attempt}: {ex.StatusCode} {ex.Message}");
-                var delay = RegistrationPolicy.ComputeBackoff(attempt, minBackoff, maxBackoff, rng.NextDouble());
-                try
-                {
-                    await Task.Delay(delay, shutdown).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException) when (shutdown.IsCancellationRequested)
-                {
-                    break;
-                }
-            }
-            catch (Exception ex)
-            {
-                attempt++;
-                RunnerLog.Error(nameof(ServiceClientManager), ex, $"Local model sync failed: {ex.Message}");
-                var delay = RegistrationPolicy.ComputeBackoff(attempt, minBackoff, maxBackoff, rng.NextDouble());
-                try
-                {
-                    await Task.Delay(delay, shutdown).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException) when (shutdown.IsCancellationRequested)
-                {
-                    break;
-                }
-            }
-        }
-    }
-
     internal static LocalModelSnapshot? PrepareInitialLocalModelSnapshot(
         Func<LocalModelSnapshot>? snapshotProvider,
         Action<LocalModelSnapshot>? snapshotObserver)
@@ -1350,7 +1199,7 @@ internal static partial class ServiceClientManager
                 snapshotObserver(snapshot);
             }
 
-            RunnerLog.Info(nameof(ServiceClientManager), BuildLocalModelSummary(snapshot));
+            RunnerLog.Info(nameof(ServiceClientManager), LocalModelSync.Summary(snapshot));
             return snapshot;
         }
         catch (Exception ex)
@@ -1634,13 +1483,6 @@ internal static partial class ServiceClientManager
         _ = commandTasks.Start(() => AcknowledgeRuntimeCommandWithRetryAsync(
             sessionSink.AckSubmitEditorActionAsync, captured, captured.HandoffId, shutdown));
         return Task.CompletedTask;
-    }
-
-    internal static TimeSpan ComputeLocalModelLoopDelay(DateTime nowUtc, DateTime nextScanUtc, DateTime nextKeepAliveUtc)
-    {
-        var nextWakeUtc = nextScanUtc <= nextKeepAliveUtc ? nextScanUtc : nextKeepAliveUtc;
-        var delay = nextWakeUtc - nowUtc;
-        return delay > TimeSpan.Zero ? delay : TimeSpan.Zero;
     }
 
     internal static async Task<string?> PreemptActiveSessionIfNeededAsync(
@@ -3953,29 +3795,6 @@ internal static partial class ServiceClientManager
             CancellationToken.None);
     }
 
-    private static string BuildLocalModelSummary(LocalModelSnapshot snapshot)
-    {
-        if (snapshot.Models.Count == 0)
-        {
-            return "Local model scan summary: 0 models detected.";
-        }
-
-        var folderParts = snapshot.FolderStats
-            .Select(stat => $"{stat.Folder}:{stat.ModelCount} ({FormatBytes(stat.TotalBytes)})");
-        return $"Local model scan summary: {snapshot.Models.Count} models | {string.Join(", ", folderParts)}";
-    }
-
-    private static string FormatBytes(long bytes)
-    {
-        if (bytes < 1024) return $"{bytes} B";
-        var kb = bytes / 1024d;
-        if (kb < 1024) return $"{kb:F1} KB";
-        var mb = kb / 1024d;
-        if (mb < 1024) return $"{mb:F1} MB";
-        var gb = mb / 1024d;
-        return $"{gb:F2} GB";
-    }
-
     /// <summary>The agent's heartbeat: the shared request, with this machine's memory read afresh each time.</summary>
     private static RegisterRunnerRequest BuildStatusUpdateRequest(
         string runnerId,
@@ -3998,20 +3817,5 @@ internal static partial class ServiceClientManager
             RunnerLog.CreateLogger(nameof(ServiceClientManager)),
             describeSealedStorage,
             launchId);
-    }
-
-    private static SyncLocalModelsRequest BuildLocalModelsRequest(string runnerId, LocalModelSnapshot snapshot, bool fullSnapshot)
-    {
-        var request = new SyncLocalModelsRequest
-        {
-            RunnerId = runnerId,
-            SnapshotDigest = snapshot.SelectionDigest,
-            FullSnapshot = fullSnapshot
-        };
-        if (fullSnapshot)
-        {
-            request.SelectionHashes.AddRange(snapshot.SelectionHashes);
-        }
-        return request;
     }
 }

@@ -55,6 +55,21 @@ public sealed partial class RunnerSupervisor
     /// <summary>When the container was last seen serving a session (or started), by <see cref="Now"/>.</summary>
     private TimeSpan _idleSince;
 
+    /// <summary>
+    /// The supervised container is released as soon as it is idle, whatever the warm time: its launch was
+    /// withdrawn before it served, or its release was asked before the app restarted.
+    /// </summary>
+    private bool _releaseDue;
+
+    private void SetReleaseDue(bool due)
+    {
+        _releaseDue = due;
+        if (View.ReleaseDue != due)
+        {
+            Update(view => view with { ReleaseDue = due });
+        }
+    }
+
     /// <summary>A release Offloadr could not be asked about is asked again from then on.</summary>
     private TimeSpan _releaseRetryAt;
 
@@ -1070,6 +1085,9 @@ public sealed partial class RunnerSupervisor
     /// </summary>
     private bool _seenRunning;
 
+    /// <summary>How long a container stays after its last session: the options' (tests), or the settings'.</summary>
+    private TimeSpan WarmTimeFor(RunnerSettings settings) => _options.WarmTime ?? TimeSpan.FromMinutes(settings.WarmMinutes);
+
     /// <summary>Whether a container seen created and never started counts as one that ran nothing.</summary>
     private bool NeverRan(bool seenNeverStarted) => seenNeverStarted && !_startUnanswered && !_seenRunning;
 
@@ -1159,6 +1177,7 @@ public sealed partial class RunnerSupervisor
         _startUnanswered = false;
         _seenRunning = false;
         _keptCreatedNoted = false;
+        SetReleaseDue(false);
         _seenCreated = false;
         _launchNoLongerNamed = false;
         _containerId = null;
