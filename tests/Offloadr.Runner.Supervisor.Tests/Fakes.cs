@@ -1422,6 +1422,18 @@ internal sealed class FakeProcessRunner : IProcessRunner
 }
 
 /// <summary>The system clock, with a wall clock that can be moved (as after a resume or a correction).</summary>
+/// <summary>The system clock, with a monotonic clock that can be stepped forward (the time a loop measures).</summary>
+internal sealed class SteppedTimeProvider : TimeProvider
+{
+    private long _offset;
+
+    public void Advance(TimeSpan by) => Interlocked.Add(ref _offset, (long)(by.TotalSeconds * System.TimestampFrequency));
+
+    public override long GetTimestamp() => System.GetTimestamp() + Interlocked.Read(ref _offset);
+
+    public override long TimestampFrequency => System.TimestampFrequency;
+}
+
 internal sealed class ShiftedTimeProvider : TimeProvider
 {
     private long _offsetTicks;

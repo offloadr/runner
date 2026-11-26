@@ -622,7 +622,7 @@ public sealed partial class RunnerSupervisor
                 }
             });
         }
-        else if (idle.UnlessSent is null && !_releaseDue && _options.WarmTime is null)
+        else if (idle.UnlessSent is null && !idle.Outdated && !_releaseDue && _options.WarmTime is null)
         {
             // Its warm time is over: not sent once a warm time other than the one that decided it is saved.
             var minutes = idle.WarmMinutes;

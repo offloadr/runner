@@ -1085,8 +1085,14 @@ public sealed partial class RunnerSupervisor
     /// </summary>
     private bool _seenRunning;
 
-    /// <summary>How long a container stays after its last session: the options' (tests), or the settings'.</summary>
-    private TimeSpan WarmTimeFor(RunnerSettings settings) => _options.WarmTime ?? TimeSpan.FromMinutes(settings.WarmMinutes);
+    /// <summary>
+    /// How long a container stays after its last session: the options' (tests), or the settings'. Settings with
+    /// problems are saved too: a warm time out of range counts as the default, never as none.
+    /// </summary>
+    private TimeSpan WarmTimeFor(RunnerSettings settings)
+        => _options.WarmTime ?? TimeSpan.FromMinutes(settings.WarmMinutes is >= 1 and <= RunnerSettings.MaximumWarmMinutes
+            ? settings.WarmMinutes
+            : RunnerSettings.DefaultWarmMinutes);
 
     /// <summary>Whether a container seen created and never started counts as one that ran nothing.</summary>
     private bool NeverRan(bool seenNeverStarted) => seenNeverStarted && !_startUnanswered && !_seenRunning;
