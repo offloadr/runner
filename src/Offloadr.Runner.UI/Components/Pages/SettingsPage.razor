@@ -29,7 +29,7 @@
                         </div>
                     </MudStack>
 
-                    <MudSelect T="string" @bind-Value="_editorTemplate" Label="Editor" Variant="Variant.Outlined"
+                    <MudSelect T="string" @bind-Value="_editorTemplate" Label="Editor for the GPU check" Variant="Variant.Outlined"
                                HelperText="@EditorHelp">
                         @foreach (var template in Templates)
                         {
@@ -77,6 +77,10 @@
                             <MudText Typo="Typo.caption" Class="mud-text-secondary ml-14">Together with the switch above, your GPU is available to Offloadr after every sign-in.</MudText>
                         </MudStack>
                     }
+
+                    <MudNumericField T="int" @bind-Value="_warmMinutes" Label="Keep an idle editor ready for (minutes)" Variant="Variant.Outlined"
+                                     Min="1" Max="@RunnerSettings.MaximumWarmMinutes"
+                                     HelperText="After a session, its editor keeps running this long, so the next session with it starts quicker. Then it stops and frees the GPU." />
 
                     <MudStack Spacing="0">
                         <MudSwitch T="bool" @bind-Value="_keepAwake" Color="Color.Primary" Label="Keep this computer awake while a session runs on it" />
@@ -150,6 +154,7 @@
     private bool _autoStart;
     private bool _downloadModels;
     private bool _keepAwake = true;
+    private int _warmMinutes = RunnerSettings.DefaultWarmMinutes;
     private bool _startAtSignIn;
     private bool _showKey;
     private bool _saving;
@@ -159,7 +164,7 @@
     private SettingsForm _saved = null!;
     private bool _savedStartAtSignIn;
 
-    private SettingsForm Form => new(_runnerKey, _editorTemplate, _modelsDirectory, _origin, _engineExecutable, _autoStart, _downloadModels, _keepAwake, _comfyUiArguments, _forgeNeoArguments, _gpuUuid);
+    private SettingsForm Form => new(_runnerKey, _editorTemplate, _modelsDirectory, _origin, _engineExecutable, _autoStart, _downloadModels, _keepAwake, _comfyUiArguments, _forgeNeoArguments, _gpuUuid, _warmMinutes);
 
     // Stands for no choice in the select, which then saves a blank GPU.
     private const string AllGpus = "all";
@@ -202,13 +207,11 @@
     private IReadOnlyList<LaunchTemplate> Templates
         => View.Plan?.Source == LaunchPlanSource.ControlPlane ? View.Plan.Templates : BuiltInLaunchPlanCatalog.Templates;
 
-    private string EditorHelp => View.Plan?.Source == LaunchPlanSource.ControlPlane
-        ? "Offloadr chooses the editor you select there. This one is used only when Offloadr has not chosen one."
-        : "Used only when Offloadr does not choose the editor itself, as now. Match the editor you use in Offloadr.";
+    private string EditorHelp => "Its runner image is downloaded on a first start to check that containers can use the GPU. Sessions start the editor you choose in Offloadr.";
 
     /// <summary>Said once for Settings and Setup: people read "runner" as an editor, and expect it to start.</summary>
     internal const string AutoStartHelp
-        = "Starts the runner in the background, where it waits for Offloadr. An editor such as ComfyUI starts only when you open a session: the one you select in Offloadr, or else the Editor in Settings.";
+        = "Offers this GPU to Offloadr in the background. An editor such as ComfyUI starts only when you open a session with it in Offloadr.";
 
     protected override void OnInitialized()
     {
@@ -225,6 +228,7 @@
         _comfyUiArguments = form.ComfyUiArguments;
         _forgeNeoArguments = form.ForgeNeoArguments;
         _gpuUuid = form.GpuUuid;
+        _warmMinutes = form.WarmMinutes;
         _startAtSignIn = Host.CanStartAtSignIn && Host.StartsAtSignIn;
         _saved = form;
         _savedStartAtSignIn = _startAtSignIn;
@@ -253,7 +257,7 @@
             _savedStartAtSignIn = _startAtSignIn;
 
             Snackbar.Add(
-                View.IsActive ? "Saved. The runner restarts with these settings when no session is using it." : "Saved.",
+                View.HasActiveSession ? "Saved. The session running now keeps its settings; the next one uses these." : "Saved.",
                 _problems.Count == 0 ? Severity.Success : Severity.Warning);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException)

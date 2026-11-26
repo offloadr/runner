@@ -29,8 +29,21 @@ public sealed record RunnerSettings
     /// <summary>Path to the docker or podman executable. Empty means discover it.</summary>
     public string? ContainerEngineExecutable { get; init; }
 
-    /// <summary>Editor template to run when the control plane does not say which one is selected.</summary>
+    /// <summary>
+    /// The editor whose runner image a first start downloads to check the GPU, when the control plane does not
+    /// say which one is selected. Sessions start the editor Offloadr names.
+    /// </summary>
     public string? SelectedEditorTemplate { get; init; }
+
+    /// <summary>
+    /// How long, in minutes, an editor's container stays after a session, so the next session with it starts
+    /// quicker; then Offloadr is asked to release it, and it is stopped.
+    /// </summary>
+    public int WarmMinutes { get; init; } = DefaultWarmMinutes;
+
+    public const int DefaultWarmMinutes = 10;
+
+    public const int MaximumWarmMinutes = 240;
 
     /// <summary>Start the runner when the app opens, idle until a session starts its editor.</summary>
     public bool AutoStart { get; init; }
@@ -152,6 +165,11 @@ public sealed record RunnerSettings
         if (!string.IsNullOrWhiteSpace(GpuUuid) && SelectedGpuUuid is null)
         {
             errors.Add($"The GPU '{GpuUuid.Trim()}' is not a complete NVIDIA GPU UUID. Choose the GPU again under Advanced.");
+        }
+
+        if (WarmMinutes is < 1 or > MaximumWarmMinutes)
+        {
+            errors.Add($"Keep an idle editor ready for 1 to {MaximumWarmMinutes} minutes.");
         }
 
         if (EditorArgumentsProblem(ComfyUiRuntimeKind, ComfyUiArguments) is { } comfyUiProblem)

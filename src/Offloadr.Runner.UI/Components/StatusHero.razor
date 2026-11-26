@@ -1,4 +1,5 @@
 @inherits SupervisorComponent
+@inject IDialogService Dialogs
 
 @* The runner's state at a glance: what it is doing, the one button that changes it, progress and problems. *@
 <MudStack Row="true" AlignItems="AlignItems.Center" Justify="Justify.SpaceBetween" Wrap="Wrap.Wrap" Spacing="3">
@@ -19,7 +20,7 @@
                            Disabled="Starting" OnClick="StartAsync">Offer this GPU again</MudButton>
             }
             <MudButton Variant="Variant.Outlined" Color="Color.Error" StartIcon="@Icons.Material.Filled.Stop"
-                       Disabled="@(View.State == SupervisorState.Stopping)" OnClick="Supervisor.RequestStop">Stop runner</MudButton>
+                       Disabled="@(View.State == SupervisorState.Stopping)" OnClick="StopAsync">Stop offering this GPU</MudButton>
         </MudStack>
     }
     else
@@ -69,7 +70,7 @@ else if (View.State is SupervisorState.Pulling or SupervisorState.Checking or Su
     public EventCallback OnStart { get; set; }
 
     [Parameter]
-    public string StartLabel { get; set; } = "Start runner";
+    public string StartLabel { get; set; } = "Make this GPU available";
 
     [Parameter]
     public EventCallback OnOpenSettings { get; set; }
@@ -85,9 +86,35 @@ else if (View.State is SupervisorState.Pulling or SupervisorState.Checking or Su
     private string TitleTag => IsPageHeading ? "h1" : "h3";
 
     // The card below says what is wrong and what to do.
-    private string Summary => View is { State: SupervisorState.Faulted, Fault: not null }
-        ? "The runner stopped. Fix the problem below, then start it again."
-        : View.Message;
+    private string Summary => View switch
+    {
+        { State: SupervisorState.Faulted, Fault: { Kind: FaultKind.AppOutdated } outdated } => outdated.Message,
+        { State: SupervisorState.Faulted, Fault: not null } => "The runner stopped. Fix the problem below, then start it again.",
+        { IsWarm: true } => $"{SupervisorView.EditorName(View.ActiveTemplate)} stays ready for a while after a session, so the next session with it starts quicker.",
+        _ => View.Message,
+    };
+
+    // Stopping also ends the session the editor serves now: asked first.
+    private async Task StopAsync()
+    {
+        // Asked for the session that runs when it is asked; another one by the answer is asked about again.
+        string? confirmed = null;
+        while (View.HasActiveSession && View.RunnerStatus?.ActiveSessionId is { } session && session != confirmed)
+        {
+            if (await Dialogs.ShowMessageBoxAsync(
+                    "Stop offering this GPU?",
+                    "An editor session is using this GPU. Stopping now stops its editor and interrupts that session.",
+                    yesText: "Stop and end the session",
+                    cancelText: "Keep running") != true)
+            {
+                return;
+            }
+
+            confirmed = session;
+        }
+
+        Supervisor.RequestStop();
+    }
 
     private async Task StartAsync()
     {

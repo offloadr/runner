@@ -5050,6 +5050,58 @@ public class RunnerSupervisorTests
     }
 
     [Test]
+    public async Task AnIdleContainer_IsReleasedAfterTheWarmTimeInSettings_AndNotBefore()
+    {
+        _settings = new FakeSettingsStore(new RunnerSettings { RunnerKey = Key, WarmMinutes = 2 });
+        _engine.StatusJson = Status(activeSessionId: "");
+        var time = new SteppedTimeProvider();
+        var supervisor = await StartSupervisorAsync(time: time, warmTimeFromSettings: true);
+        await MakeAvailableAsync();
+        await LaunchAsync();
+
+        time.Advance(TimeSpan.FromMinutes(1));
+        await Task.Delay(300);
+        Assert.That(_link.Releases, Is.Empty, "Kept warm for the two minutes in Settings.");
+
+        time.Advance(TimeSpan.FromMinutes(1.5));
+        await WaitForStateAsync(SupervisorState.Available);
+        Assert.Multiple(() =>
+        {
+            Assert.That(_link.Releases, Has.Count.EqualTo(1));
+            Assert.That(_engine.Exists(Name), Is.False);
+            Assert.That(supervisor.LogLines, Has.Some.Contains("idle for the warm time"));
+        });
+    }
+
+    [Test]
+    public async Task ALongerWarmTimeSavedAsTheReleaseIsSent_KeepsTheContainer()
+    {
+        _settings = new FakeSettingsStore(new RunnerSettings { RunnerKey = Key, WarmMinutes = 1 });
+        _engine.StatusJson = Status(activeSessionId: "");
+        var time = new SteppedTimeProvider();
+        var supervisor = await StartSupervisorAsync(time: time, warmTimeFromSettings: true);
+        await MakeAvailableAsync();
+        await LaunchAsync();
+
+        // Its warm time is over, and a longer one is saved as the release is about to be sent.
+        _link.BeforeNextRelease = () => _settings.SaveAsync(_settings.Current with { WarmMinutes = 30 }).GetAwaiter().GetResult();
+        time.Advance(TimeSpan.FromMinutes(1.5));
+
+        await WaitUntilAsync(() => _link.BeforeNextRelease is null, "the release to be about to be sent");
+        await Task.Delay(400);
+        Assert.Multiple(() =>
+        {
+            Assert.That(_link.Releases, Is.Empty, "Not sent: the warm time that decided it is no longer the one in Settings.");
+            Assert.That(_engine.Exists(Name), Is.True);
+            Assert.That(supervisor.View.State, Is.EqualTo(SupervisorState.Running));
+        });
+
+        time.Advance(TimeSpan.FromMinutes(30));
+        await WaitForStateAsync(SupervisorState.Available);
+        Assert.That(_link.Releases, Has.Count.EqualTo(1), "Decided again with the new one.");
+    }
+
+    [Test]
     public async Task AContainerServingASession_IsNotReleased()
     {
         _engine.StatusJson = Status(activeSessionId: "session-1");
@@ -5064,7 +5116,7 @@ public class RunnerSupervisorTests
         {
             Assert.That(_link.Releases, Is.Empty);
             Assert.That(_engine.Exists(Name), Is.True);
-            Assert.That(supervisor.View.StateTitle, Is.EqualTo("Session running"));
+            Assert.That(supervisor.View.StateTitle, Is.EqualTo("ComfyUI session running"));
         });
     }
 
@@ -10013,7 +10065,7 @@ public class RunnerSupervisorTests
             Assert.That(input.OtherRunnerKeys, Is.EqualTo(new[] { Key }));
             Assert.That(Offloadr.Runner.Supervisor.Hosting.DiagnosticsReport.Redact($"old {Key} new {newKey}", input), Is.EqualTo("old [runner key] new [runner key]"));
             Assert.That(report, Does.Not.Contain(Key).And.Not.Contain(newKey));
-            Assert.That(report, Does.Contain("State: Session running (Running)"));
+            Assert.That(report, Does.Contain("session running (Running)"));
             Assert.That(name, Does.StartWith("offloadr-runner-diagnostics-").And.EndWith(".txt"));
         });
     }
@@ -10424,6 +10476,7 @@ public class RunnerSupervisorTests
         TimeSpan? statusStaleAfter = null,
         TimeSpan? retryBackoff = null,
         TimeSpan? warmTime = null,
+        bool warmTimeFromSettings = false,
         SupervisorPaths? paths = null,
         TimeSpan? runTimeout = null,
         TimeSpan? lateContainerWatch = null,
@@ -10438,7 +10491,7 @@ public class RunnerSupervisorTests
             StopTimeout = TimeSpan.FromSeconds(1),
             CancelledLaunchSettle = TimeSpan.FromSeconds(1),
             StatusStaleAfter = statusStaleAfter ?? TimeSpan.FromMinutes(1),
-            WarmTime = warmTime ?? TimeSpan.FromHours(1),
+            WarmTime = warmTimeFromSettings ? null : warmTime ?? TimeSpan.FromHours(1),
             ReleaseRetryInterval = TimeSpan.FromMilliseconds(50),
             StaleOfferWait = TimeSpan.FromMilliseconds(300),
             EngineCheckInterval = TimeSpan.FromMilliseconds(50),

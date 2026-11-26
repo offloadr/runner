@@ -186,7 +186,7 @@ public partial class ServiceClientManagerTests
     public void ComputeLocalModelLoopDelay_PicksKeepAliveWhenSoonerThanScan()
     {
         var now = new DateTime(2026, 2, 28, 17, 0, 0, DateTimeKind.Utc);
-        var delay = ServiceClientManager.ComputeLocalModelLoopDelay(
+        var delay = LocalModelSync.ComputeDelay(
             now,
             now.AddMinutes(5),
             now.AddMinutes(1));
@@ -198,7 +198,7 @@ public partial class ServiceClientManagerTests
     public void ComputeLocalModelLoopDelay_PicksScanWhenSoonerThanKeepAlive()
     {
         var now = new DateTime(2026, 2, 28, 17, 0, 0, DateTimeKind.Utc);
-        var delay = ServiceClientManager.ComputeLocalModelLoopDelay(
+        var delay = LocalModelSync.ComputeDelay(
             now,
             now.AddSeconds(30),
             now.AddMinutes(1));
@@ -210,7 +210,7 @@ public partial class ServiceClientManagerTests
     public void ComputeLocalModelLoopDelay_ClampsNegativeDelayToZero()
     {
         var now = new DateTime(2026, 2, 28, 17, 0, 0, DateTimeKind.Utc);
-        var delay = ServiceClientManager.ComputeLocalModelLoopDelay(
+        var delay = LocalModelSync.ComputeDelay(
             now,
             now.AddSeconds(-10),
             now.AddMinutes(1));
@@ -226,7 +226,7 @@ public partial class ServiceClientManagerTests
         var secondAttemptObserved = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var attempt = 0;
 
-        var loopTask = ServiceClientManager.RunLocalModelSyncLoopAsync(
+        var loopTask = LocalModelSync.RunAsync(
             async (_, cancellationToken) =>
             {
                 attempt++;
@@ -247,7 +247,8 @@ public partial class ServiceClientManagerTests
             maxBackoff: TimeSpan.FromMilliseconds(5),
             snapshotProvider: () => CreateSnapshot("digest-1", "selection-1"),
             snapshotObserver: null,
-            initialStatusApplied: Task.CompletedTask);
+            initialStatusApplied: Task.CompletedTask,
+            logger: Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance);
 
         await firstFailureObserved.Task.WaitAsync(TimeSpan.FromSeconds(2));
         Assert.That(cts.IsCancellationRequested, Is.False);
@@ -267,7 +268,7 @@ public partial class ServiceClientManagerTests
         var syncObserved = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var snapshotAttempt = 0;
 
-        var loopTask = ServiceClientManager.RunLocalModelSyncLoopAsync(
+        var loopTask = LocalModelSync.RunAsync(
             (_, _) =>
             {
                 syncObserved.TrySetResult();
@@ -290,7 +291,8 @@ public partial class ServiceClientManagerTests
                 return CreateSnapshot("digest-2", "selection-2");
             },
             snapshotObserver: null,
-            initialStatusApplied: Task.CompletedTask);
+            initialStatusApplied: Task.CompletedTask,
+            logger: Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance);
 
         await firstFailureObserved.Task.WaitAsync(TimeSpan.FromSeconds(2));
         Assert.That(cts.IsCancellationRequested, Is.False);
@@ -308,7 +310,7 @@ public partial class ServiceClientManagerTests
         using var cts = new CancellationTokenSource();
         var requestObserved = new TaskCompletionSource<Offloadr.Runner.V1.SyncLocalModelsRequest>(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        var loopTask = ServiceClientManager.RunLocalModelSyncLoopAsync(
+        var loopTask = LocalModelSync.RunAsync(
             (request, _) =>
             {
                 requestObserved.TrySetResult(request);
@@ -321,7 +323,8 @@ public partial class ServiceClientManagerTests
             maxBackoff: TimeSpan.FromMilliseconds(5),
             snapshotProvider: () => CreateSnapshot("digest-empty"),
             snapshotObserver: null,
-            initialStatusApplied: Task.CompletedTask);
+            initialStatusApplied: Task.CompletedTask,
+            logger: Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance);
 
         var request = await requestObserved.Task.WaitAsync(TimeSpan.FromSeconds(2));
         cts.Cancel();
@@ -338,8 +341,8 @@ public partial class ServiceClientManagerTests
     [Test]
     public async Task RunLocalModelSyncLoopAsync_ForcesFullResync_AfterDigestOnlyRefreshRejected()
     {
-        var originalKeepAlive = ServiceClientManager.LocalModelKeepAliveInterval;
-        ServiceClientManager.LocalModelKeepAliveInterval = TimeSpan.FromMilliseconds(5);
+        var originalKeepAlive = LocalModelSync.KeepAliveInterval;
+        LocalModelSync.KeepAliveInterval = TimeSpan.FromMilliseconds(5);
         using var cts = new CancellationTokenSource();
         var firstFullSyncObserved = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var secondFullSyncObserved = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -347,7 +350,7 @@ public partial class ServiceClientManagerTests
 
         try
         {
-            var loopTask = ServiceClientManager.RunLocalModelSyncLoopAsync(
+            var loopTask = LocalModelSync.RunAsync(
                 (request, _) =>
                 {
                     lock (requests)
@@ -377,7 +380,8 @@ public partial class ServiceClientManagerTests
                 maxBackoff: TimeSpan.FromMilliseconds(5),
                 snapshotProvider: () => CreateSnapshot("digest-1", "selection-1"),
                 snapshotObserver: null,
-                initialStatusApplied: Task.CompletedTask);
+                initialStatusApplied: Task.CompletedTask,
+                logger: Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance);
 
             await firstFullSyncObserved.Task.WaitAsync(TimeSpan.FromSeconds(2));
             await secondFullSyncObserved.Task.WaitAsync(TimeSpan.FromSeconds(2));
@@ -385,7 +389,7 @@ public partial class ServiceClientManagerTests
         }
         finally
         {
-            ServiceClientManager.LocalModelKeepAliveInterval = originalKeepAlive;
+            LocalModelSync.KeepAliveInterval = originalKeepAlive;
         }
 
         Assert.That(requests, Has.Count.EqualTo(3));

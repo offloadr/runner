@@ -1080,9 +1080,9 @@ public sealed partial class RunnerSupervisor
             NoteRelease(launchId, ReleaseNote.None);
         }
 
-        _idleSince = launchId is not null && string.Equals(launchId, _releaseAsked, StringComparison.OrdinalIgnoreCase)
-            ? now - _options.WarmTime
-            : now;
+        // One whose release was asked before is released again as soon as it is idle, whatever the warm time.
+        _idleSince = now;
+        SetReleaseDue(launchId is not null && string.Equals(launchId, _releaseAsked, StringComparison.OrdinalIgnoreCase));
         _releaseRetryAt = TimeSpan.Zero;
         ResetStatusTracking();
         ContainerChanged();
@@ -1911,6 +1911,7 @@ public sealed partial class RunnerSupervisor
                 {
                     if (Showing())
                     {
+                        Update(view => view with { LaunchingEditor = null });
                         Set(SupervisorState.Pulling, $"Downloading {label} to check the GPU. The first download is large and can take a while.");
                     }
                 }),

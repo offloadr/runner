@@ -57,6 +57,7 @@ public sealed class FileRunnerSettingsStore : IRunnerSettingsStore
             DownloadModels = normalized.DownloadModels,
             ContainerEngineExecutable = normalized.ContainerEngineExecutable,
             SelectedEditorTemplate = normalized.SelectedEditorTemplate,
+            WarmMinutes = normalized.WarmMinutes,
             AutoStart = normalized.AutoStart,
             KeepAwakeDuringSessions = normalized.KeepAwakeDuringSessions,
             ComfyUiArguments = normalized.ComfyUiArguments,
@@ -125,6 +126,7 @@ public sealed class FileRunnerSettingsStore : IRunnerSettingsStore
             DownloadModels = document.DownloadModels,
             ContainerEngineExecutable = document.ContainerEngineExecutable,
             SelectedEditorTemplate = document.SelectedEditorTemplate,
+            WarmMinutes = document.WarmMinutes,
             AutoStart = document.AutoStart,
             KeepAwakeDuringSessions = document.KeepAwakeDuringSessions,
             ComfyUiArguments = document.ComfyUiArguments,
@@ -162,6 +164,9 @@ public sealed class FileRunnerSettingsStore : IRunnerSettingsStore
         public string? ContainerEngineExecutable { get; set; }
 
         public string? SelectedEditorTemplate { get; set; }
+
+        // Settings saved before the option existed keep the default.
+        public int WarmMinutes { get; set; } = RunnerSettings.DefaultWarmMinutes;
 
         public bool AutoStart { get; set; }
 

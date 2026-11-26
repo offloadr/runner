@@ -91,8 +91,8 @@ internal static class PlatformWindow
         {
             var view = supervisor.View;
             var runnerItem = view.IsActive || view.State == SupervisorState.Stopping
-                ? new TrayMenuItem(view.HasActiveSession ? "Stop runner and end the session" : "Stop runner", supervisor.RequestStop, view.State != SupervisorState.Stopping)
-                : new TrayMenuItem("Start runner", supervisor.RequestStart);
+                ? new TrayMenuItem(view.HasActiveSession ? "Stop offering this GPU and end the session" : "Stop offering this GPU", supervisor.RequestStop, view.State != SupervisorState.Stopping)
+                : new TrayMenuItem("Make this GPU available", supervisor.RequestStart);
             return
             [
                 new TrayMenuItem("Open Offloadr Runner", Open, IsDefault: true),

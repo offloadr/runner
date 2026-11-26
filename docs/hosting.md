@@ -286,6 +286,7 @@ Local model notes:
 - When a model in the local folder is to be linked where the runner already downloaded the same model (downloaded before the file was added, say), the downloaded copy is deleted so the model is not kept twice. While the editor has that copy open, it stays and keeps being used; the next session or prompt replaces it. This covers ComfyUI's model folder and Forge Neo's model cache.
 - Runner-only local files do not appear in Installed until you add the same model to your studio catalog.
 - If you add/remove files under the mounted directory, the runner auto-rescans and updates inventory on the next scan interval. Unchanged inventories refresh by digest only to keep the Offloadr API lease alive. The Model Manager also supports manual refresh.
+- A folder that cannot be read (it is gone, or listing it fails) is not an empty folder: nothing is published for it, and the inventory read last stays published until a scan succeeds again. Only a folder that was read and has no models publishes an empty inventory.
 
 Runtime telemetry notes:
 
